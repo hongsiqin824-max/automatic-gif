@@ -1,0 +1,54 @@
+{
+  "model": "T-DEED SoccerNet_small",
+  "model_repository": "https://github.com/arturxe2/T-DEED",
+  "checkpoint_sha256": "69b319badc5dcdf5026e7769f1276d947aeec8a822bf6f172852c67089cc61ea",
+  "analysis_fps": 25.0,
+  "input_width": 398,
+  "input_height": 224,
+  "threshold": 0.2,
+  "tolerance_seconds": 15.0,
+  "samples": [
+    {
+      "name": "goal_1",
+      "source_start_sec": 989.0,
+      "expected_event_sec": 1049.0,
+      "result": "tmp/verification/tdeed_goal_1_25fps_398/results_inference.json",
+      "wall_seconds": 13.82
+    },
+    {
+      "name": "goal_2",
+      "source_start_sec": 4973.0,
+      "expected_event_sec": 5033.0,
+      "result": "tmp/verification/tdeed_goal_2_25fps_398/results_inference.json",
+      "wall_seconds": 13.64
+    },
+    {
+      "name": "goal_3",
+      "source_start_sec": 6503.0,
+      "expected_event_sec": 6563.0,
+      "result": "tmp/verification/tdeed_goal_3_25fps_398/results_inference.json",
+      "wall_seconds": 17.54
+    },
+    {
+      "name": "negative_1",
+      "source_start_sec": 700.0,
+      "expected_event_sec": null,
+      "result": "tmp/verification/tdeed_negative_1_25fps_398/results_inference.json",
+      "wall_seconds": null
+    },
+    {
+      "name": "negative_2",
+      "source_start_sec": 2100.0,
+      "expected_event_sec": null,
+      "result": "tmp/verification/tdeed_negative_2_25fps_398/results_inference.json",
+      "wall_seconds": null
+    },
+    {
+      "name": "negative_3",
+      "source_start_sec": 5900.0,
+      "expected_event_sec": null,
+      "result": "tmp/verification/tdeed_negative_3_25fps_398/results_inference.json",
+      "wall_seconds": null
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "match_id": "demo-match-54154533",
+  "events": [
+    {
+      "code": "G",
+      "source_time_sec": 1046,
+      "notification_delay_sec": 8,
+      "minute": "18",
+      "team": "teamA",
+      "person": "demo scorer",
+      "person_id": "demo-goal-1",
+      "score": "1-0"
+    }
+  ]
+}

@@ -1,0 +1,35 @@
+{
+  "match_id": "demo-match-54154533",
+  "events": [
+    {
+      "code": "G",
+      "source_time_sec": 1046,
+      "notification_delay_sec": 2,
+      "minute": "18",
+      "team": "teamA",
+      "person": "demo scorer",
+      "person_id": "demo-goal-1",
+      "score": "1-0"
+    },
+    {
+      "code": "YC",
+      "source_time_sec": 1055,
+      "notification_delay_sec": 3,
+      "minute": "19",
+      "team": "teamB",
+      "person": "demo yellow-card player",
+      "person_id": "demo-yc-1",
+      "reason": "foul"
+    },
+    {
+      "code": "RC",
+      "source_time_sec": 1065,
+      "notification_delay_sec": 4,
+      "minute": "20",
+      "team": "teamB",
+      "person": "demo red-card player",
+      "person_id": "demo-rc-1",
+      "reason": "serious foul"
+    }
+  ]
+}

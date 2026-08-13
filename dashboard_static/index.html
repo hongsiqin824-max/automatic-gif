@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>足球事件 GIF 控制台</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <link rel="stylesheet" href="/static/runtime.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">MATCH EVENT STUDIO</p>
+        <h1>足球直播事件控制台</h1>
+        <p class="subhead">以比赛 ID 串联比赛详情、直播源、事件接口与 GIF 产出。</p>
+      </div>
+      <div class="port-badge"><span class="dot"></span> 8899 · 本地控制台</div>
+    </header>
+
+    <section class="control-panel">
+      <div class="field wide"><label for="match-id">比赛 ID</label><input id="match-id" value="demo-match-54154533" placeholder="输入真实 match_id"></div>
+      <button id="load-btn" class="button secondary">查询比赛</button>
+      <button id="demo-btn" class="button ghost">运行演示链路</button>
+      <button id="start-btn" class="button primary">启动实时处理</button>
+      <button id="stop-btn" class="button danger">停止</button>
+    </section>
+
+    <div id="notice" class="notice hidden"></div>
+
+    <section class="hero-grid">
+      <article class="match-card panel">
+        <div class="panel-head"><span>比赛概览</span><span id="match-status" class="status-pill uncertain">Uncertain</span></div>
+        <div class="teams"><div class="team"><div id="team-a-logo" class="logo-placeholder">A</div><strong id="team-a">等待比赛详情</strong></div><div class="score"><b id="score">-</b><span id="match-minute">--</span></div><div class="team"><div id="team-b-logo" class="logo-placeholder">B</div><strong id="team-b">等待比赛详情</strong></div></div>
+        <div class="match-meta"><span id="competition">未加载</span><span id="start-play">开赛时间 --</span></div>
+      </article>
+      <article class="panel health-card">
+        <div class="panel-head"><span>实时链路</span><span id="worker-status" class="runtime-badge idle"><i></i>未启动</span></div>
+        <div class="pipeline-steps">
+          <div id="source-step" class="pipeline-step"><i></i><span>直播源</span><b id="source-health">未查询</b></div>
+          <div id="buffer-step" class="pipeline-step"><i></i><span>视频缓存</span><b id="buffer-health">未建立</b></div>
+          <div id="event-step" class="pipeline-step"><i></i><span>事件轮询</span><b id="event-health">未启动</b></div>
+          <div id="gif-step" class="pipeline-step"><i></i><span>GIF 任务</span><b id="gif-health">0 个产物</b></div>
+        </div>
+        <div class="runtime-proof">
+          <div><span>运行时长</span><b id="runtime-elapsed">--</b></div>
+          <div><span>处理心跳</span><b id="heartbeat-at">--</b></div>
+          <div><span>外部轮询</span><b id="polling-health">未启动</b></div>
+          <div><span>FFmpeg</span><b id="ffmpeg-health">未启动</b></div>
+        </div>
+        <div id="runtime-message" class="runtime-message hidden"></div>
+      </article>
+    </section>
+
+    <section class="content-grid">
+      <article class="panel events-panel"><div class="panel-head"><span>事件与 GIF</span><span id="event-count" class="muted">唯一事件 0</span></div><div class="event-legend"><span><i class="history-dot"></i>历史未生成</span><span><i class="task-dot"></i>处理中</span><span><i class="ready-dot"></i>已生成 GIF</span></div><div id="events" class="events-list"><div class="empty">输入比赛 ID 查询，或运行演示链路。</div></div></article>
+      <aside class="side-stack">
+        <article class="panel settings"><div class="panel-head"><span>运行配置</span><span class="muted">可调整</span></div><div class="settings-grid"><label>事件轮询<input id="event-poll" type="number" value="3" min="1" step="1"><small>秒</small></label><label>直播源轮询<input id="source-poll" type="number" value="10" min="1" step="1"><small>秒</small></label><label>赛况轮询<input id="detail-poll" type="number" value="10" min="1" step="1"><small>秒</small></label><label>GIF 前置<input id="before" type="number" value="30" min="0" step="1"><small>秒</small></label><label>GIF 后置<input id="after" type="number" value="20" min="1" step="1"><small>秒</small></label><label>GIF 宽度<input id="width" type="number" value="384" min="160" step="16"><small>px</small></label></div><p class="config-note">固定 GIF 参数，不因超过 10 MB 自动降质量。10 MB 仅作为参考提示。</p></article>
+        <article class="panel source-panel"><div class="panel-head"><span>直播源</span><span id="source-change" class="warning hidden">地址有变化</span></div><code id="resource">尚未获取 resource</code><div class="source-meta"><span>updated_at</span><b id="updated-at">--</b></div></article>
+      </aside>
+    </section>
+
+    <section class="panel logs-panel"><div class="panel-head"><span>运行日志</span><span id="last-refresh" class="muted">--</span></div><div id="logs" class="logs"><div class="empty">暂无日志</div></div></section>
+    <footer>第一阶段：事件接口驱动的 G / YC / RC GIF 生成。发布接口和标题生成暂不接入。</footer>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>

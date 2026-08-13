@@ -1,0 +1,37 @@
+# 虚拟环境和工具目录
+tmp/
+.tools/
+.tools-py311/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+venv/
+env/
+
+# 视频/下载文件
+downloads/
+*.mp4
+*.mov
+*.avi
+
+# 生成产物
+output_gifs/
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 模型权重
+*.pt
+*.pth
+*.onnx
+
+# 本机接口密钥和运行配置
+.env

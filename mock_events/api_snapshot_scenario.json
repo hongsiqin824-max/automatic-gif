@@ -1,0 +1,100 @@
+{
+  "version": 1,
+  "steps": [
+    {
+      "at_stream_sec": 0,
+      "payload": {
+        "status": 0,
+        "match_status": "Playing",
+        "events": {}
+      }
+    },
+    {
+      "at_stream_sec": 10,
+      "payload": {
+        "status": 0,
+        "match_status": "Playing",
+        "events": {
+          "18": {
+            "minute": "18",
+            "teamAEvents": [
+              {
+                "minute_extra": "0",
+                "person": "demo scorer",
+                "person_id": "demo-goal-1",
+                "score": "1-0",
+                "reason": "",
+                "code": "G"
+              }
+            ],
+            "teamBEvents": []
+          }
+        }
+      }
+    },
+    {
+      "at_stream_sec": 12,
+      "payload": {
+        "status": 0,
+        "match_status": "Playing",
+        "events": {
+          "18": {
+            "minute": "18",
+            "teamAEvents": [
+              {
+                "minute_extra": "0",
+                "person": "demo scorer",
+                "person_id": "demo-goal-1",
+                "score": "1-0",
+                "reason": "",
+                "code": "G"
+              }
+            ],
+            "teamBEvents": []
+          }
+        }
+      }
+    },
+    {
+      "at_stream_sec": 15,
+      "error": "simulated event API timeout"
+    },
+    {
+      "at_stream_sec": 20,
+      "payload": {
+        "status": 0,
+        "match_status": "Playing",
+        "events": {
+          "18": {
+            "minute": "18",
+            "teamAEvents": [
+              {
+                "minute_extra": "0",
+                "person": "demo scorer",
+                "person_id": "demo-goal-1",
+                "score": "1-0",
+                "reason": "",
+                "code": "G"
+              }
+            ],
+            "teamBEvents": []
+          },
+          "19": {
+            "minute": "19",
+            "teamAEvents": [],
+            "teamBEvents": [
+              {
+                "minute_extra": "0",
+                "person": "demo booked player",
+                "person_id": "demo-yellow-1",
+                "score": "",
+                "reason": "foul",
+                "code": "YC"
+              }
+            ]
+          }
+        }
+      }
+    }
+  ]
+}
