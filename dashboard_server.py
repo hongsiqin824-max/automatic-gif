@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import errno
 import json
+import math
 import os
 import re
 import signal
@@ -21,11 +22,14 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from flask import Flask, abort, jsonify, request, send_from_directory
 
+from event_api_response import EventApiResponseError, normalize_event_api_response
+from heavy_task_coordinator import HeavyTaskCoordinator, HeavyTaskCoordinatorError
 from match_event_identity import events_represent_same_incident
 
 
@@ -59,6 +63,22 @@ def _load_dotenv(path: Path) -> None:
 _load_dotenv(ROOT / ".env")
 HOST = os.environ.get("GIF_DASHBOARD_HOST", "127.0.0.1")
 PORT = int(os.environ.get("GIF_DASHBOARD_PORT", "8899"))
+
+
+def _positive_environment_integer(name: str, default: int) -> int:
+    raw_value = os.environ.get(name, str(default))
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} 必须是正整数") from exc
+    if value < 1:
+        raise RuntimeError(f"{name} 必须是正整数")
+    return value
+
+
+MAX_CONCURRENT_MATCHES = _positive_environment_integer(
+    "GIF_MAX_CONCURRENT_MATCHES", 8
+)
 DEFAULT_OUTPUT = ROOT / "output_gifs" / "dashboard"
 DEFAULT_EVENT_URL = (
     "https://openapi.dongqiudi.com/internal/api/data/overview/match/{match_id}"
@@ -70,6 +90,17 @@ DEFAULT_SOURCE_URL = (
     "https://openapi.dongqiudi.com/internal/sport-data/inner/tool/"
     "match/live_source/query"
 )
+MATCH_CATALOG_URL = "https://api.dongqiudi.com/data/tab/new/lotzc"
+MATCH_CATALOG_REFRESH_SECONDS = 30.0
+MATCH_CATALOG_BACKOFF_SECONDS = (5.0, 10.0, 20.0, 30.0)
+MATCH_CATALOG_LIMIT = 20
+MATCH_CATALOG_UPCOMING_SECONDS = 15 * 60
+MATCH_CATALOG_CARD_FIELDS = (
+    "match_id", "team_A_name", "team_A_logo", "team_B_name", "team_B_logo",
+    "competition_name", "round_name", "status", "start_play", "sort_timestamp",
+    "fs_A", "fs_B", "minute", "minute_extra", "minute_period", "cmp_type",
+)
+BEIJING_TIMEZONE = timezone(timedelta(hours=8))
 MATCH_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
 MATCH_STATUS_LABELS = {
     "Cancelled": "已取消",
@@ -88,7 +119,17 @@ WORKER_KILL_GRACE_SECONDS = float(
 )
 WORKER_CLEANUP_POLL_SECONDS = 0.1
 PLAYED_CONFIRMATIONS_REQUIRED = 2
+WORKER_FINISH_GRACE_SECONDS = 90.0
 WORKER_FINISH_TIMEOUT_SECONDS = 120.0
+DASHBOARD_BUFFER_SECONDS = 360.0
+VISION_SEARCH_BEFORE_SECONDS = 300.0
+VISION_SEARCH_AFTER_SECONDS = 0.0
+FALLBACK_GIF_WIDTH = 384
+FALLBACK_GIF_FPS = 6.0
+FALLBACK_GIF_COLORS = 160
+DEFAULT_DEMO_SCOREBOARD_PROFILE = (
+    ROOT / "scoreboard_profiles" / "demo_wiesbaden_1280x720.json"
+)
 # Leave the worker time to flush its task pool and write the final report before
 # the dashboard escalates to process-group cleanup.
 FINISHING_TIMEOUT_SECONDS = WORKER_FINISH_TIMEOUT_SECONDS + 15.0
@@ -106,6 +147,18 @@ def validate_match_id(value: str) -> str:
     if not MATCH_ID_PATTERN.fullmatch(match_id):
         raise ValueError("match_id 只能包含字母、数字、下划线和连字符，长度不超过 80")
     return match_id
+
+
+def _usable_match_start_play(detail: dict[str, Any]) -> str | None:
+    """Return a real start_play value, excluding demo/placeholder text."""
+    value = str(detail.get("start_play") or "").strip()
+    if not value or value in {"演示数据", "未知", "--"}:
+        return None
+    if re.fullmatch(r"\d+(?:\.\d+)?", value):
+        return value
+    if re.match(r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}", value):
+        return value
+    return None
 
 
 def _demo_detail(match_id: str) -> dict[str, Any]:
@@ -133,9 +186,16 @@ class MatchSession:
     detail_poll_seconds: float = 10.0
     before_seconds: float = 30.0
     after_seconds: float = 20.0
-    gif_width: int = 384
-    gif_fps: float = 6.0
-    gif_colors: int = 160
+    event_to_video_offset_seconds: float = -60.0
+    gif_width: int = 768
+    gif_fps: float = 16.0
+    gif_colors: int = 256
+    vision_enabled: bool = True
+    vision_before_seconds: float = 8.0
+    vision_after_seconds: float = 12.0
+    scoreboard_profile_path: str = field(
+        default_factory=lambda: os.environ.get("GIF_SCOREBOARD_PROFILE", "").strip()
+    )
     source: dict[str, Any] = field(default_factory=dict)
     detail: dict[str, Any] = field(default_factory=dict)
     event_payload: dict[str, Any] = field(default_factory=dict)
@@ -230,15 +290,14 @@ def query_detail(match_id: str) -> dict[str, Any]:
 def query_events(match_id: str) -> dict[str, Any]:
     url = DEFAULT_EVENT_URL.format(match_id=urllib.parse.quote(match_id))
     payload = _json_request(url + "?" + urllib.parse.urlencode({"user": _user()}))
-    status = payload.get("status")
-    if status not in (0, "0"):
-        raise ValueError(f"事件接口返回异常状态 status={status!r}")
-    events = payload.get("events")
-    if events == []:
-        payload["events"] = {}
-    elif not isinstance(events, dict):
-        raise ValueError("事件接口返回缺少有效的 events 对象")
-    return payload
+    try:
+        return normalize_event_api_response(payload)
+    except EventApiResponseError as exc:
+        if exc.reason == "status":
+            raise ValueError(f"事件接口返回异常状态 status={exc.status!r}") from exc
+        if exc.reason == "events":
+            raise ValueError("事件接口返回缺少有效的 events 对象") from exc
+        raise
 
 
 def query_source(match_id: str) -> dict[str, Any]:
@@ -252,6 +311,227 @@ def query_source(match_id: str) -> dict[str, Any]:
         method="POST",
         body={"secret": secret},
     )
+
+
+def _catalog_match_timestamp(item: dict[str, Any]) -> float:
+    raw_timestamp = item.get("sort_timestamp")
+    try:
+        timestamp = float(raw_timestamp)
+    except (TypeError, ValueError):
+        timestamp = 0.0
+    if timestamp > 0:
+        return timestamp
+
+    start_play = str(item.get("start_play") or "").strip()
+    try:
+        parsed = datetime.strptime(start_play, "%Y-%m-%d %H:%M:%S")
+    except ValueError as exc:
+        raise ValueError(
+            f"比赛 {item.get('match_id')!r} 缺少有效的 sort_timestamp/start_play"
+        ) from exc
+    return parsed.replace(tzinfo=BEIJING_TIMEZONE).timestamp()
+
+
+def _catalog_required_text(item: dict[str, Any], field_name: str, index: int) -> str:
+    value = item.get(field_name)
+    if isinstance(value, (str, int)):
+        text = str(value).strip()
+        if text:
+            return text
+    raise ValueError(f"赛事目录第 {index + 1} 项缺少有效字段 {field_name}")
+
+
+class MatchCatalog:
+    """Small, independent cache for the global soccer match directory."""
+
+    def __init__(self) -> None:
+        self.lock = threading.RLock()
+        self.playing: list[dict[str, Any]] = []
+        self.upcoming: list[dict[str, Any]] = []
+        self.last_success_at: float | None = None
+        self.last_attempt_at: float | None = None
+        self.next_attempt_at = 0.0
+        self.last_latency_ms: float | None = None
+        self.last_error: str | None = None
+        self.last_query_start: str | None = None
+        self.consecutive_failures = 0
+        self.source_count = 0
+        self.soccer_count = 0
+
+    @staticmethod
+    def _iso_beijing(timestamp: float | None) -> str | None:
+        if timestamp is None:
+            return None
+        return datetime.fromtimestamp(timestamp, BEIJING_TIMEZONE).isoformat()
+
+    def _fetch(
+        self,
+        now_unix: float,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int, int, str]:
+        query_start = datetime.fromtimestamp(now_unix, BEIJING_TIMEZONE).strftime(
+            "%Y-%m-%d%H:%M:%S"
+        )
+        self.last_query_start = query_start
+        url = MATCH_CATALOG_URL + "?" + urllib.parse.urlencode(
+            {"start": query_start, "init": "1", "user": _user()}
+        )
+        payload = _json_request(url)
+        rows = payload.get("list")
+        if not isinstance(rows, list):
+            raise ValueError("赛事目录响应缺少有效的 list 数组")
+
+        candidates: dict[str, tuple[dict[str, Any], float]] = {}
+        soccer_count = 0
+        for index, raw_item in enumerate(rows):
+            if not isinstance(raw_item, dict):
+                raise ValueError(f"赛事目录第 {index + 1} 项不是 JSON 对象")
+            if str(raw_item.get("cmp_type") or "").strip() != "soccer":
+                continue
+            soccer_count += 1
+            match_id = validate_match_id(
+                _catalog_required_text(raw_item, "match_id", index)
+            )
+            _catalog_required_text(raw_item, "team_A_name", index)
+            _catalog_required_text(raw_item, "team_B_name", index)
+            status = _catalog_required_text(raw_item, "status", index)
+            if status not in {"Playing", "Fixture"}:
+                continue
+            item = {
+                field_name: raw_item.get(field_name)
+                for field_name in MATCH_CATALOG_CARD_FIELDS
+            }
+            item["match_id"] = match_id
+            match_timestamp = _catalog_match_timestamp(item)
+            existing = candidates.get(match_id)
+            if existing is None:
+                candidates[match_id] = (item, match_timestamp)
+                continue
+            existing_status = str(existing[0].get("status") or "")
+            if (
+                status == "Playing" and existing_status != "Playing"
+            ) or (
+                status == existing_status and match_timestamp < existing[1]
+            ):
+                candidates[match_id] = (item, match_timestamp)
+
+        playing_rows: list[tuple[dict[str, Any], float]] = []
+        upcoming_rows: list[tuple[dict[str, Any], float]] = []
+        upcoming_deadline = now_unix + MATCH_CATALOG_UPCOMING_SECONDS
+        for item, match_timestamp in candidates.values():
+            if item.get("status") == "Playing":
+                playing_rows.append((item, match_timestamp))
+            elif now_unix <= match_timestamp <= upcoming_deadline:
+                upcoming_rows.append((item, match_timestamp))
+
+        playing_rows.sort(key=lambda entry: (entry[1], entry[0]["match_id"]))
+        upcoming_rows.sort(key=lambda entry: (entry[1], entry[0]["match_id"]))
+        return (
+            [item for item, _ in playing_rows[:MATCH_CATALOG_LIMIT]],
+            [item for item, _ in upcoming_rows[:MATCH_CATALOG_LIMIT]],
+            len(rows),
+            soccer_count,
+            query_start,
+        )
+
+    def _refresh_if_due(self, now_unix: float) -> None:
+        if now_unix < self.next_attempt_at:
+            return
+
+        self.last_attempt_at = now_unix
+        started_monotonic = time.monotonic()
+        try:
+            playing, upcoming, source_count, soccer_count, query_start = self._fetch(
+                now_unix
+            )
+        except Exception as exc:
+            completed_at = time.time()
+            self.last_latency_ms = round(
+                (time.monotonic() - started_monotonic) * 1000, 1
+            )
+            self.consecutive_failures += 1
+            backoff = MATCH_CATALOG_BACKOFF_SECONDS[
+                min(
+                    self.consecutive_failures - 1,
+                    len(MATCH_CATALOG_BACKOFF_SECONDS) - 1,
+                )
+            ]
+            self.next_attempt_at = completed_at + backoff
+            self.last_error = str(exc)
+            return
+
+        completed_at = time.time()
+        self.playing = playing
+        self.upcoming = upcoming
+        self.source_count = source_count
+        self.soccer_count = soccer_count
+        self.last_query_start = query_start
+        self.last_success_at = completed_at
+        self.last_latency_ms = round(
+            (time.monotonic() - started_monotonic) * 1000, 1
+        )
+        self.consecutive_failures = 0
+        self.last_error = None
+        self.next_attempt_at = max(
+            completed_at,
+            now_unix + MATCH_CATALOG_REFRESH_SECONDS,
+        )
+
+    def snapshot(self) -> dict[str, Any]:
+        now_unix = time.time()
+        with self.lock:
+            self._refresh_if_due(now_unix)
+            cache_age = (
+                max(0.0, now_unix - self.last_success_at)
+                if self.last_success_at is not None
+                else None
+            )
+            has_cache = self.last_success_at is not None
+            if self.last_error and has_cache:
+                state, status = "stale", "degraded"
+            elif self.last_error:
+                state, status = "error", "unavailable"
+            else:
+                state, status = "healthy", "ok"
+            total_count = len(self.playing) + len(self.upcoming)
+            from_cache = self.last_error is not None and has_cache
+            health_label = {
+                "healthy": "接口正常",
+                "stale": "接口异常 · 缓存可用",
+                "error": "接口异常",
+            }[state]
+            return {
+                "playing": [dict(item) for item in self.playing],
+                "upcoming": [dict(item) for item in self.upcoming],
+                "health": {
+                    "state": state,
+                    "status": status,
+                    "label": health_label,
+                    "from_cache": from_cache,
+                    "last_success_at_unix": self.last_success_at,
+                    "last_success_at": self._iso_beijing(self.last_success_at),
+                    "last_attempt_at_unix": self.last_attempt_at,
+                    "last_attempt_at": self._iso_beijing(self.last_attempt_at),
+                    "latency_ms": self.last_latency_ms,
+                    "cache_age_seconds": (
+                        round(cache_age, 1) if cache_age is not None else None
+                    ),
+                    "consecutive_failures": self.consecutive_failures,
+                    "source_count": self.source_count,
+                    "soccer_count": self.soccer_count,
+                    "total_count": total_count,
+                    "error": self.last_error,
+                    "next_retry_at_unix": (
+                        self.next_attempt_at if self.next_attempt_at > 0 else None
+                    ),
+                    "next_retry_at": (
+                        self._iso_beijing(self.next_attempt_at)
+                        if self.next_attempt_at > 0
+                        else None
+                    ),
+                    "refresh_interval_seconds": MATCH_CATALOG_REFRESH_SECONDS,
+                    "query_start": self.last_query_start,
+                },
+            }
 
 
 def flatten_events(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -396,6 +676,36 @@ def _tasks_from_database(
                 if has_aliases
                 else []
             )
+            has_vision = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'vision_tasks'"
+            ).fetchone()
+            vision_columns = (
+                {
+                    str(row["name"])
+                    for row in connection.execute("PRAGMA table_info(vision_tasks)")
+                }
+                if has_vision
+                else set()
+            )
+            vision_error_kind_field = (
+                "last_error_kind"
+                if "last_error_kind" in vision_columns
+                else "NULL AS last_error_kind"
+            )
+            vision_rows = (
+                connection.execute(
+                    """
+                    SELECT event_key, status, located_anchor_stream_time,
+                           confidence, inference_seconds, model_name,
+                           model_version, output_path, output_bytes,
+                           result_json, error, """
+                    + vision_error_kind_field
+                    + """
+                    FROM vision_tasks ORDER BY created_at_unix, event_key
+                    """
+                ).fetchall()
+                if has_vision else []
+            )
         finally:
             connection.close()
     except (OSError, sqlite3.Error, json.JSONDecodeError):
@@ -426,6 +736,8 @@ def _tasks_from_database(
                 "output": row["output_path"] or result.get("output"),
                 "bytes": row["output_bytes"] or result.get("bytes"),
                 "duration_sec": result.get("duration_sec"),
+                "coverage_status": result.get("coverage_status"),
+                "coverage_reason": result.get("coverage_reason"),
                 "seconds_after_event_observed": result.get(
                     "seconds_after_event_observed"
                 ),
@@ -436,6 +748,101 @@ def _tasks_from_database(
         str(row["version_key"]): str(row["canonical_key"])
         for row in alias_rows
     }
+    vision_by_key: dict[str, dict[str, Any]] = {}
+    for row in vision_rows:
+        try:
+            vision_result = json.loads(row["result_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            vision_result = {}
+        if not isinstance(vision_result, dict):
+            vision_result = {}
+        error_kind = vision_result.get("error_kind") or row["last_error_kind"]
+        locator_method = (
+            vision_result.get("locator_method")
+            or vision_result.get("location_method")
+        )
+        if not locator_method and "t-deed" in str(row["model_name"] or "").lower():
+            locator_method = "tdeed"
+        ocr_diagnostics = (
+            vision_result.get("ocr_diagnostics")
+            or vision_result.get("ocr_diagnostics_summary")
+        )
+        if not isinstance(ocr_diagnostics, dict):
+            ocr_payload = vision_result.get("ocr")
+            ocr_error = vision_result.get("ocr_error")
+            nested_diagnostics = (
+                ocr_payload.get("diagnostics")
+                if isinstance(ocr_payload, dict) else None
+            )
+            if not isinstance(nested_diagnostics, dict) and isinstance(ocr_error, dict):
+                nested_diagnostics = ocr_error.get("diagnostics")
+            if isinstance(nested_diagnostics, dict):
+                ocr_diagnostics = {
+                    "sampled_frames": nested_diagnostics.get("sampled_frame_count"),
+                    "clock_readable_frames": nested_diagnostics.get(
+                        "clock_readable_frame_count"
+                    ),
+                    "clock_readable_rate": nested_diagnostics.get(
+                        "clock_readable_rate"
+                    ),
+                    "score_readable_frames": nested_diagnostics.get(
+                        "score_readable_frame_count"
+                    ),
+                    "score_readable_rate": nested_diagnostics.get(
+                        "score_readable_rate"
+                    ),
+                    "clock_repaired_frames": nested_diagnostics.get(
+                        "clock_repaired_frame_count"
+                    ),
+                    "scoreboard_missing_frames": nested_diagnostics.get(
+                        "scoreboard_missing_frame_count"
+                    ),
+                    "ambiguous_frames": nested_diagnostics.get(
+                        "ambiguous_frame_count"
+                    ),
+                    "worker_wall_seconds": nested_diagnostics.get(
+                        "worker_wall_seconds"
+                    ),
+                    "inference_seconds": nested_diagnostics.get(
+                        "inference_seconds"
+                    ),
+                    "worker_mode": nested_diagnostics.get("worker_mode"),
+                }
+        vision_by_key[str(row["event_key"])] = {
+            "status": str(row["status"]),
+            "anchor_stream_time_sec": row["located_anchor_stream_time"],
+            "confidence": row["confidence"],
+            "inference_seconds": row["inference_seconds"],
+            "model_name": row["model_name"],
+            "model_version": row["model_version"],
+            "output": row["output_path"] or vision_result.get("output"),
+            "bytes": row["output_bytes"] or vision_result.get("bytes"),
+            "anchor_delta_seconds": vision_result.get("anchor_delta_seconds"),
+            "coverage_status": vision_result.get("coverage_status"),
+            "coverage_reason": vision_result.get("coverage_reason"),
+            "experimental": bool(vision_result.get("experimental")),
+            "error_kind": error_kind,
+            "last_error_kind": row["last_error_kind"],
+            "locator_method": locator_method,
+            "stage": vision_result.get("stage") or vision_result.get("failed_stage"),
+            "fallback_used": vision_result.get("fallback_used"),
+            "minute_fallback": bool(vision_result.get("minute_fallback")),
+            "fallback_generated": bool(vision_result.get("fallback_generated")),
+            "default_gif_preserved": vision_result.get("default_gif_preserved"),
+            "output_kind": vision_result.get("output_kind"),
+            "precise_location": vision_result.get("precise_location"),
+            "failure_reason": vision_result.get("failure_reason"),
+            "clip_before_seconds": vision_result.get("clip_before_seconds"),
+            "clip_after_seconds": vision_result.get("clip_after_seconds"),
+            "output_width": vision_result.get("output_width"),
+            "output_fps": vision_result.get("output_fps"),
+            "output_colors": vision_result.get("output_colors"),
+            "tdeed_error_kind": vision_result.get("tdeed_error_kind"),
+            "ocr_diagnostics": ocr_diagnostics,
+            "error": row["error"] or vision_result.get("error"),
+        }
+    for task in tasks:
+        task["vision"] = vision_by_key.get(str(task.get("event_key")))
     return tasks, aliases, suppressed_keys
 
 
@@ -569,18 +976,53 @@ def _canonicalize_event_rows(
     return list(reversed(canonical_rows))
 
 
-def _latest_ingest_message(output_dir: Path) -> str | None:
+def _latest_ingest_message(
+    output_dir: Path,
+    *,
+    started_at_unix: float | None = None,
+) -> str | None:
+    paths: list[tuple[float, Path]] = []
     try:
-        paths = list(output_dir.glob("ingest_ffmpeg_*.log"))
-        latest = max(paths, key=lambda path: path.stat().st_mtime)
-        lines = [
-            line.strip()
-            for line in latest.read_text(encoding="utf-8", errors="replace").splitlines()
-            if line.strip()
-        ]
-    except (ValueError, OSError):
-        return None
-    return lines[-1] if lines else None
+        for path in output_dir.glob("ingest_ffmpeg_*.log"):
+            try:
+                modified_at = path.stat().st_mtime
+            except OSError:
+                continue
+            if started_at_unix is None or modified_at >= started_at_unix:
+                paths.append((modified_at, path))
+    except OSError:
+        pass
+    paths.sort(key=lambda item: item[0], reverse=True)
+    for _, path in paths:
+        try:
+            lines = [
+                line.strip()
+                for line in path.read_text(
+                    encoding="utf-8",
+                    errors="replace",
+                ).splitlines()
+                if line.strip()
+            ]
+        except OSError:
+            continue
+        if lines:
+            # FFmpeg runs with -loglevel error, so every non-empty line is an
+            # ingest error. A newer, empty log means the current retry is alive;
+            # retain the preceding error so the reconnect remains explainable.
+            return lines[-1]
+    return None
+
+
+def _row_is_from_current_run(
+    row: dict[str, Any],
+    started_at_unix: float | None,
+) -> bool:
+    if started_at_unix is None:
+        return True
+    try:
+        return float(row.get("timestamp_unix") or 0) >= started_at_unix
+    except (TypeError, ValueError):
+        return False
 
 
 def _runtime_evidence(
@@ -595,16 +1037,19 @@ def _runtime_evidence(
     current_log_rows = [
         row
         for row in log_rows
-        if not started_at or float(row.get("timestamp_unix") or 0) >= started_at - 1
+        if _row_is_from_current_run(row, started_at)
     ]
     heartbeat = next(
         (row for row in current_log_rows if row.get("event") == "runtime_heartbeat"),
         {},
     )
 
-    report_started_at = float(report.get("started_at_unix") or 0)
+    try:
+        report_started_at = float(report.get("started_at_unix") or 0)
+    except (TypeError, ValueError):
+        report_started_at = 0.0
     report_is_current = bool(report) and (
-        started_at is None or report_started_at >= started_at - 1
+        started_at is None or report_started_at >= started_at
     )
     current_report = report if report_is_current else {}
     event_source = current_report.get("event_source") or {}
@@ -614,7 +1059,7 @@ def _runtime_evidence(
     try:
         for path in (session.output_dir / "buffer").glob("*.ts"):
             modified = path.stat().st_mtime
-            if started_at is not None and modified < started_at - 2:
+            if started_at is not None and modified < started_at:
                 continue
             segment_count += 1
             latest_segment_unix = max(latest_segment_unix or modified, modified)
@@ -623,8 +1068,37 @@ def _runtime_evidence(
 
     heartbeat_unix = float(heartbeat.get("timestamp_unix") or 0) or None
     heartbeat_age = max(0.0, now - heartbeat_unix) if heartbeat_unix else None
+    heartbeat_fresh = heartbeat_age is not None and heartbeat_age <= 9
     segment_age = (
         max(0.0, now - latest_segment_unix) if latest_segment_unix else None
+    )
+    segment_writing = segment_age is not None and segment_age <= 9
+    raw_ingest_running = heartbeat.get("ingest_running")
+    ingest_running = (
+        raw_ingest_running if isinstance(raw_ingest_running, bool) else None
+    )
+    try:
+        ingest_restart_count = int(
+            heartbeat.get("ingest_restart_count")
+            if heartbeat.get("ingest_restart_count") is not None
+            else (current_report.get("runtime") or {}).get(
+                "ingest_restart_count",
+                0,
+            )
+        )
+    except (TypeError, ValueError):
+        ingest_restart_count = 0
+    try:
+        ingest_reconnect_due_unix = (
+            float(heartbeat["ingest_reconnect_due_unix"])
+            if heartbeat.get("ingest_reconnect_due_unix") is not None
+            else None
+        )
+    except (TypeError, ValueError):
+        ingest_reconnect_due_unix = None
+    last_ingest_error = _latest_ingest_message(
+        session.output_dir,
+        started_at_unix=started_at,
     )
     elapsed = max(0.0, now - started_at) if started_at else None
     if not worker_running and current_report.get("processing_wall_seconds") is not None:
@@ -677,16 +1151,27 @@ def _runtime_evidence(
     if state is not None:
         pass
     elif worker_running:
-        evidence_fresh = (
-            heartbeat_age is not None
-            and heartbeat_age <= 9
-            and segment_age is not None
-            and segment_age <= 9
-        )
-        if evidence_fresh and not last_event_error:
-            state, label = "healthy", "实时链路正常"
-        elif elapsed is not None and elapsed < 12 and heartbeat_age is None:
+        if heartbeat_age is None and elapsed is not None and elapsed < 12:
             state, label = "starting", "正在建立直播缓存"
+        elif not heartbeat_fresh:
+            state, label = "degraded", "Worker 存活 · 运行心跳超时"
+        elif ingest_running is False and ingest_reconnect_due_unix is not None:
+            state, label = "recovering", "Worker 存活 · FFmpeg 等待重连"
+        elif ingest_running is False:
+            state, label = "degraded", "Worker 存活 · FFmpeg 未运行"
+        elif ingest_running is True and not segment_writing:
+            if elapsed is not None and elapsed < 12 and segment_count == 0:
+                state, label = "starting", "FFmpeg 已启动 · 等待首个视频分片"
+            else:
+                state, label = "degraded", "FFmpeg 运行中 · 视频分片未持续写入"
+        elif ingest_running is True and last_event_error:
+            state, label = "degraded", "视频采集正常 · 事件接口异常"
+        elif ingest_running is True:
+            state, label = "healthy", "实时链路正常"
+        elif segment_writing and not last_event_error:
+            # Compatibility with heartbeats written by older Workers that did
+            # not yet expose ingest_running.
+            state, label = "healthy", "实时链路正常"
         else:
             state, label = "degraded", "运行中 · 信号待确认"
     elif not started_at and not current_report:
@@ -702,13 +1187,13 @@ def _runtime_evidence(
     else:
         state, label = "stopped", "处理进程已退出"
 
-    exit_message = None
+    exit_message = last_ingest_error
     if not worker_running and (started_at or current_report):
         if stopped_by_user:
             exit_message = "用户停止"
         elif ffmpeg_return_code is not None:
             exit_message = f"FFmpeg 返回码 {ffmpeg_return_code}"
-        exit_message = _latest_ingest_message(session.output_dir) or exit_message
+        exit_message = last_ingest_error or exit_message
     if session.worker_cleanup_failure:
         exit_message = session.worker_cleanup_failure
     elif (
@@ -726,17 +1211,22 @@ def _runtime_evidence(
         "elapsed_seconds": round(elapsed, 1) if elapsed is not None else None,
         "heartbeat_unix": heartbeat_unix,
         "heartbeat_age_seconds": round(heartbeat_age, 1) if heartbeat_age is not None else None,
+        "heartbeat_fresh": heartbeat_fresh,
         "stream_time_seconds": heartbeat.get("stream_time_sec"),
         "buffer_segment_count": int(heartbeat.get("buffer_segment_count") or segment_count),
         "buffer_coverage_seconds": heartbeat.get("buffer_coverage_seconds"),
         "latest_segment_unix": latest_segment_unix,
         "latest_segment_age_seconds": round(segment_age, 1) if segment_age is not None else None,
+        "segment_writing": segment_writing,
         "event_poll_count": event_poll_count,
         "event_error_count": event_error_count,
         "last_event_error": last_event_error,
         "task_counts": task_counts,
         "ffmpeg_return_code": ffmpeg_return_code,
-        "ingest_restart_count": (current_report.get("runtime") or {}).get("ingest_restart_count", 0),
+        "ingest_running": ingest_running,
+        "ingest_restart_count": ingest_restart_count,
+        "ingest_reconnect_due_unix": ingest_reconnect_due_unix,
+        "last_ingest_error": last_ingest_error,
         "exit_message": exit_message,
         "lifecycle_state": session.lifecycle_state,
         "finish_reason": session.finish_reason,
@@ -836,11 +1326,30 @@ def _session_json(session: MatchSession) -> dict[str, Any]:
         "gif": {
             "before_seconds": session.before_seconds,
             "after_seconds": session.after_seconds,
+            "event_to_video_offset_seconds": session.event_to_video_offset_seconds,
             "width": session.gif_width,
             "fps": session.gif_fps,
             "colors": session.gif_colors,
             "size_reference_mb": 10,
             "adaptive_quality_reduction": False,
+        },
+        "vision": {
+            "enabled": session.vision_enabled,
+            "worker_enabled": "--vision-enabled" in session.worker_command,
+            "before_seconds": session.vision_before_seconds,
+            "after_seconds": session.vision_after_seconds,
+            "search_before_seconds": VISION_SEARCH_BEFORE_SECONDS,
+            "search_after_seconds": VISION_SEARCH_AFTER_SECONDS,
+            "scoreboard_profile_path": session.scoreboard_profile_path or None,
+            "model": "OCR + T-DEED fallback",
+            "workers": 1,
+            "fallback_gif": {
+                "before_seconds": 60.0,
+                "after_seconds": 60.0,
+                "width": FALLBACK_GIF_WIDTH,
+                "fps": FALLBACK_GIF_FPS,
+                "colors": FALLBACK_GIF_COLORS,
+            },
         },
         "events": tasks,
         "event_counts": event_counts,
@@ -851,11 +1360,137 @@ def _session_json(session: MatchSession) -> dict[str, Any]:
 
 
 class Dashboard:
-    def __init__(self, *, background_monitors: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        background_monitors: bool = True,
+        max_concurrent_matches: int | None = None,
+    ) -> None:
         self.sessions: dict[str, MatchSession] = {}
         self.lock = threading.RLock()
         self.background_monitors = background_monitors
         self.monitor_threads: dict[str, threading.Thread] = {}
+        self.max_concurrent_matches = (
+            MAX_CONCURRENT_MATCHES
+            if max_concurrent_matches is None
+            else int(max_concurrent_matches)
+        )
+        if self.max_concurrent_matches < 1:
+            raise ValueError("max_concurrent_matches 必须是正整数")
+
+    @staticmethod
+    def _session_holds_worker_slot(session: MatchSession) -> bool:
+        return bool(
+            session.worker_running()
+            or session.desired_running
+            or session.lifecycle_state in {"starting", "finishing", "stopping"}
+            or session.worker_cleanup_process_group is not None
+        )
+
+    def _active_match_summaries_locked(self) -> list[dict[str, Any]]:
+        summaries = []
+        for match_id, session in self.sessions.items():
+            worker_running = session.worker_running()
+            if not (
+                worker_running
+                or session.desired_running
+                or session.lifecycle_state in {"starting", "finishing", "stopping"}
+                or session.worker_cleanup_process_group is not None
+            ):
+                continue
+            if session.worker_cleanup_process_group is not None:
+                reservation_state = "cleaning"
+            elif session.lifecycle_state == "finishing":
+                reservation_state = "finishing"
+            elif session.lifecycle_state == "stopping":
+                reservation_state = "stopping"
+            elif worker_running:
+                reservation_state = "running"
+            elif session.desired_running:
+                reservation_state = "recovering"
+            else:
+                reservation_state = "starting"
+            summaries.append(
+                {
+                    "match_id": match_id,
+                    "state": reservation_state,
+                    "match_status": session.status(),
+                    "lifecycle_state": session.lifecycle_state,
+                    "worker_running": worker_running,
+                    "desired_running": session.desired_running,
+                    "worker_mode": session.worker_mode,
+                    "worker_pid": session.worker.pid if worker_running else None,
+                    "restart_due_at_unix": session.worker_restart_due_at,
+                    "cleanup_process_group": session.worker_cleanup_process_group,
+                    "finish_reason": session.finish_reason,
+                }
+            )
+        return sorted(summaries, key=lambda item: item["match_id"])
+
+    def worker_slot_status(self) -> dict[str, Any]:
+        with self.lock:
+            active_matches = self._active_match_summaries_locked()
+            active_match_ids = [item["match_id"] for item in active_matches]
+            active_match_count = len(active_match_ids)
+            available_slots = max(
+                0, self.max_concurrent_matches - active_match_count
+            )
+            at_capacity = available_slots == 0
+            return {
+                # The singular field remains for old clients. It is intentionally
+                # unset when several matches are active to avoid selecting one
+                # arbitrary match as the global owner.
+                "active_match_id": (
+                    active_match_ids[0] if len(active_match_ids) == 1 else None
+                ),
+                "active_match_ids": active_match_ids,
+                "active_matches": active_matches,
+                "active_match_count": active_match_count,
+                "max_concurrent_matches": self.max_concurrent_matches,
+                "available_worker_slots": available_slots,
+                "at_capacity": at_capacity,
+                "locked": at_capacity,
+            }
+
+    def _assert_worker_slot_available(self, session: MatchSession) -> None:
+        with self.lock:
+            active_match_ids = {
+                item["match_id"] for item in self._active_match_summaries_locked()
+            }
+            if session.match_id in active_match_ids:
+                return
+            if len(active_match_ids) >= self.max_concurrent_matches:
+                raise RuntimeError(
+                    f"并发比赛已达上限 {self.max_concurrent_matches} 场；"
+                    "请先停止一场比赛并等待其 Worker 完全退出"
+                )
+
+    def _claim_worker_slot(self, session: MatchSession) -> None:
+        with self.lock:
+            active_match_ids = {
+                item["match_id"] for item in self._active_match_summaries_locked()
+            }
+            if (
+                session.match_id not in active_match_ids
+                and len(active_match_ids) >= self.max_concurrent_matches
+            ) or len(active_match_ids) > self.max_concurrent_matches:
+                raise RuntimeError(
+                    f"并发比赛已达上限 {self.max_concurrent_matches} 场；"
+                    "请先停止一场比赛并等待其 Worker 完全退出"
+                )
+
+    def _release_worker_slot(
+        self,
+        session: MatchSession,
+        *,
+        force: bool = False,
+    ) -> None:
+        # Capacity is derived from the per-match lifecycle instead of a mutable
+        # global owner. Keep this method so existing transition call sites remain
+        # explicit about when a match is expected to release its reservation.
+        del force
+        if self._session_holds_worker_slot(session):
+            return
 
     def get(self, match_id: str) -> MatchSession:
         match_id = validate_match_id(match_id)
@@ -1175,7 +1810,7 @@ class Dashboard:
         )
         if session.worker_running():
             self._request_worker_finish(session)
-        else:
+        elif session.worker_cleanup_process_group is None:
             self._finalize_finishing(session)
 
     def _confirm_already_played_session(self, session: MatchSession, now: float) -> None:
@@ -1279,11 +1914,44 @@ class Dashboard:
             exit_reason=session.exit_reason,
             worker_return_code=return_code,
         )
+        self._release_worker_slot(session, force=True)
 
     def refresh(self, session: MatchSession) -> None:
         now = time.time()
         with session.lock:
             if session.match_id.startswith("demo-"):
+                if session.worker is not None and session.worker.poll() is not None:
+                    if session.worker_exit_logged_pid != session.worker.pid:
+                        session.worker_exit_logged_pid = session.worker.pid
+                        self._log_control(
+                            session,
+                            "worker_exited",
+                            pid=session.worker.pid,
+                            return_code=session.worker.returncode,
+                            runtime_seconds=(
+                                round(max(0.0, now - session.worker_started_at), 3)
+                                if session.worker_started_at is not None
+                                else 0.0
+                            ),
+                        )
+                        session.desired_running = False
+                        session.worker_restart_due_at = None
+                        if session.worker_process_group is not None:
+                            self._begin_worker_cleanup(
+                                session,
+                                session.worker_process_group,
+                                now,
+                            )
+                    self._advance_worker_cleanup(session, now)
+                    if session.worker_cleanup_process_group is None:
+                        session.lifecycle_state = (
+                            "completed" if session.worker.returncode == 0 else "failed"
+                        )
+                        self._release_worker_slot(session, force=True)
+                    elif session.worker_cleanup_failure:
+                        session.lifecycle_state = "failed"
+                    else:
+                        session.lifecycle_state = "stopping"
                 return
             if (
                 session.worker is not None
@@ -1458,6 +2126,7 @@ class Dashboard:
                         self._signal_finish_timeout(session, now)
                 elif session.worker_cleanup_process_group is None:
                     self._finalize_finishing(session)
+            self._release_worker_slot(session)
 
     @staticmethod
     def _log_control(session: MatchSession, event: str, **fields: Any) -> None:
@@ -1481,11 +2150,20 @@ class Dashboard:
     ) -> None:
         with session.lock:
             if session.worker_running():
-                return
+                raise RuntimeError(f"比赛 {session.match_id} 的 Worker 已在运行")
             if session.worker_cleanup_process_group is not None:
                 raise RuntimeError(
                     "前一个 Worker 进程组尚未确认清理，拒绝启动新的 Worker"
                 )
+            if not recovery and (
+                session.desired_running
+                or session.lifecycle_state in {"starting", "finishing", "stopping"}
+            ):
+                raise RuntimeError(
+                    f"比赛 {session.match_id} 已处于 {session.lifecycle_state} 状态，"
+                    "不能重复启动"
+                )
+            self._assert_worker_slot_available(session)
             if session.worker_process_group is not None:
                 if not self._cleanup_worker_group_blocking(
                     session,
@@ -1511,13 +2189,16 @@ class Dashboard:
                 source = str(ROOT / "downloads" / "SV Wehen Wiesbaden vs FC Bayern Munchen [zqJI-83XFhM].mp4")
                 command = [
                     "python3", str(ROOT / "event_driven_pipeline.py"), source,
-                    "--simulate-live", "--replay-speed", "4", "--start", "1037", "--duration", "50",
+                    "--simulate-live", "--replay-speed", "4", "--start", "1037", "--duration", "95",
                     "--match-id", session.match_id, "--replay-events",
                     str(ROOT / "mock_events" / "api_snapshot_scenario.json"),
                     "--before", str(session.before_seconds), "--after", str(session.after_seconds),
+                    "--event-to-video-offset", str(session.event_to_video_offset_seconds),
+                    "--buffer-seconds", str(DASHBOARD_BUFFER_SECONDS),
                     "--event-poll-seconds", str(session.event_poll_seconds),
                     "--gif-width", str(session.gif_width), "--gif-fps", str(session.gif_fps),
                     "--gif-colors", str(session.gif_colors), "--output-dir", str(session.output_dir),
+                    "--graceful-stop-grace-seconds", str(WORKER_FINISH_GRACE_SECONDS),
                     "--graceful-stop-timeout-seconds", str(WORKER_FINISH_TIMEOUT_SECONDS),
                 ]
             else:
@@ -1530,18 +2211,59 @@ class Dashboard:
                     "--event-user", _user(),
                     "--event-poll-seconds", str(session.event_poll_seconds),
                     "--before", str(session.before_seconds), "--after", str(session.after_seconds),
+                    "--event-to-video-offset", str(session.event_to_video_offset_seconds),
+                    "--buffer-seconds", str(DASHBOARD_BUFFER_SECONDS),
                     "--gif-width", str(session.gif_width), "--gif-fps", str(session.gif_fps),
                     "--gif-colors", str(session.gif_colors), "--output-dir", str(session.output_dir),
+                    "--graceful-stop-grace-seconds", str(WORKER_FINISH_GRACE_SECONDS),
                     "--graceful-stop-timeout-seconds", str(WORKER_FINISH_TIMEOUT_SECONDS),
                 ]
+            match_start_play = _usable_match_start_play(session.detail)
+            if match_start_play is not None:
+                command.extend([
+                    "--match-start-play", match_start_play,
+                    "--match-start-naive-timezone", "utc",
+                ])
+            if session.vision_enabled:
+                command.extend([
+                    "--vision-enabled",
+                    "--vision-search-before", str(VISION_SEARCH_BEFORE_SECONDS),
+                    "--vision-search-after", str(VISION_SEARCH_AFTER_SECONDS),
+                    "--vision-before", str(session.vision_before_seconds),
+                    "--vision-after", str(session.vision_after_seconds),
+                    "--vision-workers", "1",
+                    "--fallback-gif-width", str(FALLBACK_GIF_WIDTH),
+                    "--fallback-gif-fps", str(FALLBACK_GIF_FPS),
+                    "--fallback-gif-colors", str(FALLBACK_GIF_COLORS),
+                ])
+                configured_profile = session.scoreboard_profile_path
+                if demo and not configured_profile:
+                    configured_profile = str(DEFAULT_DEMO_SCOREBOARD_PROFILE)
+                if configured_profile:
+                    profile_path = Path(
+                        configured_profile
+                    ).expanduser().resolve()
+                    if not profile_path.is_file():
+                        raise RuntimeError(
+                            f"记分牌 profile 文件不存在: {profile_path}"
+                        )
+                    command.extend(["--scoreboard-profile", str(profile_path)])
             session.worker_command = command
             session.worker_mode = "demo" if demo else "live"
-            session.worker = subprocess.Popen(
-                command,
-                cwd=ROOT,
-                text=True,
-                start_new_session=True,
-            )
+            previous_lifecycle_state = session.lifecycle_state
+            session.lifecycle_state = "starting"
+            try:
+                self._claim_worker_slot(session)
+                session.worker = subprocess.Popen(
+                    command,
+                    cwd=ROOT,
+                    text=True,
+                    start_new_session=True,
+                )
+            except Exception:
+                session.lifecycle_state = previous_lifecycle_state
+                self._release_worker_slot(session, force=True)
+                raise
             session.worker_process_group = session.worker.pid
             session.desired_running = True
             session.worker_started_at = time.time()
@@ -1597,6 +2319,7 @@ class Dashboard:
                         )
                     if not keep_desired:
                         session.lifecycle_state = "stopped"
+                        self._release_worker_slot(session, force=True)
                     return
                 assert session.worker is not None
                 worker = session.worker
@@ -1645,10 +2368,82 @@ class Dashboard:
                 raise
             if not keep_desired:
                 session.lifecycle_state = "stopped"
+                self._release_worker_slot(session, force=True)
 
 
 dashboard = Dashboard()
+match_catalog = MatchCatalog()
+heavy_task_monitor = HeavyTaskCoordinator.from_environment()
 app = Flask(__name__, static_folder="dashboard_static", static_url_path="/static")
+
+
+def _heavy_task_status() -> dict[str, Any]:
+    """Expose scheduler evidence without leaking local coordinator details."""
+    try:
+        snapshot = heavy_task_monitor.snapshot()
+    except HeavyTaskCoordinatorError as exc:
+        return {
+            "state": "error",
+            "error": str(exc),
+            "total_slots": heavy_task_monitor.max_heavy_tasks,
+            "vision_slots": heavy_task_monitor.max_vision_tasks,
+            "occupied": 0,
+            "vision_active": 0,
+            "queued": 0,
+            "oldest_wait_seconds": 0.0,
+            "active_items": [],
+            "waiting_items": [],
+        }
+
+    now = time.time()
+    active_items = [
+        {
+            key: item.get(key)
+            for key in (
+                "task_kind",
+                "match_id",
+                "event_key",
+                "acquired_at_unix",
+                "heartbeat_at_unix",
+            )
+        }
+        for item in snapshot["active"]["items"]
+    ]
+    waiting_items = []
+    for item in snapshot["waiting"]["items"]:
+        requested_at = float(item.get("requested_at_unix") or now)
+        waiting_items.append(
+            {
+                **{
+                    key: item.get(key)
+                    for key in (
+                        "task_kind",
+                        "match_id",
+                        "event_key",
+                        "requested_at_unix",
+                        "heartbeat_at_unix",
+                    )
+                },
+                "wait_seconds": round(max(0.0, now - requested_at), 3),
+            }
+        )
+    oldest_wait = max(
+        (float(item["wait_seconds"]) for item in waiting_items),
+        default=0.0,
+    )
+    return {
+        "state": "healthy",
+        "error": None,
+        "updated_at_unix": snapshot["updated_at_unix"],
+        "total_slots": snapshot["limits"]["heavy"],
+        "vision_slots": snapshot["limits"]["vision"],
+        "occupied": snapshot["active"]["heavy"],
+        "vision_active": snapshot["active"]["vision"],
+        "queued": snapshot["waiting"]["tasks"],
+        "oldest_wait_seconds": round(oldest_wait, 3),
+        "active_items": active_items,
+        "waiting_items": waiting_items,
+    }
 
 
 @app.get("/")
@@ -1659,6 +2454,17 @@ def index():
 @app.get("/api/health")
 def health():
     return jsonify({"ok": True, "port": PORT, "time_unix": time.time()})
+
+
+@app.get("/api/matches")
+def matches_catalog():
+    payload = match_catalog.snapshot()
+    worker_slot = dashboard.worker_slot_status()
+    payload.update(worker_slot)
+    payload["heavy_tasks"] = _heavy_task_status()
+    # Compatibility name consumed by the current dashboard UI.
+    payload["selection_locked"] = worker_slot["locked"]
+    return jsonify(payload)
 
 
 @app.get("/api/session")
@@ -1687,12 +2493,26 @@ def session_configure():
             ("gif_width", "gif_width", int),
             ("gif_fps", "gif_fps", float),
             ("gif_colors", "gif_colors", int),
+            ("vision_before_seconds", "vision_before_seconds", float),
+            ("vision_after_seconds", "vision_after_seconds", float),
         ):
             if key in body:
                 value = cast(body[key])
                 if value <= 0:
                     return jsonify({"error": f"{field_name} 必须大于 0"}), 400
                 setattr(session, field_name, value)
+        if "event_to_video_offset_seconds" in body:
+            value = float(body["event_to_video_offset_seconds"])
+            if not math.isfinite(value):
+                return jsonify({"error": "event_to_video_offset_seconds 必须是有限数字"}), 400
+            session.event_to_video_offset_seconds = value
+        if "vision_enabled" in body:
+            session.vision_enabled = bool(body["vision_enabled"])
+        if "scoreboard_profile_path" in body:
+            profile_path = str(body["scoreboard_profile_path"] or "").strip()
+            if profile_path and not Path(profile_path).expanduser().is_file():
+                return jsonify({"error": "scoreboard_profile_path 文件不存在"}), 400
+            session.scoreboard_profile_path = profile_path
     return jsonify(_session_json(session))
 
 

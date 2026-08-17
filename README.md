@@ -8,8 +8,9 @@ video/RTMP-equivalent input -> event timestamp -> retroactive clip -> GIF
 ```
 
 The primary implementation is now event-feed driven. It supports `G` (goal),
-`YC` (yellow card), and `RC` (red card) without requiring a broadcast
-scoreboard. `live_goal_pipeline.py` remains as the earlier scoreboard baseline.
+`OG` (own goal), `YC` (yellow card), and `RC` (red card). The default GIF does
+not require a broadcast scoreboard; optional precise localization uses its
+clock and score. `live_goal_pipeline.py` remains as the earlier baseline.
 
 ## Run
 
@@ -80,6 +81,28 @@ structured runtime log. Enter a real `match_id` for production API data. The
 "运行演示链路" button uses the supplied MP4 and cumulative API snapshots, so
 it remains usable without network access or a live match.
 
+One console can manage several matches. Active matches appear as tabs, and
+switching tabs only changes the visible match; it does not stop the other
+Workers. The defaults allow eight active matches while globally limiting heavy
+work to two concurrent tasks, including at most one vision task:
+
+```bash
+GIF_MAX_CONCURRENT_MATCHES=8
+GIF_MAX_CONCURRENT_HEAVY_TASKS=2
+GIF_MAX_CONCURRENT_VISION_TASKS=1
+```
+
+The limits apply across all match Worker processes. A ninth match receives an
+HTTP 409 response until one active match has completely stopped. GIF encoding
+has queue priority over optional vision refinement, and the activity panel
+shows current heavy-task occupancy and queue depth.
+
+The default event anchor is the API first-observed stream time minus 60
+seconds. With the normal 30-second pre-roll and 20-second post-roll, the
+default GIF covers `[T-90, T-40]` and can be encoded immediately from history.
+Optional refinement uses the unshifted API time `T`, scans `[T-300, T]`, and is
+not submitted until the corresponding default GIF has succeeded.
+
 For a real match, "启动实时处理" is enabled by behavior only after the source
 query has returned a non-empty `resource`. A source `resource` or `updated_at`
 change is logged and causes the worker to restart against the new source while
@@ -104,9 +127,9 @@ retaining SQLite event deduplication state.
 
 ## Event API-driven pipeline
 
-`event_driven_pipeline.py` keeps the latest 120 seconds of video and polls a
-match event source. A newly observed `G`, `YC`, or `RC` event creates one GIF
-job. The first API response seeds the already-known event set by default, so
+`event_driven_pipeline.py` keeps the latest 360 seconds of video and polls a
+match event source. A newly observed `G`, `OG`, `YC`, or `RC` event creates one
+GIF job. The first API response seeds the already-known event set by default, so
 starting the process during a match does not regenerate every earlier event.
 
 Run a recording as a live stream with the local simulated event feed:
@@ -157,6 +180,7 @@ python3 event_driven_pipeline.py \
   --match-id 54154533 \
   --event-url "https://openapi.dongqiudi.com/internal/api/data/overview/match/{match_id}" \
   --event-user "user@example.com" \
+  --match-start-play "2026-05-20 11:00:00" \
   --event-poll-seconds 5 \
   --output-dir output_gifs/match_54154533
 ```
@@ -164,6 +188,9 @@ python3 event_driven_pipeline.py \
 `--event-to-video-offset` configures the measured relationship between the
 event's first appearance and the corresponding action in the received video.
 It remains `0` until a same-match API/RTMP live test establishes that offset.
+`--match-start-play` accepts the match-detail API's Beijing time. It supplies a
+coarse match-clock reference for the visual search window; the API observation
+time remains the default GIF anchor, and T-DEED performs the final refinement.
 GIF parameters are fixed for the entire run. The 10 MB value is a reporting
 reference only and never causes automatic resolution, FPS, or color reduction.
 
@@ -173,6 +200,7 @@ Every run now creates these operational artifacts under `--output-dir`:
 
 - `pipeline_state.sqlite3`: durable event and GIF-task state. Restarting with
   the same match ID and output directory does not regenerate encoded events.
+  It also stores the per-match wall-clock/stream-time mapping.
 - `pipeline_events.jsonl`: immediately flushed records for discovery, duplicate
   events, API failures, task transitions, ingest restarts, and completed GIFs.
 - `ingest_ffmpeg_RUN_ID_gNNN.log`: one FFmpeg log per initial connection or
@@ -181,9 +209,27 @@ Every run now creates these operational artifacts under `--output-dir`:
   `event_pipeline_report.json` points to the latest run's contents.
 - `buffer/segments_RUN_ID_gNNN.csv` and `buffer/segment_RUN_ID_gNNN_*.ts`:
   rolling video segments retained across reconnects and program restarts.
+- `buffer/segment_manifest.json`: atomically written generation list and stream
+  offsets used to restore those segments on Worker restart.
+
+磁盘生命周期由终态清理器统一管理：
+
+- 运行中每次创建新的 FFmpeg generation 前，会把本场历史 ingest 日志限制在
+  `--lifecycle-keep-ingest-logs` 个以内。
+- 确认比赛正常结束、FFmpeg 已停止且 GIF/视觉任务已收敛后，默认原子清空
+  manifest 的 generation，再回收未被 lease 保护的 TS 和无引用 CSV；手动停止、
+  进程异常退出或 lease 查询失败时会延后清理，保留现场供恢复。
+- `--post-match-buffer-retention-seconds` 可保留赛后最近一段 TS；运行报告按
+  `--lifecycle-keep-run-reports` 限制数量，过大的 `pipeline_events.jsonl` 按
+  `--lifecycle-event-log-max-mb` 和 `--lifecycle-event-log-archives` 轮转。
+- 清理结果写入 `event_pipeline_report.json` 的 `disk_lifecycle` 字段，包含删除
+  文件数、释放字节数、保留/跳过数量和错误信息。SQLite 任务库不会被删除，只会
+  在终态执行 WAL checkpoint。
 
 RTMP input is supervised and restarted after either a clean or non-zero FFmpeg
-exit, with exponential backoff capped at 30 seconds. By default retries do not
+exit, with progressive backoff of 2, 3, then 5 seconds (capped at 5 seconds).
+Producing a new non-empty
+segment resets that backoff. By default retries do not
 expire; the event API continues polling during the reconnect delay. Set a
 finite retry budget only when needed with `--rtmp-max-reconnects`,
 `--rtmp-reconnect-initial-seconds`, and `--rtmp-reconnect-max-seconds`.
@@ -199,8 +245,11 @@ the pre-start match history as new.
 
 GIF encoding uses a bounded worker pool (`--gif-workers`, default 2), so two
 near-simultaneous events can encode independently without blocking event/API
-polling. Output filenames include a stable event-key suffix to prevent two
-same-type events at the same observation time from overwriting each other.
+polling. New event-driven outputs use readable names such as
+`54154533_m090+03_goal_Player-Name_2-1_default_abcdef.gif`. The `default` or
+`ai` variant and stable six-character event suffix prevent the two artifacts,
+or otherwise similar events, from overwriting each other. Existing outputs are
+not renamed.
 
 Run all deterministic tests with:
 
@@ -241,8 +290,8 @@ python3 live_goal_pipeline.py \
 ```
 
 The default event window is 12 seconds before score confirmation and 18 seconds
-after it. GIF encoding uses one fixed profile, currently 384 pixels wide, 6 FPS,
-and 160 palette colors. The 10 MB setting is a reporting reference only: the
+after it. GIF encoding uses one fixed profile, currently 768 pixels wide, 16 FPS,
+and 256 palette colors. The 10 MB setting is a reporting reference only: the
 encoder does not reduce colors, FPS, or resolution, and a larger GIF still
 succeeds. The fixed profile can be selected explicitly with `--gif-width`,
 `--gif-fps`, and `--gif-colors`.
@@ -277,15 +326,55 @@ to seven seconds for the current keyframe-based segment to close, and about two
 seconds of GIF encoding. Compared with the manually reviewed visible goal action,
 the end-to-end result was ready in approximately 28-29 seconds.
 
+## Optional scoreboard OCR
+
+PaddleOCR runs in an isolated environment so its dependencies cannot change the
+Dashboard or T-DEED runtime:
+
+```bash
+python3 -m venv tmp/ocr_venv
+tmp/ocr_venv/bin/python -m pip install -r ocr_requirements.txt
+```
+
+Enable `AI 精剪` before starting a match Worker. Goal and own-goal tasks look
+for a stable transition to the API target score and place the refined anchor
+three seconds before the first stable new score. Card tasks use OCR only to map
+the API minute to a video interval, then require T-DEED for second-level action
+location. The rolling buffer retains 360 seconds and OCR searches the latest
+300 seconds at one sample per second. Clock and score are cropped and parsed
+independently, and recognition-only inference runs in batches of up to eight
+crops through one persistent local worker shared by active matches.
+
+Each broadcast layout needs a JSON profile with a reference resolution and
+pixel ROIs. Configure it with `GIF_SCOREBOARD_PROFILE` or the
+`scoreboard_profile_path` session field. For example:
+
+```json
+{
+  "profile_id": "source-a-1080p",
+  "reference_resolution": [1920, 1080],
+  "clock_roi": [40, 30, 180, 82],
+  "score_roi": [180, 30, 360, 82],
+  "second_half_clock_mode": "continuous"
+}
+```
+
+Unknown or mismatched layouts never publish a false precise result. The
+existing default GIF remains unchanged and a separate 120-second
+`_fallback_` GIF is attempted at 384px / 6 FPS with a structured failure
+reason. A successful second-level location still publishes the short
+`-8/+12` second `_ai_` GIF. Extra time and penalty shootouts remain outside V1.
+
 ## Current boundary
 
-The event-driven implementation no longer depends on a scoreboard or a visual
-goal classifier. The supplied recording proves event routing, streaming buffer,
-retroactive extraction, post-roll wait, fixed-profile GIF generation, durable
-deduplication, concurrent jobs, and the one-minute latency budget for the tested
-profile. The reconnect policy is deterministically tested, but a same-match live
-RTMP feed and event API are still required to measure their clock offset, real
-network behavior, event corrections, and production event-code payloads.
+The default event-driven path does not depend on OCR or a visual classifier.
+The supplied recording proves event routing, streaming buffer, retroactive
+extraction, fixed-profile GIF generation, durable deduplication, and concurrent
+jobs. PaddleOCR has been locally verified against an existing broadcast GIF:
+after ROI upscaling it read the score in 48 of 50 sampled frames and correctly
+refused to invent a transition when the clip already began at the target score.
+A live shadow run is still required to measure full 300-second OCR accuracy,
+card localization, fallback file size, and four-match production latency.
 
 ## Visual localization research
 

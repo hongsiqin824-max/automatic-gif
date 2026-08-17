@@ -18,7 +18,7 @@ class ProcessExit:
 
 
 class IngestSupervisor:
-    """Restart an ingest process with capped exponential backoff."""
+    """Restart an ingest process with capped progressive backoff."""
 
     def __init__(
         self,
@@ -46,6 +46,25 @@ class IngestSupervisor:
         self.process: subprocess.Popen[Any] | None = None
         self.log_handle: Any = None
         self.started_monotonic = 0.0
+
+    def _restart_delay(self) -> float:
+        """Return a short Fibonacci-style delay capped at ``backoff_max``."""
+        first = min(self.backoff_initial, self.backoff_max)
+        if self.consecutive_failures <= 1 or first >= self.backoff_max:
+            return first
+        second = min(self.backoff_initial * 1.5, self.backoff_max)
+        if self.consecutive_failures == 2 or second >= self.backoff_max:
+            return second
+        previous, current = first, second
+        for _ in range(3, self.consecutive_failures + 1):
+            previous, current = current, min(previous + current, self.backoff_max)
+            if current >= self.backoff_max:
+                break
+        return current
+
+    def note_media_progress(self) -> None:
+        """Reset failure backoff after FFmpeg closes a non-empty segment."""
+        self.consecutive_failures = 0
 
     def start(self, now_monotonic: float | None = None) -> subprocess.Popen[Any]:
         if self.process is not None and self.process.poll() is None:
@@ -87,8 +106,7 @@ class IngestSupervisor:
         )
         delay = 0.0
         if should_restart:
-            exponent = min(self.consecutive_failures - 1, 60)
-            delay = min(self.backoff_initial * (2**exponent), self.backoff_max)
+            delay = self._restart_delay()
             self.restart_count += 1
         return ProcessExit(
             return_code=return_code,

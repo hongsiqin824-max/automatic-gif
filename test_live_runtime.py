@@ -19,8 +19,8 @@ class FakeProcess:
 
 
 class LiveRuntimeTests(unittest.TestCase):
-    def test_supervisor_restarts_with_capped_exponential_backoff(self):
-        processes = [FakeProcess(1), FakeProcess(1), FakeProcess(1)]
+    def test_supervisor_restarts_with_two_three_five_backoff(self):
+        processes = [FakeProcess(1), FakeProcess(1), FakeProcess(1), FakeProcess(1)]
         popen = Mock(side_effect=processes)
         logs = []
 
@@ -33,23 +33,54 @@ class LiveRuntimeTests(unittest.TestCase):
             lambda generation: ["ffmpeg", str(generation)],
             log_factory,
             reconnect=True,
-            max_reconnects=2,
-            backoff_initial=1,
-            backoff_max=2,
+            max_reconnects=3,
+            backoff_initial=2,
+            backoff_max=5,
             popen=popen,
         )
         supervisor.start(0)
         first = supervisor.observe_exit(1)
         self.assertTrue(first.restart)
-        self.assertEqual(first.restart_delay_seconds, 1)
-        supervisor.start(2)
-        second = supervisor.observe_exit(3)
+        self.assertEqual(first.restart_delay_seconds, 2)
+        supervisor.start(3)
+        second = supervisor.observe_exit(4)
         self.assertTrue(second.restart)
-        self.assertEqual(second.restart_delay_seconds, 2)
-        supervisor.start(5)
-        third = supervisor.observe_exit(6)
-        self.assertFalse(third.restart)
-        self.assertEqual([call.args[0][-1] for call in popen.call_args_list], ["0", "1", "2"])
+        self.assertEqual(second.restart_delay_seconds, 3)
+        supervisor.start(7)
+        third = supervisor.observe_exit(8)
+        self.assertTrue(third.restart)
+        self.assertEqual(third.restart_delay_seconds, 5)
+        supervisor.start(13)
+        fourth = supervisor.observe_exit(14)
+        self.assertFalse(fourth.restart)
+        self.assertEqual(
+            [call.args[0][-1] for call in popen.call_args_list],
+            ["0", "1", "2", "3"],
+        )
+
+    def test_successful_media_progress_resets_reconnect_backoff(self):
+        supervisor = IngestSupervisor(
+            lambda generation: ["ffmpeg", str(generation)],
+            lambda generation: io.StringIO(),
+            reconnect=True,
+            max_reconnects=None,
+            backoff_initial=2,
+            backoff_max=5,
+            popen=Mock(side_effect=[FakeProcess(1), FakeProcess(1), FakeProcess(1)]),
+        )
+
+        supervisor.start(0)
+        self.assertEqual(supervisor.observe_exit(1).restart_delay_seconds, 2)
+        supervisor.start(3)
+        self.assertEqual(supervisor.observe_exit(4).restart_delay_seconds, 3)
+
+        supervisor.start(7)
+        supervisor.note_media_progress()
+        recovered_exit = supervisor.observe_exit(8)
+
+        self.assertEqual(recovered_exit.restart_delay_seconds, 2)
+        self.assertEqual(recovered_exit.consecutive_failures, 1)
+        self.assertEqual(supervisor.restart_count, 3)
 
     def test_clean_rtmp_exit_is_restarted(self):
         supervisor = IngestSupervisor(

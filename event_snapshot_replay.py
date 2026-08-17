@@ -7,6 +7,8 @@ import math
 from pathlib import Path
 from typing import Any, Callable
 
+from event_api_response import normalize_event_api_response
+
 
 class SnapshotReplayEventSource:
     """Expose new events from scheduled, cumulative API response snapshots.
@@ -76,11 +78,7 @@ class SnapshotReplayEventSource:
         self.updated_events: list[Any] = []
 
     def _read_payload(self, payload: dict[str, Any]) -> list[Any]:
-        if payload.get("status") not in (None, 0, "0"):
-            raise ValueError(f"event API returned status={payload.get('status')!r}")
-        if not isinstance(payload.get("events"), dict):
-            raise ValueError("event API response does not contain an events object")
-        return self.parse_events(payload)
+        return self.parse_events(normalize_event_api_response(payload))
 
     def poll(self, stream_time: float, now_monotonic: float) -> list[Any]:
         del now_monotonic

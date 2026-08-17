@@ -16,7 +16,9 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
+from typing import Any, Iterable
 
 import numpy as np
 
@@ -64,6 +66,289 @@ class BufferNotReady(RuntimeError):
 
 class BufferUnavailable(RuntimeError):
     """The requested interval contains a permanent gap in received video."""
+
+
+class CoverageStatus(str, Enum):
+    READY_FULL = "ready_full"
+    WAITING = "waiting"
+    UNAVAILABLE = "unavailable"
+    READY_DEGRADED = "ready_degraded"
+
+
+@dataclass(frozen=True)
+class VideoCoverage:
+    """Pure coverage decision shared by default and visual GIF paths."""
+
+    status: CoverageStatus
+    requested_start: float
+    requested_end: float
+    anchor: float
+    effective_start: float | None
+    effective_end: float | None
+    segments: tuple[Any, ...]
+    gaps: tuple[tuple[float, float], ...]
+    error_kind: str | None = None
+    reason: str = ""
+
+    @property
+    def skipped_gap_seconds(self) -> float:
+        return round(sum(end - start for start, end in self.gaps), 3)
+
+    def validate_request(
+        self,
+        *,
+        window_start: float,
+        window_end: float,
+        anchor: float,
+    ) -> None:
+        expected = (window_start, window_end, anchor)
+        actual = (self.requested_start, self.requested_end, self.anchor)
+        if any(abs(left - right) > 1e-6 for left, right in zip(actual, expected)):
+            raise ValueError(
+                "video coverage was computed for a different window or anchor"
+            )
+
+
+def analyze_video_coverage(
+    segments: Iterable[Any],
+    *,
+    window_start: float,
+    window_end: float,
+    anchor: float,
+    gap_tolerance: float = 0.5,
+    edge_tolerance: float = 0.25,
+    allow_degraded: bool = False,
+    force_degraded: bool = False,
+    min_degraded_seconds: float = 2.0,
+) -> VideoCoverage:
+    """Classify whether one requested interval can be materialized safely.
+
+    Only a missing live tail is retryable. Missing history, internal gaps, and
+    anchors outside all continuous components cannot be repaired by waiting.
+    ``force_degraded`` is reserved for a caller that has reached its deadline:
+    it permits using the anchor component even when the live tail is incomplete.
+    """
+    if window_start < 0:
+        raise ValueError("video window start must not be negative")
+    if window_end <= window_start:
+        raise ValueError("video window end must be after its start")
+    if not window_start <= anchor <= window_end:
+        raise ValueError("video anchor must be inside the requested window")
+    if gap_tolerance < 0 or edge_tolerance < 0:
+        raise ValueError("video coverage tolerances must not be negative")
+    if min_degraded_seconds < 0:
+        raise ValueError("minimum degraded clip duration must not be negative")
+    if force_degraded and not allow_degraded:
+        raise ValueError("force_degraded requires allow_degraded")
+
+    available = sorted(
+        (
+            segment
+            for segment in segments
+            if Path(segment.path).is_file()
+        ),
+        key=lambda segment: (float(segment.start), str(segment.path)),
+    )
+    selected = [
+        segment
+        for segment in available
+        if float(segment.end) > window_start
+        and float(segment.start) < window_end
+    ]
+
+    def decision(
+        status: CoverageStatus,
+        *,
+        effective_start: float | None = None,
+        effective_end: float | None = None,
+        chosen: Iterable[Any] = (),
+        gaps: Iterable[tuple[float, float]] = (),
+        error_kind: str | None = None,
+        reason: str,
+    ) -> VideoCoverage:
+        return VideoCoverage(
+            status=status,
+            requested_start=window_start,
+            requested_end=window_end,
+            anchor=anchor,
+            effective_start=effective_start,
+            effective_end=effective_end,
+            segments=tuple(chosen),
+            gaps=tuple(gaps),
+            error_kind=error_kind,
+            reason=reason,
+        )
+
+    if not selected:
+        latest_end = max((float(item.end) for item in available), default=None)
+        if latest_end is None or latest_end < window_end - edge_tolerance:
+            return decision(
+                CoverageStatus.WAITING,
+                error_kind="waiting_for_video",
+                reason=(
+                    "no closed video segment covers the requested window yet"
+                ),
+            )
+        return decision(
+            CoverageStatus.UNAVAILABLE,
+            error_kind="history_unavailable",
+            reason="requested video history is no longer present in the buffer",
+        )
+
+    components: list[list[Any]] = [[selected[0]]]
+    component_ends = [float(selected[0].end)]
+    gaps: list[tuple[float, float]] = []
+    for segment in selected[1:]:
+        start = float(segment.start)
+        previous_end = component_ends[-1]
+        if start - previous_end > gap_tolerance:
+            gap = (max(previous_end, window_start), min(start, window_end))
+            if gap[1] > gap[0]:
+                gaps.append(gap)
+            components.append([segment])
+            component_ends.append(float(segment.end))
+        else:
+            components[-1].append(segment)
+            component_ends[-1] = max(previous_end, float(segment.end))
+
+    component_bounds = [
+        (float(items[0].start), component_ends[index])
+        for index, items in enumerate(components)
+    ]
+    anchor_index = next(
+        (
+            index
+            for index, (start, end) in enumerate(component_bounds)
+            if start - edge_tolerance <= anchor <= end + edge_tolerance
+        ),
+        None,
+    )
+
+    latest_end = max(float(item.end) for item in available)
+    if anchor_index is None:
+        if latest_end < anchor - edge_tolerance:
+            return decision(
+                CoverageStatus.WAITING,
+                gaps=gaps,
+                error_kind="waiting_for_anchor",
+                reason="the live buffer has not reached the event anchor yet",
+            )
+        return decision(
+            CoverageStatus.UNAVAILABLE,
+            gaps=gaps,
+            error_kind="anchor_gap",
+            reason="the event anchor falls inside missing video",
+        )
+
+    anchor_component = components[anchor_index]
+    component_start, component_end = component_bounds[anchor_index]
+    effective_start = max(window_start, component_start)
+    effective_end = min(window_end, component_end)
+    covers_start = component_start <= window_start + edge_tolerance
+    covers_end = component_end >= window_end - edge_tolerance
+
+    def degraded_decision(*, error_kind: str, reason: str) -> VideoCoverage:
+        degraded_duration = effective_end - effective_start
+        if degraded_duration < min_degraded_seconds:
+            return decision(
+                CoverageStatus.UNAVAILABLE,
+                effective_start=effective_start,
+                effective_end=effective_end,
+                chosen=anchor_component,
+                gaps=gaps,
+                error_kind="degraded_clip_too_short",
+                reason=(
+                    "the anchor-side video component is too short for a degraded GIF: "
+                    f"{degraded_duration:.3f}s < {min_degraded_seconds:.3f}s"
+                ),
+            )
+        return decision(
+            CoverageStatus.READY_DEGRADED,
+            effective_start=effective_start,
+            effective_end=effective_end,
+            chosen=anchor_component,
+            gaps=gaps,
+            error_kind=error_kind,
+            reason=reason,
+        )
+
+    if covers_start and covers_end:
+        return decision(
+            CoverageStatus.READY_FULL,
+            effective_start=window_start,
+            effective_end=window_end,
+            chosen=anchor_component,
+            gaps=gaps,
+            reason="the requested window is continuously covered",
+        )
+
+    if not covers_start and not allow_degraded:
+        error_kind = "internal_video_gap" if anchor_index > 0 else "history_unavailable"
+        reason = (
+            "the requested window contains a permanent video gap"
+            if anchor_index > 0
+            else "the beginning of the requested window is no longer available"
+        )
+        return decision(
+            CoverageStatus.UNAVAILABLE,
+            effective_start=effective_start,
+            effective_end=effective_end,
+            chosen=anchor_component,
+            gaps=gaps,
+            error_kind=error_kind,
+            reason=reason,
+        )
+
+    if anchor_index < len(components) - 1 and not allow_degraded:
+        return decision(
+            CoverageStatus.UNAVAILABLE,
+            effective_start=effective_start,
+            effective_end=effective_end,
+            chosen=anchor_component,
+            gaps=gaps,
+            error_kind="internal_video_gap",
+            reason="the requested window contains a permanent video gap",
+        )
+
+    if force_degraded:
+        return degraded_decision(
+            error_kind="degraded_deadline",
+            reason="using the anchor-side component at the video deadline",
+        )
+
+    if (
+        not covers_end
+        and anchor_index == len(components) - 1
+        and latest_end < window_end - edge_tolerance
+    ):
+        return decision(
+            CoverageStatus.WAITING,
+            effective_start=effective_start,
+            effective_end=effective_end,
+            chosen=anchor_component,
+            gaps=gaps,
+            error_kind="waiting_for_tail",
+            reason=(
+                f"video tail has reached {latest_end:.3f}s but "
+                f"{window_end:.3f}s is required"
+            ),
+        )
+
+    if allow_degraded:
+        return degraded_decision(
+            error_kind="degraded_window",
+            reason="using the continuous component that contains the event anchor",
+        )
+
+    return decision(
+        CoverageStatus.UNAVAILABLE,
+        effective_start=effective_start,
+        effective_end=effective_end,
+        chosen=anchor_component,
+        gaps=gaps,
+        error_kind="internal_video_gap",
+        reason="the requested window contains a permanent video gap",
+    )
 
 
 def parse_box(value: str) -> Box:
@@ -262,126 +547,160 @@ def encode_gif(
     colors: int,
     size_reference_bytes: int,
     cancel_event: threading.Event | None = None,
+    coverage: VideoCoverage | None = None,
+    allow_degraded: bool = False,
+    output_filename: str | None = None,
 ) -> dict:
-    wanted_start = max(0.0, event.stream_time - before)
-    wanted_end = event.stream_time + after
-    selected = [
-        segment
-        for segment in segments
-        if segment.path.exists()
-        and segment.end > wanted_start
-        and segment.start < wanted_end
-    ]
-    if not selected:
-        raise BufferNotReady("no rolling-buffer segments cover the event yet")
-    if selected[0].start > wanted_start + 0.25 or selected[-1].end < wanted_end - 0.25:
-        raise BufferNotReady(
-            "rolling buffer is incomplete: "
-            f"wanted {wanted_start:.3f}-{wanted_end:.3f}, "
-            f"found {selected[0].start:.3f}-{selected[-1].end:.3f}"
-        )
-    for previous, current in zip(selected, selected[1:]):
-        gap_start = max(previous.end, wanted_start)
-        gap_end = min(current.start, wanted_end)
-        if gap_end - gap_start > 0.5:
-            raise BufferUnavailable(
-                "rolling buffer has a video gap: "
-                f"missing {gap_start:.3f}-{gap_end:.3f}"
-            )
+    requested_start = max(0.0, event.stream_time - before)
+    requested_end = event.stream_time + after
+    coverage = coverage or analyze_video_coverage(
+        segments,
+        window_start=requested_start,
+        window_end=requested_end,
+        anchor=event.stream_time,
+        allow_degraded=allow_degraded,
+    )
+    coverage.validate_request(
+        window_start=requested_start,
+        window_end=requested_end,
+        anchor=event.stream_time,
+    )
+    if coverage.status == CoverageStatus.WAITING:
+        raise BufferNotReady(coverage.reason)
+    if coverage.status == CoverageStatus.UNAVAILABLE:
+        raise BufferUnavailable(coverage.reason)
+    if coverage.effective_start is None or coverage.effective_end is None:
+        raise BufferUnavailable("video coverage has no usable interval")
+    selected = list(coverage.segments)
+    wanted_start = coverage.effective_start
+    wanted_end = coverage.effective_end
 
-    label_time = event.source_time if event.source_time is not None else event.stream_time
-    stem = f"{event.event_type.lower()}_{label_time:09.3f}"
-    if event.output_id:
-        safe_output_id = "".join(
-            character
-            for character in event.output_id
-            if character.isalnum() or character in ("-", "_")
+    if output_filename is not None:
+        requested_filename = str(output_filename)
+        filename_path = Path(requested_filename)
+        if (
+            filename_path.is_absolute()
+            or filename_path.name != requested_filename
+            or "\\" in requested_filename
+            or filename_path.suffix.lower() != ".gif"
+        ):
+            raise ValueError("output_filename must be a plain .gif filename")
+        stem = filename_path.stem
+    else:
+        label_time = (
+            event.source_time if event.source_time is not None else event.stream_time
         )
-        if safe_output_id:
-            stem = f"{stem}_{safe_output_id}"
+        stem = f"{event.event_type.lower()}_{label_time:09.3f}"
+        if event.output_id:
+            safe_output_id = "".join(
+                character
+                for character in event.output_id
+                if character.isalnum() or character in ("-", "_")
+            )
+            if safe_output_id:
+                stem = f"{stem}_{safe_output_id}"
     concat_path = output_dir / f"{stem}_segments.txt"
     concat_path.write_text(
         "".join(f"file '{concat_escape(segment.path)}'\n" for segment in selected),
         encoding="utf-8",
     )
-    output = output_dir / f"{stem}.gif"
-    seek = max(0.0, wanted_start - selected[0].start)
-    wanted_duration = wanted_end - wanted_start
-    encode_started = time.perf_counter()
-    video_filter = (
-        f"fps={fps:g},scale={width}:-2:flags=lanczos,split[s0][s1];"
-        f"[s0]palettegen=max_colors={colors}:stats_mode=diff[p];"
-        "[s1][p]paletteuse=dither=sierra2_4a"
-    )
-    completed = run(
-        [
-            ffmpeg,
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            str(concat_path),
-            "-ss",
-            f"{seek:.3f}",
-            "-t",
-            f"{wanted_duration:.3f}",
-            "-vf",
-            video_filter,
-            "-loop",
-            "0",
-            str(output),
-        ],
-        cancel_event=cancel_event,
-    )
-    size = output.stat().st_size
-    encoding = {
-        "width": width,
-        "fps": fps,
-        "colors": colors,
-        "bytes": size,
-        "encode_seconds": round(time.perf_counter() - encode_started, 3),
-    }
-    if completed.stderr:
-        encoding["ffmpeg_stderr"] = completed.stderr[-2000:]
-
-    probe = json.loads(
-        run(
+    output = output_dir / (output_filename or f"{stem}.gif")
+    try:
+        seek = max(0.0, wanted_start - selected[0].start)
+        wanted_duration = wanted_end - wanted_start
+        encode_started = time.perf_counter()
+        video_filter = (
+            f"fps={fps:g},scale={width}:-2:flags=lanczos,split[s0][s1];"
+            f"[s0]palettegen=max_colors={colors}:stats_mode=diff[p];"
+            "[s1][p]paletteuse=dither=sierra2_4a"
+        )
+        completed = run(
             [
-                ffprobe,
-                "-v",
+                ffmpeg,
+                "-y",
+                "-hide_banner",
+                "-loglevel",
                 "error",
-                "-show_entries",
-                "format=duration,size:stream=width,height,r_frame_rate",
-                "-of",
-                "json",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(concat_path),
+                "-ss",
+                f"{seek:.3f}",
+                "-t",
+                f"{wanted_duration:.3f}",
+                "-vf",
+                video_filter,
+                "-loop",
+                "0",
                 str(output),
             ],
             cancel_event=cancel_event,
-        ).stdout
-    )
-    stream = (probe.get("streams") or [{}])[0]
-    fmt = probe.get("format") or {}
-    return {
-        "output": str(output.resolve()),
-        "bytes": int(fmt.get("size", output.stat().st_size)),
-        "duration_sec": float(fmt.get("duration", wanted_duration)),
-        "width": stream.get("width"),
-        "height": stream.get("height"),
-        "fps": stream.get("r_frame_rate"),
-        "clip_stream_start_sec": wanted_start,
-        "clip_stream_end_sec": wanted_end,
-        "buffer_coverage_sec": [selected[0].start, selected[-1].end],
-        "selected_segment_count": len(selected),
-        "encode_seconds": round(time.perf_counter() - encode_started, 3),
-        "encoding": encoding,
-        "size_reference_bytes": size_reference_bytes,
-        "over_size_reference": size > size_reference_bytes,
-    }
+        )
+        if not output.is_file():
+            raise RuntimeError(f"FFmpeg did not create GIF output: {output}")
+        size = output.stat().st_size
+        if size <= 0:
+            raise RuntimeError(f"FFmpeg created an empty GIF output: {output}")
+        encoding = {
+            "width": width,
+            "fps": fps,
+            "colors": colors,
+            "bytes": size,
+            "encode_seconds": round(time.perf_counter() - encode_started, 3),
+        }
+        if completed.stderr:
+            encoding["ffmpeg_stderr"] = completed.stderr[-2000:]
+
+        probe = json.loads(
+            run(
+                [
+                    ffprobe,
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration,size:stream=width,height,r_frame_rate",
+                    "-of",
+                    "json",
+                    str(output),
+                ],
+                cancel_event=cancel_event,
+            ).stdout
+        )
+        stream = (probe.get("streams") or [{}])[0]
+        fmt = probe.get("format") or {}
+        return {
+            "output": str(output.resolve()),
+            "bytes": int(fmt.get("size", output.stat().st_size)),
+            "duration_sec": float(fmt.get("duration", wanted_duration)),
+            "width": stream.get("width"),
+            "height": stream.get("height"),
+            "fps": stream.get("r_frame_rate"),
+            "clip_stream_start_sec": wanted_start,
+            "clip_stream_end_sec": wanted_end,
+            "requested_clip_stream_start_sec": requested_start,
+            "requested_clip_stream_end_sec": requested_end,
+            "buffer_coverage_sec": [selected[0].start, selected[-1].end],
+            "selected_segment_count": len(selected),
+            "encode_seconds": round(time.perf_counter() - encode_started, 3),
+            "encoding": encoding,
+            "size_reference_bytes": size_reference_bytes,
+            "over_size_reference": size > size_reference_bytes,
+            "coverage_status": coverage.status.value,
+            "coverage_reason": coverage.reason,
+            **(
+                {"coverage_error_kind": coverage.error_kind}
+                if coverage.error_kind else {}
+            ),
+            **(
+                {"skipped_gap_seconds": coverage.skipped_gap_seconds}
+                if coverage.skipped_gap_seconds else {}
+            ),
+        }
+    finally:
+        concat_path.unlink(missing_ok=True)
 
 
 def prune_buffer(
@@ -390,6 +709,8 @@ def prune_buffer(
     buffer_seconds: float,
     events: list[PendingEvent],
     before: float,
+    protected_paths: set[str] | None = None,
+    extra_cutoffs: list[float] | None = None,
 ) -> None:
     normal_cutoff = stream_time - buffer_seconds
     pending_starts = [
@@ -397,9 +718,15 @@ def prune_buffer(
         for event in events
         if event.status in ("pending", "encoding")
     ]
-    cutoff = min([normal_cutoff, *pending_starts]) if pending_starts else normal_cutoff
+    retention_cutoffs = [*pending_starts, *(extra_cutoffs or [])]
+    cutoff = min([normal_cutoff, *retention_cutoffs]) if retention_cutoffs else normal_cutoff
+    protected = protected_paths or set()
     for segment in segments:
-        if segment.end < cutoff and segment.path.exists():
+        if (
+            segment.end < cutoff
+            and str(segment.path.resolve()) not in protected
+            and segment.path.exists()
+        ):
             segment.path.unlink()
 
 
@@ -480,9 +807,9 @@ def main() -> None:
     parser.add_argument("--before", type=float, default=12.0)
     parser.add_argument("--after", type=float, default=18.0)
     parser.add_argument("--segment-slack", type=float, default=7.0)
-    parser.add_argument("--gif-width", type=int, default=384)
-    parser.add_argument("--gif-fps", type=float, default=6.0)
-    parser.add_argument("--gif-colors", type=int, default=160)
+    parser.add_argument("--gif-width", type=int, default=768)
+    parser.add_argument("--gif-fps", type=float, default=16.0)
+    parser.add_argument("--gif-colors", type=int, default=256)
     parser.add_argument(
         "--gif-size-reference-mb",
         "--gif-max-mb",

@@ -9,9 +9,29 @@ from pathlib import Path
 from unittest.mock import Mock, call, patch
 
 import dashboard_server
+from heavy_task_coordinator import HeavyTaskCoordinator
 
 
 class DashboardTests(unittest.TestCase):
+    @staticmethod
+    def _catalog_match(
+        match_id,
+        status,
+        timestamp,
+        *,
+        cmp_type="soccer",
+    ):
+        return {
+            "match_id": match_id,
+            "status": status,
+            "sort_timestamp": timestamp,
+            "start_play": "2027-01-15 08:00:00",
+            "cmp_type": cmp_type,
+            "team_A_name": f"A-{match_id}",
+            "team_B_name": f"B-{match_id}",
+            "large_unused_payload": {"must_not_reach_browser": True},
+        }
+
     def test_dotenv_loads_values_without_overriding_shell(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / ".env"
@@ -24,6 +44,31 @@ class DashboardTests(unittest.TestCase):
                 self.assertEqual(os.environ["FROM_FILE"], "loaded")
                 self.assertEqual(os.environ["EXISTING"], "shell-value")
                 self.assertEqual(os.environ["QUOTED"], "quoted value")
+
+    def test_max_concurrent_matches_environment_setting_defaults_to_eight(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                dashboard_server._positive_environment_integer(
+                    "GIF_MAX_CONCURRENT_MATCHES", 8
+                ),
+                8,
+            )
+        with patch.dict(
+            os.environ, {"GIF_MAX_CONCURRENT_MATCHES": "7"}, clear=True
+        ):
+            self.assertEqual(
+                dashboard_server._positive_environment_integer(
+                    "GIF_MAX_CONCURRENT_MATCHES", 8
+                ),
+                7,
+            )
+        with patch.dict(
+            os.environ, {"GIF_MAX_CONCURRENT_MATCHES": "0"}, clear=True
+        ):
+            with self.assertRaisesRegex(RuntimeError, "正整数"):
+                dashboard_server._positive_environment_integer(
+                    "GIF_MAX_CONCURRENT_MATCHES", 8
+                )
 
     def test_flatten_events_keeps_only_supported_codes(self):
         payload = {
@@ -76,19 +121,255 @@ class DashboardTests(unittest.TestCase):
             payload = dashboard_server.query_events("54478923")
         self.assertEqual(payload["events"], {})
 
+    def test_query_events_accepts_all_success_status_variants(self):
+        for status_payload in (
+            {"events": {}},
+            {"status": None, "events": {}},
+            {"status": 0, "events": {}},
+            {"status": "0", "events": {}},
+        ):
+            with self.subTest(payload=status_payload), patch(
+                "dashboard_server._json_request", return_value=status_payload
+            ):
+                payload = dashboard_server.query_events("54478923")
+                self.assertEqual(payload["events"], {})
+
     def test_query_events_requires_success_status_and_valid_events_shape(self):
+        for status in (1, "1", 500, True, False):
+            with self.subTest(status=status), patch(
+                "dashboard_server._json_request",
+                return_value={"status": status, "events": {}},
+            ):
+                with self.assertRaisesRegex(ValueError, "status"):
+                    dashboard_server.query_events("54478923")
+
+        for events in (None, True, "not-an-object", [{"code": "G"}]):
+            with self.subTest(events=events), patch(
+                "dashboard_server._json_request",
+                return_value={"status": 0, "events": events},
+            ):
+                with self.assertRaisesRegex(ValueError, "events"):
+                    dashboard_server.query_events("54478923")
+
+    def test_match_catalog_keeps_only_soccer(self):
+        now = 1_800_000_000.0
+        rows = [
+            self._catalog_match("soccer-live", "Playing", now - 30),
+            self._catalog_match(
+                "basketball-live",
+                "Playing",
+                now - 10,
+                cmp_type="basketball",
+            ),
+        ]
+        catalog = dashboard_server.MatchCatalog()
+
+        with patch("dashboard_server._json_request", return_value={"list": rows}), patch(
+            "dashboard_server.time.time", return_value=now
+        ):
+            payload = catalog.snapshot()
+
+        self.assertEqual(
+            [item["match_id"] for item in payload["playing"]],
+            ["soccer-live"],
+        )
+        self.assertEqual(payload["upcoming"], [])
+        self.assertNotIn("large_unused_payload", payload["playing"][0])
+        self.assertEqual(payload["health"]["source_count"], 2)
+        self.assertEqual(payload["health"]["soccer_count"], 1)
+
+    def test_match_catalog_sorts_and_limits_playing_and_upcoming(self):
+        now = 1_800_000_000.0
+        playing = [
+            self._catalog_match(f"playing-{index:02d}", "Playing", now - index)
+            for index in range(25)
+        ]
+        upcoming = [
+            self._catalog_match(
+                f"fixture-{index:02d}",
+                "Fixture",
+                now + 15 + index,
+            )
+            for index in range(25)
+        ]
+        rows = list(reversed(playing + upcoming))
+        catalog = dashboard_server.MatchCatalog()
+
+        with patch("dashboard_server._json_request", return_value={"list": rows}), patch(
+            "dashboard_server.time.time", return_value=now
+        ):
+            payload = catalog.snapshot()
+
+        self.assertEqual(len(payload["playing"]), 20)
+        self.assertEqual(len(payload["upcoming"]), 20)
+        self.assertEqual(
+            [item["sort_timestamp"] for item in payload["playing"]],
+            sorted(item["sort_timestamp"] for item in playing)[:20],
+        )
+        self.assertEqual(
+            [item["sort_timestamp"] for item in payload["upcoming"]],
+            sorted(item["sort_timestamp"] for item in upcoming)[:20],
+        )
+
+    def test_match_catalog_excludes_past_and_more_than_15_minute_fixtures(self):
+        now = 1_800_000_000.0
+        rows = [
+            self._catalog_match("fixture-past", "Fixture", now - 0.001),
+            self._catalog_match("fixture-now", "Fixture", now),
+            self._catalog_match("fixture-boundary", "Fixture", now + 15 * 60),
+            self._catalog_match("fixture-late", "Fixture", now + 15 * 60 + 0.001),
+        ]
+        catalog = dashboard_server.MatchCatalog()
+
+        with patch("dashboard_server._json_request", return_value={"list": rows}), patch(
+            "dashboard_server.time.time", return_value=now
+        ):
+            payload = catalog.snapshot()
+
+        self.assertEqual(
+            [item["match_id"] for item in payload["upcoming"]],
+            ["fixture-now", "fixture-boundary"],
+        )
+
+    def test_empty_match_catalog_is_healthy(self):
+        now = 1_800_000_000.0
+        catalog = dashboard_server.MatchCatalog()
+
+        with patch("dashboard_server._json_request", return_value={"list": []}), patch(
+            "dashboard_server.time.time", return_value=now
+        ):
+            payload = catalog.snapshot()
+
+        self.assertEqual(payload["playing"], [])
+        self.assertEqual(payload["upcoming"], [])
+        self.assertEqual(payload["health"]["state"], "healthy")
+        self.assertEqual(payload["health"]["status"], "ok")
+        self.assertEqual(payload["health"]["total_count"], 0)
+        self.assertIsNone(payload["health"]["error"])
+
+    def test_invalid_match_catalog_list_is_reported_as_unavailable(self):
+        now = 1_800_000_000.0
+        catalog = dashboard_server.MatchCatalog()
+
         with patch(
             "dashboard_server._json_request",
-            return_value={"status": 500, "events": {}},
-        ):
-            with self.assertRaisesRegex(ValueError, "status=500"):
-                dashboard_server.query_events("54478923")
+            return_value={"list": {"not": "an array"}},
+        ), patch("dashboard_server.time.time", return_value=now):
+            payload = catalog.snapshot()
+
+        self.assertEqual(payload["playing"], [])
+        self.assertEqual(payload["upcoming"], [])
+        self.assertEqual(payload["health"]["state"], "error")
+        self.assertEqual(payload["health"]["status"], "unavailable")
+        self.assertEqual(payload["health"]["consecutive_failures"], 1)
+        self.assertIn("list", payload["health"]["error"])
+        self.assertEqual(payload["health"]["next_retry_at_unix"], now + 5)
+
+    def test_match_catalog_failure_keeps_cache_and_accumulates_backoff(self):
+        catalog = dashboard_server.MatchCatalog()
+        cached_rows = [self._catalog_match("cached-live", "Playing", 90.0)]
+
         with patch(
-            "dashboard_server._json_request",
-            return_value={"status": 0, "events": [{"code": "G"}]},
+            "dashboard_server._json_request", return_value={"list": cached_rows}
+        ), patch("dashboard_server.time.time", return_value=100.0):
+            healthy = catalog.snapshot()
+        self.assertEqual(healthy["playing"][0]["match_id"], "cached-live")
+
+        catalog.next_attempt_at = 0.0
+        with patch(
+            "dashboard_server._json_request", side_effect=OSError("catalog offline")
+        ), patch("dashboard_server.time.time", return_value=120.0):
+            first_failure = catalog.snapshot()
+
+        self.assertEqual(first_failure["playing"], healthy["playing"])
+        self.assertEqual(first_failure["health"]["state"], "stale")
+        self.assertEqual(first_failure["health"]["status"], "degraded")
+        self.assertEqual(first_failure["health"]["consecutive_failures"], 1)
+        self.assertEqual(first_failure["health"]["next_retry_at_unix"], 125.0)
+        self.assertEqual(first_failure["health"]["cache_age_seconds"], 20.0)
+
+        catalog.next_attempt_at = 0.0
+        with patch(
+            "dashboard_server._json_request", side_effect=OSError("still offline")
+        ), patch("dashboard_server.time.time", return_value=130.0):
+            second_failure = catalog.snapshot()
+
+        self.assertEqual(second_failure["playing"], healthy["playing"])
+        self.assertEqual(second_failure["health"]["consecutive_failures"], 2)
+        self.assertEqual(second_failure["health"]["next_retry_at_unix"], 140.0)
+        self.assertIn("still offline", second_failure["health"]["error"])
+
+    def test_match_catalog_refresh_interval_is_measured_from_request_start(self):
+        catalog = dashboard_server.MatchCatalog()
+        rows = [self._catalog_match("refresh-live", "Playing", 90.0)]
+
+        with patch(
+            "dashboard_server._json_request", return_value={"list": rows}
+        ) as request_json, patch(
+            "dashboard_server.time.time", side_effect=[100.0, 104.0, 130.0, 134.0]
         ):
-            with self.assertRaisesRegex(ValueError, "events"):
-                dashboard_server.query_events("54478923")
+            catalog.snapshot()
+            catalog.snapshot()
+
+        self.assertEqual(request_json.call_count, 2)
+
+    def test_matches_endpoint_does_not_create_match_session(self):
+        manager = dashboard_server.Dashboard(background_monitors=False)
+        catalog = dashboard_server.MatchCatalog()
+
+        with patch.object(dashboard_server, "dashboard", manager), patch.object(
+            dashboard_server, "match_catalog", catalog
+        ), patch("dashboard_server._json_request", return_value={"list": []}):
+            response = dashboard_server.app.test_client().get("/api/matches")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(manager.sessions, {})
+        self.assertFalse(response.get_json()["locked"])
+        self.assertIsNone(response.get_json()["active_match_id"])
+
+    def test_matches_endpoint_exposes_global_heavy_task_status(self):
+        manager = dashboard_server.Dashboard(background_monitors=False)
+        catalog = Mock()
+        catalog.snapshot.return_value = {
+            "playing": [],
+            "upcoming": [],
+            "health": {"state": "healthy"},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            coordinator = HeavyTaskCoordinator(
+                Path(directory) / "coordinator.sqlite3",
+                max_heavy_tasks=2,
+                max_vision_tasks=1,
+            )
+            lease = coordinator.acquire(
+                "vision",
+                match_id="heavy-status-match",
+                event_key="heavy-status-match:G:1",
+            )
+            try:
+                with patch.object(dashboard_server, "dashboard", manager), patch.object(
+                    dashboard_server, "match_catalog", catalog
+                ), patch.object(
+                    dashboard_server, "heavy_task_monitor", coordinator
+                ):
+                    response = dashboard_server.app.test_client().get("/api/matches")
+
+                self.assertEqual(response.status_code, 200)
+                status = response.get_json()["heavy_tasks"]
+                self.assertEqual(status["total_slots"], 2)
+                self.assertEqual(status["vision_slots"], 1)
+                self.assertEqual(status["occupied"], 1)
+                self.assertEqual(status["vision_active"], 1)
+                self.assertEqual(status["queued"], 0)
+                self.assertEqual(
+                    status["active_items"][0]["match_id"],
+                    "heavy-status-match",
+                )
+                self.assertNotIn("owner_pid", status["active_items"][0])
+                self.assertNotIn("database_path", status)
+            finally:
+                lease.release()
+                coordinator.close()
 
     def test_event_api_failure_keeps_last_valid_payload(self):
         manager = dashboard_server.Dashboard(background_monitors=False)
@@ -195,6 +476,603 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(tasks[0]["score"], "4-1")
         self.assertEqual(tasks[0]["minute_extra"], "1")
         self.assertEqual(tasks[0]["output"], "/tmp/goal.gif")
+
+    def test_database_task_includes_independent_vision_artifact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            runtime = dashboard_server.sqlite3.connect(output / "pipeline_state.sqlite3")
+            runtime.executescript(
+                """
+                CREATE TABLE event_tasks (
+                    event_key TEXT, code TEXT, event_type TEXT, event_json TEXT,
+                    status TEXT, discovered_at_unix REAL, updated_at_unix REAL,
+                    output_path TEXT, output_bytes INTEGER, result_json TEXT,
+                    error TEXT
+                );
+                CREATE TABLE vision_tasks (
+                    event_key TEXT, status TEXT, located_anchor_stream_time REAL,
+                    confidence REAL, inference_seconds REAL, model_name TEXT,
+                    model_version TEXT, output_path TEXT, output_bytes INTEGER,
+                    result_json TEXT, error TEXT, created_at_unix REAL
+                );
+                """
+            )
+            event = {"event_key": "m:G:1", "code": "G", "event_type": "goal"}
+            runtime.execute(
+                "INSERT INTO event_tasks VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                ("m:G:1", "G", "goal", json.dumps(event), "encoded", 1, 2,
+                 "/tmp/default.gif", 10,
+                 json.dumps({"coverage_status": "ready_degraded"}), None),
+            )
+            runtime.execute(
+                "INSERT INTO vision_tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("m:G:1", "encoded", 26.4, 0.91, 14.2, "T-DEED",
+                 "SoccerNet_small", "/tmp/refined.gif", 8,
+                 json.dumps({
+                     "anchor_delta_seconds": 2.4,
+                     "coverage_status": "ready_degraded",
+                 }), None, 1),
+            )
+            runtime.commit(); runtime.close()
+            tasks, _, _ = dashboard_server._tasks_from_database(output / "pipeline_state.sqlite3")
+        self.assertEqual(tasks[0]["output"], "/tmp/default.gif")
+        self.assertEqual(tasks[0]["vision"]["output"], "/tmp/refined.gif")
+        self.assertEqual(tasks[0]["vision"]["confidence"], 0.91)
+        self.assertEqual(tasks[0]["vision"]["locator_method"], "tdeed")
+        self.assertEqual(tasks[0]["coverage_status"], "ready_degraded")
+        self.assertEqual(tasks[0]["vision"]["coverage_status"], "ready_degraded")
+
+    def test_database_vision_failure_exposes_structured_ocr_diagnostics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "pipeline_state.sqlite3"
+            runtime = dashboard_server.sqlite3.connect(database)
+            runtime.executescript(
+                """
+                CREATE TABLE event_tasks (
+                    event_key TEXT, code TEXT, event_type TEXT, event_json TEXT,
+                    status TEXT, discovered_at_unix REAL, updated_at_unix REAL,
+                    output_path TEXT, output_bytes INTEGER, result_json TEXT,
+                    error TEXT
+                );
+                CREATE TABLE vision_tasks (
+                    event_key TEXT, status TEXT, located_anchor_stream_time REAL,
+                    confidence REAL, inference_seconds REAL, model_name TEXT,
+                    model_version TEXT, output_path TEXT, output_bytes INTEGER,
+                    result_json TEXT, error TEXT, last_error_kind TEXT,
+                    created_at_unix REAL
+                );
+                """
+            )
+            event = {"event_key": "m:G:ocr", "code": "G", "event_type": "goal"}
+            runtime.execute(
+                "INSERT INTO event_tasks VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                ("m:G:ocr", "G", "goal", json.dumps(event), "encoded", 1, 2,
+                 "/tmp/default.gif", 10, "{}", None),
+            )
+            runtime.execute(
+                "INSERT INTO vision_tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("m:G:ocr", "failed", None, None, 4.2, "scoreboard-clock-ocr",
+                 "1", None, None, json.dumps({
+                     "stage": "ocr",
+                     "locator_method": "ocr",
+                     "fallback_used": False,
+                     "ocr_diagnostics": {
+                         "sampled_frames": 120,
+                         "valid_clock_frames": 0,
+                         "candidate_count": 0,
+                     },
+                 }), "no valid clock", "ocr_no_clock", 1),
+            )
+            runtime.commit(); runtime.close()
+            tasks, _, _ = dashboard_server._tasks_from_database(database)
+
+        vision = tasks[0]["vision"]
+        self.assertEqual(vision["error_kind"], "ocr_no_clock")
+        self.assertEqual(vision["last_error_kind"], "ocr_no_clock")
+        self.assertEqual(vision["locator_method"], "ocr")
+        self.assertEqual(vision["stage"], "ocr")
+        self.assertFalse(vision["fallback_used"])
+        self.assertEqual(vision["ocr_diagnostics"]["sampled_frames"], 120)
+        self.assertEqual(vision["error"], "no valid clock")
+
+    def test_new_session_defaults_to_calibrated_candidate_window(self):
+        manager = dashboard_server.Dashboard(background_monitors=False)
+        session = manager.get("default-gif-only")
+
+        self.assertEqual(session.before_seconds, 30.0)
+        self.assertEqual(session.after_seconds, 20.0)
+        self.assertEqual(session.event_to_video_offset_seconds, -60.0)
+        self.assertEqual(session.gif_width, 768)
+        self.assertEqual(session.gif_fps, 16.0)
+        self.assertEqual(session.gif_colors, 256)
+        self.assertTrue(session.vision_enabled)
+        payload = dashboard_server._session_json(session)
+        self.assertEqual(payload["gif"]["before_seconds"], 30.0)
+        self.assertEqual(payload["gif"]["after_seconds"], 20.0)
+        self.assertEqual(payload["gif"]["event_to_video_offset_seconds"], -60.0)
+        self.assertEqual(payload["gif"]["width"], 768)
+        self.assertEqual(payload["gif"]["fps"], 16.0)
+        self.assertEqual(payload["gif"]["colors"], 256)
+        self.assertTrue(payload["vision"]["enabled"])
+        self.assertFalse(payload["vision"]["worker_enabled"])
+        self.assertEqual(payload["vision"]["search_before_seconds"], 300.0)
+        self.assertEqual(payload["vision"]["search_after_seconds"], 0.0)
+        self.assertEqual(payload["vision"]["fallback_gif"]["width"], 384)
+        self.assertEqual(payload["vision"]["fallback_gif"]["fps"], 6.0)
+
+    def test_session_configuration_accepts_and_preserves_negative_event_offset(self):
+        manager = dashboard_server.Dashboard(background_monitors=False)
+        with patch.object(dashboard_server, "dashboard", manager):
+            response = dashboard_server.app.test_client().post(
+                "/api/session",
+                json={
+                    "match_id": "custom-event-offset",
+                    "before_seconds": 30.5,
+                    "after_seconds": 12.5,
+                    "event_to_video_offset_seconds": -22.5,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["gif"]["before_seconds"], 30.5)
+        self.assertEqual(payload["gif"]["after_seconds"], 12.5)
+        self.assertEqual(payload["gif"]["event_to_video_offset_seconds"], -22.5)
+        session = manager.get("custom-event-offset")
+        self.assertEqual(session.event_to_video_offset_seconds, -22.5)
+
+    def test_session_configuration_rejects_non_finite_event_offset(self):
+        manager = dashboard_server.Dashboard(background_monitors=False)
+        with patch.object(dashboard_server, "dashboard", manager):
+            response = dashboard_server.app.test_client().post(
+                "/api/session",
+                json={
+                    "match_id": "invalid-event-offset",
+                    "event_to_video_offset_seconds": "nan",
+                },
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("必须是有限数字", response.get_json()["error"])
+
+    def test_concurrent_matches_are_isolated_and_manual_stop_releases_one_slot(self):
+        manager = dashboard_server.Dashboard(
+            background_monitors=False,
+            max_concurrent_matches=2,
+        )
+        first = manager.get("worker-slot-first")
+        second = manager.get("worker-slot-second")
+        third = manager.get("worker-slot-third")
+        first.source = {"resource": "rtmp://example/first"}
+        second.source = {"resource": "rtmp://example/second"}
+        third.source = {"resource": "rtmp://example/third"}
+        first_worker = Mock(pid=701, returncode=None)
+        first_worker.poll.return_value = None
+        second_worker = Mock(pid=702, returncode=None)
+        second_worker.poll.return_value = None
+        third_worker = Mock(pid=703, returncode=None)
+        third_worker.poll.return_value = None
+
+        with tempfile.TemporaryDirectory() as directory:
+            first.output_dir = Path(directory) / "first"
+            second.output_dir = Path(directory) / "second"
+            third.output_dir = Path(directory) / "third"
+            with patch(
+                "dashboard_server.subprocess.Popen",
+                side_effect=[first_worker, second_worker, third_worker],
+            ) as popen:
+                manager.start(first)
+                manager.start(second)
+                active_status = manager.worker_slot_status()
+                self.assertEqual(
+                    set(active_status["active_match_ids"]),
+                    {first.match_id, second.match_id},
+                )
+                self.assertEqual(active_status["active_match_count"], 2)
+                self.assertEqual(active_status["available_worker_slots"], 0)
+                self.assertTrue(active_status["locked"])
+                self.assertEqual(popen.call_count, 2)
+
+                first_worker.poll.return_value = 0
+                first_worker.returncode = 0
+                with patch.object(
+                    manager, "_cleanup_worker_group_blocking", return_value=True
+                ):
+                    manager.stop(first)
+
+                released_status = manager.worker_slot_status()
+                self.assertEqual(
+                    released_status["active_match_ids"], [second.match_id]
+                )
+                self.assertEqual(released_status["available_worker_slots"], 1)
+                self.assertFalse(released_status["locked"])
+                self.assertTrue(second.worker_running())
+                manager.start(third)
+
+        self.assertEqual(popen.call_count, 3)
+        self.assertEqual(
+            set(manager.worker_slot_status()["active_match_ids"]),
+            {second.match_id, third.match_id},
+        )
+
+    def test_terminal_worker_state_releases_a_worker_slot(self):
+        manager = dashboard_server.Dashboard(
+            background_monitors=False,
+            max_concurrent_matches=1,
+        )
+        finished = manager.get("demo-worker-slot-finished")
+        replacement = manager.get("demo-worker-slot-replacement")
+        finished_worker = Mock(pid=711, returncode=None)
+        finished_worker.poll.return_value = None
+        replacement_worker = Mock(pid=712, returncode=None)
+        replacement_worker.poll.return_value = None
+
+        with tempfile.TemporaryDirectory() as directory:
+            finished.output_dir = Path(directory) / "finished"
+            replacement.output_dir = Path(directory) / "replacement"
+            with patch(
+                "dashboard_server.subprocess.Popen",
+                side_effect=[finished_worker, replacement_worker],
+            ):
+                manager.start(finished, demo=True)
+                self.assertEqual(
+                    manager.worker_slot_status()["active_match_ids"],
+                    [finished.match_id],
+                )
+
+                finished_worker.poll.return_value = 0
+                finished_worker.returncode = 0
+                manager.refresh(finished)
+
+                self.assertEqual(finished.lifecycle_state, "completed")
+                self.assertFalse(manager.worker_slot_status()["locked"])
+                manager.start(replacement, demo=True)
+
+        self.assertEqual(
+            manager.worker_slot_status()["active_match_ids"],
+            [replacement.match_id],
+        )
+
+    def test_capacity_counts_starting_recovery_finishing_stopping_and_cleanup(self):
+        manager = dashboard_server.Dashboard(
+            background_monitors=False,
+            max_concurrent_matches=5,
+        )
+        starting = manager.get("capacity-starting")
+        starting.lifecycle_state = "starting"
+
+        recovering = manager.get("capacity-recovering")
+        recovering.desired_running = True
+        recovering.worker_mode = "live"
+        recovering.worker_restart_due_at = 200.0
+
+        finishing = manager.get("capacity-finishing")
+        finishing.lifecycle_state = "finishing"
+
+        stopping = manager.get("capacity-stopping")
+        stopping.lifecycle_state = "stopping"
+
+        cleaning = manager.get("capacity-cleaning")
+        cleaning.worker_cleanup_process_group = 501
+
+        status = manager.worker_slot_status()
+        self.assertEqual(status["active_match_count"], 5)
+        self.assertEqual(status["available_worker_slots"], 0)
+        self.assertTrue(status["at_capacity"])
+        self.assertEqual(
+            {item["lifecycle_state"] for item in status["active_matches"]},
+            {"idle", "starting", "finishing", "stopping"},
+        )
+        self.assertEqual(
+            {item["state"] for item in status["active_matches"]},
+            {"starting", "recovering", "finishing", "stopping", "cleaning"},
+        )
+
+        sixth = manager.get("capacity-sixth")
+        sixth.source = {"resource": "rtmp://example/sixth"}
+        with patch("dashboard_server.subprocess.Popen") as popen:
+            with self.assertRaisesRegex(RuntimeError, "上限 5 场"):
+                manager.start(sixth)
+        popen.assert_not_called()
+
+    def test_recovery_reuses_its_reserved_slot_at_capacity(self):
+        manager = dashboard_server.Dashboard(
+            background_monitors=False,
+            max_concurrent_matches=1,
+        )
+        session = manager.get("capacity-recovery")
+        session.source = {"resource": "rtmp://example/recovery"}
+        session.desired_running = True
+        session.worker_mode = "live"
+        session.lifecycle_state = "playing"
+        session.worker_restart_due_at = 100.0
+        worker = Mock(pid=751, returncode=None)
+        worker.poll.return_value = None
+
+        with tempfile.TemporaryDirectory() as directory:
+            session.output_dir = Path(directory)
+            with patch(
+                "dashboard_server.subprocess.Popen", return_value=worker
+            ) as popen:
+                manager.start(session, recovery=True)
+
+        popen.assert_called_once()
+        status = manager.worker_slot_status()
+        self.assertEqual(status["active_match_ids"], [session.match_id])
+        self.assertEqual(status["active_matches"][0]["state"], "running")
+        self.assertTrue(status["at_capacity"])
+
+    def test_sixth_api_start_returns_409_and_catalog_exposes_active_summaries(self):
+        manager = dashboard_server.Dashboard(
+            background_monitors=False,
+            max_concurrent_matches=5,
+        )
+        catalog = Mock()
+        catalog.snapshot.return_value = {
+            "playing": [],
+            "upcoming": [],
+            "health": {"state": "healthy"},
+        }
+        workers = []
+        with tempfile.TemporaryDirectory() as directory:
+            for index in range(1, 7):
+                session = manager.get(f"parallel-{index}")
+                session.source = {"resource": f"rtmp://example/{index}"}
+                session.output_dir = Path(directory) / str(index)
+                worker = Mock(pid=800 + index, returncode=None)
+                worker.poll.return_value = None
+                workers.append(worker)
+
+            with patch.object(dashboard_server, "dashboard", manager), patch.object(
+                dashboard_server, "match_catalog", catalog
+            ), patch(
+                "dashboard_server.subprocess.Popen", side_effect=workers[:5]
+            ) as popen:
+                client = dashboard_server.app.test_client()
+                for index in range(1, 6):
+                    response = client.post(
+                        "/api/session/start",
+                        json={"match_id": f"parallel-{index}"},
+                    )
+                    self.assertEqual(response.status_code, 200)
+
+                rejected = client.post(
+                    "/api/session/start", json={"match_id": "parallel-6"}
+                )
+                catalog_response = client.get("/api/matches")
+
+        self.assertEqual(rejected.status_code, 409)
+        self.assertIn("上限 5 场", rejected.get_json()["error"])
+        self.assertEqual(popen.call_count, 5)
+        capacity = catalog_response.get_json()
+        self.assertEqual(capacity["active_match_count"], 5)
+        self.assertEqual(capacity["max_concurrent_matches"], 5)
+        self.assertEqual(capacity["available_worker_slots"], 0)
+        self.assertTrue(capacity["at_capacity"])
+        self.assertTrue(capacity["selection_locked"])
+        self.assertIsNone(capacity["active_match_id"])
+        self.assertEqual(
+            set(capacity["active_match_ids"]),
+            {f"parallel-{index}" for index in range(1, 6)},
+        )
+        self.assertEqual(len(capacity["active_matches"]), 5)
+
+    def test_duplicate_start_for_same_match_returns_409_without_second_process(self):
+        manager = dashboard_server.Dashboard(background_monitors=False)
+        session = manager.get("duplicate-start")
+        session.source = {"resource": "rtmp://example/duplicate"}
+        worker = Mock(pid=901, returncode=None)
+        worker.poll.return_value = None
+
+        with tempfile.TemporaryDirectory() as directory:
+            session.output_dir = Path(directory)
+            with patch.object(dashboard_server, "dashboard", manager), patch(
+                "dashboard_server.subprocess.Popen", return_value=worker
+            ) as popen:
+                client = dashboard_server.app.test_client()
+                first = client.post(
+                    "/api/session/start", json={"match_id": session.match_id}
+                )
+                duplicate = client.post(
+                    "/api/session/start", json={"match_id": session.match_id}
+                )
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(duplicate.status_code, 409)
+        self.assertIn("已在运行", duplicate.get_json()["error"])
+        popen.assert_called_once()
+
+    def test_dashboard_form_matches_backend_defaults(self):
+        html = (dashboard_server.ROOT / "dashboard_static" / "index.html").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('id="before" type="number" value="30"', html)
+        self.assertIn('id="after" type="number" value="20"', html)
+        self.assertIn('id="event-offset" type="number" value="-60"', html)
+        self.assertIn('id="width" type="number" value="768"', html)
+        self.assertIn('id="vision-enabled" type="checkbox" checked', html)
+        self.assertIn('id="vision-state">默认开启', html)
+
+    def test_direct_start_uses_backend_defaults_and_enables_vision(self):
+        manager = dashboard_server.Dashboard(background_monitors=False)
+        worker = Mock(pid=122, returncode=None)
+        worker.poll.return_value = None
+
+        def provide_source(session):
+            session.source = {"resource": "rtmp://example/live"}
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            dashboard_server, "DEFAULT_OUTPUT", Path(directory)
+        ), patch.object(
+            dashboard_server, "dashboard", manager
+        ), patch.object(
+            manager, "refresh", side_effect=provide_source
+        ), patch(
+            "dashboard_server.subprocess.Popen", return_value=worker
+        ) as popen:
+            response = dashboard_server.app.test_client().post(
+                "/api/session/start", json={"match_id": "direct-default-start"}
+            )
+
+        self.assertEqual(response.status_code, 200)
+        command = popen.call_args.args[0]
+        self.assertEqual(command[command.index("--before") + 1], "30.0")
+        self.assertEqual(command[command.index("--after") + 1], "20.0")
+        self.assertEqual(
+            command[command.index("--event-to-video-offset") + 1],
+            "-60.0",
+        )
+        self.assertEqual(
+            command[command.index("--buffer-seconds") + 1],
+            "360.0",
+        )
+        self.assertEqual(command[command.index("--gif-width") + 1], "768")
+        self.assertEqual(command[command.index("--gif-fps") + 1], "16.0")
+        self.assertEqual(command[command.index("--gif-colors") + 1], "256")
+        self.assertEqual(
+            float(command[command.index("--graceful-stop-grace-seconds") + 1]),
+            dashboard_server.WORKER_FINISH_GRACE_SECONDS,
+        )
+        self.assertIn("--vision-enabled", command)
+        self.assertEqual(
+            command[command.index("--vision-search-before") + 1],
+            "300.0",
+        )
+        self.assertEqual(
+            command[command.index("--vision-search-after") + 1],
+            "0.0",
+        )
+        payload = response.get_json()
+        self.assertTrue(payload["vision"]["enabled"])
+        self.assertTrue(payload["vision"]["worker_enabled"])
+
+    def test_live_start_passes_match_start_play_to_worker(self):
+        manager = dashboard_server.Dashboard(background_monitors=False)
+        session = manager.get("timeline-command")
+        session.source = {"resource": "rtmp://example/live"}
+        session.detail = {"start_play": "2026-05-20 11:00:00"}
+        worker = Mock(pid=126, returncode=None)
+        worker.poll.return_value = None
+
+        with patch("dashboard_server.subprocess.Popen", return_value=worker) as popen:
+            manager.start(session)
+
+        command = popen.call_args.args[0]
+        self.assertEqual(
+            command[command.index("--match-start-play") + 1],
+            "2026-05-20 11:00:00",
+        )
+        self.assertEqual(
+            command[command.index("--match-start-naive-timezone") + 1],
+            "utc",
+        )
+        self.assertIsNone(
+            dashboard_server._usable_match_start_play({"start_play": "演示数据"})
+        )
+
+    def test_session_json_keeps_worker_vision_state_separate_from_configuration(self):
+        manager = dashboard_server.Dashboard(background_monitors=False)
+        session = manager.get("vision-runtime-state")
+        session.source = {"resource": "rtmp://example/live"}
+        session.vision_enabled = True
+        worker = Mock(pid=125, returncode=None)
+        worker.poll.return_value = None
+
+        with patch("dashboard_server.subprocess.Popen", return_value=worker):
+            manager.start(session)
+        session.vision_enabled = False
+
+        payload = dashboard_server._session_json(session)
+        self.assertFalse(payload["vision"]["enabled"])
+        self.assertTrue(payload["vision"]["worker_enabled"])
+
+    def test_dashboard_passes_vision_configuration_to_worker(self):
+        manager = dashboard_server.Dashboard(background_monitors=False)
+        session = manager.get("vision-command")
+        session.source = {"resource": "rtmp://example/live"}
+        session.vision_enabled = True
+        session.vision_before_seconds = 7
+        session.vision_after_seconds = 11
+        worker = Mock(pid=123, returncode=None)
+        worker.poll.return_value = None
+        with patch("dashboard_server.subprocess.Popen", return_value=worker) as popen:
+            manager.start(session)
+        command = popen.call_args.args[0]
+        self.assertIn("--vision-enabled", command)
+        self.assertEqual(command[command.index("--vision-before") + 1], "7")
+        self.assertEqual(command[command.index("--vision-after") + 1], "11")
+        self.assertEqual(
+            command[command.index("--vision-search-before") + 1],
+            "300.0",
+        )
+        self.assertEqual(
+            command[command.index("--vision-search-after") + 1],
+            "0.0",
+        )
+        self.assertEqual(
+            command[command.index("--buffer-seconds") + 1],
+            "360.0",
+        )
+        self.assertEqual(command[command.index("--gif-width") + 1], "768")
+        self.assertEqual(command[command.index("--gif-fps") + 1], "16.0")
+        self.assertEqual(command[command.index("--gif-colors") + 1], "256")
+        self.assertEqual(command[command.index("--fallback-gif-width") + 1], "384")
+        self.assertEqual(command[command.index("--fallback-gif-fps") + 1], "6.0")
+
+    def test_dashboard_passes_explicit_scoreboard_profile_path(self):
+        manager = dashboard_server.Dashboard(background_monitors=False)
+        session = manager.get("profile-command")
+        session.source = {"resource": "rtmp://example/live"}
+        worker = Mock(pid=127, returncode=None)
+        worker.poll.return_value = None
+        with tempfile.TemporaryDirectory() as directory:
+            profile_path = Path(directory) / "layout.json"
+            profile_path.write_text("{}", encoding="utf-8")
+            session.scoreboard_profile_path = str(profile_path)
+            with patch("dashboard_server.subprocess.Popen", return_value=worker) as popen:
+                manager.start(session)
+
+        command = popen.call_args.args[0]
+        self.assertEqual(
+            command[command.index("--scoreboard-profile") + 1],
+            str(profile_path.resolve()),
+        )
+
+    def test_demo_duration_covers_default_vision_post_search_window(self):
+        manager = dashboard_server.Dashboard(background_monitors=False)
+        session = manager.get("demo-vision-duration")
+        session.vision_enabled = True
+        worker = Mock(pid=124, returncode=None)
+        worker.poll.return_value = None
+
+        with tempfile.TemporaryDirectory() as directory:
+            session.output_dir = Path(directory)
+            with patch("dashboard_server.subprocess.Popen", return_value=worker) as popen:
+                manager.start(session, demo=True)
+
+        command = popen.call_args.args[0]
+        duration = float(command[command.index("--duration") + 1])
+        scenario_path = Path(command[command.index("--replay-events") + 1])
+        scenario = json.loads(scenario_path.read_text(encoding="utf-8"))
+        last_event_time = max(
+            float(step["at_stream_sec"])
+            for step in scenario["steps"]
+            if step.get("payload", {}).get("events")
+        )
+
+        # event_driven_pipeline defaults: 60s post-search plus 7s to close
+        # the final transport-stream segment before queuing T-DEED.
+        self.assertGreaterEqual(duration, last_event_time + 60.0 + 7.0)
+        self.assertIn("--vision-enabled", command)
+        self.assertEqual(
+            float(command[command.index("--graceful-stop-grace-seconds") + 1]),
+            dashboard_server.WORKER_FINISH_GRACE_SECONDS,
+        )
+        self.assertEqual(
+            float(command[command.index("--graceful-stop-timeout-seconds") + 1]),
+            dashboard_server.WORKER_FINISH_TIMEOUT_SECONDS,
+        )
 
     def test_goal_revisions_are_one_unique_dashboard_event(self):
         tasks = [
@@ -365,6 +1243,9 @@ class DashboardTests(unittest.TestCase):
                         "event": "runtime_heartbeat",
                         "event_poll_count": 3,
                         "event_error_count": 0,
+                        "ingest_running": True,
+                        "ingest_restart_count": 2,
+                        "ingest_reconnect_due_unix": None,
                         "buffer_segment_count": 1,
                         "buffer_coverage_seconds": 2,
                     }
@@ -376,6 +1257,157 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(evidence["state"], "healthy")
         self.assertEqual(evidence["event_poll_count"], 3)
         self.assertEqual(evidence["buffer_segment_count"], 1)
+        self.assertTrue(evidence["worker_running"])
+        self.assertTrue(evidence["ingest_running"])
+        self.assertEqual(evidence["ingest_restart_count"], 2)
+        self.assertIsNone(evidence["ingest_reconnect_due_unix"])
+        self.assertTrue(evidence["heartbeat_fresh"])
+        self.assertTrue(evidence["segment_writing"])
+
+    def test_runtime_evidence_reports_live_ingest_reconnect_and_current_error(self):
+        manager = dashboard_server.Dashboard(background_monitors=False)
+        session = manager.get("runtime-reconnect")
+        with tempfile.TemporaryDirectory() as directory:
+            session.output_dir = Path(directory)
+            session.worker_started_at = 100.0
+            session.worker = Mock(pid=4322, returncode=None)
+            session.worker.poll.return_value = None
+            (session.output_dir / "pipeline_events.jsonl").write_text(
+                "\n".join(
+                    json.dumps(row)
+                    for row in (
+                        {
+                            "timestamp_unix": 90.0,
+                            "event": "runtime_heartbeat",
+                            "ingest_running": True,
+                            "ingest_restart_count": 99,
+                        },
+                        {
+                            "timestamp_unix": 199.0,
+                            "event": "runtime_heartbeat",
+                            "event_poll_count": 8,
+                            "ingest_running": False,
+                            "ingest_restart_count": 4,
+                            "ingest_reconnect_due_unix": 205.0,
+                        },
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            old_error = session.output_dir / "ingest_ffmpeg_old_g001.log"
+            old_error.write_text("old run error\n", encoding="utf-8")
+            os.utime(old_error, (90.0, 90.0))
+            current_error = session.output_dir / "ingest_ffmpeg_current_g001.log"
+            current_error.write_text(
+                "server error: Input/output error\n",
+                encoding="utf-8",
+            )
+            os.utime(current_error, (150.0, 150.0))
+            current_retry = session.output_dir / "ingest_ffmpeg_current_g002.log"
+            current_retry.write_text("", encoding="utf-8")
+            os.utime(current_retry, (180.0, 180.0))
+
+            with patch("dashboard_server.time.time", return_value=200.0):
+                evidence = dashboard_server._runtime_evidence(session, {}, [])
+
+        self.assertEqual(evidence["state"], "recovering")
+        self.assertIn("等待重连", evidence["label"])
+        self.assertTrue(evidence["worker_running"])
+        self.assertFalse(evidence["ingest_running"])
+        self.assertEqual(evidence["ingest_restart_count"], 4)
+        self.assertEqual(evidence["ingest_reconnect_due_unix"], 205.0)
+        self.assertEqual(
+            evidence["last_ingest_error"],
+            "server error: Input/output error",
+        )
+        self.assertEqual(evidence["exit_message"], evidence["last_ingest_error"])
+
+    def test_runtime_evidence_detects_running_ingest_with_stale_segments(self):
+        manager = dashboard_server.Dashboard(background_monitors=False)
+        session = manager.get("runtime-stale-segments")
+        with tempfile.TemporaryDirectory() as directory:
+            session.output_dir = Path(directory)
+            session.worker_started_at = 100.0
+            session.worker = Mock(pid=4323, returncode=None)
+            session.worker.poll.return_value = None
+            buffer_dir = session.output_dir / "buffer"
+            buffer_dir.mkdir()
+            segment = buffer_dir / "segment_current.ts"
+            segment.write_bytes(b"video")
+            os.utime(segment, (180.0, 180.0))
+            (session.output_dir / "pipeline_events.jsonl").write_text(
+                json.dumps(
+                    {
+                        "timestamp_unix": 199.0,
+                        "event": "runtime_heartbeat",
+                        "ingest_running": True,
+                        "ingest_restart_count": 2,
+                        "buffer_segment_count": 1,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with patch("dashboard_server.time.time", return_value=200.0):
+                evidence = dashboard_server._runtime_evidence(session, {}, [])
+
+        self.assertEqual(evidence["state"], "degraded")
+        self.assertIn("视频分片未持续写入", evidence["label"])
+        self.assertTrue(evidence["heartbeat_fresh"])
+        self.assertTrue(evidence["ingest_running"])
+        self.assertFalse(evidence["segment_writing"])
+        self.assertEqual(evidence["latest_segment_age_seconds"], 20.0)
+
+    def test_runtime_evidence_ignores_artifacts_from_previous_worker_run(self):
+        manager = dashboard_server.Dashboard(background_monitors=False)
+        session = manager.get("runtime-current-run-only")
+        with tempfile.TemporaryDirectory() as directory:
+            session.output_dir = Path(directory)
+            session.worker_started_at = 150.0
+            session.worker = Mock(pid=4324, returncode=None)
+            session.worker.poll.return_value = None
+            buffer_dir = session.output_dir / "buffer"
+            buffer_dir.mkdir()
+            old_segment = buffer_dir / "segment_old.ts"
+            old_segment.write_bytes(b"old video")
+            os.utime(old_segment, (145.0, 145.0))
+            (session.output_dir / "pipeline_events.jsonl").write_text(
+                json.dumps(
+                    {
+                        "timestamp_unix": 140.0,
+                        "event": "runtime_heartbeat",
+                        "ingest_running": False,
+                        "ingest_restart_count": 7,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            old_error = session.output_dir / "ingest_ffmpeg_old_g001.log"
+            old_error.write_text("stale Input/output error\n", encoding="utf-8")
+            os.utime(old_error, (145.0, 145.0))
+
+            stale_report = {
+                "started_at_unix": 149.9,
+                "runtime": {"ingest_restart_count": 12},
+                "ffmpeg_return_code": 1,
+            }
+            with patch("dashboard_server.time.time", return_value=160.0):
+                evidence = dashboard_server._runtime_evidence(
+                    session,
+                    stale_report,
+                    [],
+                )
+
+        self.assertEqual(evidence["state"], "starting")
+        self.assertIsNone(evidence["heartbeat_unix"])
+        self.assertIsNone(evidence["ingest_running"])
+        self.assertEqual(evidence["ingest_restart_count"], 0)
+        self.assertEqual(evidence["buffer_segment_count"], 0)
+        self.assertIsNone(evidence["last_ingest_error"])
+        self.assertIsNone(evidence["exit_message"])
 
     def test_api_only_event_is_labeled_as_history(self):
         manager = dashboard_server.Dashboard(background_monitors=False)

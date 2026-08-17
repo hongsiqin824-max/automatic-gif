@@ -1,0 +1,8 @@
+{
+  "profile_id": "demo-wiesbaden-1280x720",
+  "reference_resolution": [1280, 720],
+  "clock_roi": [176, 66, 216, 84],
+  "score_roi": [178, 42, 214, 66],
+  "second_half_clock_mode": "continuous",
+  "aspect_ratio_tolerance": 0.04
+}

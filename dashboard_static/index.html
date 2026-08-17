@@ -18,13 +18,50 @@
       <div class="port-badge"><span class="dot"></span> 8899 · 本地控制台</div>
     </header>
 
+    <section id="active-overview" class="panel activity-overview" aria-labelledby="activity-title">
+      <div class="activity-head">
+        <div class="activity-title"><span id="activity-title">活动比赛</span><b id="active-capacity">活动场次 0/8</b></div>
+        <div id="heavy-task-summary" class="heavy-task-summary unavailable" aria-live="polite">
+          <span>重任务</span><b>槽位 --</b><b>占用 --</b><b>排队 --</b><b>视觉 --</b>
+        </div>
+      </div>
+      <div class="active-tabs-row">
+        <div id="active-match-tabs" class="active-match-tabs" role="tablist" aria-label="活动比赛">
+          <span class="active-tabs-empty">暂无活动比赛</span>
+        </div>
+        <button id="new-match-btn" class="new-match-button" type="button" aria-label="准备新比赛" title="准备新比赛">+</button>
+      </div>
+    </section>
+
+    <section id="match-discovery" class="panel discovery-panel">
+      <button id="discovery-toggle" class="discovery-toggle" type="button" aria-expanded="true" aria-controls="discovery-body">
+        <span class="discovery-heading"><b>比赛发现</b><small id="discovery-summary">正在读取赛事目录</small></span>
+        <span class="discovery-toggle-meta"><span id="discovery-health" class="discovery-health loading"><i></i>连接中</span><span class="discovery-chevron" aria-hidden="true"></span></span>
+      </button>
+      <div id="discovery-body" class="discovery-body">
+        <div class="discovery-status-line"><span id="discovery-detail">正在同步进行中与即将开赛的比赛</span><span id="discovery-lock" class="discovery-lock hidden">活动场次已满，可查看或停止当前比赛</span></div>
+        <div class="discovery-groups">
+          <section class="discovery-group" aria-labelledby="playing-title">
+            <div class="discovery-group-head"><h2 id="playing-title">进行中</h2><span id="playing-count">0 场</span></div>
+            <div id="playing-matches" class="discovery-list"><div class="discovery-empty">暂无进行中的比赛</div></div>
+          </section>
+          <section class="discovery-group" aria-labelledby="upcoming-title">
+            <div class="discovery-group-head"><h2 id="upcoming-title">未来 15 分钟</h2><span id="upcoming-count">0 场</span></div>
+            <div id="upcoming-matches" class="discovery-list"><div class="discovery-empty">暂无即将开赛的比赛</div></div>
+          </section>
+        </div>
+      </div>
+    </section>
+
     <section class="control-panel">
-      <div class="field wide"><label for="match-id">比赛 ID</label><input id="match-id" value="demo-match-54154533" placeholder="输入真实 match_id"></div>
+      <div class="field wide"><label for="match-id">比赛 ID（可手工输入）</label><input id="match-id" value="demo-match-54154533" placeholder="从上方选择或输入真实 match_id"></div>
       <button id="load-btn" class="button secondary">查询比赛</button>
       <button id="demo-btn" class="button ghost">运行演示链路</button>
-      <button id="start-btn" class="button primary">启动实时处理</button>
-      <button id="stop-btn" class="button danger">停止</button>
+      <button id="start-btn" class="button primary">启动此比赛</button>
+      <button id="stop-btn" class="button danger">停止当前比赛</button>
     </section>
+
+    <div id="selection-hint" class="selection-hint hidden"></div>
 
     <div id="notice" class="notice hidden"></div>
 
@@ -44,10 +81,15 @@
         </div>
         <div class="runtime-proof">
           <div><span>运行时长</span><b id="runtime-elapsed">--</b></div>
+          <div><span>Worker 进程</span><b id="worker-process-health">未启动</b></div>
+          <div><span>FFmpeg 接收</span><b id="ingest-health">未启动</b></div>
+          <div><span>最新视频分片</span><b id="segment-age-health">未上报</b></div>
+          <div><span>采集重连</span><b id="reconnect-health">未上报</b></div>
           <div><span>处理心跳</span><b id="heartbeat-at">--</b></div>
           <div><span>外部轮询</span><b id="polling-health">未启动</b></div>
-          <div><span>FFmpeg</span><b id="ffmpeg-health">未启动</b></div>
+          <div><span>比赛 / 收尾</span><b id="lifecycle-health">未启动</b></div>
         </div>
+        <div id="ingest-error-message" class="ingest-error-message hidden"><span>最近 FFmpeg 接收错误</span><b id="ingest-error">--</b></div>
         <div id="runtime-message" class="runtime-message hidden"></div>
       </article>
     </section>
@@ -55,13 +97,13 @@
     <section class="content-grid">
       <article class="panel events-panel"><div class="panel-head"><span>事件与 GIF</span><span id="event-count" class="muted">唯一事件 0</span></div><div class="event-legend"><span><i class="history-dot"></i>历史未生成</span><span><i class="task-dot"></i>处理中</span><span><i class="ready-dot"></i>已生成 GIF</span></div><div id="events" class="events-list"><div class="empty">输入比赛 ID 查询，或运行演示链路。</div></div></article>
       <aside class="side-stack">
-        <article class="panel settings"><div class="panel-head"><span>运行配置</span><span class="muted">可调整</span></div><div class="settings-grid"><label>事件轮询<input id="event-poll" type="number" value="3" min="1" step="1"><small>秒</small></label><label>直播源轮询<input id="source-poll" type="number" value="10" min="1" step="1"><small>秒</small></label><label>赛况轮询<input id="detail-poll" type="number" value="10" min="1" step="1"><small>秒</small></label><label>GIF 前置<input id="before" type="number" value="30" min="0" step="1"><small>秒</small></label><label>GIF 后置<input id="after" type="number" value="20" min="1" step="1"><small>秒</small></label><label>GIF 宽度<input id="width" type="number" value="384" min="160" step="16"><small>px</small></label></div><p class="config-note">固定 GIF 参数，不因超过 10 MB 自动降质量。10 MB 仅作为参考提示。</p></article>
+        <article class="panel settings"><div class="panel-head"><span>运行配置</span><span class="muted">可调整</span></div><div class="settings-grid"><label>事件轮询<input id="event-poll" type="number" value="3" min="1" step="1"><small>秒</small></label><label>直播源轮询<input id="source-poll" type="number" value="10" min="1" step="1"><small>秒</small></label><label>赛况轮询<input id="detail-poll" type="number" value="10" min="1" step="1"><small>秒</small></label><label>GIF 前置<input id="before" type="number" value="30" min="0" step="1"><small>秒</small></label><label>GIF 后置<input id="after" type="number" value="20" min="1" step="1"><small>秒</small></label><label>事件时间校准<input id="event-offset" type="number" value="-60" step="0.5"><small>秒</small></label><label>GIF 宽度<input id="width" type="number" value="768" min="160" step="16"><small>px</small></label><label class="vision-toggle">AI 精剪<input id="vision-enabled" type="checkbox" checked><small id="vision-state">默认开启</small></label><label>精剪前置<input id="vision-before" type="number" value="8" min="0" step="1"><small>秒</small></label><label>精剪后置<input id="vision-after" type="number" value="12" min="1" step="1"><small>秒</small></label></div><p class="config-note">默认 GIF：前置 30 秒 + 后置 20 秒 · 事件时间校准 -60 秒 · 视觉搜索向前 300 秒、后置 0 秒</p></article>
         <article class="panel source-panel"><div class="panel-head"><span>直播源</span><span id="source-change" class="warning hidden">地址有变化</span></div><code id="resource">尚未获取 resource</code><div class="source-meta"><span>updated_at</span><b id="updated-at">--</b></div></article>
       </aside>
     </section>
 
     <section class="panel logs-panel"><div class="panel-head"><span>运行日志</span><span id="last-refresh" class="muted">--</span></div><div id="logs" class="logs"><div class="empty">暂无日志</div></div></section>
-    <footer>第一阶段：事件接口驱动的 G / YC / RC GIF 生成。发布接口和标题生成暂不接入。</footer>
+    <footer>默认 GIF 与视觉精剪独立生成；视觉分支优先使用 OCR，并保留 T-DEED 回退。</footer>
   </main>
   <script src="/static/app.js"></script>
 </body>
