@@ -23,13 +23,15 @@ from typing import Any, Callable, Mapping, Sequence
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_WORKER = ROOT / "scoreboard_ocr_worker.py"
-SUPPORTED_EVENT_CODES = frozenset({"G", "OG", "YC", "RC"})
+GOAL_LIKE_EVENT_CODES = frozenset({"G", "OG", "PG"})
+SUPPORTED_EVENT_CODES = GOAL_LIKE_EVENT_CODES | frozenset({"YC", "RC"})
 STRUCTURED_ERROR_KINDS = frozenset(
     {
         "scoreboard_missing",
         "ocr_clock_unreadable",
         "ocr_score_unreadable",
         "ocr_no_score_transition",
+        "ocr_exact_second_not_found",
         "ocr_ambiguous",
         "inference_timeout",
         "ocr_model_unavailable",
@@ -71,7 +73,13 @@ _COMPACT_CLOCK_PATTERN = re.compile(r"(?<!\d)(\d{2,3})([0-5]\d)(?!\d)")
 _STOPPAGE_CLOCK_PATTERN = re.compile(
     r"(?<!\d)(45|90)\s*\+\s*(\d{1,2})(?:\s*[:.]\s*([0-5]\d))?(?!\d)"
 )
+_ADDED_STOPWATCH_PATTERN = re.compile(
+    r"(?<!\d)(45|90)\s*[:.]\s*00\s*\+\s*(\d{1,2})\s*[:.]\s*([0-5]\d)(?!\d)"
+)
 _SCORE_PATTERN = re.compile(r"(?<!\d)(\d{1,2})\s*[-:]\s*(\d{1,2})(?!\d)")
+_J_LEAGUE_SCORE_PATTERN = re.compile(
+    r"(?<!\d)(\d)\s*\.\s*1\s*(\d)(?!\d)"
+)
 _MAX_REASONABLE_MATCH_MINUTE = 150
 _MAX_REASONABLE_SCORE = 20
 
@@ -103,7 +111,7 @@ class ScoreboardProfile:
     reference_width: int
     reference_height: int
     clock_roi: Roi
-    score_roi: Roi
+    score_roi: Roi | None = None
     second_half_clock_mode: str = "continuous"
     aspect_ratio_tolerance: float = 0.04
 
@@ -116,9 +124,13 @@ class ScoreboardProfile:
         if width <= 0 or height <= 0:
             raise ValueError("reference resolution must be positive")
         clock_roi = _coerce_roi(self.clock_roi, field_name="clock_roi")
-        score_roi = _coerce_roi(self.score_roi, field_name="score_roi")
+        score_roi = (
+            _coerce_roi(self.score_roi, field_name="score_roi")
+            if self.score_roi is not None
+            else None
+        )
         for field_name, roi in (("clock_roi", clock_roi), ("score_roi", score_roi)):
-            if roi[2] > width or roi[3] > height:
+            if roi is not None and (roi[2] > width or roi[3] > height):
                 raise ValueError(
                     f"{field_name} {roi!r} exceeds reference resolution {width}x{height}"
                 )
@@ -155,7 +167,11 @@ class ScoreboardProfile:
             reference_width=int(reference_width),
             reference_height=int(reference_height),
             clock_roi=_coerce_roi(value.get("clock_roi"), field_name="clock_roi"),
-            score_roi=_coerce_roi(value.get("score_roi"), field_name="score_roi"),
+            score_roi=(
+                _coerce_roi(value.get("score_roi"), field_name="score_roi")
+                if value.get("score_roi") is not None
+                else None
+            ),
             second_half_clock_mode=str(
                 value.get("second_half_clock_mode") or "continuous"
             ),
@@ -169,7 +185,7 @@ class ScoreboardProfile:
             "profile_id": self.profile_id,
             "reference_resolution": [self.reference_width, self.reference_height],
             "clock_roi": list(self.clock_roi),
-            "score_roi": list(self.score_roi),
+            "score_roi": list(self.score_roi) if self.score_roi is not None else None,
             "second_half_clock_mode": self.second_half_clock_mode,
             "aspect_ratio_tolerance": self.aspect_ratio_tolerance,
         }
@@ -210,7 +226,10 @@ class ScoreboardProfile:
                 max(1, min(height, round(y2 * scale_y))),
             )
 
-        return {"clock_roi": scale(self.clock_roi), "score_roi": scale(self.score_roi)}
+        return {
+            "clock_roi": scale(self.clock_roi),
+            "score_roi": scale(self.score_roi) if self.score_roi is not None else None,
+        }
 
 
 _SCOREBOARD_PROFILES: dict[str, ScoreboardProfile] = {}
@@ -294,6 +313,40 @@ def parse_clock_texts(texts: Sequence[str] | str) -> ParsedMatchClock:
     """Parse only a match clock; score-like tokens are deliberately ignored."""
     parsed: dict[int, tuple[str, str, int | None, int | None, str]] = {}
     candidates = _normalized_ocr_candidates(texts)
+    added_stopwatches: dict[
+        int, tuple[str, str, int | None, int | None, str]
+    ] = {}
+    for candidate in candidates:
+        for match in _ADDED_STOPWATCH_PATTERN.finditer(candidate):
+            base = int(match.group(1))
+            added = int(match.group(2))
+            second = int(match.group(3))
+            total_minute = base + added
+            if total_minute <= _MAX_REASONABLE_MATCH_MINUTE:
+                added_stopwatches[total_minute * 60 + second] = (
+                    f"{base}:00+{added:02d}:{second:02d}",
+                    "added_stopwatch",
+                    base,
+                    added,
+                    "second",
+                )
+    if added_stopwatches:
+        seconds = tuple(sorted(added_stopwatches))
+        if len(seconds) != 1:
+            return ParsedMatchClock(None, ambiguous=True, candidates=seconds)
+        clock_seconds = seconds[0]
+        display, clock_format, base, added, precision = added_stopwatches[
+            clock_seconds
+        ]
+        return ParsedMatchClock(
+            clock_seconds,
+            display_text=display,
+            precision=precision,
+            clock_format=clock_format,
+            base_minute=base,
+            added_minutes=added,
+            candidates=seconds,
+        )
     for candidate in candidates:
         stoppage_spans: list[tuple[int, int]] = []
         for match in _STOPPAGE_CLOCK_PATTERN.finditer(candidate):
@@ -382,10 +435,26 @@ def parse_score_texts(texts: Sequence[str] | str) -> ParsedScore:
 
     collect(originals)
     if not scores:
+        # Some J.League scorebugs place a J1 logo between the two scores.
+        # Recognition-only OCR commonly renders ``0 [J1] 0`` as ``0.10``.
+        for candidate in originals:
+            for match in _J_LEAGUE_SCORE_PATTERN.finditer(candidate):
+                scores.add((int(match.group(1)), int(match.group(2))))
+    if not scores:
         # Joined candidates are only a fallback for split tokens such as
         # ["1", "-", "0"]. Joining already-complete scores can create a
         # synthetic cross-boundary value (for example, 0-0 + 1-0 -> 0-01).
         collect(["".join(originals), " ".join(originals)])
+    if not scores and len(originals) == 2:
+        # Some compact scorebugs render the two scores in separate boxes with
+        # no visible separator. Detection OCR then returns ["4", "0"]. This
+        # fallback is intentionally restricted to exactly two numeric tokens;
+        # clock crops are parsed independently and never reach this function.
+        split_score = [
+            int(value) for value in originals if re.fullmatch(r"\d{1,2}", value)
+        ]
+        if len(split_score) == 2 and max(split_score) <= _MAX_REASONABLE_SCORE:
+            scores.add((split_score[0], split_score[1]))
     ordered = tuple(sorted(scores))
     return ParsedScore(
         ordered[0] if len(ordered) == 1 else None,
@@ -437,6 +506,7 @@ class ClockContinuityStateMachine:
         maximum_repair_gap_seconds: float = 5.0,
         maximum_consecutive_repairs: int = 3,
         resync_observations: int = 4,
+        second_half_clock_mode: str | None = None,
     ) -> None:
         if maximum_repair_gap_seconds <= 0:
             raise ValueError("maximum_repair_gap_seconds must be positive")
@@ -444,7 +514,17 @@ class ClockContinuityStateMachine:
             raise ValueError("maximum_consecutive_repairs must be positive")
         if resync_observations < 2:
             raise ValueError("resync_observations must be at least 2")
+        clock_mode = (
+            profile.second_half_clock_mode
+            if profile is not None
+            else str(second_half_clock_mode or "continuous").strip().lower()
+        )
+        if clock_mode not in _SECOND_HALF_CLOCK_MODES:
+            raise ValueError(
+                "second_half_clock_mode must be continuous, reset, or auto"
+            )
         self.profile = profile
+        self.second_half_clock_mode = clock_mode
         self.maximum_repair_gap_seconds = float(maximum_repair_gap_seconds)
         self.maximum_consecutive_repairs = int(maximum_consecutive_repairs)
         self.resync_observations = int(resync_observations)
@@ -476,7 +556,7 @@ class ClockContinuityStateMachine:
     ) -> int:
         assert parsed.clock_seconds is not None
         clock_seconds = parsed.clock_seconds
-        mode = self.profile.second_half_clock_mode if self.profile else "continuous"
+        mode = self.second_half_clock_mode
         if period_number == 2:
             if mode == "reset":
                 return clock_seconds + 45 * 60
@@ -507,7 +587,8 @@ class ClockContinuityStateMachine:
         second = int(match.group(2))
         expected_minute, expected_second = divmod(expected, 60)
         if minute == expected_minute:
-            return minute * 60 + second
+            repaired = minute * 60 + second
+            return repaired if abs(repaired - expected) <= 2 else None
         if (
             second == expected_second
             and str(expected_minute).endswith(str(minute))
@@ -809,6 +890,7 @@ class ScoreboardOcrRequest:
     event_code: str
     target_score: str | None = None
     event_minute: str | int | None = None
+    event_second: int | None = None
     candidate_start_seconds: float = 0.0
     sample_interval_seconds: float = 1.0
     anchor_lead_seconds: float = 3.0
@@ -819,6 +901,7 @@ class ScoreboardOcrRequest:
     language: str = "en"
     ffmpeg: str = "ffmpeg"
     scoreboard_profile: ScoreboardProfile | Mapping[str, Any] | str | None = None
+    clock_only: bool = False
 
     def validate(self) -> None:
         code = self.event_code.upper().strip()
@@ -826,10 +909,28 @@ class ScoreboardOcrRequest:
             raise ValueError(f"unsupported event code: {self.event_code!r}")
         if not Path(self.candidate_path).is_file():
             raise ValueError(f"candidate video does not exist: {self.candidate_path}")
-        if code in {"G", "OG"} and not str(self.target_score or "").strip():
-            raise ValueError("target_score is required for G/OG events")
-        if code in {"YC", "RC"} and self.event_minute is None:
-            raise ValueError("event_minute is required for YC/RC events")
+        if not isinstance(self.clock_only, bool):
+            raise ValueError("clock_only must be a boolean")
+        if (
+            code in GOAL_LIKE_EVENT_CODES
+            and not self.clock_only
+            and self.event_second is None
+            and not str(self.target_score or "").strip()
+        ):
+            raise ValueError(
+                "target_score or event_second is required for goal-like events"
+            )
+        if (self.clock_only or code in {"YC", "RC"}) and not str(
+            self.event_minute if self.event_minute is not None else ""
+        ).strip():
+            raise ValueError("event_minute is required for clock-based OCR")
+        if self.event_second is not None:
+            if isinstance(self.event_second, bool) or not isinstance(
+                self.event_second, int
+            ):
+                raise ValueError("event_second must be a cumulative integer second")
+            if not 0 <= self.event_second <= _MAX_REASONABLE_MATCH_MINUTE * 60 + 59:
+                raise ValueError("event_second is outside the supported match clock range")
         if self.candidate_start_seconds < 0:
             raise ValueError("candidate_start_seconds must not be negative")
         if self.sample_interval_seconds <= 0:
@@ -845,7 +946,9 @@ class ScoreboardOcrRequest:
         if not 0 <= self.minimum_confidence <= 1:
             raise ValueError("minimum_confidence must be in [0, 1]")
         if self.scoreboard_profile is not None:
-            resolve_scoreboard_profile(self.scoreboard_profile)
+            profile = resolve_scoreboard_profile(self.scoreboard_profile)
+            if not self.clock_only and profile.score_roi is None:
+                raise ValueError("scoreboard profile must define score_roi outside clock_only mode")
 
     def to_payload(self) -> dict[str, Any]:
         self.validate()
@@ -854,6 +957,11 @@ class ScoreboardOcrRequest:
             "event_code": self.event_code.upper().strip(),
             "target_score": self.target_score,
             "event_minute": self.event_minute,
+            "event_second": (
+                self.event_second
+                if self.event_code.upper().strip() in GOAL_LIKE_EVENT_CODES
+                else None
+            ),
             "candidate_start_seconds": float(self.candidate_start_seconds),
             "sample_interval_seconds": float(self.sample_interval_seconds),
             "anchor_lead_seconds": float(self.anchor_lead_seconds),
@@ -868,6 +976,9 @@ class ScoreboardOcrRequest:
             payload["scoreboard_profile"] = resolve_scoreboard_profile(
                 self.scoreboard_profile
             ).to_payload()
+        # Preserve the legacy wire payload unless the new mode is explicit.
+        if self.clock_only:
+            payload["clock_only"] = True
         return payload
 
 
@@ -1198,6 +1309,7 @@ def locate_scoreboard_event(
     event_code: str,
     target_score: str | None = None,
     event_minute: str | int | None = None,
+    event_second: int | None = None,
     candidate_start_seconds: float = 0.0,
     sample_interval_seconds: float = 1.0,
     anchor_lead_seconds: float = 3.0,
@@ -1207,6 +1319,7 @@ def locate_scoreboard_event(
     worker_path: str | Path = DEFAULT_WORKER,
     runner: Runner = subprocess.run,
     scoreboard_profile: ScoreboardProfile | Mapping[str, Any] | str | None = None,
+    clock_only: bool = False,
 ) -> dict[str, Any]:
     """Convenience API used by the future visual-refinement integration."""
     request = ScoreboardOcrRequest(
@@ -1214,11 +1327,13 @@ def locate_scoreboard_event(
         event_code=event_code,
         target_score=target_score,
         event_minute=event_minute,
+        event_second=event_second,
         candidate_start_seconds=candidate_start_seconds,
         sample_interval_seconds=sample_interval_seconds,
         anchor_lead_seconds=anchor_lead_seconds,
         stable_frames=stable_frames,
         scoreboard_profile=scoreboard_profile,
+        clock_only=clock_only,
     )
     return run_scoreboard_ocr(
         request,

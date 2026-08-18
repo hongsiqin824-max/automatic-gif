@@ -97,10 +97,10 @@ HTTP 409 response until one active match has completely stopped. GIF encoding
 has queue priority over optional vision refinement, and the activity panel
 shows current heavy-task occupancy and queue depth.
 
-The default event anchor is the API first-observed stream time minus 60
+The default event anchor is the API first-observed stream time minus 30
 seconds. With the normal 30-second pre-roll and 20-second post-roll, the
-default GIF covers `[T-90, T-40]` and can be encoded immediately from history.
-Optional refinement uses the unshifted API time `T`, scans `[T-300, T]`, and is
+default GIF covers `[T-60, T-10]` and can be encoded immediately from history.
+Optional refinement uses the unshifted API time `T`, scans `[T-120, T]`, and is
 not submitted until the corresponding default GIF has succeeded.
 
 For a real match, "启动实时处理" is enabled by behavior only after the source
@@ -190,7 +190,8 @@ event's first appearance and the corresponding action in the received video.
 It remains `0` until a same-match API/RTMP live test establishes that offset.
 `--match-start-play` accepts the match-detail API's Beijing time. It supplies a
 coarse match-clock reference for the visual search window; the API observation
-time remains the default GIF anchor, and T-DEED performs the final refinement.
+time remains the default GIF anchor. OCR and T-DEED run as separate optional
+artifacts and never replace or delay that default GIF.
 GIF parameters are fixed for the entire run. The 10 MB value is a reporting
 reference only and never causes automatic resolution, FPS, or color reduction.
 
@@ -225,6 +226,12 @@ Every run now creates these operational artifacts under `--output-dir`:
 - 清理结果写入 `event_pipeline_report.json` 的 `disk_lifecycle` 字段，包含删除
   文件数、释放字节数、保留/跳过数量和错误信息。SQLite 任务库不会被删除，只会
   在终态执行 WAL checkpoint。
+- Dashboard 还会每 5 分钟扫描没有活跃 Session、没有有效 lease、Worker PID 已退出且
+  超过 15 分钟没有运行心跳的比赛目录，清理异常退出遗留的 TS、CSV、manifest 和视觉候选文件；
+  可用 `GIF_ORPHAN_CLEANUP_GRACE_SECONDS` 调整这段保护窗口。终态和长期未访问的
+  未启动 Session 默认保留 24 小时，最终 GIF 默认保留 24 小时，分别可用
+  `GIF_SESSION_RETENTION_SECONDS`、`GIF_FINAL_GIF_RETENTION_SECONDS` 和
+  `GIF_DISK_CLEANUP_INTERVAL_SECONDS` 配置。
 
 RTMP input is supervised and restarted after either a clean or non-zero FFmpeg
 exit, with progressive backoff of 2, 3, then 5 seconds (capped at 5 seconds).
@@ -336,18 +343,35 @@ python3 -m venv tmp/ocr_venv
 tmp/ocr_venv/bin/python -m pip install -r ocr_requirements.txt
 ```
 
-Enable `AI 精剪` before starting a match Worker. Goal and own-goal tasks look
-for a stable transition to the API target score and place the refined anchor
-three seconds before the first stable new score. Card tasks use OCR only to map
-the API minute to a video interval, then require T-DEED for second-level action
-location. The rolling buffer retains 360 seconds and OCR searches the latest
-300 seconds at one sample per second. Clock and score are cropped and parsed
-independently, and recognition-only inference runs in batches of up to eight
-crops through one persistent local worker shared by active matches.
+Enable `AI 精剪` before starting a match Worker. Each new event then has three
+independent artifacts: the unchanged default GIF, an OCR-located 60-second GIF,
+and a T-DEED-refined 20-second GIF. The Worker polls shotmap independently every
+five seconds and only treats newly added `outcome=goal` rows as goal events. Its
+first valid JSON response is a durable SQLite baseline, so goals that existed
+before the Worker started are not replayed after startup or restart. A new goal
+uses the cumulative `second` directly: for example, `455` targets `07:35` while
+the API display minute remains `8`. The default GIF uses the independent shotmap
+offset (zero by default); OCR locates the exact `MM:SS` and uses `-30/+30`, then
+T-DEED refines only that OCR window. If shotmap has no shot rows, overview goals
+remain available as the compatibility fallback. Red and yellow cards continue
+to use overview and the minute-boundary OCR rule. OCR reads only the clock area;
+the score is not required. The rolling buffer retains 360 seconds and OCR
+searches the latest 120 seconds at one sample per second through one persistent
+local worker shared by active matches. Dashboard deployments can override the
+window with `GIF_VISION_SEARCH_BEFORE_SECONDS`; direct Workers use
+`--vision-search-before`.
 
-Each broadcast layout needs a JSON profile with a reference resolution and
-pixel ROIs. Configure it with `GIF_SCOREBOARD_PROFILE` or the
-`scoreboard_profile_path` session field. For example:
+The shotmap cursor stores the last valid response and a fingerprint made from
+player, team, minute, cumulative second, situation, and normalized coordinates.
+Invalid JSON or HTTP failures update diagnostics but never initialize or replace
+the durable baseline. Runtime heartbeat and Dashboard output expose shotmap poll
+count, initialization, errors, event source, target clock, and each artifact's
+stage and failure reason.
+
+The OCR worker automatically searches the upper-left scoreboard area when no
+layout is configured. A known broadcast layout can optionally provide exact
+pixel ROIs with `GIF_SCOREBOARD_PROFILE` or the `scoreboard_profile_path`
+session field; this skips discovery and remains the fastest path. For example:
 
 ```json
 {
@@ -359,22 +383,24 @@ pixel ROIs. Configure it with `GIF_SCOREBOARD_PROFILE` or the
 }
 ```
 
-Unknown or mismatched layouts never publish a false precise result. The
-existing default GIF remains unchanged and a separate 120-second
-`_fallback_` GIF is attempted at 384px / 6 FPS with a structured failure
-reason. A successful second-level location still publishes the short
-`-8/+12` second `_ai_` GIF. Extra time and penalty shootouts remain outside V1.
+Unknown or mismatched layouts never publish a false precise result. The OCR GIF
+uses 384px / 6 FPS / 160 colors and is encoded directly from the original TS.
+T-DEED analyzes only that OCR 60-second window and, when successful, publishes
+the short `-8/+12` second `_ai_` GIF. OCR and T-DEED persist separate status,
+window metadata, output path, failure stage, and failure reason. A failure in
+either optional path does not change the default GIF. Extra time and penalty
+shootouts remain outside V1.
 
 ## Current boundary
 
 The default event-driven path does not depend on OCR or a visual classifier.
 The supplied recording proves event routing, streaming buffer, retroactive
-extraction, fixed-profile GIF generation, durable deduplication, and concurrent
-jobs. PaddleOCR has been locally verified against an existing broadcast GIF:
-after ROI upscaling it read the score in 48 of 50 sampled frames and correctly
-refused to invent a transition when the clip already began at the target score.
-A live shadow run is still required to measure full 300-second OCR accuracy,
-card localization, fallback file size, and four-match production latency.
+extraction, GIF generation, durable deduplication, and concurrent jobs. The
+automatic clock finder has been exercised against four cached broadcast
+layouts without profiles, including a `90:00 +00:xx` clock and a temporary goal
+graphic. A live shadow run is still required to measure full 120-second OCR
+accuracy, 60-second GIF file size, and multi-match production
+latency before assigning a production accuracy percentage.
 
 ## Visual localization research
 

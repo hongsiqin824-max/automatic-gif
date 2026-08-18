@@ -10,6 +10,7 @@ from vision_locator import (
     VisionBufferNotReady,
     VisionBufferUnavailable,
     VisionCandidateNotFound,
+    VisionConfigurationError,
     VisionInferenceError,
     locate,
     locate_candidate_video,
@@ -43,8 +44,23 @@ class VisionCandidateSelectionTests(unittest.TestCase):
     def test_supported_codes_map_to_expected_model_labels(self):
         self.assertEqual(EVENT_LABELS["G"], ("Goal",))
         self.assertEqual(EVENT_LABELS["OG"], ("Goal",))
+        self.assertEqual(EVENT_LABELS["PG"], ("Goal",))
         self.assertEqual(EVENT_LABELS["YC"], ("Yellow card",))
         self.assertEqual(EVENT_LABELS["RC"], ("Red card", "Yellow->red card"))
+
+    def test_penalty_goal_selects_goal_and_penalty_miss_is_unsupported(self):
+        selected = select_event_candidate(
+            [{"label": "Goal", "frame": 1500, "confidence": 0.8}],
+            "PG",
+            expected_offset_seconds=60.0,
+        )
+        self.assertEqual(selected["label"], "Goal")
+        with self.assertRaises(VisionConfigurationError):
+            select_event_candidate(
+                [{"label": "Goal", "frame": 1500, "confidence": 0.8}],
+                "PM",
+                expected_offset_seconds=60.0,
+            )
 
     def test_selects_nearest_candidate_after_label_threshold_and_distance_filters(self):
         selected = select_event_candidate(

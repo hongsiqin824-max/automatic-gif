@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any, Mapping
 
 
-GOAL_CODES = {"G", "OG"}
+GOAL_CODES = {"G", "OG", "PG"}
 MISSING_IDS = {"", "0", "none", "null"}
 
 
@@ -43,6 +44,43 @@ def minute_value(value: Mapping[str, Any]) -> int | None:
         return None
 
 
+def _nonnegative_integer(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(parsed) or parsed < 0 or not parsed.is_integer():
+        return None
+    return int(parsed)
+
+
+def stable_event_second(value: Mapping[str, Any]) -> int | None:
+    """Return a trustworthy cumulative match second when one is available."""
+    direct = _nonnegative_integer(value.get("second"))
+    if direct is not None:
+        return direct
+    metadata = value.get("metadata")
+    if not isinstance(metadata, Mapping):
+        return None
+    if (
+        str(metadata.get("second_source") or "").lower() != "shotmap"
+        and str(metadata.get("shotmap_match_status") or "").lower() != "matched"
+    ):
+        return None
+    for key in ("second", "shotmap_second"):
+        parsed = _nonnegative_integer(metadata.get(key))
+        if parsed is not None:
+            return parsed
+    candidates = metadata.get("shotmap_candidate_details")
+    if isinstance(candidates, list) and len(candidates) == 1:
+        candidate = candidates[0]
+        if isinstance(candidate, Mapping):
+            return _nonnegative_integer(candidate.get("second"))
+    return None
+
+
 def events_represent_same_incident(
     left: Mapping[str, Any],
     right: Mapping[str, Any],
@@ -54,6 +92,14 @@ def events_represent_same_incident(
     right_id = explicit_event_id(right)
     if left_id and right_id:
         return left_id == right_id
+    left_second = stable_event_second(left)
+    right_second = stable_event_second(right)
+    if (
+        left_second is not None
+        and right_second is not None
+        and left_second != right_second
+    ):
+        return False
     # A pair with no durable ID needs evidence that one record is a richer or
     # corrected version of the other. Identical task payloads can be separate
     # jobs created by an older worker and must not be silently suppressed.
@@ -86,16 +132,15 @@ def events_represent_same_incident(
         return False
 
     family = event_family(left)
+    if left_second is not None and right_second is not None:
+        return left_second == right_second
+
     left_score = str(left.get("score") or "").replace(" ", "")
     right_score = str(right.get("score") or "").replace(" ", "")
     left_person = meaningful_id(left.get("person_id"))
     right_person = meaningful_id(right.get("person_id"))
     if left_person and right_person and left_person != right_person:
         return False
-    if family == "goal" and left_score and right_score and left_score != right_score:
-        # A changed score is only safe to treat as a revision when the scorer
-        # is stable. Otherwise it may be a separate goal.
-        return bool(left_person and right_person and left_person == right_person)
     if family in {"yc", "rc"} and left_person and right_person:
         return left_person == right_person and minutes_are_close
     if family in {"yc", "rc"}:
@@ -107,22 +152,32 @@ def events_represent_same_incident(
 
     left_person_name = str(left.get("person") or "").strip()
     right_person_name = str(right.get("person") or "").strip()
+    stable_person = bool(
+        left_person and right_person and left_person == right_person
+    )
+    stable_person_name = bool(
+        left_person_name
+        and right_person_name
+        and left_person_name.casefold() == right_person_name.casefold()
+    )
+    if stable_person:
+        return True
+    if left_person_name and right_person_name and not stable_person_name:
+        return False
+    if stable_person_name:
+        return True
     if left_score and right_score:
         if left_score == right_score:
             # A populated score is a useful incident-level anchor even while
             # the provider is still filling in the scorer or minute.
             return True
-        # A score correction needs a stable scorer to distinguish it from a
-        # later real goal.
-        return bool(left_person and right_person and left_person == right_person)
+        return False
     if bool(left_score) != bool(right_score):
-        return True
-    if left_person and right_person:
-        return left_person == right_person
-    if left_person_name and right_person_name:
-        return left_person_name == right_person_name
-    # With neither score nor scorer there is no trustworthy revision signal.
-    return bool(left_person or left_person_name) != bool(right_person or right_person_name)
+        # A missing score is common in partially populated rows, but by itself
+        # it cannot distinguish an API revision from the next real goal.
+        return False
+    # With neither score nor a stable scorer there is no revision signal.
+    return False
 
 
 def merge_event_metadata(

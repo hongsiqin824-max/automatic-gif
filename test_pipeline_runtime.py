@@ -8,12 +8,16 @@ from pathlib import Path
 from unittest.mock import patch
 
 from event_driven_pipeline import (
+    EVENT_VISUAL_WINDOW_LEASE_OWNER,
     EventRevisionTracker,
     MatchEvent,
     encode_event_job,
+    protect_incomplete_vision_event_segments,
     parse_match_events,
     recovered_event_job,
+    release_terminal_event_visual_window_leases,
 )
+from live_goal_pipeline import Segment
 from pipeline_runtime import PipelineRuntime, TaskStateStore
 
 
@@ -218,6 +222,145 @@ class PipelineRuntimeTests(unittest.TestCase):
         )
         reopened.close()
 
+    def test_shotmap_cursor_only_initializes_from_valid_snapshot(self):
+        runtime = PipelineRuntime(self.database_path, self.log_path)
+
+        self.assertFalse(
+            runtime.store.upsert_shotmap_snapshot(
+                "match-1",
+                {"error": "upstream unavailable"},
+                diagnostics={"http_status": 503},
+                observed_at_unix=1000.0,
+                now=1001.0,
+            )
+        )
+        state = runtime.store.load_shotmap_state("match-1")
+        self.assertFalse(state.initialized)
+        self.assertIsNone(state.last_snapshot)
+        self.assertEqual(state.last_response_at_unix, 1000.0)
+        self.assertEqual(state.diagnostics["http_status"], 503)
+        self.assertEqual(
+            state.diagnostics["validation_error"],
+            "shots_missing_or_not_list",
+        )
+
+        self.assertTrue(
+            runtime.store.upsert_shotmap_snapshot(
+                "match-1",
+                {"shots": []},
+                diagnostics={"http_status": 200, "age": 4},
+                observed_at_unix=1010.0,
+                now=1011.0,
+            )
+        )
+        state = runtime.store.load_shotmap_state("match-1")
+        self.assertTrue(state.initialized)
+        self.assertEqual(state.initialized_at_unix, 1011.0)
+        self.assertEqual(state.last_snapshot, {"shots": []})
+        self.assertEqual(state.last_snapshot_at_unix, 1010.0)
+        self.assertEqual(state.diagnostics["valid"], True)
+        runtime.close()
+
+    def test_shotmap_baseline_and_snapshot_survive_worker_restart(self):
+        runtime = PipelineRuntime(self.database_path, self.log_path)
+        payload = {
+            "shots": [
+                {
+                    "outcome": "goal",
+                    "second": 455,
+                    "minute": 8,
+                    "playerId": 123,
+                }
+            ]
+        }
+        self.assertTrue(
+            runtime.store.upsert_shotmap_snapshot(
+                "match-1", payload, observed_at_unix=2000.0, now=2001.0
+            )
+        )
+        self.assertEqual(
+            runtime.store.mark_shotmap_seen(
+                "match-1",
+                {"goal-fingerprint"},
+                events={"goal-fingerprint": payload["shots"][0]},
+                now=2001.0,
+            ),
+            {"goal-fingerprint"},
+        )
+        runtime.close()
+
+        reopened = PipelineRuntime(self.database_path, self.log_path)
+        initialized, fingerprints = reopened.store.load_shotmap_cursor("match-1")
+        self.assertTrue(initialized)
+        self.assertEqual(fingerprints, {"goal-fingerprint"})
+        state = reopened.store.load_shotmap_state("match-1")
+        self.assertEqual(state.last_snapshot, payload)
+        self.assertEqual(state.seen_fingerprints, frozenset({"goal-fingerprint"}))
+        self.assertEqual(
+            reopened.store.mark_shotmap_seen(
+                "match-1", {"goal-fingerprint"}, now=2002.0
+            ),
+            set(),
+        )
+        reopened.close()
+
+    def test_invalid_shotmap_response_does_not_replace_valid_snapshot(self):
+        runtime = PipelineRuntime(self.database_path, self.log_path)
+        valid_payload = {"shots": [{"outcome": "goal", "second": 455}]}
+        runtime.store.upsert_shotmap_snapshot(
+            "match-1", valid_payload, observed_at_unix=3000.0, now=3001.0
+        )
+
+        self.assertFalse(
+            runtime.store.upsert_shotmap_snapshot(
+                "match-1",
+                [valid_payload],
+                diagnostics={"error": "unexpected envelope"},
+                observed_at_unix=3010.0,
+                now=3011.0,
+            )
+        )
+        state = runtime.store.load_shotmap_state("match-1")
+        self.assertTrue(state.initialized)
+        self.assertEqual(state.initialized_at_unix, 3001.0)
+        self.assertEqual(state.last_snapshot, valid_payload)
+        self.assertEqual(state.last_snapshot_at_unix, 3000.0)
+        self.assertEqual(state.last_response_at_unix, 3010.0)
+        self.assertEqual(state.diagnostics["valid"], False)
+        runtime.close()
+
+    def test_concurrent_shotmap_seen_updates_are_deduplicated(self):
+        runtime = PipelineRuntime(self.database_path, self.log_path)
+        runtime.store.upsert_shotmap_snapshot(
+            "match-1", {"shots": []}, now=4000.0
+        )
+        barrier = threading.Barrier(4)
+        errors = []
+
+        def mark_seen(index):
+            try:
+                barrier.wait()
+                runtime.store.mark_shotmap_seen(
+                    "match-1",
+                    {"shared", f"goal-{index}"},
+                    now=4001.0 + index,
+                )
+            except Exception as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=mark_seen, args=(index,)) for index in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            runtime.store.load_shotmap_fingerprints("match-1"),
+            {"shared", "goal-0", "goal-1", "goal-2", "goal-3"},
+        )
+        runtime.close()
+
     def test_event_aliases_survive_worker_restart(self):
         runtime = PipelineRuntime(self.database_path, self.log_path)
         original = event_data("match-1:G:original")
@@ -367,6 +510,49 @@ class PipelineRuntimeTests(unittest.TestCase):
         self.assertEqual(task.event_data["person"], "Updated Player")
         runtime.close()
 
+    def test_nullable_enrichment_field_can_be_explicitly_cleared(self):
+        runtime = PipelineRuntime(self.database_path, self.log_path)
+        enriched = {
+            **event_data(),
+            "second": 4177,
+            "metadata": {
+                "bucket": "18",
+                "second_source": "shotmap",
+                "shotmap_match_status": "matched",
+            },
+        }
+        self.assertTrue(runtime.discover_task(
+            match_id="match-1",
+            event_data=enriched,
+            observed_stream_time=25.0,
+            observed_source_time=125.0,
+            clip_anchor_stream_time=24.0,
+            clip_anchor_source_time=124.0,
+            output_due_stream_time=51.0,
+            detected_at_unix=1000.0,
+            deadline_at_unix=time.time() + 600.0,
+        ))
+
+        cleared = {
+            **enriched,
+            "second": None,
+            "metadata": {
+                **enriched["metadata"],
+                "second_source": None,
+                "shotmap_match_status": "missing",
+            },
+        }
+        self.assertTrue(runtime.update_task_event(
+            cleared,
+            replace_fields={"second", "metadata"},
+        ))
+
+        task = runtime.store.get("match-1:G:key")
+        self.assertIsNone(task.event_data["second"])
+        self.assertIsNone(task.event_data["metadata"]["second_source"])
+        self.assertEqual(task.event_data["metadata"]["shotmap_match_status"], "missing")
+        runtime.close()
+
     def test_encoded_event_metadata_update_keeps_anchor_and_output(self):
         runtime = PipelineRuntime(self.database_path, self.log_path)
         self.assertTrue(discover(runtime))
@@ -476,7 +662,7 @@ class PipelineRuntimeTests(unittest.TestCase):
         self.assertEqual(runtime.store.get("match-1:G:key").status, "encoded")
         runtime.close()
 
-    def test_vision_task_is_one_refined_artifact_and_does_not_change_default(self):
+    def test_default_vision_task_is_tdeed_artifact_and_does_not_change_default(self):
         runtime = PipelineRuntime(self.database_path, self.log_path)
         self.assertTrue(discover(runtime))
         default_before = runtime.store.get("match-1:G:key")
@@ -486,7 +672,7 @@ class PipelineRuntimeTests(unittest.TestCase):
 
         refined = runtime.store.get_vision_task("match-1:G:key")
         default_after = runtime.store.get("match-1:G:key")
-        self.assertEqual(refined.artifact_kind, "refined")
+        self.assertEqual(refined.artifact_kind, "tdeed_refined")
         self.assertEqual(refined.status, "pending")
         self.assertEqual(refined.source_anchor_stream_time, 24.0)
         self.assertEqual(refined.search_end_stream_time, 80.0)
@@ -497,6 +683,135 @@ class PipelineRuntimeTests(unittest.TestCase):
         self.assertEqual(default_after.output_path, default_before.output_path)
         self.assertEqual(default_after.result, default_before.result)
         runtime.close()
+
+    def test_visual_artifact_types_persist_independent_results_and_metadata(self):
+        runtime = PipelineRuntime(self.database_path, self.log_path)
+        self.assertTrue(discover(runtime))
+        self.assertTrue(enqueue_vision(runtime))
+        self.assertTrue(runtime.enqueue_vision_task(
+            "match-1:G:key",
+            artifact_kind="ocr_window",
+            search_start_stream_time=10.0,
+            search_end_stream_time=40.0,
+            clip_before_seconds=4.0,
+            clip_after_seconds=6.0,
+            model_name="PaddleOCR",
+            window_metadata={"profile": "scoreboard-a"},
+        ))
+
+        runtime.transition_vision_task(
+            "match-1:G:key", "locating", artifact_kind="ocr_window"
+        )
+        runtime.transition_vision_task(
+            "match-1:G:key",
+            "located",
+            artifact_kind="ocr_window",
+            result={"anchor_stream_time": 26.0, "confidence": 0.93},
+            location_metadata={"clock_text": "18:42"},
+        )
+        runtime.transition_vision_task(
+            "match-1:G:key", "encoding", artifact_kind="ocr_window"
+        )
+        runtime.transition_vision_task(
+            "match-1:G:key",
+            "encoded",
+            artifact_kind="ocr_window",
+            result={"output": "/tmp/ocr-window.mp4", "bytes": 321},
+        )
+
+        runtime.transition_vision_task("match-1:G:key", "locating")
+        runtime.transition_vision_task(
+            "match-1:G:key",
+            "failed",
+            result={
+                "failure_reason": {
+                    "stage": "event_localization",
+                    "message": "no T-DEED candidate",
+                }
+            },
+            error="localization failed",
+            error_kind="tdeed_no_candidate",
+            window_metadata={"candidate_count": 0},
+        )
+        default_before = runtime.store.get("match-1:G:key")
+        runtime.close()
+
+        reopened = PipelineRuntime(self.database_path, self.log_path)
+        ocr = reopened.store.get_vision_task("match-1:G:key", "ocr_window")
+        tdeed = reopened.store.get_vision_task("match-1:G:key", "refined")
+        self.assertEqual(ocr.status, "encoded")
+        self.assertEqual(ocr.output_path, "/tmp/ocr-window.mp4")
+        self.assertEqual(ocr.output_bytes, 321)
+        self.assertEqual(ocr.location_metadata["clock_text"], "18:42")
+        self.assertEqual(ocr.location_metadata["anchor_stream_time"], 26.0)
+        self.assertEqual(ocr.window_metadata["profile"], "scoreboard-a")
+        self.assertEqual(tdeed.artifact_kind, "tdeed_refined")
+        self.assertEqual(tdeed.status, "failed")
+        self.assertIsNone(tdeed.output_path)
+        self.assertEqual(tdeed.failure_stage, "event_localization")
+        self.assertEqual(tdeed.failure_reason, "no T-DEED candidate")
+        self.assertEqual(tdeed.window_metadata["candidate_count"], 0)
+        self.assertEqual(
+            {
+                (task.event_key, task.artifact_kind)
+                for task in reopened.store.list_vision_tasks("match-1")
+            },
+            {
+                ("match-1:G:key", "ocr_window"),
+                ("match-1:G:key", "tdeed_refined"),
+            },
+        )
+        default_after = reopened.store.get("match-1:G:key")
+        self.assertEqual(default_after.status, default_before.status)
+        self.assertEqual(default_after.output_path, default_before.output_path)
+        reopened.close()
+
+    def test_recovery_updates_each_visual_artifact_row_independently(self):
+        runtime = PipelineRuntime(self.database_path, self.log_path)
+        discover(runtime)
+        enqueue_vision(runtime)
+        runtime.enqueue_vision_task(
+            "match-1:G:key",
+            artifact_kind="ocr_window",
+            search_start_stream_time=10.0,
+            search_end_stream_time=40.0,
+            clip_before_seconds=4.0,
+            clip_after_seconds=6.0,
+        )
+        runtime.transition_vision_task("match-1:G:key", "locating")
+        runtime.transition_vision_task(
+            "match-1:G:key",
+            "locating",
+            artifact_kind="ocr_window",
+        )
+        runtime.transition_vision_task(
+            "match-1:G:key",
+            "located",
+            artifact_kind="ocr_window",
+            result={"anchor_stream_time": 25.0},
+        )
+        runtime.transition_vision_task(
+            "match-1:G:key",
+            "encoding",
+            artifact_kind="ocr_window",
+        )
+        runtime.close()
+
+        reopened = PipelineRuntime(self.database_path, self.log_path)
+        recovered = reopened.recover_incomplete_vision("match-1")
+        self.assertEqual(
+            {(task.artifact_kind, task.status) for task in recovered},
+            {("tdeed_refined", "pending"), ("ocr_window", "located")},
+        )
+        self.assertEqual(
+            reopened.store.get_vision_task("match-1:G:key").status,
+            "pending",
+        )
+        self.assertEqual(
+            reopened.store.get_vision_task("match-1:G:key", "ocr_window").status,
+            "located",
+        )
+        reopened.close()
 
     def test_vision_task_persists_location_and_refined_output(self):
         runtime = PipelineRuntime(self.database_path, self.log_path)
@@ -708,6 +1023,106 @@ class PipelineRuntimeTests(unittest.TestCase):
         self.assertEqual(reopened.store.protected_segment_paths(now=2001.0), set())
         reopened.close()
 
+    def test_event_visual_window_lease_is_early_renewable_and_terminally_released(self):
+        runtime = PipelineRuntime(self.database_path, self.log_path)
+        discover(runtime)
+        runtime.enqueue_vision_task(
+            "match-1:G:key",
+            artifact_kind="ocr_window",
+            search_start_stream_time=70.0,
+            search_end_stream_time=100.0,
+            clip_before_seconds=30.0,
+            clip_after_seconds=30.0,
+            deadline_at_unix=1060.0,
+            now=1000.0,
+        )
+        runtime.enqueue_vision_task(
+            "match-1:G:key",
+            artifact_kind="tdeed_refined",
+            search_start_stream_time=70.0,
+            search_end_stream_time=100.0,
+            clip_before_seconds=8.0,
+            clip_after_seconds=12.0,
+            deadline_at_unix=1060.0,
+            now=1000.0,
+        )
+        old_path = self.directory / "old.ts"
+        first_path = self.directory / "first.ts"
+        added_path = self.directory / "added.ts"
+        old_path.write_bytes(b"old")
+        first_path.write_bytes(b"first")
+        added_path.write_bytes(b"added")
+        tasks = runtime.store.list_incomplete_vision_tasks("match-1")
+
+        created = protect_incomplete_vision_event_segments(
+            runtime,
+            tasks,
+            [
+                Segment(old_path, 0.0, 5.0),
+                Segment(first_path, 15.0, 25.0),
+            ],
+            ocr_timeout_seconds=30.0,
+            vision_timeout_seconds=30.0,
+            graceful_stop_timeout_seconds=30.0,
+            now_unix=1000.0,
+        )
+        self.assertEqual(created[0]["new_segment_count"], 1)
+        self.assertEqual(
+            runtime.store.protected_segment_paths(now=1001.0),
+            {str(first_path.resolve())},
+        )
+        runtime.close()
+
+        runtime = PipelineRuntime(self.database_path, self.log_path)
+        tasks = runtime.store.list_incomplete_vision_tasks("match-1")
+
+        renewed = protect_incomplete_vision_event_segments(
+            runtime,
+            tasks,
+            [
+                Segment(first_path, 15.0, 25.0),
+                Segment(added_path, 90.0, 100.0),
+            ],
+            ocr_timeout_seconds=30.0,
+            vision_timeout_seconds=30.0,
+            graceful_stop_timeout_seconds=30.0,
+            now_unix=1010.0,
+        )
+        self.assertEqual(renewed[0]["new_segment_count"], 1)
+        self.assertEqual(renewed[0]["renewed_lease_count"], 1)
+        worker_lease = runtime.store.acquire_segment_lease(
+            "match-1:G:key",
+            [str(old_path.resolve())],
+            owner="vision-worker",
+            ttl_seconds=300.0,
+            now=1010.0,
+        )
+
+        runtime.transition_vision_task(
+            "match-1:G:key",
+            "failed",
+            artifact_kind="ocr_window",
+            error="ocr failed",
+        )
+        self.assertEqual(release_terminal_event_visual_window_leases(runtime), {})
+        runtime.transition_vision_task(
+            "match-1:G:key",
+            "failed",
+            artifact_kind="tdeed_refined",
+            error="upstream failed",
+        )
+
+        released = release_terminal_event_visual_window_leases(runtime)
+
+        self.assertEqual(released, {"match-1:G:key": 2})
+        remaining = runtime.store.list_segment_leases(event_key="match-1:G:key")
+        self.assertEqual({lease.lease_id for lease in remaining}, {worker_lease})
+        self.assertNotIn(
+            EVENT_VISUAL_WINDOW_LEASE_OWNER,
+            {lease.owner for lease in remaining},
+        )
+        runtime.close()
+
     def test_existing_database_is_migrated_without_changing_event_rows(self):
         runtime = PipelineRuntime(self.database_path, self.log_path)
         discover(runtime)
@@ -733,6 +1148,70 @@ class PipelineRuntimeTests(unittest.TestCase):
         self.assertEqual(
             migrated.store.get_vision_task("match-1:G:key").status, "pending"
         )
+        migrated.close()
+
+    def test_legacy_refined_row_migrates_to_tdeed_without_changing_default_gif(self):
+        runtime = PipelineRuntime(self.database_path, self.log_path)
+        discover(runtime)
+        runtime.transition("match-1:G:key", "encoding")
+        runtime.transition(
+            "match-1:G:key",
+            "encoded",
+            result={"output": "/tmp/default.gif", "bytes": 77},
+        )
+        enqueue_vision(runtime)
+        runtime.transition_vision_task("match-1:G:key", "locating")
+        runtime.transition_vision_task(
+            "match-1:G:key",
+            "located",
+            result={"anchor_stream_time": 26.0, "confidence": 0.88},
+        )
+        runtime.transition_vision_task("match-1:G:key", "encoding")
+        runtime.transition_vision_task(
+            "match-1:G:key",
+            "encoded",
+            result={"output": "/tmp/legacy-refined.gif", "bytes": 456},
+        )
+        runtime.close()
+
+        connection = sqlite3.connect(self.database_path)
+        connection.executescript(
+            """
+            DROP INDEX IF EXISTS vision_tasks_match_status;
+            ALTER TABLE vision_tasks RENAME TO vision_tasks_current;
+            CREATE TABLE vision_tasks AS
+            SELECT
+                event_key, match_id, code, event_type, artifact_kind, status,
+                source_anchor_stream_time, source_anchor_source_time,
+                search_start_stream_time, search_end_stream_time,
+                clip_before_seconds, clip_after_seconds,
+                model_name, model_version, model_weights_sha256,
+                created_at_unix, updated_at_unix,
+                locating_started_at_unix, located_at_unix,
+                encoding_started_at_unix, encoded_at_unix, failed_at_unix,
+                locate_attempt_count, encode_attempt_count,
+                located_anchor_stream_time, located_anchor_source_time,
+                confidence, inference_seconds, output_path, output_bytes,
+                result_json, error
+            FROM vision_tasks_current;
+            UPDATE vision_tasks SET artifact_kind = 'refined';
+            DROP TABLE vision_tasks_current;
+            """
+        )
+        connection.close()
+
+        migrated = PipelineRuntime(self.database_path, self.log_path)
+        legacy_alias = migrated.store.get_vision_task("match-1:G:key", "refined")
+        self.assertEqual(legacy_alias.artifact_kind, "tdeed_refined")
+        self.assertEqual(legacy_alias.status, "encoded")
+        self.assertEqual(legacy_alias.output_path, "/tmp/legacy-refined.gif")
+        self.assertEqual(legacy_alias.output_bytes, 456)
+        self.assertEqual(legacy_alias.location_metadata, {})
+        self.assertEqual(legacy_alias.window_metadata, {})
+        default_task = migrated.store.get("match-1:G:key")
+        self.assertEqual(default_task.status, "encoded")
+        self.assertEqual(default_task.output_path, "/tmp/default.gif")
+        self.assertEqual(default_task.output_bytes, 77)
         migrated.close()
 
     def test_stored_task_rebuilds_the_pipeline_job(self):

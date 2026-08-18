@@ -28,6 +28,7 @@ from typing import Any
 
 from flask import Flask, abort, jsonify, request, send_from_directory
 
+from disk_lifecycle import DiskLifecycleManager, DiskLifecyclePolicy
 from event_api_response import EventApiResponseError, normalize_event_api_response
 from heavy_task_coordinator import HeavyTaskCoordinator, HeavyTaskCoordinatorError
 from match_event_identity import events_represent_same_incident
@@ -76,8 +77,31 @@ def _positive_environment_integer(name: str, default: int) -> int:
     return value
 
 
+def _positive_environment_float(name: str, default: float) -> float:
+    raw_value = os.environ.get(name, str(default))
+    try:
+        value = float(raw_value)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} 必须是正数") from exc
+    if not math.isfinite(value) or value <= 0:
+        raise RuntimeError(f"{name} 必须是正数")
+    return value
+
+
 MAX_CONCURRENT_MATCHES = _positive_environment_integer(
     "GIF_MAX_CONCURRENT_MATCHES", 8
+)
+SESSION_RETENTION_SECONDS = _positive_environment_float(
+    "GIF_SESSION_RETENTION_SECONDS", 24 * 60 * 60
+)
+DISK_CLEANUP_INTERVAL_SECONDS = _positive_environment_float(
+    "GIF_DISK_CLEANUP_INTERVAL_SECONDS", 5 * 60
+)
+FINAL_GIF_RETENTION_SECONDS = _positive_environment_float(
+    "GIF_FINAL_GIF_RETENTION_SECONDS", 24 * 60 * 60
+)
+ORPHAN_CLEANUP_GRACE_SECONDS = _positive_environment_float(
+    "GIF_ORPHAN_CLEANUP_GRACE_SECONDS", 15 * 60
 )
 DEFAULT_OUTPUT = ROOT / "output_gifs" / "dashboard"
 DEFAULT_EVENT_URL = (
@@ -122,7 +146,9 @@ PLAYED_CONFIRMATIONS_REQUIRED = 2
 WORKER_FINISH_GRACE_SECONDS = 90.0
 WORKER_FINISH_TIMEOUT_SECONDS = 120.0
 DASHBOARD_BUFFER_SECONDS = 360.0
-VISION_SEARCH_BEFORE_SECONDS = 300.0
+VISION_SEARCH_BEFORE_SECONDS = _positive_environment_float(
+    "GIF_VISION_SEARCH_BEFORE_SECONDS", 120.0
+)
 VISION_SEARCH_AFTER_SECONDS = 0.0
 FALLBACK_GIF_WIDTH = 384
 FALLBACK_GIF_FPS = 6.0
@@ -182,15 +208,20 @@ class MatchSession:
     match_id: str
     output_dir: Path = DEFAULT_OUTPUT
     event_poll_seconds: float = 3.0
+    shotmap_poll_seconds: float = 5.0
     source_poll_seconds: float = 10.0
     detail_poll_seconds: float = 10.0
     before_seconds: float = 30.0
     after_seconds: float = 20.0
-    event_to_video_offset_seconds: float = -60.0
+    event_to_video_offset_seconds: float = -30.0
+    shotmap_offset_seconds: float = 0.0
     gif_width: int = 768
     gif_fps: float = 16.0
     gif_colors: int = 256
     vision_enabled: bool = True
+    # Keep the new clock-only production path behind an explicit opt-in until
+    # replay validation has been completed. AI refinement itself remains on.
+    vision_clock_only: bool = False
     vision_before_seconds: float = 8.0
     vision_after_seconds: float = 12.0
     scoreboard_profile_path: str = field(
@@ -232,6 +263,11 @@ class MatchSession:
     finish_timeout_signaled: bool = False
     finish_reason: str | None = None
     exit_reason: str | None = None
+    created_at: float = field(default_factory=time.time)
+    last_access_at: float = field(default_factory=time.time)
+    terminal_at: float | None = None
+    terminal_cleanup_done: bool = False
+    terminal_cleanup_last_attempt_at: float | None = None
     lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
     def status(self) -> str:
@@ -548,13 +584,13 @@ def flatten_events(payload: dict[str, Any]) -> list[dict[str, Any]]:
                 continue
             team = team_key.removesuffix("Events")
             for event in values:
-                if not isinstance(event, dict) or event.get("code") not in {"G", "OG", "YC", "RC"}:
+                if not isinstance(event, dict) or event.get("code") not in {"G", "OG", "PG", "YC", "RC"}:
                     continue
                 code = str(event.get("code"))
                 result.append(
                     {
                         "code": code,
-                        "label": {"G": "进球", "OG": "乌龙球", "YC": "黄牌", "RC": "红牌"}[code],
+                        "label": {"G": "进球", "OG": "乌龙球", "PG": "点球进球", "YC": "黄牌", "RC": "红牌"}[code],
                         "minute": minute,
                         "minute_extra": str(event.get("minute_extra") or "0"),
                         "team": team,
@@ -692,6 +728,21 @@ def _tasks_from_database(
                 if "last_error_kind" in vision_columns
                 else "NULL AS last_error_kind"
             )
+            vision_artifact_kind_field = (
+                "artifact_kind"
+                if "artifact_kind" in vision_columns
+                else "'refined' AS artifact_kind"
+            )
+            vision_failure_stage_field = (
+                "failure_stage"
+                if "failure_stage" in vision_columns
+                else "NULL AS failure_stage"
+            )
+            vision_failure_reason_field = (
+                "failure_reason AS persisted_failure_reason"
+                if "failure_reason" in vision_columns
+                else "NULL AS persisted_failure_reason"
+            )
             vision_rows = (
                 connection.execute(
                     """
@@ -700,8 +751,15 @@ def _tasks_from_database(
                            model_version, output_path, output_bytes,
                            result_json, error, """
                     + vision_error_kind_field
+                    + ", "
+                    + vision_artifact_kind_field
+                    + ", "
+                    + vision_failure_stage_field
+                    + ", "
+                    + vision_failure_reason_field
                     + """
-                    FROM vision_tasks ORDER BY created_at_unix, event_key
+                    FROM vision_tasks
+                    ORDER BY created_at_unix, event_key, artifact_kind
                     """
                 ).fetchall()
                 if has_vision else []
@@ -748,7 +806,7 @@ def _tasks_from_database(
         str(row["version_key"]): str(row["canonical_key"])
         for row in alias_rows
     }
-    vision_by_key: dict[str, dict[str, Any]] = {}
+    vision_by_key: dict[str, dict[str, dict[str, Any]]] = {}
     for row in vision_rows:
         try:
             vision_result = json.loads(row["result_json"] or "{}")
@@ -763,20 +821,39 @@ def _tasks_from_database(
         )
         if not locator_method and "t-deed" in str(row["model_name"] or "").lower():
             locator_method = "tdeed"
+        ocr_payload = vision_result.get("ocr")
+        if not isinstance(ocr_payload, dict):
+            ocr_payload = {}
+        ocr_error = vision_result.get("ocr_error")
+        nested_diagnostics = ocr_payload.get("diagnostics")
+        if not isinstance(nested_diagnostics, dict) and isinstance(ocr_error, dict):
+            nested_diagnostics = ocr_error.get("diagnostics")
+        if not isinstance(nested_diagnostics, dict):
+            nested_diagnostics = {}
+        exact_second_error = (
+            vision_result.get("exact_second_error")
+            or ocr_payload.get("exact_second_error")
+            or nested_diagnostics.get("exact_second_failure")
+        )
+        if not isinstance(exact_second_error, dict):
+            exact_second_error = None
+        exact_error_diagnostics = (
+            exact_second_error.get("diagnostics")
+            if exact_second_error is not None else None
+        )
+        if not isinstance(exact_error_diagnostics, dict):
+            exact_error_diagnostics = {}
+        target_clock = (
+            vision_result.get("target_clock")
+            or ocr_payload.get("target_clock")
+            or nested_diagnostics.get("target_clock")
+        )
         ocr_diagnostics = (
             vision_result.get("ocr_diagnostics")
             or vision_result.get("ocr_diagnostics_summary")
         )
         if not isinstance(ocr_diagnostics, dict):
-            ocr_payload = vision_result.get("ocr")
-            ocr_error = vision_result.get("ocr_error")
-            nested_diagnostics = (
-                ocr_payload.get("diagnostics")
-                if isinstance(ocr_payload, dict) else None
-            )
-            if not isinstance(nested_diagnostics, dict) and isinstance(ocr_error, dict):
-                nested_diagnostics = ocr_error.get("diagnostics")
-            if isinstance(nested_diagnostics, dict):
+            if nested_diagnostics:
                 ocr_diagnostics = {
                     "sampled_frames": nested_diagnostics.get("sampled_frame_count"),
                     "clock_readable_frames": nested_diagnostics.get(
@@ -808,7 +885,58 @@ def _tasks_from_database(
                     ),
                     "worker_mode": nested_diagnostics.get("worker_mode"),
                 }
-        vision_by_key[str(row["event_key"])] = {
+        if isinstance(ocr_diagnostics, dict):
+            ocr_diagnostics = dict(ocr_diagnostics)
+            ocr_diagnostics.setdefault("target_clock", target_clock)
+            ocr_diagnostics.setdefault(
+                "exact_second_failure_reason",
+                exact_error_diagnostics.get("exact_second_failure_reason")
+                or nested_diagnostics.get("exact_second_failure_reason"),
+            )
+        minute_fallback = bool(vision_result.get("minute_fallback"))
+        fallback_requested_seconds = vision_result.get(
+            "requested_fallback_seconds"
+        )
+        try:
+            fallback_requested_seconds = float(fallback_requested_seconds)
+            if not math.isfinite(fallback_requested_seconds) or fallback_requested_seconds <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            fallback_requested_seconds = 60.0
+        fallback_available_seconds = vision_result.get(
+            "available_fallback_seconds"
+        )
+        try:
+            fallback_available_seconds = float(fallback_available_seconds)
+            if not math.isfinite(fallback_available_seconds) or fallback_available_seconds < 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            # Older workers did not persist coverage metadata. The encoded
+            # duration is the best durable approximation of actual coverage.
+            fallback_available_seconds = vision_result.get("duration_sec")
+            try:
+                fallback_available_seconds = float(fallback_available_seconds)
+                if not math.isfinite(fallback_available_seconds) or fallback_available_seconds < 0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                fallback_available_seconds = None
+        fallback_complete = vision_result.get("fallback_complete")
+        if minute_fallback:
+            if fallback_complete is None:
+                fallback_complete = bool(
+                    fallback_available_seconds is not None
+                    and fallback_available_seconds
+                    >= fallback_requested_seconds * 0.9
+                )
+        else:
+            fallback_complete = None
+
+        raw_artifact_kind = str(row["artifact_kind"] or "refined")
+        artifact_kind = (
+            "tdeed_refined" if raw_artifact_kind == "refined" else raw_artifact_kind
+        )
+        artifact = {
+            "artifact_kind": artifact_kind,
             "status": str(row["status"]),
             "anchor_stream_time_sec": row["located_anchor_stream_time"],
             "confidence": row["confidence"],
@@ -824,14 +952,44 @@ def _tasks_from_database(
             "error_kind": error_kind,
             "last_error_kind": row["last_error_kind"],
             "locator_method": locator_method,
-            "stage": vision_result.get("stage") or vision_result.get("failed_stage"),
+            "stage": (
+                vision_result.get("stage")
+                or vision_result.get("failed_stage")
+                or row["failure_stage"]
+            ),
             "fallback_used": vision_result.get("fallback_used"),
-            "minute_fallback": bool(vision_result.get("minute_fallback")),
+            "minute_fallback": minute_fallback,
             "fallback_generated": bool(vision_result.get("fallback_generated")),
+            "fallback_complete": fallback_complete,
+            "fallback_label": vision_result.get("fallback_label"),
+            "fragmented_fallback": bool(vision_result.get("fragmented_fallback")),
+            "available_fallback_seconds": fallback_available_seconds,
+            "requested_fallback_seconds": fallback_requested_seconds,
             "default_gif_preserved": vision_result.get("default_gif_preserved"),
             "output_kind": vision_result.get("output_kind"),
             "precise_location": vision_result.get("precise_location"),
-            "failure_reason": vision_result.get("failure_reason"),
+            "target_clock": target_clock,
+            "exact_second_error": exact_second_error,
+            "failure_reason": (
+                vision_result.get("failure_reason")
+                or (
+                    {
+                        "kind": error_kind,
+                        "stage": row["failure_stage"],
+                        "message": row["persisted_failure_reason"],
+                    }
+                    if row["persisted_failure_reason"]
+                    else None
+                )
+            ),
+            "localization_source": vision_result.get("localization_source"),
+            "localization_quality": vision_result.get("localization_quality"),
+            "degraded": bool(vision_result.get("degraded")),
+            "degradation_mode": vision_result.get("degradation_mode"),
+            "degradation_reason": vision_result.get("degradation_reason"),
+            "requested_media_window": vision_result.get("requested_media_window"),
+            "actual_media_window": vision_result.get("actual_media_window"),
+            "source_ocr_artifact": vision_result.get("source_ocr_artifact"),
             "clip_before_seconds": vision_result.get("clip_before_seconds"),
             "clip_after_seconds": vision_result.get("clip_after_seconds"),
             "output_width": vision_result.get("output_width"),
@@ -839,10 +997,17 @@ def _tasks_from_database(
             "output_colors": vision_result.get("output_colors"),
             "tdeed_error_kind": vision_result.get("tdeed_error_kind"),
             "ocr_diagnostics": ocr_diagnostics,
+            "fragment_attempts": vision_result.get("fragment_attempts", []),
+            "fragment_window": vision_result.get("fragment_window"),
             "error": row["error"] or vision_result.get("error"),
         }
+        vision_by_key.setdefault(str(row["event_key"]), {})[artifact_kind] = artifact
     for task in tasks:
-        task["vision"] = vision_by_key.get(str(task.get("event_key")))
+        artifacts = vision_by_key.get(str(task.get("event_key")), {})
+        task["vision_artifacts"] = artifacts
+        task["ocr_window"] = artifacts.get("ocr_window")
+        # Keep the old field during the dashboard/API transition.
+        task["vision"] = artifacts.get("tdeed_refined")
     return tasks, aliases, suppressed_keys
 
 
@@ -1053,6 +1218,7 @@ def _runtime_evidence(
     )
     current_report = report if report_is_current else {}
     event_source = current_report.get("event_source") or {}
+    shotmap_source = current_report.get("shotmap_source") or {}
 
     segment_count = 0
     latest_segment_unix: float | None = None
@@ -1114,6 +1280,19 @@ def _runtime_evidence(
         or 0
     )
     last_event_error = heartbeat.get("last_event_error") or event_source.get("last_error")
+    shotmap_poll_count = int(
+        heartbeat.get("shotmap_poll_count")
+        or shotmap_source.get("request_count")
+        or 0
+    )
+    shotmap_error_count = int(
+        heartbeat.get("shotmap_error_count")
+        or shotmap_source.get("error_count")
+        or 0
+    )
+    last_shotmap_error = (
+        heartbeat.get("last_shotmap_error") or shotmap_source.get("last_error")
+    )
     task_counts = {
         status: sum(item.get("status") == status for item in tasks)
         for status in ("pending", "encoding", "encoded", "failed")
@@ -1221,6 +1400,13 @@ def _runtime_evidence(
         "event_poll_count": event_poll_count,
         "event_error_count": event_error_count,
         "last_event_error": last_event_error,
+        "shotmap_poll_count": shotmap_poll_count,
+        "shotmap_error_count": shotmap_error_count,
+        "last_shotmap_error": last_shotmap_error,
+        "shotmap_initialized": bool(
+            heartbeat.get("shotmap_initialized")
+            or shotmap_source.get("initialized")
+        ),
         "task_counts": task_counts,
         "ffmpeg_return_code": ffmpeg_return_code,
         "ingest_running": ingest_running,
@@ -1320,6 +1506,7 @@ def _session_json(session: MatchSession) -> dict[str, Any]:
         },
         "polling": {
             "events_seconds": session.event_poll_seconds,
+            "shotmap_seconds": session.shotmap_poll_seconds,
             "source_seconds": session.source_poll_seconds,
             "detail_seconds": session.detail_poll_seconds,
         },
@@ -1327,6 +1514,7 @@ def _session_json(session: MatchSession) -> dict[str, Any]:
             "before_seconds": session.before_seconds,
             "after_seconds": session.after_seconds,
             "event_to_video_offset_seconds": session.event_to_video_offset_seconds,
+            "shotmap_offset_seconds": session.shotmap_offset_seconds,
             "width": session.gif_width,
             "fps": session.gif_fps,
             "colors": session.gif_colors,
@@ -1336,6 +1524,8 @@ def _session_json(session: MatchSession) -> dict[str, Any]:
         "vision": {
             "enabled": session.vision_enabled,
             "worker_enabled": "--vision-enabled" in session.worker_command,
+            "clock_only": session.vision_clock_only,
+            "worker_clock_only": "--ocr-clock-only" in session.worker_command,
             "before_seconds": session.vision_before_seconds,
             "after_seconds": session.vision_after_seconds,
             "search_before_seconds": VISION_SEARCH_BEFORE_SECONDS,
@@ -1365,6 +1555,9 @@ class Dashboard:
         *,
         background_monitors: bool = True,
         max_concurrent_matches: int | None = None,
+        session_retention_seconds: float | None = None,
+        disk_cleanup_interval_seconds: float | None = None,
+        orphan_cleanup_grace_seconds: float | None = None,
     ) -> None:
         self.sessions: dict[str, MatchSession] = {}
         self.lock = threading.RLock()
@@ -1377,6 +1570,41 @@ class Dashboard:
         )
         if self.max_concurrent_matches < 1:
             raise ValueError("max_concurrent_matches 必须是正整数")
+        self.session_retention_seconds = (
+            SESSION_RETENTION_SECONDS
+            if session_retention_seconds is None
+            else float(session_retention_seconds)
+        )
+        self.disk_cleanup_interval_seconds = (
+            DISK_CLEANUP_INTERVAL_SECONDS
+            if disk_cleanup_interval_seconds is None
+            else float(disk_cleanup_interval_seconds)
+        )
+        self.orphan_cleanup_grace_seconds = (
+            ORPHAN_CLEANUP_GRACE_SECONDS
+            if orphan_cleanup_grace_seconds is None
+            else float(orphan_cleanup_grace_seconds)
+        )
+        if self.session_retention_seconds <= 0:
+            raise ValueError("session_retention_seconds 必须是正数")
+        if self.disk_cleanup_interval_seconds <= 0:
+            raise ValueError("disk_cleanup_interval_seconds 必须是正数")
+        if (
+            not math.isfinite(self.session_retention_seconds)
+            or not math.isfinite(self.disk_cleanup_interval_seconds)
+            or not math.isfinite(self.orphan_cleanup_grace_seconds)
+            or self.orphan_cleanup_grace_seconds <= 0
+        ):
+            raise ValueError("清理时间参数必须是有限正数")
+        self._maintenance_stop = threading.Event()
+        self.maintenance_thread: threading.Thread | None = None
+        if self.background_monitors:
+            self.maintenance_thread = threading.Thread(
+                target=self._maintenance_loop,
+                name="dashboard-disk-maintenance",
+                daemon=True,
+            )
+            self.maintenance_thread.start()
 
     @staticmethod
     def _session_holds_worker_slot(session: MatchSession) -> bool:
@@ -1467,6 +1695,8 @@ class Dashboard:
 
     def _claim_worker_slot(self, session: MatchSession) -> None:
         with self.lock:
+            if self.sessions.get(session.match_id) is not session:
+                raise RuntimeError("比赛会话已过期，请重新打开该比赛")
             active_match_ids = {
                 item["match_id"] for item in self._active_match_summaries_locked()
             }
@@ -1494,20 +1724,16 @@ class Dashboard:
 
     def get(self, match_id: str) -> MatchSession:
         match_id = validate_match_id(match_id)
+        now = time.time()
         with self.lock:
+            self._prune_terminal_sessions_locked(now)
+            self._prune_idle_sessions_locked(now)
             session = self.sessions.setdefault(
                 match_id,
                 MatchSession(match_id=match_id, output_dir=DEFAULT_OUTPUT / match_id),
             )
-            if self.background_monitors and match_id not in self.monitor_threads:
-                thread = threading.Thread(
-                    target=self._monitor,
-                    args=(session,),
-                    name=f"match-monitor-{match_id}",
-                    daemon=True,
-                )
-                self.monitor_threads[match_id] = thread
-                thread.start()
+            session.last_access_at = now
+        self._ensure_monitor(session)
         if match_id.startswith("demo-") and not session.detail:
             session.detail = _demo_detail(match_id)
             session.source = {
@@ -1522,13 +1748,340 @@ class Dashboard:
             session.last_source_poll = time.time()
         return session
 
+    def _ensure_monitor(self, session: MatchSession) -> None:
+        if not self.background_monitors:
+            return
+        with self.lock:
+            existing = self.monitor_threads.get(session.match_id)
+            if existing is not None and existing.is_alive():
+                return
+            if self._terminal_and_inactive(session):
+                return
+            self.monitor_threads.pop(session.match_id, None)
+            thread = threading.Thread(
+                target=self._monitor,
+                args=(session,),
+                name=f"match-monitor-{session.match_id}",
+                daemon=True,
+            )
+            self.monitor_threads[session.match_id] = thread
+            thread.start()
+
     def _monitor(self, session: MatchSession) -> None:
-        while True:
+        current_thread = threading.current_thread()
+        try:
+            while not self._maintenance_stop.is_set():
+                try:
+                    self.refresh(session)
+                except Exception as exc:
+                    self._log_control(session, "monitor_error", error=str(exc))
+                with session.lock:
+                    if self._terminal_and_inactive(session):
+                        self._mark_terminal(session)
+                        break
+                    if self._idle_session_expired(session, time.time()):
+                        break
+                self._maintenance_stop.wait(0.5)
+        finally:
+            with self.lock:
+                if self.monitor_threads.get(session.match_id) is current_thread:
+                    self.monitor_threads.pop(session.match_id, None)
+
+    @staticmethod
+    def _terminal_and_inactive(session: MatchSession) -> bool:
+        return bool(
+            session.lifecycle_state in TERMINAL_LIFECYCLE_STATES
+            and not session.worker_running()
+            and not session.desired_running
+            and session.worker_process_group is None
+            and session.worker_cleanup_process_group is None
+        )
+
+    def _idle_session_expired(self, session: MatchSession, now: float) -> bool:
+        """Return whether an unstarted/unowned session has gone cold."""
+        if session.lifecycle_state in {
+            "finishing",
+            *TERMINAL_LIFECYCLE_STATES,
+        }:
+            return False
+        if (
+            session.worker_running()
+            or session.desired_running
+            or session.worker_process_group is not None
+            or session.worker_cleanup_process_group is not None
+        ):
+            return False
+        return now - session.last_access_at >= self.session_retention_seconds
+
+    @staticmethod
+    def _mark_terminal(session: MatchSession, now: float | None = None) -> None:
+        if session.terminal_at is None:
+            session.terminal_at = time.time() if now is None else now
+
+    def _prune_terminal_sessions_locked(self, now: float) -> list[str]:
+        removed: list[str] = []
+        for match_id, session in list(self.sessions.items()):
+            if not self._terminal_and_inactive(session):
+                continue
+            terminal_at = session.terminal_at
+            if terminal_at is None:
+                terminal_at = session.created_at
+                session.terminal_at = terminal_at
+            if now - terminal_at < self.session_retention_seconds:
+                continue
+            thread = self.monitor_threads.get(match_id)
+            if thread is not None and thread.is_alive():
+                continue
+            self.monitor_threads.pop(match_id, None)
+            self.sessions.pop(match_id, None)
+            removed.append(match_id)
+        return removed
+
+    def _prune_idle_sessions_locked(self, now: float) -> list[str]:
+        removed: list[str] = []
+        for match_id, session in list(self.sessions.items()):
+            if not self._idle_session_expired(session, now):
+                continue
+            thread = self.monitor_threads.get(match_id)
+            if thread is not None and thread.is_alive():
+                continue
+            self.monitor_threads.pop(match_id, None)
+            self.sessions.pop(match_id, None)
+            removed.append(match_id)
+        return removed
+
+    @staticmethod
+    def _active_segment_leases(
+        state_db_path: Path,
+        *,
+        now: float,
+    ) -> tuple[bool, set[str]]:
+        if not state_db_path.exists():
+            return True, set()
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = sqlite3.connect(
+                f"{state_db_path.resolve().as_uri()}?mode=ro",
+                uri=True,
+                timeout=2.0,
+            )
+            table = connection.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'segment_leases'"
+            ).fetchone()
+            if table is None:
+                return True, set()
+            rows = connection.execute(
+                "SELECT DISTINCT segment_path FROM segment_leases "
+                "WHERE expires_at_unix > ?",
+                (now,),
+            ).fetchall()
+            return True, {str(row[0]) for row in rows if row and row[0]}
+        except (OSError, sqlite3.Error):
+            return False, set()
+        finally:
+            if connection is not None:
+                connection.close()
+
+    def _cleanup_terminal_output(self, session: MatchSession, now: float) -> None:
+        with session.lock:
+            if not self._terminal_and_inactive(session):
+                return
+            self._mark_terminal(session, now)
+            lifecycle = DiskLifecycleManager(
+                session.output_dir,
+                DiskLifecyclePolicy(
+                    final_gif_retention_seconds=FINAL_GIF_RETENTION_SECONDS,
+                ),
+            )
+            lifecycle.prune_final_gifs()
+            if session.terminal_cleanup_done:
+                return
+            session.terminal_cleanup_last_attempt_at = now
+            lease_check_ok, protected_paths = self._active_segment_leases(
+                session.output_dir / "pipeline_state.sqlite3",
+                now=now,
+            )
+            if not lease_check_ok or protected_paths:
+                return
+            summary = lifecycle.cleanup_finished_match(
+                buffer_dir=session.output_dir / "buffer",
+                manifest_path=session.output_dir / "buffer" / "segment_manifest.json",
+                event_log_path=session.output_dir / "pipeline_events.jsonl",
+                state_db_path=session.output_dir / "pipeline_state.sqlite3",
+                protected_paths=protected_paths,
+            )
+            session.terminal_cleanup_done = summary.status == "completed"
+
+    def _prune_expired_gifs(self) -> None:
+        try:
+            entries = list(os.scandir(DEFAULT_OUTPUT))
+        except FileNotFoundError:
+            return
+        except OSError:
+            return
+        policy = DiskLifecyclePolicy(
+            final_gif_retention_seconds=FINAL_GIF_RETENTION_SECONDS,
+        )
+        for entry in entries:
             try:
-                self.refresh(session)
+                if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
+                    continue
+                validate_match_id(entry.name)
+            except (OSError, ValueError):
+                continue
+            DiskLifecycleManager(Path(entry.path), policy).prune_final_gifs()
+
+    @staticmethod
+    def _latest_runtime_timestamp(log_path: Path) -> float | None:
+        """Read the newest valid runtime record timestamp from a JSONL log."""
+        try:
+            records = _read_log(log_path, limit=80)
+        except (OSError, UnicodeError):
+            return None
+        for record in records:
+            try:
+                timestamp = float(record.get("timestamp_unix"))
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(timestamp) and timestamp > 0:
+                return timestamp
+        return None
+
+    @staticmethod
+    def _worker_process_is_alive(log_path: Path) -> bool | None:
+        """Use the latest worker lifecycle record as a conservative guard."""
+        try:
+            records = _read_log(log_path, limit=600)
+        except (OSError, UnicodeError):
+            return None
+        saw_runtime_signal = False
+        for record in records:
+            event = record.get("event")
+            if event in {"worker_exited", "pipeline_stopped"}:
+                return False
+            if event == "runtime_heartbeat":
+                saw_runtime_signal = True
+                continue
+            if event != "worker_started":
+                continue
+            try:
+                pid = int(record.get("pid"))
+            except (TypeError, ValueError):
+                return None
+            if pid <= 0:
+                return None
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return False
+            except PermissionError:
+                return True
+            except OSError:
+                return False
+            return True
+        # Standalone pipeline runs do not emit Dashboard's worker_started
+        # record. A stale heartbeat is still enough evidence for the grace
+        # window above; a fresh heartbeat never reaches this method.
+        return False if saw_runtime_signal else None
+
+    def _prune_orphan_outputs(self, now: float) -> list[str]:
+        """Clean stale match directories left after a dashboard/process crash.
+
+        A directory is eligible only when it is not represented by an active
+        Session, has no live segment lease, and its last structured runtime
+        record is older than the grace period. Unknown or freshly running
+        directories are left untouched for a later pass.
+        """
+        try:
+            entries = list(os.scandir(DEFAULT_OUTPUT))
+        except (FileNotFoundError, OSError):
+            return []
+        with self.lock:
+            session_match_ids = set(self.sessions)
+        policy = DiskLifecyclePolicy(
+            final_gif_retention_seconds=FINAL_GIF_RETENTION_SECONDS,
+        )
+        cleaned: list[str] = []
+        for entry in entries:
+            try:
+                if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
+                    continue
+                match_id = validate_match_id(entry.name)
+                if match_id in session_match_ids:
+                    continue
+                output_dir = Path(entry.path)
+                last_runtime_at = self._latest_runtime_timestamp(
+                    output_dir / "pipeline_events.jsonl"
+                )
+                if (
+                    last_runtime_at is None
+                    or now - last_runtime_at < self.orphan_cleanup_grace_seconds
+                ):
+                    continue
+                worker_alive = self._worker_process_is_alive(
+                    output_dir / "pipeline_events.jsonl"
+                )
+                if worker_alive is not False:
+                    continue
+                lease_check_ok, protected_paths = self._active_segment_leases(
+                    output_dir / "pipeline_state.sqlite3",
+                    now=now,
+                )
+                if not lease_check_ok or protected_paths:
+                    continue
+                # Re-check under the Dashboard lock immediately before the
+                # destructive pass. Holding the registry lock through cleanup
+                # prevents a Session from being created between the check and
+                # the final unlink operations.
+                with self.lock:
+                    if match_id in self.sessions:
+                        continue
+                    summary = DiskLifecycleManager(
+                        output_dir,
+                        policy,
+                    ).cleanup_finished_match(
+                        buffer_dir=output_dir / "buffer",
+                        manifest_path=output_dir / "buffer" / "segment_manifest.json",
+                        event_log_path=output_dir / "pipeline_events.jsonl",
+                        state_db_path=output_dir / "pipeline_state.sqlite3",
+                        protected_paths=protected_paths,
+                    )
+                if summary.status in {"completed", "completed_with_warnings"}:
+                    cleaned.append(match_id)
+            except (OSError, ValueError):
+                continue
+        return cleaned
+
+    def run_maintenance(self, *, now: float | None = None) -> list[str]:
+        timestamp = time.time() if now is None else now
+        with self.lock:
+            sessions = list(self.sessions.values())
+        for session in sessions:
+            try:
+                self._cleanup_terminal_output(session, timestamp)
             except Exception as exc:
-                self._log_control(session, "monitor_error", error=str(exc))
-            time.sleep(0.5)
+                try:
+                    self._log_control(
+                        session,
+                        "terminal_cleanup_error",
+                        error=str(exc),
+                    )
+                except OSError:
+                    pass
+        self._prune_expired_gifs()
+        self._prune_orphan_outputs(timestamp)
+        with self.lock:
+            removed = self._prune_terminal_sessions_locked(timestamp)
+            removed.extend(self._prune_idle_sessions_locked(timestamp))
+            return removed
+
+    def _maintenance_loop(self) -> None:
+        while not self._maintenance_stop.wait(self.disk_cleanup_interval_seconds):
+            self.run_maintenance()
+
+    def close(self) -> None:
+        self._maintenance_stop.set()
 
     @staticmethod
     def _process_group_exists(process_group: int) -> bool:
@@ -1903,6 +2456,7 @@ class Dashboard:
             lifecycle_state = "completed_with_warnings"
 
         session.lifecycle_state = lifecycle_state
+        self._mark_terminal(session)
         session.finishing_deadline = None
         session.exit_reason = (
             session.exit_reason or reported_reason or session.finish_reason or "match_played"
@@ -1947,6 +2501,7 @@ class Dashboard:
                         session.lifecycle_state = (
                             "completed" if session.worker.returncode == 0 else "failed"
                         )
+                        self._mark_terminal(session, now)
                         self._release_worker_slot(session, force=True)
                     elif session.worker_cleanup_failure:
                         session.lifecycle_state = "failed"
@@ -2196,6 +2751,8 @@ class Dashboard:
                     "--event-to-video-offset", str(session.event_to_video_offset_seconds),
                     "--buffer-seconds", str(DASHBOARD_BUFFER_SECONDS),
                     "--event-poll-seconds", str(session.event_poll_seconds),
+                    "--shotmap-poll-seconds", str(session.shotmap_poll_seconds),
+                    "--shotmap-offset", str(session.shotmap_offset_seconds),
                     "--gif-width", str(session.gif_width), "--gif-fps", str(session.gif_fps),
                     "--gif-colors", str(session.gif_colors), "--output-dir", str(session.output_dir),
                     "--graceful-stop-grace-seconds", str(WORKER_FINISH_GRACE_SECONDS),
@@ -2210,6 +2767,8 @@ class Dashboard:
                     "--event-url", DEFAULT_EVENT_URL,
                     "--event-user", _user(),
                     "--event-poll-seconds", str(session.event_poll_seconds),
+                    "--shotmap-poll-seconds", str(session.shotmap_poll_seconds),
+                    "--shotmap-offset", str(session.shotmap_offset_seconds),
                     "--before", str(session.before_seconds), "--after", str(session.after_seconds),
                     "--event-to-video-offset", str(session.event_to_video_offset_seconds),
                     "--buffer-seconds", str(DASHBOARD_BUFFER_SECONDS),
@@ -2236,6 +2795,8 @@ class Dashboard:
                     "--fallback-gif-fps", str(FALLBACK_GIF_FPS),
                     "--fallback-gif-colors", str(FALLBACK_GIF_COLORS),
                 ])
+                if session.vision_clock_only:
+                    command.append("--ocr-clock-only")
                 configured_profile = session.scoreboard_profile_path
                 if demo and not configured_profile:
                     configured_profile = str(DEFAULT_DEMO_SCOREBOARD_PROFILE)
@@ -2270,6 +2831,9 @@ class Dashboard:
             session.worker_exit_logged_pid = None
             session.worker_restart_due_at = None
             session.worker_cleanup_failure = None
+            session.terminal_at = None
+            session.terminal_cleanup_done = False
+            session.terminal_cleanup_last_attempt_at = None
             session.worker_restart_count += int(recovery)
             session.finish_requested = False
             session.finish_timeout_signaled = False
@@ -2293,6 +2857,7 @@ class Dashboard:
                 recovery=recovery,
                 restart_count=session.worker_restart_count,
             )
+        self._ensure_monitor(session)
 
     def stop(self, session: MatchSession, *, keep_desired: bool = False) -> None:
         with session.lock:
@@ -2319,6 +2884,7 @@ class Dashboard:
                         )
                     if not keep_desired:
                         session.lifecycle_state = "stopped"
+                        self._mark_terminal(session)
                         self._release_worker_slot(session, force=True)
                     return
                 assert session.worker is not None
@@ -2368,6 +2934,7 @@ class Dashboard:
                 raise
             if not keep_desired:
                 session.lifecycle_state = "stopped"
+                self._mark_terminal(session)
                 self._release_worker_slot(session, force=True)
 
 
@@ -2486,6 +3053,7 @@ def session_configure():
     with session.lock:
         for key, field_name, cast in (
             ("event_poll_seconds", "event_poll_seconds", float),
+            ("shotmap_poll_seconds", "shotmap_poll_seconds", float),
             ("source_poll_seconds", "source_poll_seconds", float),
             ("detail_poll_seconds", "detail_poll_seconds", float),
             ("before_seconds", "before_seconds", float),
@@ -2506,8 +3074,18 @@ def session_configure():
             if not math.isfinite(value):
                 return jsonify({"error": "event_to_video_offset_seconds 必须是有限数字"}), 400
             session.event_to_video_offset_seconds = value
+        if "shotmap_offset_seconds" in body:
+            value = float(body["shotmap_offset_seconds"])
+            if not math.isfinite(value):
+                return jsonify({"error": "shotmap_offset_seconds 必须是有限数字"}), 400
+            session.shotmap_offset_seconds = value
         if "vision_enabled" in body:
             session.vision_enabled = bool(body["vision_enabled"])
+        if "vision_clock_only" in body:
+            value = body["vision_clock_only"]
+            if not isinstance(value, bool):
+                return jsonify({"error": "vision_clock_only 必须是 JSON 布尔值"}), 400
+            session.vision_clock_only = value
         if "scoreboard_profile_path" in body:
             profile_path = str(body["scoreboard_profile_path"] or "").strip()
             if profile_path and not Path(profile_path).expanduser().is_file():

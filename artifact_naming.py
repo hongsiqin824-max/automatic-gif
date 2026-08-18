@@ -10,6 +10,7 @@ from typing import Any, Mapping
 EVENT_TYPE_BY_CODE = {
     "G": "goal",
     "OG": "own-goal",
+    "PG": "goal",
     "YC": "yellow-card",
     "RC": "red-card",
 }

@@ -86,6 +86,8 @@ class SplitScoreboardParsingTests(unittest.TestCase):
             (["45", "+", "2"], 47 * 60, "stoppage", "minute"),
             (["45+2:17"], 47 * 60 + 17, "stoppage", "second"),
             (["90+5"], 95 * 60, "stoppage", "minute"),
+            (["90:00", "+00:28"], 90 * 60 + 28, "added_stopwatch", "second"),
+            (["45:00 +02:17"], 47 * 60 + 17, "added_stopwatch", "second"),
         ]
         for texts, expected, clock_format, precision in cases:
             with self.subTest(texts=texts):
@@ -109,6 +111,16 @@ class SplitScoreboardParsingTests(unittest.TestCase):
         self.assertEqual(clock.candidates, (59 * 60 + 10, 59 * 60 + 11))
         self.assertTrue(score.ambiguous)
         self.assertEqual(score.candidates, ((0, 0), (1, 0)))
+
+    def test_parses_j_league_logo_joined_into_score_text(self):
+        parsed = parse_score_texts(["0.10"])
+        self.assertEqual(parsed.score, (0, 0))
+        parsed = parse_score_texts(["0.11"])
+        self.assertEqual(parsed.score, (0, 1))
+
+    def test_parses_score_digits_from_separate_ocr_crops(self):
+        self.assertEqual(parse_score_texts(["4", "0"]).score, (4, 0))
+        self.assertIsNone(parse_score_texts(["62", "13"]).score)
 
 
 class ScoreboardProfileTests(unittest.TestCase):
@@ -165,6 +177,40 @@ class ScoreboardProfileTests(unittest.TestCase):
         self.assertEqual(payload["scoreboard_profile"]["score_roi"], [180, 30, 360, 82])
         self.assertEqual(payload["scoreboard_profile"]["reference_resolution"], [1920, 1080])
 
+    def test_goal_request_serializes_cumulative_second_without_target_score(self):
+        with tempfile.TemporaryDirectory() as directory:
+            candidate = Path(directory) / "candidate.mp4"
+            candidate.write_bytes(b"video")
+            payload = ScoreboardOcrRequest(
+                candidate,
+                "G",
+                event_minute=69,
+                event_second=4177,
+            ).to_payload()
+
+        self.assertEqual(payload["event_second"], 4177)
+        self.assertIsNone(payload["target_score"])
+
+    def test_penalty_goal_request_serializes_cumulative_second(self):
+        with tempfile.TemporaryDirectory() as directory:
+            candidate = Path(directory) / "candidate.mp4"
+            candidate.write_bytes(b"video")
+            payload = ScoreboardOcrRequest(
+                candidate,
+                "PG",
+                event_minute=69,
+                event_second=4177,
+            ).to_payload()
+
+        self.assertEqual(payload["event_code"], "PG")
+        self.assertEqual(payload["event_second"], 4177)
+        self.assertIsNone(payload["target_score"])
+        with tempfile.TemporaryDirectory() as directory:
+            candidate = Path(directory) / "candidate.mp4"
+            candidate.write_bytes(b"video")
+            with self.assertRaisesRegex(ValueError, "unsupported event code"):
+                ScoreboardOcrRequest(candidate, "PM", event_minute=69).to_payload()
+
 
 class ClockContinuityTests(unittest.TestCase):
     def test_repairs_b56_and_short_backwards_digit_outliers(self):
@@ -189,6 +235,16 @@ class ClockContinuityTests(unittest.TestCase):
         repaired = tracker.update(1.0, "B:56")
         self.assertEqual(repaired.clock_seconds, 68 * 60 + 56)
         self.assertEqual(repaired.reason, "ocr_character_repaired")
+
+    def test_character_repair_cannot_move_clock_away_from_expected_time(self):
+        tracker = ClockContinuityStateMachine()
+        tracker.update(0.0, "79:18")
+
+        repaired = tracker.update(1.0, "79:I1")
+
+        self.assertEqual(repaired.clock_seconds, 79 * 60 + 19)
+        self.assertEqual(repaired.status, "repaired")
+        self.assertEqual(repaired.reason, "continuity_outlier_repaired")
 
     def test_accepts_pause_and_does_not_invent_clock_while_scoreboard_missing(self):
         tracker = ClockContinuityStateMachine()
@@ -341,6 +397,230 @@ class ScoreboardLocationTests(unittest.TestCase):
         self.assertEqual(result["diagnostics"]["previous_score"], "0-0")
         self.assertEqual(result["diagnostics"]["transition_clock"], "59:10")
 
+    def test_clock_only_goal_ignores_score_transition_and_uses_minute_boundary(self):
+        readings = [
+            self._reading(0, 0.0, "58:58 0-0"),
+            self._reading(1, 1.0, "58:59 0-0"),
+            self._reading(2, 2.0, "59:00 1-0"),
+            self._reading(3, 3.0, "59:01 1-0"),
+        ]
+
+        result = locate_from_readings(
+            readings,
+            {
+                "event_code": "G",
+                "event_minute": "59",
+                "target_score": "1-0",
+                "clock_only": True,
+                "candidate_start_seconds": 100.0,
+                "sample_interval_seconds": 1.0,
+            },
+        )
+
+        self.assertEqual(result["method"], "paddleocr_minute_boundary")
+        self.assertEqual(result["anchor_seconds"], 102.0)
+        self.assertEqual(result["location_kind"], "match_clock_minute_boundary")
+        self.assertEqual(result["minute_window_start_clock"], "58:00")
+        self.assertEqual(result["minute_window_end_clock"], "59:00")
+        self.assertTrue(result["diagnostics"]["clock_only"])
+        self.assertNotIn("score_transition_error", result)
+
+    def test_clock_only_rejects_non_boolean_mode(self):
+        with self.assertRaises(WorkerError) as raised:
+            locate_from_readings(
+                [self._reading(0, 0.0, "59:08")],
+                {
+                    "event_code": "YC",
+                    "event_minute": "59",
+                    "clock_only": "true",
+                },
+            )
+
+        self.assertEqual(raised.exception.kind, "ocr_invalid_request")
+
+    def test_goal_exact_second_uses_observed_clock_as_anchor(self):
+        readings = [
+            self._reading(0, 8.0, "69:36 0-0"),
+            self._reading(1, 9.0, "69:37 0-0"),
+            self._reading(2, 10.0, "69:38 0-0"),
+        ]
+
+        result = locate_from_readings(
+            readings,
+            {
+                "event_code": "G",
+                "event_second": 4177,
+                "target_score": "1-0",
+                "candidate_start_seconds": 100.0,
+            },
+        )
+
+        self.assertEqual(result["anchor_seconds"], 109.0)
+        self.assertEqual(result["method"], "paddleocr_exact_clock")
+        self.assertEqual(result["precision"], "observed_second")
+        self.assertEqual(result["target_clock"], "69:37")
+        self.assertEqual(result["location_kind"], "match_clock_second")
+
+    def test_goal_cumulative_second_152_targets_02_32_without_score(self):
+        readings = [
+            self._reading(0, 0.0, "02:31"),
+            self._reading(1, 1.0, "02:32"),
+            self._reading(2, 2.0, "02:33"),
+        ]
+
+        result = locate_from_readings(
+            readings,
+            {
+                "event_code": "G",
+                "event_second": 152,
+                "candidate_start_seconds": 40.0,
+            },
+        )
+
+        self.assertEqual(result["anchor_seconds"], 41.0)
+        self.assertEqual(result["target_clock"], "02:32")
+
+    def test_goal_second_interpolates_between_trustworthy_adjacent_clocks(self):
+        readings = [
+            self._reading(0, 8.0, "69:36 0-0"),
+            self._reading(2, 10.0, "69:38 0-0"),
+        ]
+
+        result = locate_from_readings(
+            readings,
+            {
+                "event_code": "OG",
+                "event_second": 4177,
+                "target_score": "1-0",
+                "candidate_start_seconds": 100.0,
+            },
+        )
+
+        self.assertEqual(result["anchor_seconds"], 109.0)
+        self.assertEqual(result["method"], "paddleocr_interpolated_clock")
+        self.assertEqual(result["precision"], "interpolated_second")
+        self.assertEqual(
+            result["diagnostics"]["interpolation_clock_bounds"],
+            ["69:36", "69:38"],
+        )
+
+    def test_goal_second_rejects_multiple_disjoint_clock_occurrences(self):
+        readings = [
+            self._reading(0, 0.0, "69:37"),
+            self._reading(1, 1.0, "69:38"),
+            self._reading(100, 100.0, "69:37"),
+            self._reading(101, 101.0, "69:38"),
+        ]
+
+        with self.assertRaises(WorkerError) as raised:
+            locate_from_readings(
+                readings,
+                {
+                    "event_code": "G",
+                    "event_second": 4177,
+                    "target_score": "1-0",
+                },
+            )
+
+        self.assertEqual(raised.exception.kind, "ocr_ambiguous")
+        self.assertEqual(
+            raised.exception.diagnostics["exact_second_failure_reason"],
+            "multiple_disjoint_occurrences",
+        )
+        self.assertEqual(
+            raised.exception.diagnostics["matching_occurrence_count"], 2
+        )
+
+    def test_goal_second_pause_prefers_earliest_frame_in_continuous_occurrence(self):
+        readings = [
+            self._reading(0, 0.0, "69:36"),
+            self._reading(1, 1.0, "69:37"),
+            self._reading(2, 2.0, "69:37"),
+            self._reading(3, 3.0, "69:37"),
+            self._reading(4, 4.0, "69:38"),
+        ]
+
+        result = locate_from_readings(
+            readings,
+            {
+                "event_code": "G",
+                "event_second": 4177,
+                "candidate_start_seconds": 100.0,
+            },
+        )
+
+        self.assertEqual(result["anchor_seconds"], 101.0)
+        self.assertEqual(result["method"], "paddleocr_exact_clock")
+
+    def test_goal_second_does_not_trust_one_isolated_clock_reading(self):
+        readings = [self._reading(0, 7.0, "69:37")]
+
+        with self.assertRaises(WorkerError) as raised:
+            locate_from_readings(
+                readings,
+                {
+                    "event_code": "G",
+                    "event_second": 4177,
+                },
+            )
+
+        self.assertEqual(raised.exception.kind, "ocr_exact_second_not_found")
+        self.assertEqual(
+            raised.exception.diagnostics["isolated_target_reading_count"], 1
+        )
+
+    def test_goal_second_failure_downgrades_to_score_transition(self):
+        readings = [
+            self._reading(0, 8.0, "59:08 0-0"),
+            self._reading(1, 9.0, "59:09 0-0"),
+            self._reading(2, 10.0, "59:10 1-0"),
+            self._reading(3, 11.0, "59:11 1-0"),
+        ]
+
+        result = locate_from_readings(
+            readings,
+            {
+                "event_code": "G",
+                "event_second": 4177,
+                "target_score": "1-0",
+                "candidate_start_seconds": 100.0,
+                "stable_frames": 2,
+            },
+        )
+
+        self.assertEqual(result["method"], "paddleocr_score_transition")
+        self.assertEqual(
+            result["exact_second_error"]["kind"],
+            "ocr_exact_second_not_found",
+        )
+        self.assertEqual(
+            result["diagnostics"]["exact_second_failure_reason"],
+            "target_clock_not_found",
+        )
+
+    def test_goal_second_failure_without_score_downgrades_to_minute_interval(self):
+        readings = [
+            self._reading(0, 0.0, "34:59"),
+            self._reading(1, 1.0, "35:00"),
+            self._reading(2, 2.0, "35:01"),
+        ]
+
+        result = locate_from_readings(
+            readings,
+            {
+                "event_code": "G",
+                "event_second": 4177,
+                "event_minute": "35",
+            },
+        )
+
+        self.assertEqual(result["method"], "paddleocr_goal_clock_interval")
+        self.assertTrue(result["requires_tdeed"])
+        self.assertEqual(
+            result["exact_second_error"]["kind"],
+            "ocr_exact_second_not_found",
+        )
+
     def test_goal_does_not_claim_transition_when_clip_starts_at_target_score(self):
         readings = [
             self._reading(0, 0.0, "59:20 1-0"),
@@ -378,7 +658,7 @@ class ScoreboardLocationTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(result["candidate_interval_start_seconds"], 101.0)
+        self.assertEqual(result["candidate_interval_start_seconds"], 100.0)
         self.assertEqual(result["candidate_interval_end_seconds"], 104.0)
         self.assertEqual(result["method"], "paddleocr_goal_clock_interval")
         self.assertTrue(result["requires_tdeed"])
@@ -430,6 +710,132 @@ class ScoreboardLocationTests(unittest.TestCase):
         self.assertEqual(result["method"], "paddleocr_clock_interval")
         self.assertEqual(result["precision"], "interval_only")
         self.assertTrue(result["requires_tdeed"])
+
+    def test_card_interval_tolerates_one_ambiguous_clock_sample(self):
+        readings = [
+            self._reading(0, 0.0, "90:20"),
+            self._reading(1, 1.0, "10:00+00:15"),
+            self._reading(2, 2.0, "90:22"),
+        ]
+
+        result = locate_from_readings(
+            readings,
+            {
+                "event_code": "YC",
+                "event_minute": "90",
+                "sample_interval_seconds": 1.0,
+            },
+        )
+
+        self.assertEqual(result["candidate_interval_start_seconds"], 0.0)
+        self.assertEqual(result["candidate_interval_end_seconds"], 3.0)
+
+    def test_card_bridges_long_gap_when_clock_projection_is_consistent(self):
+        readings = [
+            self._reading(35, 35.0, "38:00"),
+            self._reading(38, 38.0, "38:03"),
+            self._reading(94, 94.0, "39:00"),
+            self._reading(98, 98.0, "39:04"),
+        ]
+
+        result = locate_from_readings(
+            readings,
+            {
+                "event_code": "YC",
+                "event_minute": 39,
+                "sample_interval_seconds": 1.0,
+            },
+        )
+
+        self.assertEqual(result["candidate_interval_start_seconds"], 35.0)
+        self.assertEqual(result["candidate_interval_end_seconds"], 99.0)
+        self.assertEqual(
+            result["diagnostics"]["bridged_matching_clock_gaps"],
+            [
+                {
+                    "left_frame_index": 38,
+                    "right_frame_index": 94,
+                    "left_frame_seconds": 38.0,
+                    "right_frame_seconds": 94.0,
+                    "left_clock": "38:03",
+                    "right_clock": "39:00",
+                    "boundary_gap_seconds": 56.0,
+                    "anchor_video_gap_seconds": 56.0,
+                    "clock_advance_seconds": 57,
+                    "projection_error_seconds": 1.0,
+                }
+            ],
+        )
+
+    def test_card_does_not_bridge_projection_inconsistent_long_gap(self):
+        readings = [
+            self._reading(0, 0.0, "38:00"),
+            self._reading(1, 1.0, "38:01"),
+            self._reading(60, 60.0, "38:10"),
+            self._reading(61, 61.0, "38:11"),
+        ]
+
+        with self.assertRaises(WorkerError) as raised:
+            locate_from_readings(
+                readings,
+                {
+                    "event_code": "YC",
+                    "event_minute": 39,
+                    "sample_interval_seconds": 1.0,
+                },
+            )
+
+        self.assertEqual(raised.exception.kind, "ocr_ambiguous")
+        self.assertEqual(
+            raised.exception.diagnostics["bridged_matching_clock_gaps"], []
+        )
+
+    def test_card_does_not_bridge_across_readable_non_target_minute(self):
+        readings = [
+            self._reading(0, 0.0, "38:00"),
+            self._reading(1, 1.0, "38:01"),
+            self._reading(30, 30.0, "40:00"),
+            self._reading(60, 60.0, "39:00"),
+            self._reading(61, 61.0, "39:01"),
+        ]
+
+        with self.assertRaises(WorkerError) as raised:
+            locate_from_readings(
+                readings,
+                {
+                    "event_code": "RC",
+                    "event_minute": 39,
+                    "sample_interval_seconds": 1.0,
+                },
+            )
+
+        self.assertEqual(raised.exception.kind, "ocr_ambiguous")
+        self.assertEqual(
+            raised.exception.diagnostics["bridged_matching_clock_gaps"], []
+        )
+
+    def test_card_does_not_bridge_beyond_hard_gap_limit(self):
+        readings = [
+            self._reading(0, 0.0, "38:00"),
+            self._reading(1, 1.0, "38:01"),
+            self._reading(82, 82.0, "39:22"),
+            self._reading(83, 83.0, "39:23"),
+        ]
+
+        with self.assertRaises(WorkerError) as raised:
+            locate_from_readings(
+                readings,
+                {
+                    "event_code": "YC",
+                    "event_minute": 39,
+                    "sample_interval_seconds": 1.0,
+                },
+            )
+
+        self.assertEqual(raised.exception.kind, "ocr_ambiguous")
+        self.assertEqual(
+            raised.exception.diagnostics["bridged_matching_clock_gaps"], []
+        )
 
     def test_card_rejects_repeated_disjoint_minute_intervals(self):
         readings = [
@@ -488,7 +894,7 @@ class ScoreboardLocationTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(result["candidate_interval_start_seconds"], 103.0)
+        self.assertEqual(result["candidate_interval_start_seconds"], 100.0)
         self.assertEqual(result["candidate_interval_end_seconds"], 106.0)
 
     def test_structured_readability_errors(self):
@@ -522,6 +928,31 @@ class ScoreboardLocationTests(unittest.TestCase):
 
 
 class ScoreboardClientTests(unittest.TestCase):
+    def test_clock_only_contract_requires_minute_and_omits_legacy_false_flag(self):
+        with tempfile.TemporaryDirectory() as directory:
+            candidate = Path(directory) / "candidate.mp4"
+            candidate.write_bytes(b"video")
+
+            legacy = ScoreboardOcrRequest(
+                candidate, "G", target_score="1-0"
+            ).to_payload()
+            clock_only = ScoreboardOcrRequest(
+                candidate,
+                "G",
+                event_minute="35",
+                clock_only=True,
+            ).to_payload()
+
+            self.assertNotIn("clock_only", legacy)
+            self.assertTrue(clock_only["clock_only"])
+            self.assertIsNone(clock_only["target_score"])
+            with self.assertRaisesRegex(ValueError, "event_minute"):
+                ScoreboardOcrRequest(
+                    candidate,
+                    "G",
+                    clock_only=True,
+                ).to_payload()
+
     def test_client_module_has_no_model_framework_imports(self):
         source = Path(__file__).with_name("scoreboard_ocr.py").read_text(
             encoding="utf-8"
@@ -564,6 +995,7 @@ class ScoreboardClientTests(unittest.TestCase):
                 candidate,
                 event_code="G",
                 target_score="1-0",
+                event_second=4177,
                 candidate_start_seconds=100.0,
                 python_executable="ocr-python",
                 runner=runner,
@@ -576,6 +1008,7 @@ class ScoreboardClientTests(unittest.TestCase):
         request = json.loads(runner.call_args.kwargs["input"])
         self.assertEqual(request["candidate_start_seconds"], 100.0)
         self.assertEqual(request["target_score"], "1-0")
+        self.assertEqual(request["event_second"], 4177)
         self.assertEqual(result["diagnostics"]["worker_python"], "ocr-python")
 
     def test_client_uses_persistent_worker_protocol_when_enabled(self):

@@ -11,8 +11,11 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
+import os
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -503,7 +506,11 @@ class ScoreboardGoalDetector:
 
 
 def read_segments(
-    list_path: Path, buffer_dir: Path, time_offset: float = 0.0
+    list_path: Path,
+    buffer_dir: Path,
+    time_offset: float = 0.0,
+    *,
+    existing_only: bool = False,
 ) -> list[Segment]:
     if not list_path.exists():
         return []
@@ -516,17 +523,122 @@ def read_segments(
                 path = Path(row[0])
                 if not path.is_absolute():
                     path = buffer_dir / path
-                segments.append(
-                    Segment(
-                        path,
-                        float(row[1]) + time_offset,
-                        float(row[2]) + time_offset,
-                    )
-                )
-    except (OSError, ValueError):
-        # FFmpeg may be appending the last CSV row while it is being read.
+                try:
+                    start = float(row[1]) + time_offset
+                    end = float(row[2]) + time_offset
+                    if existing_only and (
+                        not path.is_file() or path.stat().st_size <= 0
+                    ):
+                        continue
+                except (OSError, ValueError):
+                    # FFmpeg may be appending the last CSV row while it is read.
+                    continue
+                segments.append(Segment(path, start, end))
+    except OSError:
         return []
     return segments
+
+
+def rolling_segment_list_size(
+    buffer_seconds: float,
+    segment_seconds: float,
+    *,
+    extra_retention_seconds: float = 0.0,
+) -> int:
+    """Return a conservative finite FFmpeg live-list capacity."""
+    if buffer_seconds <= 0 or segment_seconds <= 0 or extra_retention_seconds < 0:
+        raise ValueError("segment-list retention values must be valid")
+    # Keyframe-aligned segments may be longer than the requested duration. Four
+    # extra entries prevent boundary jitter from hiding a retained clip edge.
+    return max(
+        8,
+        math.ceil((buffer_seconds + extra_retention_seconds) / segment_seconds) + 4,
+    )
+
+
+def compact_segment_list(list_path: Path, buffer_dir: Path) -> tuple[int, int]:
+    """Atomically remove rows whose media no longer exists from a closed CSV.
+
+    The caller must not pass the list currently owned by FFmpeg. A before/after
+    identity check is still used as a final guard against an unexpected writer.
+    The returned tuple is ``(listed_rows, retained_rows)``; equal values mean no
+    rewrite was performed.
+    """
+    list_path = Path(list_path)
+    try:
+        before = list_path.stat()
+    except FileNotFoundError:
+        return 0, 0
+    except OSError:
+        return 0, 0
+
+    retained: list[list[str]] = []
+    listed_rows = 0
+    try:
+        with list_path.open(newline="", encoding="utf-8") as handle:
+            for row in csv.reader(handle):
+                listed_rows += 1
+                if len(row) < 3:
+                    return listed_rows, listed_rows
+                try:
+                    float(row[1])
+                    float(row[2])
+                except ValueError:
+                    return listed_rows, listed_rows
+                media_path = Path(row[0])
+                if not media_path.is_absolute():
+                    media_path = buffer_dir / media_path
+                try:
+                    if media_path.is_file() and media_path.stat().st_size > 0:
+                        retained.append(row)
+                except OSError:
+                    continue
+    except (OSError, UnicodeError, csv.Error):
+        return listed_rows, listed_rows
+
+    if len(retained) == listed_rows:
+        return listed_rows, listed_rows
+    try:
+        after_read = list_path.stat()
+    except OSError:
+        return listed_rows, listed_rows
+    identity = lambda value: (
+        value.st_dev,
+        value.st_ino,
+        value.st_size,
+        value.st_mtime_ns,
+    )
+    if identity(before) != identity(after_read):
+        return listed_rows, listed_rows
+
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            newline="",
+            encoding="utf-8",
+            prefix=f".{list_path.name}.",
+            suffix=".tmp",
+            dir=list_path.parent,
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            csv.writer(temporary).writerows(retained)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        if identity(list_path.stat()) != identity(after_read):
+            return listed_rows, listed_rows
+        os.replace(temporary_path, list_path)
+        temporary_path = None
+        return listed_rows, len(retained)
+    except OSError:
+        return listed_rows, listed_rows
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def concat_escape(path: Path) -> str:
@@ -765,6 +877,16 @@ def build_ingest_command(
             "segment",
             "-segment_time",
             f"{args.segment_seconds:.3f}",
+            "-segment_list_flags",
+            "+live",
+            "-segment_list_size",
+            str(
+                rolling_segment_list_size(
+                    args.buffer_seconds,
+                    args.segment_seconds,
+                    extra_retention_seconds=args.after,
+                )
+            ),
             "-reset_timestamps",
             "1",
             "-segment_list",

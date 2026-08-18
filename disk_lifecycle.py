@@ -15,6 +15,7 @@ import os
 import sqlite3
 import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Iterable
@@ -39,6 +40,7 @@ class DiskLifecyclePolicy:
     event_log_archives: int = 3
     post_match_buffer_seconds: float = 0.0
     vision_candidate_retention_seconds: float = 24 * 60 * 60
+    final_gif_retention_seconds: float = 24 * 60 * 60
 
     def __post_init__(self) -> None:
         if self.keep_ingest_logs < 1:
@@ -53,6 +55,8 @@ class DiskLifecyclePolicy:
             raise ValueError("post_match_buffer_seconds cannot be negative")
         if self.vision_candidate_retention_seconds <= 0:
             raise ValueError("vision_candidate_retention_seconds must be positive")
+        if self.final_gif_retention_seconds <= 0:
+            raise ValueError("final_gif_retention_seconds must be positive")
 
 
 @dataclass
@@ -121,31 +125,42 @@ class DiskLifecycleManager:
         protected = self._normalize_protected_paths(protected_paths)
 
         if buffer_root is not None:
-            clear_manifest_first = (
-                self.policy.post_match_buffer_seconds == 0 and not protected
-            )
-            media_cleanup_allowed = True
-            if clear_manifest_first and not self._clear_manifest(manifest, summary):
-                media_cleanup_allowed = False
-                summary.actions.append("media_cleanup_skipped_after_manifest_write_failure")
-            if media_cleanup_allowed:
-                retained_media = self._cleanup_ts_files(
-                    buffer_root,
-                    protected=protected,
-                    summary=summary,
-                )
-                retained_lists = self._cleanup_segment_lists(
-                    buffer_root,
-                    retained_media=retained_media,
-                    protected=protected,
-                    summary=summary,
-                )
-                if (
-                    not clear_manifest_first
-                    and not retained_lists
-                    and not retained_media
-                ):
-                    self._clear_manifest(manifest, summary)
+            with self._segment_lease_guard(state_db_path, summary) as active_leases:
+                if active_leases is None:
+                    media_cleanup_allowed = False
+                elif active_leases:
+                    protected.update(active_leases)
+                    media_cleanup_allowed = False
+                    summary.actions.append("media_cleanup_skipped_after_active_lease")
+                else:
+                    media_cleanup_allowed = True
+                if media_cleanup_allowed:
+                    clear_manifest_first = (
+                        self.policy.post_match_buffer_seconds == 0 and not protected
+                    )
+                    if clear_manifest_first and not self._clear_manifest(manifest, summary):
+                        media_cleanup_allowed = False
+                        summary.actions.append(
+                            "media_cleanup_skipped_after_manifest_write_failure"
+                        )
+                    if media_cleanup_allowed:
+                        retained_media = self._cleanup_ts_files(
+                            buffer_root,
+                            protected=protected,
+                            summary=summary,
+                        )
+                        retained_lists = self._cleanup_segment_lists(
+                            buffer_root,
+                            retained_media=retained_media,
+                            protected=protected,
+                            summary=summary,
+                        )
+                        if (
+                            not clear_manifest_first
+                            and not retained_lists
+                            and not retained_media
+                        ):
+                            self._clear_manifest(manifest, summary)
         else:
             summary.status = "completed_with_warnings"
 
@@ -167,7 +182,103 @@ class DiskLifecycleManager:
         self._rotate_event_log(event_log_path, summary)
         self._checkpoint_sqlite(state_db_path, summary)
         self._cleanup_vision_candidates(summary)
+        self._cleanup_final_gifs(summary)
         return summary
+
+    def prune_final_gifs(self) -> CleanupSummary:
+        """Delete expired product GIFs directly under this match directory.
+
+        Only regular files below ``output_dir`` are considered.  Nested
+        diagnostics and symlinks are deliberately left untouched because they
+        may be owned by another cleanup policy or point outside the match.
+        """
+        summary = CleanupSummary(phase="final_gif_retention")
+        self._cleanup_final_gifs(summary)
+        return summary
+
+    def _cleanup_final_gifs(self, summary: CleanupSummary) -> None:
+        cutoff = time.time() - self.policy.final_gif_retention_seconds
+        try:
+            candidates = sorted(self.output_dir.glob("*.gif"))
+        except OSError as exc:
+            summary.add_error(self.output_dir, exc)
+            return
+        for path in candidates:
+            if not self._is_safe_regular_file(path, self.output_dir):
+                summary.skipped_files += 1
+                continue
+            try:
+                if path.stat().st_mtime >= cutoff:
+                    summary.retained_files += 1
+                    continue
+            except OSError as exc:
+                summary.add_error(path, exc)
+                continue
+            self._delete_file(path, summary)
+        if candidates:
+            summary.actions.append("expired_final_gifs_pruned")
+
+    @contextmanager
+    def _segment_lease_guard(
+        self,
+        state_db_path: Path,
+        summary: CleanupSummary,
+    ) -> Iterable[set[Path] | None]:
+        """Hold SQLite's writer lock while terminal media is being deleted.
+
+        Lease acquisition uses the same database. Holding ``BEGIN IMMEDIATE``
+        across the media pass prevents a new lease from appearing between the
+        final check and an unlink operation. ``None`` means the guard could not
+        be established, so callers must defer destructive media cleanup.
+        """
+        path = Path(state_db_path)
+        if not path.exists():
+            yield set()
+            return
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = sqlite3.connect(path, timeout=2.0)
+            connection.execute("BEGIN IMMEDIATE")
+            table = connection.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'segment_leases'"
+            ).fetchone()
+            active: set[Path] = set()
+            if table is not None:
+                connection.execute(
+                    "DELETE FROM segment_leases WHERE expires_at_unix <= ?",
+                    (time.time(),),
+                )
+                rows = connection.execute(
+                    "SELECT DISTINCT segment_path FROM segment_leases "
+                    "WHERE expires_at_unix > ?",
+                    (time.time(),),
+                ).fetchall()
+                active = {
+                    Path(str(row[0])).resolve()
+                    for row in rows
+                    if row and row[0]
+                }
+        except (OSError, sqlite3.Error) as exc:
+            summary.add_error(path, exc)
+            if connection is not None:
+                connection.close()
+            yield None
+            return
+
+        try:
+            yield active
+        except BaseException:
+            connection.rollback()
+            raise
+        else:
+            try:
+                connection.commit()
+            except (OSError, sqlite3.Error) as exc:
+                summary.add_error(path, exc)
+                connection.rollback()
+        finally:
+            connection.close()
 
     def _cleanup_vision_candidates(self, summary: CleanupSummary) -> None:
         """Delete expired visual-debug artifacts without traversing symlinks."""

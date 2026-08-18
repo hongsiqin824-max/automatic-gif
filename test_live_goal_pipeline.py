@@ -11,12 +11,38 @@ from live_goal_pipeline import (
     PendingEvent,
     Segment,
     analyze_video_coverage,
+    compact_segment_list,
+    rolling_segment_list_size,
     encode_gif,
     run,
 )
 
 
 class GifBufferTests(unittest.TestCase):
+    def test_rolling_segment_list_capacity_is_finite(self):
+        self.assertEqual(rolling_segment_list_size(60.0, 2.0), 34)
+        self.assertGreater(
+            rolling_segment_list_size(60.0, 2.0, extra_retention_seconds=30.0),
+            34,
+        )
+
+    def test_compact_segment_list_keeps_only_existing_media(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            valid = root / "valid.ts"
+            valid.write_bytes(b"media")
+            listing = root / "segments.csv"
+            listing.write_text(
+                "valid.ts,0,1\nmissing.ts,1,2\n",
+                encoding="utf-8",
+            )
+
+            self.assertEqual(compact_segment_list(listing, root), (2, 1))
+            self.assertEqual(
+                listing.read_text(encoding="utf-8"),
+                "valid.ts,0,1\n",
+            )
+
     def test_encode_gif_honors_an_explicit_safe_output_filename(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

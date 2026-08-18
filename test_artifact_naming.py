@@ -111,6 +111,18 @@ class ArtifactNamingTests(unittest.TestCase):
                 event_data=self.event_data(code="SUB"),
             )
 
+    def test_penalty_goal_uses_the_goal_artifact_label_and_pm_is_rejected(self):
+        filename = build_gif_filename(
+            match_id="match-42",
+            event_data=self.event_data(code="PG"),
+        )
+        self.assertIn("_goal_", filename)
+        with self.assertRaisesRegex(ValueError, "unsupported event code"):
+            build_gif_filename(
+                match_id="match-42",
+                event_data=self.event_data(code="PM"),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

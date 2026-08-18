@@ -40,13 +40,50 @@ from scoreboard_ocr import (
 CLOCK_PATTERN = re.compile(r"(?<!\d)(\d{1,3})\s*[:.]\s*([0-5]\d)(?!\d)")
 COMPACT_CLOCK_PATTERN = re.compile(r"(?<!\d)(\d{2,3})([0-5]\d)(?!\d)")
 SCORE_PATTERN = re.compile(r"(?<!\d)(\d{1,2})\s*[-:]\s*(\d{1,2})(?!\d)")
-SUPPORTED_EVENT_CODES = frozenset({"G", "OG", "YC", "RC"})
+GOAL_LIKE_EVENT_CODES = frozenset({"G", "OG", "PG"})
+SUPPORTED_EVENT_CODES = GOAL_LIKE_EVENT_CODES | frozenset({"YC", "RC"})
 MAX_REASONABLE_MATCH_MINUTE = 150
 MAX_REASONABLE_SCORE = 20
 OCR_CROP_KINDS = frozenset({"clock", "score"})
 MIN_PROFILE_TRUSTED_CLOCK_FRAMES = 3
 MIN_PROFILE_TRUSTED_CLOCK_RATE = 0.20
 MIN_PROFILE_CLOCK_PROGRESSION_SECONDS = 1
+AUTO_SEARCH_WIDTH_RATIO = 0.40
+AUTO_SEARCH_HEIGHT_RATIO = 0.25
+AUTO_SEARCH_SCALE = 3
+AUTO_DISCOVERY_OBSERVATIONS = 3
+AUTO_DISCOVERY_MAX_MISSES = 3
+AUTO_REACQUIRE_MISSING_FRAMES = 8
+AUTO_SEARCH_BATCH_FRAMES = 5
+AUTO_MAXIMUM_ANALYSIS_SECONDS = 360.0
+CLOCK_PREPROCESS_VARIANTS = ("gray_contrast_sharp", "binary_contrast")
+
+_CLOCK_CHARACTER_TRANSLATION = str.maketrans(
+    {
+        "O": "0",
+        "I": "1",
+        "L": "1",
+        "S": "5",
+        "B": "8",
+        "|": "1",
+        "０": "0",
+        "１": "1",
+        "２": "2",
+        "３": "3",
+        "４": "4",
+        "５": "5",
+        "６": "6",
+        "７": "7",
+        "８": "8",
+        "９": "9",
+        "：": ":",
+        "．": ".",
+        "＋": "+",
+    }
+)
+_ALLOWED_CLOCK_CHARACTERS = frozenset("0123456789:+. ")
+
+BBox = tuple[float, float, float, float]
 
 
 class WorkerError(RuntimeError):
@@ -93,6 +130,54 @@ class FrameReading:
     continuity_status: str | None = None
     continuity_reason: str | None = None
     scoreboard_visible: bool = True
+    observed_clock_seconds: int | None = None
+
+
+@dataclass(frozen=True)
+class _ClockSecondCandidate:
+    frame_seconds: float
+    method: str
+    precision: str
+    segment_index: int
+    left: FrameReading
+    right: FrameReading | None = None
+
+
+@dataclass(frozen=True)
+class DetectedText:
+    """One OCR detection with its text, confidence, and quadrilateral bounds."""
+
+    text: str
+    confidence: float
+    bbox: BBox
+
+
+@dataclass(frozen=True)
+class AutoClockDecision:
+    status: str
+    reason: str
+    clock_seconds: int | None = None
+    clock_roi: BBox | None = None
+    score_roi: BBox | None = None
+    score_rois: tuple[BBox, ...] = ()
+    search_roi: BBox | None = None
+    candidate_count: int = 0
+    miss_count: int = 0
+    expanded_search: bool = False
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "reason": self.reason,
+            "clock_seconds": self.clock_seconds,
+            "clock_roi": list(self.clock_roi) if self.clock_roi else None,
+            "score_roi": list(self.score_roi) if self.score_roi else None,
+            "score_rois": [list(roi) for roi in self.score_rois],
+            "search_roi": list(self.search_roi) if self.search_roi else None,
+            "candidate_count": self.candidate_count,
+            "miss_count": self.miss_count,
+            "expanded_search": self.expanded_search,
+        }
 
 
 @dataclass(frozen=True)
@@ -235,6 +320,675 @@ def parse_scoreboard_texts(texts: Iterable[str]) -> ParsedScoreboard:
     )
 
 
+def _as_sequence(value: Any) -> list[Any] | None:
+    """Return JSON-like arrays, including NumPy arrays from Paddle results."""
+    if isinstance(value, (str, bytes, bytearray)):
+        return None
+    if isinstance(value, Sequence):
+        return list(value)
+    to_list = getattr(value, "tolist", None)
+    if callable(to_list):
+        try:
+            converted = to_list()
+        except Exception:
+            return None
+        return _as_sequence(converted)
+    return None
+
+
+def _bbox_from_polygon(value: Any) -> BBox | None:
+    points = _as_sequence(value)
+    if not points:
+        return None
+    if len(points) == 4 and all(isinstance(item, (int, float)) for item in points):
+        x1, y1, x2, y2 = (float(item) for item in points)
+        if x2 > x1 and y2 > y1 and all(
+            math.isfinite(item) for item in (x1, y1, x2, y2)
+        ):
+            return x1, y1, x2, y2
+        return None
+    coordinates: list[tuple[float, float]] = []
+    for point in points:
+        pair = _as_sequence(point)
+        if pair is None or len(pair) < 2:
+            return None
+        try:
+            x, y = float(pair[0]), float(pair[1])
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(x) or not math.isfinite(y):
+            return None
+        coordinates.append((x, y))
+    if len(coordinates) < 2:
+        return None
+    xs, ys = zip(*coordinates)
+    x1, y1, x2, y2 = min(xs), min(ys), max(xs), max(ys)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return x1, y1, x2, y2
+
+
+def _extract_detected_texts(value: Any) -> list[DetectedText]:
+    """Normalize PaddleOCR v2/v3 text detections without losing bbox pairing."""
+    extracted: list[DetectedText] = []
+    visited: set[int] = set()
+
+    def append(text: Any, confidence: Any, polygon: Any) -> None:
+        bbox = _bbox_from_polygon(polygon)
+        if bbox is None:
+            return
+        normalized = str(text).strip()
+        if not normalized:
+            return
+        try:
+            score = float(confidence)
+        except (TypeError, ValueError):
+            score = 1.0
+        if not math.isfinite(score):
+            return
+        extracted.append(DetectedText(normalized, score, bbox))
+
+    def visit(item: Any) -> None:
+        if item is None:
+            return
+        if not isinstance(item, (str, int, float, bool)):
+            identity = id(item)
+            if identity in visited:
+                return
+            visited.add(identity)
+        if isinstance(item, Mapping):
+            texts = _as_sequence(item.get("rec_texts"))
+            scores = _as_sequence(item.get("rec_scores")) or []
+            polygons = (
+                _as_sequence(item.get("rec_polys"))
+                or _as_sequence(item.get("dt_polys"))
+                or _as_sequence(item.get("rec_boxes"))
+            )
+            if texts is not None and polygons is not None:
+                for index in range(min(len(texts), len(polygons))):
+                    append(
+                        texts[index],
+                        scores[index] if index < len(scores) else 1.0,
+                        polygons[index],
+                    )
+                return
+            for nested in item.values():
+                visit(nested)
+            return
+
+        values = _as_sequence(item)
+        if values is not None:
+            if len(values) == 2:
+                recognized = _as_sequence(values[1])
+                if (
+                    _bbox_from_polygon(values[0]) is not None
+                    and recognized is not None
+                    and len(recognized) == 2
+                    and isinstance(recognized[0], str)
+                ):
+                    append(values[1][0], values[1][1], values[0])
+                    return
+            for nested in values:
+                visit(nested)
+            return
+
+        json_value = getattr(item, "json", None)
+        if callable(json_value):
+            try:
+                json_value = json_value()
+            except Exception:
+                return
+        if isinstance(json_value, str):
+            try:
+                json_value = json.loads(json_value)
+            except json.JSONDecodeError:
+                return
+        if json_value is not None:
+            visit(json_value)
+
+    visit(value)
+    deduplicated: list[DetectedText] = []
+    seen: set[tuple[str, float, BBox]] = set()
+    for detected in extracted:
+        key = (
+            detected.text,
+            round(detected.confidence, 6),
+            tuple(round(point, 3) for point in detected.bbox),
+        )
+        if key not in seen:
+            seen.add(key)
+            deduplicated.append(detected)
+    return deduplicated
+
+
+def _bbox_union(boxes: Iterable[BBox]) -> BBox | None:
+    values = list(boxes)
+    if not values:
+        return None
+    return (
+        min(box[0] for box in values),
+        min(box[1] for box in values),
+        max(box[2] for box in values),
+        max(box[3] for box in values),
+    )
+
+
+def _bbox_center(box: BBox) -> tuple[float, float]:
+    return (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+
+
+def _bbox_similar(left: BBox, right: BBox) -> bool:
+    left_width, left_height = left[2] - left[0], left[3] - left[1]
+    right_width, right_height = right[2] - right[0], right[3] - right[1]
+    if min(left_width, left_height, right_width, right_height) <= 0:
+        return False
+    overlap_width = max(0.0, min(left[2], right[2]) - max(left[0], right[0]))
+    overlap_height = max(0.0, min(left[3], right[3]) - max(left[1], right[1]))
+    intersection = overlap_width * overlap_height
+    union = left_width * left_height + right_width * right_height - intersection
+    if union > 0 and intersection / union >= 0.25:
+        return True
+    left_center, right_center = _bbox_center(left), _bbox_center(right)
+    return (
+        abs(left_center[0] - right_center[0])
+        <= max(left_width, right_width) * 0.6 + 5.0
+        and abs(left_center[1] - right_center[1])
+        <= max(left_height, right_height) * 0.5 + 4.0
+    )
+
+
+def _padded_roi(
+    bbox: BBox,
+    *,
+    frame_width: int,
+    frame_height: int,
+    padding_ratio: float = 0.30,
+) -> BBox:
+    width, height = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    padding_x, padding_y = max(4.0, width * padding_ratio), max(4.0, height * padding_ratio)
+    return (
+        max(0.0, bbox[0] - padding_x),
+        max(0.0, bbox[1] - padding_y),
+        min(float(frame_width), bbox[2] + padding_x),
+        min(float(frame_height), bbox[3] + padding_y),
+    )
+
+
+def _spatial_text_groups(detections: Sequence[DetectedText]) -> list[DetectedText]:
+    """Include same-line joined tokens for clocks/scores split by detection."""
+    rows: list[list[DetectedText]] = []
+    for detected in sorted(detections, key=lambda item: _bbox_center(item.bbox)[1]):
+        center_y = _bbox_center(detected.bbox)[1]
+        for row in rows:
+            row_center = sum(_bbox_center(item.bbox)[1] for item in row) / len(row)
+            row_height = max(item.bbox[3] - item.bbox[1] for item in row)
+            if abs(center_y - row_center) <= max(row_height, detected.bbox[3] - detected.bbox[1]):
+                row.append(detected)
+                break
+        else:
+            rows.append([detected])
+    grouped = list(detections)
+    for row in rows:
+        ordered = sorted(row, key=lambda item: item.bbox[0])
+        for start in range(len(ordered)):
+            current: list[DetectedText] = []
+            previous_x2: float | None = None
+            for detected in ordered[start : start + 4]:
+                width = detected.bbox[2] - detected.bbox[0]
+                if previous_x2 is not None and detected.bbox[0] - previous_x2 > max(20.0, width * 2.0):
+                    break
+                current.append(detected)
+                previous_x2 = detected.bbox[2]
+                if len(current) > 1:
+                    bbox = _bbox_union(item.bbox for item in current)
+                    assert bbox is not None
+                    grouped.append(
+                        DetectedText(
+                            "".join(item.text for item in current),
+                            min(item.confidence for item in current),
+                            bbox,
+                        )
+                    )
+    return grouped
+
+
+@dataclass(frozen=True)
+class _AutoClockCandidate:
+    clock_seconds: int
+    bbox: BBox
+    confidence: float
+
+
+@dataclass
+class _AutoClockTrack:
+    bbox: BBox
+    first_clock_seconds: int
+    last_clock_seconds: int
+    last_video_seconds: float
+    boxes: list[BBox]
+    observations: int = 1
+    misses: int = 0
+
+
+@dataclass
+class _AutoScoreTrack:
+    bbox: BBox
+    boxes: list[BBox]
+    observations: int = 1
+    misses: int = 0
+
+
+class AutoClockTracker:
+    """Find one spatially stable match-clock ROI before normal OCR begins."""
+
+    def __init__(
+        self,
+        frame_width: int,
+        frame_height: int,
+        *,
+        stable_observations: int = AUTO_DISCOVERY_OBSERVATIONS,
+        maximum_misses: int = AUTO_DISCOVERY_MAX_MISSES,
+        clock_only: bool = False,
+    ) -> None:
+        if frame_width <= 0 or frame_height <= 0:
+            raise ValueError("frame dimensions must be positive")
+        if stable_observations < 2 or maximum_misses < 1:
+            raise ValueError("invalid automatic clock tracker thresholds")
+        self.frame_width = int(frame_width)
+        self.frame_height = int(frame_height)
+        self.stable_observations = int(stable_observations)
+        self.maximum_misses = int(maximum_misses)
+        if not isinstance(clock_only, bool):
+            raise ValueError("clock_only must be a boolean")
+        self.clock_only = clock_only
+        self.expanded_search = False
+        self.clock_roi: BBox | None = None
+        self.score_roi: BBox | None = None
+        self.score_rois: tuple[BBox, ...] = ()
+        self._clock_tracks: list[_AutoClockTrack] = []
+        self._score_tracks: list[_AutoScoreTrack] = []
+        self._locked_clock_seconds: int | None = None
+        self._locked_video_seconds: float | None = None
+        self._locked_misses = 0
+        self._timeline_discontinuities = 0
+
+    @property
+    def search_roi(self) -> BBox:
+        width = self.frame_width if self.expanded_search else self.frame_width * AUTO_SEARCH_WIDTH_RATIO
+        return 0.0, 0.0, float(width), self.frame_height * AUTO_SEARCH_HEIGHT_RATIO
+
+    @staticmethod
+    def _clock_candidates(detections: Sequence[DetectedText]) -> list[_AutoClockCandidate]:
+        candidates: list[_AutoClockCandidate] = []
+        for detected in _spatial_text_groups(detections):
+            parsed = parse_clock_texts(detected.text)
+            if parsed.clock_seconds is None or parsed.ambiguous:
+                continue
+            candidate = _AutoClockCandidate(
+                parsed.clock_seconds,
+                detected.bbox,
+                detected.confidence,
+            )
+            duplicate_index = next(
+                (
+                    index
+                    for index, existing in enumerate(candidates)
+                    if existing.clock_seconds == candidate.clock_seconds
+                    and _bbox_similar(existing.bbox, candidate.bbox)
+                ),
+                None,
+            )
+            if duplicate_index is None:
+                candidates.append(candidate)
+            else:
+                existing = candidates[duplicate_index]
+                existing_area = (existing.bbox[2] - existing.bbox[0]) * (
+                    existing.bbox[3] - existing.bbox[1]
+                )
+                candidate_area = (candidate.bbox[2] - candidate.bbox[0]) * (
+                    candidate.bbox[3] - candidate.bbox[1]
+                )
+                if candidate_area < existing_area:
+                    candidates[duplicate_index] = candidate
+        return candidates
+
+    @staticmethod
+    def _score_candidates(
+        detections: Sequence[DetectedText],
+    ) -> list[DetectedText]:
+        candidates: list[DetectedText] = []
+        for detected in _spatial_text_groups(detections):
+            parsed_clock = parse_clock_texts(detected.text)
+            parsed = parse_score_texts(detected.text)
+            clock_like = (
+                parsed_clock.clock_seconds is not None
+                and any(separator in detected.text for separator in (":", "."))
+            )
+            if (
+                parsed.score is not None
+                and not parsed.ambiguous
+                and not clock_like
+            ):
+                candidates.append(detected)
+        # A full detector line such as ``0310`` can be a score separator
+        # dropped by PaddleOCR. Keep this fallback to original boxes only;
+        # applying it to joined same-line tokens would absorb team names.
+        for detected in detections:
+            parsed_clock = parse_clock_texts(detected.text)
+            if (
+                parsed_clock.clock_seconds is not None
+                and any(separator in detected.text for separator in (":", "."))
+            ):
+                continue
+            compact_numeric = (
+                len(detected.text) <= 8
+                and sum(character.isdigit() for character in detected.text)
+                >= max(2, len(detected.text) // 2)
+            )
+            if compact_numeric:
+                candidates.append(detected)
+        unique: list[DetectedText] = []
+        seen: set[tuple[str, BBox]] = set()
+        for candidate in candidates:
+            key = (candidate.text, candidate.bbox)
+            if key not in seen:
+                seen.add(key)
+                unique.append(candidate)
+        return unique
+
+    @staticmethod
+    def _is_continuous(track: _AutoClockTrack, candidate: _AutoClockCandidate, video_seconds: float) -> bool:
+        elapsed = video_seconds - track.last_video_seconds
+        if elapsed <= 0:
+            return False
+        clock_delta = candidate.clock_seconds - track.last_clock_seconds
+        return 0 <= clock_delta <= max(4, round(elapsed * 2.0) + 2)
+
+    def _best_clock_track(self, candidate: _AutoClockCandidate) -> _AutoClockTrack | None:
+        matches = [track for track in self._clock_tracks if _bbox_similar(track.bbox, candidate.bbox)]
+        if not matches:
+            return None
+        return min(
+            matches,
+            key=lambda track: math.dist(
+                _bbox_center(track.bbox), _bbox_center(candidate.bbox)
+            ),
+        )
+
+    def _update_score_tracks(self, detections: Sequence[DetectedText]) -> None:
+        matched: set[int] = set()
+        for candidate in self._score_candidates(detections):
+            matches = [
+                (index, track)
+                for index, track in enumerate(self._score_tracks)
+                if _bbox_similar(track.bbox, candidate.bbox)
+            ]
+            if matches:
+                index, track = min(
+                    matches,
+                    key=lambda item: math.dist(
+                        _bbox_center(item[1].bbox), _bbox_center(candidate.bbox)
+                    ),
+                )
+                track.bbox = candidate.bbox
+                track.boxes.append(candidate.bbox)
+                track.observations += 1
+                track.misses = 0
+                matched.add(index)
+            else:
+                self._score_tracks.append(_AutoScoreTrack(candidate.bbox, [candidate.bbox]))
+                matched.add(len(self._score_tracks) - 1)
+        self._score_tracks = [
+            track
+            for index, track in enumerate(self._score_tracks)
+            if index in matched or track.misses + 1 < self.stable_observations
+        ]
+        for index, track in enumerate(self._score_tracks):
+            if index not in matched:
+                track.misses += 1
+
+    def _score_roi_for_clock(self, clock_bbox: BBox) -> BBox | None:
+        qualified = [
+            track for track in self._score_tracks if track.observations >= self.stable_observations
+        ]
+        if not qualified:
+            return None
+        clock_y = _bbox_center(clock_bbox)[1]
+        clock_height = max(1.0, clock_bbox[3] - clock_bbox[1])
+        aligned = [
+            track
+            for track in qualified
+            if abs(_bbox_center(track.bbox)[1] - clock_y)
+            <= max(clock_height * 1.5, self.frame_height * 0.04)
+            and min(
+                abs(_bbox_center(track.bbox)[0] - clock_bbox[0]),
+                abs(_bbox_center(track.bbox)[0] - clock_bbox[2]),
+            )
+            <= self.frame_width * 0.30
+        ]
+        if not aligned:
+            return None
+        bbox = _bbox_union(
+            box for track in aligned for box in track.boxes
+        )
+        assert bbox is not None
+        return _padded_roi(
+            bbox,
+            frame_width=self.frame_width,
+            frame_height=self.frame_height,
+            padding_ratio=0.08,
+        )
+
+    def _score_roi_candidates(self, clock_bbox: BBox) -> tuple[BBox, ...]:
+        detected = self._score_roi_for_clock(clock_bbox)
+        clock_width = max(1.0, clock_bbox[2] - clock_bbox[0])
+        clock_height = max(1.0, clock_bbox[3] - clock_bbox[1])
+        span = max(clock_width * 3.0, self.frame_width * 0.12)
+        y1 = max(0.0, clock_bbox[1] - clock_height * 0.45)
+        y2 = min(float(self.frame_height), clock_bbox[3] + clock_height * 0.45)
+        candidates = [
+            detected,
+            (
+                max(0.0, clock_bbox[0] - span),
+                y1,
+                max(1.0, clock_bbox[0] - 1.0),
+                y2,
+            ),
+            (
+                min(float(self.frame_width - 1), clock_bbox[2] + 1.0),
+                y1,
+                min(float(self.frame_width), clock_bbox[2] + span),
+                y2,
+            ),
+        ]
+        unique: list[BBox] = []
+        for candidate in candidates:
+            if candidate is None or candidate[2] <= candidate[0] or candidate[3] <= candidate[1]:
+                continue
+            if not any(_bbox_similar(candidate, existing) for existing in unique):
+                unique.append(candidate)
+        return tuple(unique)
+
+    def observe_search(
+        self,
+        frame_index: int,
+        video_seconds: float,
+        detections: Sequence[DetectedText],
+    ) -> AutoClockDecision:
+        del frame_index
+        candidates = self._clock_candidates(detections)
+        if not self.clock_only:
+            self._update_score_tracks(detections)
+        matched_tracks: set[int] = set()
+        discontinuous = False
+        for candidate in candidates:
+            track = self._best_clock_track(candidate)
+            if track is None:
+                self._clock_tracks.append(
+                    _AutoClockTrack(
+                        candidate.bbox,
+                        candidate.clock_seconds,
+                        candidate.clock_seconds,
+                        float(video_seconds),
+                        [candidate.bbox],
+                    )
+                )
+                matched_tracks.add(len(self._clock_tracks) - 1)
+                continue
+            track_index = self._clock_tracks.index(track)
+            if not self._is_continuous(track, candidate, float(video_seconds)):
+                discontinuous = True
+                continue
+            track.bbox = candidate.bbox
+            track.last_clock_seconds = candidate.clock_seconds
+            track.last_video_seconds = float(video_seconds)
+            track.boxes.append(candidate.bbox)
+            track.observations += 1
+            track.misses = 0
+            matched_tracks.add(track_index)
+        retained: list[_AutoClockTrack] = []
+        for index, track in enumerate(self._clock_tracks):
+            if index not in matched_tracks:
+                track.misses += 1
+            # Discovery validation is deliberately consecutive. This prevents
+            # a static score token misread as a compact clock every other frame
+            # from accumulating enough observations to lock.
+            if track.misses == 0:
+                retained.append(track)
+        self._clock_tracks = retained
+        progressing = [
+            track
+            for track in self._clock_tracks
+            if track.observations >= self.stable_observations
+            and track.last_clock_seconds > track.first_clock_seconds
+        ]
+        # Discovery must prove that the candidate is a running match clock.
+        # A paused clock is supported after the ROI is locked, but a static
+        # token (often a score misread as compact ``MMSS``) must not establish
+        # the initial lock on its own.
+        qualified = progressing
+        if len(qualified) > 1:
+            return AutoClockDecision(
+                "ambiguous",
+                "ambiguous",
+                search_roi=self.search_roi,
+                candidate_count=len(qualified),
+                expanded_search=self.expanded_search,
+            )
+        if len(qualified) == 1:
+            track = qualified[0]
+            bbox = _bbox_union(track.boxes)
+            assert bbox is not None
+            self.clock_roi = _padded_roi(
+                bbox, frame_width=self.frame_width, frame_height=self.frame_height
+            )
+            if self.clock_only:
+                self.score_rois = ()
+                self.score_roi = None
+            else:
+                self.score_rois = self._score_roi_candidates(bbox)
+                self.score_roi = self.score_rois[0] if self.score_rois else None
+            self._locked_clock_seconds = track.last_clock_seconds
+            self._locked_video_seconds = track.last_video_seconds
+            self._locked_misses = 0
+            return AutoClockDecision(
+                "locked",
+                "stable_clock_track",
+                clock_seconds=track.last_clock_seconds,
+                clock_roi=self.clock_roi,
+                score_roi=self.score_roi,
+                score_rois=self.score_rois,
+                search_roi=self.search_roi,
+                candidate_count=1,
+                expanded_search=self.expanded_search,
+            )
+        if discontinuous:
+            return AutoClockDecision(
+                "searching",
+                "timeline_discontinuous",
+                search_roi=self.search_roi,
+                candidate_count=len(candidates),
+                expanded_search=self.expanded_search,
+            )
+        return AutoClockDecision(
+            "searching",
+            "searching",
+            search_roi=self.search_roi,
+            candidate_count=len(candidates),
+            expanded_search=self.expanded_search,
+        )
+
+    def observe_locked(
+        self, video_seconds: float, clock_texts: Sequence[str]
+    ) -> AutoClockDecision:
+        if self.clock_roi is None:
+            return AutoClockDecision(
+                "searching",
+                "auto_search_failed",
+                search_roi=self.search_roi,
+                expanded_search=self.expanded_search,
+            )
+        parsed = parse_clock_texts(clock_texts)
+        if parsed.clock_seconds is None or parsed.ambiguous:
+            self._locked_misses += 1
+            if self._locked_misses < self.maximum_misses:
+                return AutoClockDecision(
+                    "locked",
+                    "temporarily_hidden",
+                    clock_roi=self.clock_roi,
+                    score_roi=self.score_roi,
+                    score_rois=self.score_rois,
+                    search_roi=self.search_roi,
+                    miss_count=self._locked_misses,
+                    expanded_search=self.expanded_search,
+                )
+            self.expanded_search = True
+            self.clock_roi = None
+            self.score_roi = None
+            self.score_rois = ()
+            return AutoClockDecision(
+                "searching",
+                "auto_search_failed",
+                search_roi=self.search_roi,
+                miss_count=self._locked_misses,
+                expanded_search=True,
+            )
+        if (
+            self._locked_clock_seconds is not None
+            and self._locked_video_seconds is not None
+            and (
+                parsed.clock_seconds < self._locked_clock_seconds - 1
+                or parsed.clock_seconds - self._locked_clock_seconds
+                > max(4, round((video_seconds - self._locked_video_seconds) * 2.0) + 2)
+            )
+        ):
+            self._timeline_discontinuities += 1
+            return AutoClockDecision(
+                "locked",
+                "timeline_discontinuous",
+                clock_roi=self.clock_roi,
+                score_roi=self.score_roi,
+                score_rois=self.score_rois,
+                search_roi=self.search_roi,
+                miss_count=self._locked_misses,
+                expanded_search=self.expanded_search,
+            )
+        self._locked_clock_seconds = parsed.clock_seconds
+        self._locked_video_seconds = float(video_seconds)
+        self._locked_misses = 0
+        self._timeline_discontinuities = 0
+        return AutoClockDecision(
+            "locked",
+            "accepted",
+            clock_seconds=parsed.clock_seconds,
+            clock_roi=self.clock_roi,
+            score_roi=self.score_roi,
+            score_rois=self.score_rois,
+            search_roi=self.search_roi,
+            expanded_search=self.expanded_search,
+        )
+
+
 def frame_reading(
     frame_index: int,
     frame_seconds: float,
@@ -256,6 +1010,7 @@ def frame_reading(
         ),
         ambiguous_clock=parsed.ambiguous_clock,
         ambiguous_score=parsed.ambiguous_score,
+        observed_clock_seconds=parsed.clock_seconds,
     )
 
 
@@ -269,17 +1024,24 @@ def split_frame_reading(
     score_confidences: Iterable[float] = (),
     tracker: ClockContinuityStateMachine,
     period: str | int | None = None,
+    clock_visible: bool | None = None,
+    scoreboard_visible: bool | None = None,
 ) -> FrameReading:
     """Build one reading from independent clock and score recognition crops."""
     clock_values = tuple(str(text) for text in clock_texts if str(text).strip())
     score_values = tuple(str(text) for text in score_texts if str(text).strip())
     parsed_clock = parse_clock_texts(clock_values)
     parsed_score = parse_score_texts(score_values)
-    scoreboard_visible = bool(clock_values or score_values)
+    clock_is_visible = bool(clock_values) if clock_visible is None else bool(clock_visible)
+    visible = (
+        bool(clock_values or score_values)
+        if scoreboard_visible is None
+        else bool(scoreboard_visible)
+    )
     continuity = tracker.update(
         float(frame_seconds),
         clock_values,
-        scoreboard_visible=scoreboard_visible,
+        scoreboard_visible=clock_is_visible,
         period=period,
     )
     confidence_values = [
@@ -302,8 +1064,79 @@ def split_frame_reading(
         score_texts=score_values,
         continuity_status=continuity.status,
         continuity_reason=continuity.reason,
-        scoreboard_visible=scoreboard_visible,
+        scoreboard_visible=visible,
+        observed_clock_seconds=continuity.observed_clock_seconds,
     )
+
+
+def _clock_timeline_diagnostics(
+    readings: Sequence[FrameReading],
+) -> dict[str, Any]:
+    """Expose raw observations and every continuity correction/jump."""
+    observations: list[dict[str, Any]] = []
+    repairs: list[dict[str, Any]] = []
+    abnormal_jumps: list[dict[str, Any]] = []
+    previous_effective: FrameReading | None = None
+    for reading in readings:
+        observed = reading.observed_clock_seconds
+        effective = reading.clock_seconds
+        observation = {
+            "frame_index": reading.frame_index,
+            "frame_seconds": round(reading.frame_seconds, 3),
+            "clock_texts": list(reading.clock_texts),
+            "observed_clock_seconds": observed,
+            "observed_clock": _clock_text(observed),
+            "effective_clock_seconds": effective,
+            "effective_clock": _clock_text(effective),
+            "continuity_status": reading.continuity_status,
+            "continuity_reason": reading.continuity_reason,
+        }
+        observations.append(observation)
+        if reading.continuity_status == "repaired":
+            repairs.append(
+                {
+                    **observation,
+                    "correction_seconds": (
+                        effective - observed
+                        if effective is not None and observed is not None
+                        else None
+                    ),
+                }
+            )
+        if observed is not None and previous_effective is not None:
+            previous_clock = previous_effective.clock_seconds
+            if previous_clock is not None:
+                video_delta = reading.frame_seconds - previous_effective.frame_seconds
+                expected_clock = previous_clock + max(0, round(video_delta))
+                deviation = observed - expected_clock
+                maximum_deviation = max(3, round(max(0.0, video_delta) * 0.8) + 2)
+                if (
+                    video_delta <= 0
+                    or abs(deviation) > maximum_deviation
+                    or reading.continuity_reason == "clock_discontinuity"
+                ):
+                    abnormal_jumps.append(
+                        {
+                            "frame_index": reading.frame_index,
+                            "frame_seconds": round(reading.frame_seconds, 3),
+                            "previous_effective_clock_seconds": previous_clock,
+                            "observed_clock_seconds": observed,
+                            "expected_clock_seconds": expected_clock,
+                            "video_delta_seconds": round(video_delta, 3),
+                            "jump_deviation_seconds": deviation,
+                            "continuity_status": reading.continuity_status,
+                            "continuity_reason": reading.continuity_reason,
+                        }
+                    )
+        if effective is not None:
+            previous_effective = reading
+    return {
+        "clock_raw_observations": observations,
+        "clock_continuity_repairs": repairs,
+        "clock_continuity_repair_count": len(repairs),
+        "abnormal_clock_jumps": abnormal_jumps,
+        "abnormal_clock_jump_count": len(abnormal_jumps),
+    }
 
 
 def _base_diagnostics(
@@ -348,6 +1181,8 @@ def _base_diagnostics(
                 "clock_texts": list(reading.clock_texts),
                 "score_texts": list(reading.score_texts),
                 "clock": _clock_text(reading.clock_seconds),
+                "observed_clock_seconds": reading.observed_clock_seconds,
+                "observed_clock": _clock_text(reading.observed_clock_seconds),
                 "score": _score_text(reading.score),
                 "mean_confidence": (
                     round(reading.mean_confidence, 4)
@@ -361,6 +1196,7 @@ def _base_diagnostics(
             }
             for reading in readings
         ],
+        **_clock_timeline_diagnostics(readings),
     }
 
 
@@ -425,6 +1261,295 @@ def _raise_for_missing_scoreboard(
             "no scoreboard text was detected in the configured top-left ROI",
             diagnostics=diagnostics,
         )
+
+
+def _trustworthy_clock_reading(reading: FrameReading) -> bool:
+    """Return whether a continuity-cleaned clock can support second precision."""
+    return (
+        reading.clock_seconds is not None
+        and math.isfinite(reading.frame_seconds)
+        and not reading.ambiguous_clock
+        and reading.scoreboard_visible
+        and reading.continuity_status not in {"rejected", "repaired"}
+    )
+
+
+def _clock_segments(
+    readings: Sequence[FrameReading], *, sample_interval_seconds: float
+) -> list[list[FrameReading]]:
+    trusted = [reading for reading in readings if _trustworthy_clock_reading(reading)]
+    segments: list[list[FrameReading]] = []
+    maximum_video_gap = max(5.0, sample_interval_seconds * 3.1)
+    for reading in trusted:
+        previous = segments[-1][-1] if segments else None
+        starts_new_segment = previous is None
+        if previous is not None:
+            assert previous.clock_seconds is not None
+            assert reading.clock_seconds is not None
+            video_delta = reading.frame_seconds - previous.frame_seconds
+            clock_delta = reading.clock_seconds - previous.clock_seconds
+            maximum_clock_advance = video_delta + max(2.0, sample_interval_seconds)
+            starts_new_segment = (
+                video_delta <= 0
+                or video_delta > maximum_video_gap
+                or clock_delta < 0
+                or clock_delta > maximum_clock_advance
+                or reading.continuity_status == "resynchronized"
+            )
+        if starts_new_segment:
+            segments.append([reading])
+        else:
+            segments[-1].append(reading)
+    return segments
+
+
+def _locate_goal_second(
+    readings: Sequence[FrameReading],
+    *,
+    event_second: int,
+    candidate_start_seconds: float,
+    sample_interval_seconds: float,
+    diagnostics: dict[str, Any],
+) -> dict[str, Any]:
+    target_clock = _clock_text(event_second)
+    segments = _clock_segments(
+        readings,
+        sample_interval_seconds=sample_interval_seconds,
+    )
+    trusted_count = sum(len(segment) for segment in segments)
+    base = {
+        **diagnostics,
+        "target_clock": target_clock,
+        "target_clock_seconds": event_second,
+        "trusted_clock_frame_count": trusted_count,
+        "clock_continuity_segment_count": len(segments),
+    }
+    if not segments:
+        raise WorkerError(
+            "ocr_clock_unreadable",
+            f"no trustworthy match-clock readings were available for {target_clock}",
+            diagnostics={
+                **base,
+                "exact_second_failure_reason": "no_trustworthy_clock_readings",
+            },
+        )
+
+    candidates: list[_ClockSecondCandidate] = []
+    isolated_target_reading_count = 0
+    for segment_index, segment in enumerate(segments):
+        for reading in segment:
+            if reading.clock_seconds == event_second:
+                if len(segment) < 2:
+                    isolated_target_reading_count += 1
+                    continue
+                candidates.append(
+                    _ClockSecondCandidate(
+                        reading.frame_seconds,
+                        "paddleocr_exact_clock",
+                        "observed_second",
+                        segment_index,
+                        reading,
+                    )
+                )
+        for left, right in zip(segment, segment[1:]):
+            assert left.clock_seconds is not None
+            assert right.clock_seconds is not None
+            if not left.clock_seconds < event_second < right.clock_seconds:
+                continue
+            video_delta = right.frame_seconds - left.frame_seconds
+            clock_delta = right.clock_seconds - left.clock_seconds
+            # Paused or accelerated displays do not provide a defensible linear
+            # second mapping. Keep those cases on the existing fallback path.
+            interpolation_tolerance = max(1.5, sample_interval_seconds * 0.75)
+            if (
+                video_delta <= 0
+                or abs(clock_delta - video_delta) > interpolation_tolerance
+            ):
+                continue
+            fraction = (event_second - left.clock_seconds) / clock_delta
+            candidates.append(
+                _ClockSecondCandidate(
+                    left.frame_seconds + fraction * video_delta,
+                    "paddleocr_interpolated_clock",
+                    "interpolated_second",
+                    segment_index,
+                    left,
+                    right,
+                )
+            )
+
+    matching_segments = sorted({candidate.segment_index for candidate in candidates})
+    match_diagnostics = {
+        **base,
+        "isolated_target_reading_count": isolated_target_reading_count,
+    }
+    if len(matching_segments) > 1:
+        raise WorkerError(
+            "ocr_ambiguous",
+            f"the target match clock {target_clock} appeared in multiple disjoint intervals",
+            diagnostics={
+                **match_diagnostics,
+                "exact_second_failure_reason": "multiple_disjoint_occurrences",
+                "matching_occurrence_count": len(matching_segments),
+                "matching_frame_seconds": [
+                    round(candidate.frame_seconds, 3) for candidate in candidates
+                ],
+            },
+        )
+    if not candidates:
+        readable_clocks = [
+            reading.clock_seconds
+            for segment in segments
+            for reading in segment
+            if reading.clock_seconds is not None
+        ]
+        raise WorkerError(
+            "ocr_exact_second_not_found",
+            f"the target match clock {target_clock} was not observed or safely interpolated",
+            diagnostics={
+                **match_diagnostics,
+                "exact_second_failure_reason": "target_clock_not_found",
+                "trusted_clock_range": [
+                    _clock_text(min(readable_clocks)),
+                    _clock_text(max(readable_clocks)),
+                ],
+                "matching_occurrence_count": 0,
+            },
+        )
+
+    selected = min(candidates, key=lambda candidate: candidate.frame_seconds)
+    anchor = candidate_start_seconds + selected.frame_seconds
+    diagnostics.update(
+        {
+            "target_clock": target_clock,
+            "target_clock_seconds": event_second,
+            "trusted_clock_frame_count": trusted_count,
+            "clock_continuity_segment_count": len(segments),
+            "isolated_target_reading_count": isolated_target_reading_count,
+            "matching_occurrence_count": 1,
+            "exact_second_method": selected.method,
+            "exact_second_precision": selected.precision,
+            "target_frame_seconds": round(selected.frame_seconds, 3),
+            "interpolation_clock_bounds": (
+                [
+                    _clock_text(selected.left.clock_seconds),
+                    _clock_text(selected.right.clock_seconds),
+                ]
+                if selected.right is not None
+                else None
+            ),
+            "interpolation_frame_bounds": (
+                [
+                    round(selected.left.frame_seconds, 3),
+                    round(selected.right.frame_seconds, 3),
+                ]
+                if selected.right is not None
+                else None
+            ),
+        }
+    )
+    return {
+        "anchor_seconds": round(anchor, 3),
+        "method": selected.method,
+        "precision": selected.precision,
+        "location_kind": "match_clock_second",
+        "localization_quality": "exact",
+        "degraded": False,
+        "degradation_mode": None,
+        "degradation_reason": None,
+        "target_clock": target_clock,
+        "target_clock_seconds": event_second,
+        "requires_tdeed": False,
+        "diagnostics": diagnostics,
+    }
+
+
+def _locate_minute_boundary(
+    readings: Sequence[FrameReading],
+    *,
+    event_minute: int,
+    candidate_start_seconds: float,
+    sample_interval_seconds: float,
+    diagnostics: dict[str, Any],
+) -> dict[str, Any]:
+    """Locate the end boundary of the API event minute.
+
+    API minute M describes the running interval [(M-1):00, M:00]. The OCR
+    artifact therefore ends at M:00 and contains exactly the preceding minute.
+    """
+    target_second = event_minute * 60
+    try:
+        located = _locate_goal_second(
+            readings,
+            event_second=target_second,
+            candidate_start_seconds=candidate_start_seconds,
+            sample_interval_seconds=sample_interval_seconds,
+            diagnostics=diagnostics,
+        )
+    except WorkerError as exc:
+        if exc.kind == "ocr_invalid_request":
+            raise
+        raise WorkerError(
+            "ocr_minute_boundary_not_found",
+            f"the end boundary {_clock_text(target_second)} of API minute {event_minute} was not located",
+            diagnostics={
+                **exc.diagnostics,
+                "api_event_minute": event_minute,
+                "minute_window_start_clock": _clock_text(max(0, target_second - 60)),
+                "minute_window_end_clock": _clock_text(target_second),
+                "minute_boundary_failure": exc.as_dict(),
+            },
+        ) from exc
+    located.update({
+        "method": "paddleocr_minute_boundary",
+        "precision": "minute_boundary",
+        "location_kind": "match_clock_minute_boundary",
+        "api_event_minute": event_minute,
+        "minute_window_start_clock": _clock_text(max(0, target_second - 60)),
+        "minute_window_end_clock": _clock_text(target_second),
+    })
+    return located
+
+
+def _attach_exact_second_failure(
+    result: dict[str, Any],
+    error: WorkerError,
+    *,
+    degradation_mode: str,
+) -> dict[str, Any]:
+    failure = error.as_dict()
+    result["exact_second_error"] = failure
+    result["localization_quality"] = "degraded"
+    result["degraded"] = True
+    result["degradation_mode"] = degradation_mode
+    result["degradation_reason"] = failure
+    diagnostics = result.get("diagnostics")
+    if isinstance(diagnostics, dict):
+        diagnostics["exact_second_failure"] = failure
+        diagnostics["target_clock"] = error.diagnostics.get("target_clock")
+        diagnostics["exact_second_failure_reason"] = error.diagnostics.get(
+            "exact_second_failure_reason"
+        )
+    return result
+
+
+def _combined_goal_location_failure(
+    score_error: WorkerError, exact_second_error: WorkerError
+) -> WorkerError:
+    preferred = (
+        exact_second_error
+        if exact_second_error.kind == "ocr_ambiguous"
+        else score_error
+    )
+    return WorkerError(
+        preferred.kind,
+        preferred.message,
+        diagnostics={
+            **preferred.diagnostics,
+            "exact_second_failure": exact_second_error.as_dict(),
+            "score_transition_failure": score_error.as_dict(),
+        },
+    )
 
 
 def _locate_goal(
@@ -537,17 +1662,27 @@ def _locate_goal(
     }
 
 
+def _event_minute_candidates(event_minute: int) -> tuple[int, ...]:
+    """Accept the API minute and the preceding displayed minute."""
+    return tuple(
+        dict.fromkeys(
+            value for value in (event_minute - 1, event_minute) if value >= 0
+        )
+    )
+
+
 def _matching_clock_groups(
     readings: Sequence[FrameReading],
     *,
     event_minute: int,
     sample_interval_seconds: float,
-) -> list[list[FrameReading]]:
+) -> tuple[list[list[FrameReading]], list[dict[str, Any]]]:
+    event_minutes = set(_event_minute_candidates(event_minute))
     matching = [
         reading
         for reading in readings
         if reading.clock_seconds is not None
-        and reading.clock_seconds // 60 == event_minute
+        and reading.clock_seconds // 60 in event_minutes
     ]
     groups: list[list[FrameReading]] = []
     maximum_missing_gap = max(45.0, sample_interval_seconds * 3.1)
@@ -572,7 +1707,7 @@ def _matching_clock_groups(
             )
             or any(
                 item.clock_seconds is not None
-                and item.clock_seconds // 60 != event_minute
+                and item.clock_seconds // 60 not in event_minutes
                 for item in intervening_readable
             )
         )
@@ -580,7 +1715,83 @@ def _matching_clock_groups(
             groups.append([reading])
         else:
             groups[-1].append(reading)
-    return groups
+
+    # A low-resolution clock can be unreadable for most of a minute while the
+    # trusted observations on both sides still prove one continuous timeline.
+    # Bridge only that narrow case; repeated overlays and isolated false clocks
+    # must continue to produce separate groups.
+    maximum_bridge_gap = 75.0
+    maximum_projection_error = 3.0
+    merged_groups: list[list[FrameReading]] = []
+    bridged_gaps: list[dict[str, Any]] = []
+    for group in groups:
+        if not merged_groups:
+            merged_groups.append(group)
+            continue
+        left_group = merged_groups[-1]
+        left_anchor = next(
+            (
+                item
+                for item in reversed(left_group)
+                if _trustworthy_clock_reading(item)
+            ),
+            None,
+        )
+        right_anchor = next(
+            (item for item in group if _trustworthy_clock_reading(item)),
+            None,
+        )
+        boundary_gap = group[0].frame_seconds - left_group[-1].frame_seconds
+        intervening_non_target = any(
+            item.clock_seconds is not None
+            and item.clock_seconds // 60 not in event_minutes
+            and left_group[-1].frame_seconds
+            < item.frame_seconds
+            < group[0].frame_seconds
+            for item in readings
+        )
+        if left_anchor is not None and right_anchor is not None:
+            assert left_anchor.clock_seconds is not None
+            assert right_anchor.clock_seconds is not None
+            anchor_video_gap = (
+                right_anchor.frame_seconds - left_anchor.frame_seconds
+            )
+            clock_advance = (
+                right_anchor.clock_seconds - left_anchor.clock_seconds
+            )
+            projection_error = clock_advance - anchor_video_gap
+        else:
+            anchor_video_gap = math.inf
+            clock_advance = -1
+            projection_error = math.inf
+        can_bridge = (
+            boundary_gap > maximum_missing_gap
+            and len(left_group) >= 2
+            and len(group) >= 2
+            and 0 < anchor_video_gap <= maximum_bridge_gap
+            and clock_advance >= 0
+            and abs(projection_error) <= maximum_projection_error
+            and not intervening_non_target
+        )
+        if not can_bridge:
+            merged_groups.append(group)
+            continue
+        bridged_gaps.append(
+            {
+                "left_frame_index": left_anchor.frame_index,
+                "right_frame_index": right_anchor.frame_index,
+                "left_frame_seconds": round(left_anchor.frame_seconds, 3),
+                "right_frame_seconds": round(right_anchor.frame_seconds, 3),
+                "left_clock": _clock_text(left_anchor.clock_seconds),
+                "right_clock": _clock_text(right_anchor.clock_seconds),
+                "boundary_gap_seconds": round(boundary_gap, 3),
+                "anchor_video_gap_seconds": round(anchor_video_gap, 3),
+                "clock_advance_seconds": clock_advance,
+                "projection_error_seconds": round(projection_error, 3),
+            }
+        )
+        left_group.extend(group)
+    return merged_groups, bridged_gaps
 
 
 def _locate_card_interval(
@@ -591,12 +1802,10 @@ def _locate_card_interval(
     sample_interval_seconds: float,
     diagnostics: dict[str, Any],
 ) -> dict[str, Any]:
-    if any(reading.ambiguous_clock for reading in readings):
-        raise WorkerError(
-            "ocr_ambiguous",
-            "OCR produced conflicting match-clock values",
-            diagnostics=diagnostics,
-        )
+    # A single ambiguous detector result is treated as a missing sample. The
+    # continuity state machine may already have repaired the surrounding
+    # timeline, and rejecting the whole interval here would turn a normal
+    # low-resolution OCR glitch into a false fallback.
     clock_readings = [
         reading for reading in readings if reading.clock_seconds is not None
     ]
@@ -607,11 +1816,13 @@ def _locate_card_interval(
             "scoreboard text was found but no match clock could be parsed",
             diagnostics=diagnostics,
         )
-    groups = _matching_clock_groups(
+    groups, bridged_gaps = _matching_clock_groups(
         readings,
         event_minute=event_minute,
         sample_interval_seconds=sample_interval_seconds,
     )
+    diagnostics["bridged_matching_clock_gaps"] = bridged_gaps
+    event_minutes = set(_event_minute_candidates(event_minute))
     if len(groups) != 1:
         raise WorkerError(
             "ocr_ambiguous",
@@ -623,6 +1834,7 @@ def _locate_card_interval(
             diagnostics={
                 **diagnostics,
                 "api_event_minute": event_minute,
+                "api_event_minute_candidates": sorted(event_minutes),
                 "clock_range": [
                     _clock_text(min(clocks)),
                     _clock_text(max(clocks)),
@@ -631,10 +1843,30 @@ def _locate_card_interval(
             },
         )
     group = groups[0]
-    for previous, current in zip(group, group[1:]):
-        assert previous.clock_seconds is not None
+    filtered_group: list[FrameReading] = []
+    dropped_backward_outliers: list[dict[str, Any]] = []
+    for index, current in enumerate(group):
         assert current.clock_seconds is not None
-        if current.clock_seconds < previous.clock_seconds - 2:
+        previous = filtered_group[-1] if filtered_group else None
+        if (
+            previous is not None
+            and previous.clock_seconds is not None
+            and current.clock_seconds < previous.clock_seconds - 2
+        ):
+            next_clock = next(
+                (
+                    later.clock_seconds
+                    for later in group[index + 1 :]
+                    if later.clock_seconds is not None
+                ),
+                None,
+            )
+            if next_clock is not None and next_clock >= previous.clock_seconds - 2:
+                dropped_backward_outliers.append({
+                    "frame_index": current.frame_index,
+                    "clock": _clock_text(current.clock_seconds),
+                })
+                continue
             raise WorkerError(
                 "ocr_ambiguous",
                 "OCR match clocks move backwards inside the matching interval",
@@ -646,6 +1878,8 @@ def _locate_card_interval(
                     ],
                 },
             )
+        filtered_group.append(current)
+    group = filtered_group
     interval_start = candidate_start_seconds + group[0].frame_seconds
     interval_end = (
         candidate_start_seconds
@@ -655,8 +1889,10 @@ def _locate_card_interval(
     diagnostics.update(
         {
             "api_event_minute": event_minute,
+            "api_event_minute_candidates": sorted(event_minutes),
             "ocr_interval_clock_start": _clock_text(group[0].clock_seconds),
             "ocr_interval_clock_end": _clock_text(group[-1].clock_seconds),
+            "dropped_backward_clock_outliers": dropped_backward_outliers,
         }
     )
     return {
@@ -677,6 +1913,10 @@ def locate_from_readings(
     code = str(request.get("event_code") or "").upper().strip()
     if code not in SUPPORTED_EVENT_CODES:
         raise WorkerError("ocr_invalid_request", f"unsupported event code: {code!r}")
+    raw_clock_only = request.get("clock_only", False)
+    if not isinstance(raw_clock_only, bool):
+        raise WorkerError("ocr_invalid_request", "clock_only must be a boolean")
+    clock_only = raw_clock_only
     sample_interval = float(request.get("sample_interval_seconds", 1.0))
     candidate_start = float(request.get("candidate_start_seconds", 0.0))
     if sample_interval <= 0 or candidate_start < 0:
@@ -686,8 +1926,76 @@ def locate_from_readings(
         sample_interval_seconds=sample_interval,
         candidate_start_seconds=candidate_start,
     )
+    if clock_only:
+        diagnostics.update({"clock_only": True, "score_ocr_skipped": True})
+        raw_event_minute = request.get("event_minute")
+        if raw_event_minute is None or not str(raw_event_minute).strip():
+            raise WorkerError(
+                "ocr_invalid_request",
+                "event_minute is required when clock_only is enabled",
+                diagnostics=diagnostics,
+            )
     _raise_for_missing_scoreboard(ordered, diagnostics)
-    if code in {"G", "OG"}:
+    exact_second_error: WorkerError | None = None
+    event_second = request.get("event_second")
+    if code in GOAL_LIKE_EVENT_CODES and event_second is not None:
+        if isinstance(event_second, bool) or not isinstance(event_second, int):
+            raise WorkerError(
+                "ocr_invalid_request",
+                "event_second must be a cumulative integer second",
+                diagnostics={**diagnostics, "event_second": event_second},
+            )
+        if not 0 <= event_second <= MAX_REASONABLE_MATCH_MINUTE * 60 + 59:
+            raise WorkerError(
+                "ocr_invalid_request",
+                "event_second is outside the supported match clock range",
+                diagnostics={**diagnostics, "event_second": event_second},
+            )
+        try:
+            exact = _locate_goal_second(
+                ordered,
+                event_second=event_second,
+                candidate_start_seconds=candidate_start,
+                sample_interval_seconds=sample_interval,
+                diagnostics=dict(diagnostics),
+            )
+            if clock_only:
+                exact["clock_only"] = True
+            return exact
+        except WorkerError as exc:
+            if exc.kind == "ocr_invalid_request":
+                raise
+            exact_second_error = exc
+    if clock_only:
+        try:
+            boundary = _locate_minute_boundary(
+                ordered,
+                event_minute=parse_event_minute(raw_event_minute),
+                candidate_start_seconds=candidate_start,
+                sample_interval_seconds=sample_interval,
+                diagnostics=diagnostics,
+            )
+        except WorkerError as boundary_error:
+            if exact_second_error is None:
+                raise
+            raise WorkerError(
+                boundary_error.kind,
+                boundary_error.message,
+                diagnostics={
+                    **boundary_error.diagnostics,
+                    "exact_second_failure": exact_second_error.as_dict(),
+                    "minute_boundary_failure": boundary_error.as_dict(),
+                },
+            ) from boundary_error
+        if exact_second_error is not None:
+            _attach_exact_second_failure(
+                boundary,
+                exact_second_error,
+                degradation_mode="minute_boundary_fallback",
+            )
+        boundary["clock_only"] = True
+        return boundary
+    if code in GOAL_LIKE_EVENT_CODES:
         stable_frames = int(request.get("stable_frames", 2))
         anchor_lead_seconds = float(request.get("anchor_lead_seconds", 3.0))
         if stable_frames < 2:
@@ -697,9 +2005,44 @@ def locate_from_readings(
                 "ocr_invalid_request",
                 "anchor_lead_seconds must not be negative",
             )
-        target_score = parse_target_score(request.get("target_score"))
+        raw_target_score = request.get("target_score")
+        if not str(raw_target_score or "").strip():
+            event_minute = request.get("event_minute")
+            if exact_second_error is None:
+                raise WorkerError(
+                    "ocr_invalid_request",
+                    "target_score or event_second is required for goal-like events",
+                    diagnostics=diagnostics,
+                )
+            if event_minute is None or not str(event_minute).strip():
+                raise exact_second_error
+            try:
+                interval = _locate_card_interval(
+                    ordered,
+                    event_minute=parse_event_minute(event_minute),
+                    candidate_start_seconds=candidate_start,
+                    sample_interval_seconds=sample_interval,
+                    diagnostics=dict(diagnostics),
+                )
+            except WorkerError as interval_error:
+                raise WorkerError(
+                    exact_second_error.kind,
+                    exact_second_error.message,
+                    diagnostics={
+                        **exact_second_error.diagnostics,
+                        "minute_interval_failure": interval_error.as_dict(),
+                    },
+                ) from interval_error
+            interval["method"] = "paddleocr_goal_clock_interval"
+            _attach_exact_second_failure(
+                interval,
+                exact_second_error,
+                degradation_mode="minute_interval_fallback",
+            )
+            return interval
+        target_score = parse_target_score(raw_target_score)
         try:
-            return _locate_goal(
+            score_result = _locate_goal(
                 ordered,
                 target_score=target_score,
                 candidate_start_seconds=candidate_start,
@@ -708,6 +2051,13 @@ def locate_from_readings(
                 anchor_lead_seconds=anchor_lead_seconds,
                 diagnostics=diagnostics,
             )
+            if exact_second_error is not None:
+                _attach_exact_second_failure(
+                    score_result,
+                    exact_second_error,
+                    degradation_mode="score_transition_fallback",
+                )
+            return score_result
         except WorkerError as score_error:
             event_minute = request.get("event_minute")
             if (
@@ -719,7 +2069,11 @@ def locate_from_readings(
                 or event_minute is None
                 or not str(event_minute).strip()
             ):
-                raise
+                if exact_second_error is None:
+                    raise
+                raise _combined_goal_location_failure(
+                    score_error, exact_second_error
+                ) from score_error
             try:
                 interval = _locate_card_interval(
                     ordered,
@@ -729,17 +2083,28 @@ def locate_from_readings(
                     diagnostics=dict(diagnostics),
                 )
             except WorkerError:
-                raise score_error
+                if exact_second_error is None:
+                    raise score_error
+                raise _combined_goal_location_failure(
+                    score_error, exact_second_error
+                ) from score_error
             interval["method"] = "paddleocr_goal_clock_interval"
             interval["score_transition_error"] = score_error.as_dict()
+            if exact_second_error is not None:
+                _attach_exact_second_failure(
+                    interval,
+                    exact_second_error,
+                    degradation_mode="minute_interval_fallback",
+                )
             return interval
-    return _locate_card_interval(
+    interval = _locate_card_interval(
         ordered,
         event_minute=parse_event_minute(request.get("event_minute")),
         candidate_start_seconds=candidate_start,
         sample_interval_seconds=sample_interval,
         diagnostics=diagnostics,
     )
+    return interval
 
 
 def _extract_text_confidences(value: Any) -> list[tuple[str, float]]:
@@ -848,6 +2213,96 @@ def load_ocr_engine(language: str) -> Any:
             "ocr_model_unavailable",
             f"PaddleOCR could not be imported or initialized: {exc}",
         ) from exc
+
+
+_AUTO_DISCOVERY_ENGINE_LOCK = threading.RLock()
+_AUTO_DISCOVERY_ENGINES: dict[str, Any] = {}
+
+
+def load_auto_discovery_engine(
+    language: str,
+) -> Any:
+    """Load a detection-capable PaddleOCR pipeline for a small search batch."""
+    normalized = str(language or "en").strip() or "en"
+    with _AUTO_DISCOVERY_ENGINE_LOCK:
+        cached = _AUTO_DISCOVERY_ENGINES.get(normalized)
+        if cached is not None:
+            return cached
+        try:
+            with contextlib.redirect_stdout(sys.stderr):
+                from paddleocr import PaddleOCR
+
+                try:
+                    engine = PaddleOCR(
+                        lang=normalized,
+                        text_detection_model_name=os.environ.get(
+                            "GIF_OCR_DETECTION_MODEL", "PP-OCRv6_medium_det"
+                        ),
+                        text_recognition_model_name=os.environ.get(
+                            "GIF_OCR_RECOGNITION_MODEL", "PP-OCRv6_medium_rec"
+                        ),
+                        use_doc_orientation_classify=False,
+                        use_doc_unwarping=False,
+                        use_textline_orientation=False,
+                    )
+                except (TypeError, ValueError):
+                    # PaddleOCR v2 accepts the legacy constructor and still
+                    # returns text boxes in its standard OCR output shape.
+                    engine = PaddleOCR(
+                        lang=normalized,
+                        use_angle_cls=False,
+                        show_log=False,
+                    )
+        except Exception as exc:
+            raise WorkerError(
+                "ocr_model_unavailable",
+                f"PaddleOCR detection model could not be imported or initialized: {exc}",
+            ) from exc
+        _AUTO_DISCOVERY_ENGINES[normalized] = engine
+        return engine
+
+
+def detect_batch(
+    engine: Any,
+    frames: Sequence[Any],
+    *,
+    minimum_confidence: float,
+) -> list[list[DetectedText]]:
+    """Run the detection-capable engine once for a batch of search frames."""
+    if not frames:
+        return []
+    inputs = [
+        str(frame) if isinstance(frame, (PathLike, Path)) else frame
+        for frame in frames
+    ]
+    try:
+        with contextlib.redirect_stdout(sys.stderr):
+            if hasattr(engine, "predict"):
+                raw = engine.predict(inputs)
+            elif hasattr(engine, "ocr"):
+                try:
+                    raw = engine.ocr(inputs, cls=False)
+                except TypeError:
+                    raw = engine.ocr(inputs)
+            else:
+                raise AttributeError("PaddleOCR detection engine has no predict/ocr method")
+            per_frame = _split_batch_output(raw, len(inputs))
+    except WorkerError:
+        raise
+    except Exception as exc:
+        raise WorkerError(
+            "ocr_inference_failed",
+            f"PaddleOCR detection batch inference failed: {exc}",
+            diagnostics={"batch_size": len(inputs), "stage": "auto_search"},
+        ) from exc
+    return [
+        [
+            detected
+            for detected in _extract_detected_texts(raw_result)
+            if detected.confidence >= minimum_confidence
+        ]
+        for raw_result in per_frame
+    ]
 
 
 def recognize_frame(
@@ -1382,6 +2837,100 @@ def _resolve_worker_profile(value: Any) -> ScoreboardProfile:
         ) from exc
 
 
+def extract_profile_clock_frames(
+    candidate_path: Path,
+    output_dir: Path,
+    *,
+    ffmpeg: str,
+    sample_interval_seconds: float,
+    profile: ScoreboardProfile,
+    maximum_frames: int = 300,
+    deadline_monotonic: float | None = None,
+) -> tuple[list[Path], dict[str, Any]]:
+    """Extract only the clock ROI for an explicit clock-only request."""
+    frame_width, frame_height = probe_video_dimensions(
+        candidate_path,
+        ffmpeg=ffmpeg,
+        timeout_seconds=_remaining_seconds(
+            deadline_monotonic,
+            stage="ffprobe",
+        ),
+    )
+    try:
+        clock_x1, clock_y1, clock_x2, clock_y2 = profile.scaled_rois(
+            frame_width, frame_height
+        )["clock_roi"]
+    except ScoreboardOcrError as exc:
+        raise WorkerError(
+            exc.kind,
+            exc.message,
+            diagnostics=exc.diagnostics,
+        ) from exc
+    frame_rate = 1.0 / sample_interval_seconds
+    clock_pattern = output_dir / "clock_only_%06d.png"
+    command = [
+        ffmpeg,
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(candidate_path),
+        "-an",
+        "-vf",
+        (
+            f"fps={frame_rate:.8f},"
+            f"crop={clock_x2 - clock_x1}:{clock_y2 - clock_y1}:"
+            f"{clock_x1}:{clock_y1},scale=iw*3:ih*3:flags=lanczos"
+        ),
+        "-frames:v",
+        str(maximum_frames),
+        str(clock_pattern),
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            text=True,
+            capture_output=True,
+            timeout=_remaining_seconds(
+                deadline_monotonic,
+                stage="frame_extraction",
+            ),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise WorkerError(
+            "inference_timeout",
+            "FFmpeg timed out while extracting clock crops",
+            diagnostics={"stage": "frame_extraction"},
+        ) from exc
+    except OSError as exc:
+        raise WorkerError(
+            "ocr_model_unavailable",
+            f"cannot start FFmpeg for clock extraction: {exc}",
+        ) from exc
+    if completed.returncode != 0:
+        raise WorkerError(
+            "ocr_frame_extraction_failed",
+            "FFmpeg could not extract the configured clock ROI",
+            diagnostics={"ffmpeg_stderr": (completed.stderr or "")[-2000:]},
+        )
+    clock_frames = sorted(output_dir.glob("clock_only_*.png"))
+    if not clock_frames:
+        raise WorkerError(
+            "scoreboard_missing",
+            "the candidate video did not produce configured clock crops",
+        )
+    return clock_frames, {
+        "profile_id": profile.profile_id,
+        "frame_resolution": [frame_width, frame_height],
+        "clock_roi": [clock_x1, clock_y1, clock_x2, clock_y2],
+        "score_roi": None,
+        "clock_only": True,
+        "score_ocr_skipped": True,
+    }
+
+
 def extract_profile_frames(
     candidate_path: Path,
     output_dir: Path,
@@ -1505,28 +3054,41 @@ def extract_scoreboard_frames(
     roi_height_ratio: float,
     maximum_frames: int = 300,
     timeout_seconds: float | None = None,
+    output_prefix: str = "scoreboard",
+    start_seconds: float = 0.0,
 ) -> list[Path]:
     frame_rate = 1.0 / sample_interval_seconds
     crop = (
         f"crop=trunc(iw*{roi_width_ratio:.6f}/2)*2:"
         f"trunc(ih*{roi_height_ratio:.6f}/2)*2:0:0"
     )
-    output_pattern = output_dir / "scoreboard_%06d.png"
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", output_prefix):
+        raise ValueError("output_prefix contains unsupported characters")
+    output_pattern = output_dir / f"{output_prefix}_%06d.png"
+    if start_seconds < 0:
+        raise ValueError("start_seconds must not be negative")
     command = [
         ffmpeg,
         "-nostdin",
         "-hide_banner",
         "-loglevel",
         "error",
-        "-i",
-        str(candidate_path),
-        "-an",
-        "-vf",
-        f"fps={frame_rate:.8f},{crop},scale=iw*3:ih*3:flags=lanczos",
-        "-frames:v",
-        str(maximum_frames),
-        str(output_pattern),
     ]
+    if start_seconds > 0:
+        command.extend(["-ss", f"{start_seconds:.6f}"])
+    command.extend(
+        [
+            "-i",
+            str(candidate_path),
+            "-an",
+            "-vf",
+            f"fps={frame_rate:.8f},{crop},"
+            f"scale=iw*{AUTO_SEARCH_SCALE}:ih*{AUTO_SEARCH_SCALE}:flags=lanczos",
+            "-frames:v",
+            str(maximum_frames),
+            str(output_pattern),
+        ]
+    )
     try:
         completed = subprocess.run(
             command,
@@ -1552,13 +3114,472 @@ def extract_scoreboard_frames(
             "FFmpeg could not extract scoreboard frames",
             diagnostics={"ffmpeg_stderr": (completed.stderr or "")[-2000:]},
         )
-    frames = sorted(output_dir.glob("scoreboard_*.png"))
+    frames = sorted(output_dir.glob(f"{output_prefix}_*.png"))
     if not frames:
         raise WorkerError(
             "scoreboard_missing",
             "the candidate video did not produce any scoreboard frames",
         )
     return frames
+
+
+def _integer_roi(bbox: BBox, frame_width: int, frame_height: int) -> tuple[int, int, int, int]:
+    x1 = max(0, min(frame_width - 1, math.floor(bbox[0])))
+    y1 = max(0, min(frame_height - 1, math.floor(bbox[1])))
+    x2 = max(x1 + 1, min(frame_width, math.ceil(bbox[2])))
+    y2 = max(y1 + 1, min(frame_height, math.ceil(bbox[3])))
+    return x1, y1, x2, y2
+
+
+def extract_auto_roi_frames(
+    candidate_path: Path,
+    output_dir: Path,
+    *,
+    ffmpeg: str,
+    sample_interval_seconds: float,
+    frame_width: int,
+    frame_height: int,
+    clock_roi: BBox,
+    score_roi: BBox | None,
+    score_rois: Sequence[BBox] | None = None,
+    maximum_frames: int,
+    deadline_monotonic: float | None,
+    output_prefix: str = "auto",
+) -> tuple[list[Path], list[str], dict[str, Any]]:
+    """Extract a locked automatic clock ROI and an optional independent score ROI."""
+    clock = _integer_roi(clock_roi, frame_width, frame_height)
+    raw_score_rois = list(score_rois or ())
+    if not raw_score_rois and score_roi is not None:
+        raw_score_rois = [score_roi]
+    scores = [
+        _integer_roi(roi, frame_width, frame_height)
+        for roi in raw_score_rois
+    ]
+    frame_rate = 1.0 / sample_interval_seconds
+    clock_x1, clock_y1, clock_x2, clock_y2 = clock
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", output_prefix):
+        raise ValueError("output_prefix contains unsupported characters")
+    clock_pattern = output_dir / f"{output_prefix}_clock_%06d.png"
+    command = [
+        ffmpeg,
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(candidate_path),
+        "-an",
+    ]
+    if not scores:
+        command.extend(
+            [
+                "-vf",
+                (
+                    f"fps={frame_rate:.8f},"
+                    f"crop={clock_x2 - clock_x1}:{clock_y2 - clock_y1}:{clock_x1}:{clock_y1},"
+                    "scale=iw*3:ih*3:flags=lanczos"
+                ),
+                "-frames:v",
+                str(maximum_frames),
+                str(clock_pattern),
+            ]
+        )
+    else:
+        split_labels = ["clock_source", *[f"score_source_{index}" for index in range(len(scores))]]
+        filter_graph = (
+            f"[0:v]fps={frame_rate:.8f},split={len(split_labels)}"
+            + "".join(f"[{label}]" for label in split_labels)
+            + ";"
+            + f"[clock_source]crop={clock_x2 - clock_x1}:{clock_y2 - clock_y1}:"
+            + f"{clock_x1}:{clock_y1},scale=iw*3:ih*3:flags=lanczos[clock];"
+        )
+        for index, (score_x1, score_y1, score_x2, score_y2) in enumerate(scores):
+            filter_graph += (
+                f"[score_source_{index}]crop={score_x2 - score_x1}:{score_y2 - score_y1}:"
+                f"{score_x1}:{score_y1},scale=iw*3:ih*3:flags=lanczos[score_{index}];"
+            )
+        command.extend(["-filter_complex", filter_graph.rstrip(";")])
+        command.extend(["-map", "[clock]", "-frames:v", str(maximum_frames), str(clock_pattern)])
+        for index in range(len(scores)):
+            score_pattern = output_dir / f"{output_prefix}_score_{index}_%06d.png"
+            command.extend(["-map", f"[score_{index}]", "-frames:v", str(maximum_frames), str(score_pattern)])
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            text=True,
+            capture_output=True,
+            timeout=_remaining_seconds(deadline_monotonic, stage="frame_extraction"),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise WorkerError(
+            "inference_timeout",
+            "FFmpeg timed out while extracting automatic clock crops",
+            diagnostics={"stage": "frame_extraction"},
+        ) from exc
+    except OSError as exc:
+        raise WorkerError(
+            "ocr_model_unavailable",
+            f"cannot start FFmpeg for automatic scoreboard extraction: {exc}",
+        ) from exc
+    if completed.returncode != 0:
+        raise WorkerError(
+            "ocr_frame_extraction_failed",
+            "FFmpeg could not extract the automatically discovered clock ROI",
+            diagnostics={"ffmpeg_stderr": (completed.stderr or "")[-2000:]},
+        )
+    clock_frames = sorted(output_dir.glob(f"{output_prefix}_clock_*.png"))
+    if not clock_frames:
+        raise WorkerError(
+            "scoreboard_missing",
+            "the automatic clock ROI did not produce any frames",
+        )
+    if not scores:
+        return clock_frames, ["clock"] * len(clock_frames), {
+            "clock_roi": list(clock),
+            "score_roi": None,
+        }
+    score_frames_by_roi = [
+        sorted(output_dir.glob(f"{output_prefix}_score_{index}_*.png"))
+        for index in range(len(scores))
+    ]
+    if any(len(score_frames) != len(clock_frames) for score_frames in score_frames_by_roi):
+        raise WorkerError(
+            "ocr_frame_extraction_failed",
+            "automatic clock and score crops are not aligned",
+            diagnostics={
+                "clock_frame_count": len(clock_frames),
+                "score_frame_counts": [len(items) for items in score_frames_by_roi],
+            },
+        )
+    paths: list[Path] = []
+    kinds: list[str] = []
+    for frame_index, clock_frame in enumerate(clock_frames):
+        paths.append(clock_frame)
+        kinds.append("clock")
+        for score_frames in score_frames_by_roi:
+            paths.append(score_frames[frame_index])
+            kinds.append("score")
+    return paths, kinds, {
+        "clock_roi": list(clock),
+        "score_roi": list(scores[0]) if scores else None,
+        "score_rois": [list(roi) for roi in scores],
+    }
+
+
+def _map_search_detections(
+    detections: Sequence[DetectedText],
+    *,
+    search_roi: BBox,
+    scale: float = AUTO_SEARCH_SCALE,
+) -> list[DetectedText]:
+    offset_x, offset_y = search_roi[0], search_roi[1]
+    return [
+        DetectedText(
+            detected.text,
+            detected.confidence,
+            (
+                offset_x + detected.bbox[0] / scale,
+                offset_y + detected.bbox[1] / scale,
+                offset_x + detected.bbox[2] / scale,
+                offset_y + detected.bbox[3] / scale,
+            ),
+        )
+        for detected in detections
+    ]
+
+
+def _search_auto_clock_frames(
+    tracker: AutoClockTracker,
+    frames: Sequence[Path],
+    *,
+    detector: Any,
+    minimum_confidence: float,
+    sample_interval_seconds: float,
+    maximum_search_frames: int = 60,
+    start_frame_index: int = 0,
+) -> tuple[AutoClockDecision | None, list[dict[str, Any]]]:
+    decisions: list[dict[str, Any]] = []
+    limited = frames[:maximum_search_frames]
+    for offset in range(0, len(limited), AUTO_SEARCH_BATCH_FRAMES):
+        batch = limited[offset : offset + AUTO_SEARCH_BATCH_FRAMES]
+        with _AUTO_DISCOVERY_ENGINE_LOCK:
+            detected_batch = detect_batch(
+                detector,
+                batch,
+                minimum_confidence=minimum_confidence,
+            )
+        for batch_index, detections in enumerate(detected_batch):
+            frame_index = start_frame_index + offset + batch_index
+            mapped = _map_search_detections(
+                detections,
+                search_roi=tracker.search_roi,
+            )
+            decision = tracker.observe_search(
+                frame_index,
+                frame_index * sample_interval_seconds,
+                mapped,
+            )
+            decisions.append({"frame_index": frame_index, **decision.as_dict()})
+            if decision.status in {"locked", "ambiguous"}:
+                return decision, decisions
+    return None, decisions
+
+
+def discover_auto_clock(
+    candidate_path: Path,
+    output_dir: Path,
+    *,
+    ffmpeg: str,
+    language: str,
+    sample_interval_seconds: float,
+    minimum_confidence: float,
+    maximum_frames: int,
+    deadline_monotonic: float | None,
+    detector: Any | None = None,
+    clock_only: bool = False,
+) -> tuple[AutoClockTracker, dict[str, Any]]:
+    """Discover and validate a clock bbox, expanding from top-left when needed."""
+    frame_width, frame_height = probe_video_dimensions(
+        candidate_path,
+        ffmpeg=ffmpeg,
+        timeout_seconds=_remaining_seconds(deadline_monotonic, stage="ffprobe"),
+    )
+    if detector is None:
+        detector = load_auto_discovery_engine(language)
+
+    attempts: list[dict[str, Any]] = []
+    for expanded, width_ratio, prefix in (
+        (False, AUTO_SEARCH_WIDTH_RATIO, "auto_search_left"),
+        (True, 1.0, "auto_search_top"),
+    ):
+        frames = extract_scoreboard_frames(
+            candidate_path,
+            output_dir,
+            ffmpeg=ffmpeg,
+            sample_interval_seconds=sample_interval_seconds,
+            roi_width_ratio=width_ratio,
+            roi_height_ratio=AUTO_SEARCH_HEIGHT_RATIO,
+            maximum_frames=min(maximum_frames, 60),
+            timeout_seconds=_remaining_seconds(
+                deadline_monotonic, stage="auto_search_extraction"
+            ),
+            output_prefix=prefix,
+        )
+        tracker = AutoClockTracker(frame_width, frame_height, clock_only=clock_only)
+        tracker.expanded_search = expanded
+        decision, frame_decisions = _search_auto_clock_frames(
+            tracker,
+            frames,
+            detector=detector,
+            minimum_confidence=minimum_confidence,
+            sample_interval_seconds=sample_interval_seconds,
+            maximum_search_frames=min(maximum_frames, 60),
+        )
+        attempts.append(
+            {
+                "expanded_search": expanded,
+                "search_roi": list(tracker.search_roi),
+                "searched_frame_count": len(frame_decisions),
+                "decisions": frame_decisions[-10:],
+            }
+        )
+        if decision is not None and decision.status == "ambiguous":
+            raise WorkerError(
+                "ocr_ambiguous",
+                "automatic clock search found multiple stable clock candidates",
+                diagnostics={
+                    "auto_clock": {
+                        **decision.as_dict(),
+                        "attempts": attempts,
+                    }
+                },
+            )
+        if decision is not None and decision.status == "locked":
+            return tracker, {
+                **decision.as_dict(),
+                "frame_resolution": [frame_width, frame_height],
+                "attempts": attempts,
+            }
+
+    final_reason = "auto_search_failed"
+    if any(
+        item.get("reason") == "timeline_discontinuous"
+        for attempt in attempts
+        for item in attempt["decisions"]
+    ):
+        final_reason = "timeline_discontinuous"
+    raise WorkerError(
+        "ocr_clock_unreadable" if final_reason == "timeline_discontinuous" else "scoreboard_missing",
+        "automatic clock search could not validate one stable match clock",
+        diagnostics={
+            "auto_clock": {
+                "status": "failed",
+                "reason": final_reason,
+                "attempts": attempts,
+            }
+        },
+    )
+
+
+def _first_clock_missing_run(
+    recognized: Sequence[tuple[list[str], list[float]]],
+    kinds: Sequence[str],
+    *,
+    minimum_length: int = AUTO_REACQUIRE_MISSING_FRAMES,
+) -> int | None:
+    clock_indices = [index for index, kind in enumerate(kinds) if kind == "clock"]
+    run_start: int | None = None
+    run_length = 0
+    for frame_index, result_index in enumerate(clock_indices):
+        texts = recognized[result_index][0]
+        missing = parse_clock_texts(texts).clock_seconds is None
+        if missing:
+            run_start = frame_index if run_start is None else run_start
+            run_length += 1
+            if run_length >= minimum_length:
+                return run_start
+        else:
+            run_start = None
+            run_length = 0
+    return None
+
+
+def _auto_results_by_frame(
+    recognized: Sequence[tuple[list[str], list[float]]],
+    kinds: Sequence[str],
+) -> list[dict[str, tuple[list[str], list[float]]]]:
+    if len(recognized) != len(kinds):
+        raise ValueError("recognized results and kinds must have equal lengths")
+    frames: list[dict[str, tuple[list[str], list[float]]]] = []
+    current: dict[str, tuple[list[str], list[float]]] | None = None
+    for kind, result in zip(kinds, recognized):
+        if kind == "clock":
+            current = {"clock": result}
+            frames.append(current)
+        elif kind == "score" and current is not None:
+            previous = current.get("score")
+            if previous is None:
+                current["score"] = result
+            else:
+                current["score"] = (
+                    [*previous[0], *result[0]],
+                    [*previous[1], *result[1]],
+                )
+        else:
+            raise ValueError("automatic OCR results are not clock/score aligned")
+    return frames
+
+
+def _flatten_auto_results(
+    frames: Sequence[Mapping[str, tuple[list[str], list[float]]]],
+) -> tuple[list[tuple[list[str], list[float]]], list[str]]:
+    paired = any("score" in frame for frame in frames)
+    recognized: list[tuple[list[str], list[float]]] = []
+    kinds: list[str] = []
+    for frame in frames:
+        recognized.append(frame.get("clock", ([], [])))
+        kinds.append("clock")
+        if paired:
+            recognized.append(frame.get("score", ([], [])))
+            kinds.append("score")
+    return recognized, kinds
+
+
+def _merge_auto_results(
+    primary: Sequence[Mapping[str, tuple[list[str], list[float]]]],
+    recovered: Sequence[Mapping[str, tuple[list[str], list[float]]]],
+) -> list[dict[str, tuple[list[str], list[float]]]]:
+    """Use a re-acquired ROI only for frames the original ROI cannot parse.
+
+    Scoreboards can move briefly during a goal/replay graphic and then return
+    to their original position. A whole-tail ROI replacement would therefore
+    turn valid readings before or after the graphic into false gaps.
+    """
+    if len(primary) != len(recovered):
+        raise ValueError("automatic OCR recovery results must have equal lengths")
+
+    def usable_clock(result: tuple[list[str], list[float]] | None) -> bool:
+        if result is None:
+            return False
+        parsed = parse_clock_texts(result[0])
+        return parsed.clock_seconds is not None and not parsed.ambiguous
+
+    def usable_score(result: tuple[list[str], list[float]] | None) -> bool:
+        if result is None:
+            return False
+        parsed = parse_score_texts(result[0])
+        return parsed.score is not None and not parsed.ambiguous
+
+    merged: list[dict[str, tuple[list[str], list[float]]]] = []
+    for old, new in zip(primary, recovered):
+        frame: dict[str, tuple[list[str], list[float]]] = {}
+        old_clock = old.get("clock")
+        new_clock = new.get("clock")
+        frame["clock"] = (
+            old_clock
+            if usable_clock(old_clock) or not usable_clock(new_clock)
+            else new_clock
+        )
+        old_score = old.get("score")
+        new_score = new.get("score")
+        if old_score is not None or new_score is not None:
+            frame["score"] = (
+                old_score
+                if usable_score(old_score) or not usable_score(new_score)
+                else (new_score or ([], []))
+            )
+        merged.append(frame)
+    return merged
+
+
+def _recover_auto_clock(
+    candidate_path: Path,
+    output_dir: Path,
+    *,
+    ffmpeg: str,
+    language: str,
+    sample_interval_seconds: float,
+    minimum_confidence: float,
+    maximum_frames: int,
+    start_frame_index: int,
+    frame_width: int,
+    frame_height: int,
+    deadline_monotonic: float | None,
+    clock_only: bool = False,
+) -> tuple[AutoClockTracker | None, dict[str, Any]]:
+    """Re-search a missing run using the expanded top-of-frame region."""
+    frames = extract_scoreboard_frames(
+        candidate_path,
+        output_dir,
+        ffmpeg=ffmpeg,
+        sample_interval_seconds=sample_interval_seconds,
+        roi_width_ratio=1.0,
+        roi_height_ratio=AUTO_SEARCH_HEIGHT_RATIO,
+        maximum_frames=min(60, max(1, maximum_frames - start_frame_index)),
+        timeout_seconds=_remaining_seconds(deadline_monotonic, stage="auto_research_extraction"),
+        output_prefix="auto_research_top",
+        start_seconds=start_frame_index * sample_interval_seconds,
+    )
+    tracker = AutoClockTracker(frame_width, frame_height, clock_only=clock_only)
+    tracker.expanded_search = True
+    detector = load_auto_discovery_engine(language)
+    decision, decisions = _search_auto_clock_frames(
+        tracker,
+        frames,
+        detector=detector,
+        minimum_confidence=minimum_confidence,
+        sample_interval_seconds=sample_interval_seconds,
+        start_frame_index=start_frame_index,
+    )
+    diagnostics = {
+        "start_frame_index": start_frame_index,
+        "status": decision.status if decision is not None else "searching",
+        "reason": decision.reason if decision is not None else "auto_search_failed",
+        "decision_count": len(decisions),
+        "decisions": decisions[-10:],
+    }
+    return (tracker if decision is not None and decision.status == "locked" else None), diagnostics
 
 
 def _recognize_paths(
@@ -1585,6 +3606,17 @@ def _recognize_paths(
     return recognized, failed_paths
 
 
+def _frame_indices_for_kinds(kinds: Sequence[str]) -> list[int]:
+    """Map interleaved clock/score crops back to their sampled video frame."""
+    frame_indices: list[int] = []
+    frame_index = -1
+    for kind in kinds:
+        if kind == "clock":
+            frame_index += 1
+        frame_indices.append(max(0, frame_index))
+    return frame_indices
+
+
 def _recognize_paths_shared(
     batch_worker: BatchOcrWorker,
     paths: Sequence[Path],
@@ -1596,6 +3628,7 @@ def _recognize_paths_shared(
     sample_interval: float,
     minimum_confidence: float,
     deadline_monotonic: float,
+    source_frame_indices: Sequence[int] | None = None,
 ) -> tuple[list[tuple[list[str], list[float]]], list[str]]:
     if len(paths) != len(kinds):
         raise ValueError("paths and kinds must have equal lengths")
@@ -1604,7 +3637,13 @@ def _recognize_paths_shared(
     recognized: list[tuple[list[str], list[float]]] = [
         ([], []) for _path in paths
     ]
-    paired_crops = "score" in kinds
+    frame_indices = (
+        [int(value) for value in source_frame_indices]
+        if source_frame_indices is not None
+        else _frame_indices_for_kinds(kinds)
+    )
+    if len(frame_indices) != len(paths) or any(value < 0 for value in frame_indices):
+        raise ValueError("source frame indices must align with OCR paths")
 
     def collect_oldest() -> None:
         index, future = pending.pop(0)
@@ -1628,13 +3667,13 @@ def _recognize_paths_shared(
                 stage="ocr_queue",
             )
             assert remaining is not None
-            frame_index = index // 2 if paired_crops else index
+            crop_frame_index = frame_indices[index]
             while True:
                 try:
                     future = batch_worker.submit(
                         match_id=match_id,
                         video_pts=(
-                            candidate_start_seconds + frame_index * sample_interval
+                            candidate_start_seconds + crop_frame_index * sample_interval
                         ),
                         kind=kind,
                         profile=profile_id,
@@ -1704,6 +3743,48 @@ def _request_period(request: Mapping[str, Any]) -> int | str | None:
         return None
 
 
+def _profile_clock_readings(
+    recognized: Sequence[tuple[list[str], list[float]]],
+    *,
+    profile: ScoreboardProfile,
+    sample_interval: float,
+    period: int | str | None,
+) -> tuple[list[FrameReading], list[dict[str, Any]]]:
+    """Build one continuity-aware reading per clock crop, with no score OCR."""
+    tracker = ClockContinuityStateMachine(profile)
+    readings: list[FrameReading] = []
+    continuity_diagnostics: list[dict[str, Any]] = []
+    for frame_index, (clock_texts, clock_confidences) in enumerate(recognized):
+        reading = split_frame_reading(
+            frame_index,
+            frame_index * sample_interval,
+            clock_texts,
+            (),
+            clock_confidences=clock_confidences,
+            tracker=tracker,
+            period=period,
+            # The extracted crop exists even when OCR misses one frame. This
+            # lets the continuity state machine repair a bounded short gap.
+            clock_visible=True,
+            scoreboard_visible=bool(clock_texts),
+        )
+        readings.append(reading)
+        continuity_diagnostics.append(
+            {
+                "frame_index": reading.frame_index,
+                "video_seconds": reading.frame_seconds,
+                "observed_clock_seconds": reading.observed_clock_seconds,
+                "clock_seconds": reading.clock_seconds,
+                "status": reading.continuity_status,
+                "reason": reading.continuity_reason,
+                "clock_texts": list(reading.clock_texts),
+                "score_texts": [],
+                "scoreboard_visible": reading.scoreboard_visible,
+            }
+        )
+    return readings, continuity_diagnostics
+
+
 def _profile_readings(
     recognized: Sequence[tuple[list[str], list[float]]],
     *,
@@ -1733,6 +3814,7 @@ def _profile_readings(
             {
                 "frame_index": reading.frame_index,
                 "video_seconds": reading.frame_seconds,
+                "observed_clock_seconds": reading.observed_clock_seconds,
                 "clock_seconds": reading.clock_seconds,
                 "status": reading.continuity_status,
                 "reason": reading.continuity_reason,
@@ -1742,6 +3824,326 @@ def _profile_readings(
             }
         )
     return readings, continuity_diagnostics
+
+
+def _auto_readings(
+    recognized: Sequence[tuple[list[str], list[float]]],
+    *,
+    kinds: Sequence[str],
+    sample_interval: float,
+    period: int | str | None,
+    clock_only: bool = False,
+) -> tuple[list[FrameReading], list[dict[str, Any]]]:
+    """Parse auto-discovered clock and score crops as independent streams."""
+    if len(recognized) != len(kinds):
+        raise ValueError("recognized results and crop kinds must have equal lengths")
+    frames = _auto_results_by_frame(recognized, kinds)
+    tracker = ClockContinuityStateMachine(second_half_clock_mode="auto")
+    readings: list[FrameReading] = []
+    diagnostics: list[dict[str, Any]] = []
+    for frame_index, frame in enumerate(frames):
+        clock_texts, clock_confidences = frame.get("clock", ([], []))
+        score_texts, score_confidences = frame.get("score", ([], []))
+        reading = split_frame_reading(
+            frame_index,
+            frame_index * sample_interval,
+            clock_texts,
+            score_texts,
+            clock_confidences=clock_confidences,
+            score_confidences=score_confidences,
+            tracker=tracker,
+            period=period,
+            clock_visible=(True if clock_only else bool(clock_texts)),
+            scoreboard_visible=bool(clock_texts or score_texts),
+        )
+        readings.append(reading)
+        diagnostics.append(
+            {
+                "frame_index": reading.frame_index,
+                "video_seconds": reading.frame_seconds,
+                "observed_clock_seconds": reading.observed_clock_seconds,
+                "clock_seconds": reading.clock_seconds,
+                "status": reading.continuity_status,
+                "reason": reading.continuity_reason,
+                "clock_texts": list(reading.clock_texts),
+                "score_texts": list(reading.score_texts),
+                "scoreboard_visible": reading.scoreboard_visible,
+            }
+        )
+    return readings, diagnostics
+
+
+def _recognize_request_paths(
+    frames: Sequence[Path],
+    crop_kinds: Sequence[str],
+    *,
+    engine: Any | None,
+    batch_worker: BatchOcrWorker | None,
+    request: Mapping[str, Any],
+    profile_id: str,
+    sample_interval: float,
+    minimum_confidence: float,
+    inference_batch_size: int,
+    deadline_monotonic: float | None,
+    source_frame_indices: Sequence[int] | None = None,
+) -> tuple[list[tuple[list[str], list[float]]], list[str]]:
+    if batch_worker is not None:
+        return _recognize_paths_shared(
+            batch_worker,
+            frames,
+            kinds=crop_kinds,
+            match_id=str(request.get("match_id") or Path(str(request["candidate_path"])).parent.name),
+            profile_id=profile_id,
+            candidate_start_seconds=float(request.get("candidate_start_seconds", 0.0)),
+            sample_interval=sample_interval,
+            minimum_confidence=minimum_confidence,
+            deadline_monotonic=(
+                deadline_monotonic
+                if deadline_monotonic is not None
+                else time.monotonic() + 3600.0
+            ),
+            source_frame_indices=source_frame_indices,
+        )
+    assert engine is not None
+    return _recognize_paths(
+        engine,
+        frames,
+        minimum_confidence=minimum_confidence,
+        batch_size=inference_batch_size,
+    )
+
+
+def _canonicalize_clock_text(text: str) -> str:
+    translated = str(text).upper().translate(_CLOCK_CHARACTER_TRANSLATION)
+    filtered = "".join(
+        character if character in _ALLOWED_CLOCK_CHARACTERS else " "
+        for character in translated
+    )
+    return " ".join(filtered.split())
+
+
+def _normalize_clock_recognition_results(
+    recognized: Sequence[tuple[list[str], list[float]]],
+    kinds: Sequence[str],
+    *,
+    source_frame_indices: Sequence[int] | None = None,
+    source: str = "raw",
+) -> tuple[list[tuple[list[str], list[float]]], list[dict[str, Any]]]:
+    """Repair clock-like OCR characters only when the raw text is unusable."""
+    if len(recognized) != len(kinds):
+        raise ValueError("recognized results and crop kinds must have equal lengths")
+    frame_indices = (
+        [int(value) for value in source_frame_indices]
+        if source_frame_indices is not None
+        else _frame_indices_for_kinds(kinds)
+    )
+    if len(frame_indices) != len(recognized):
+        raise ValueError("source frame indices must align with OCR results")
+    normalized_results = [
+        (list(texts), list(confidences)) for texts, confidences in recognized
+    ]
+    repairs: list[dict[str, Any]] = []
+    for crop_index, ((texts, confidences), kind) in enumerate(
+        zip(normalized_results, kinds)
+    ):
+        if kind != "clock":
+            continue
+        raw_clock = parse_clock_texts(texts)
+        if raw_clock.clock_seconds is not None and not raw_clock.ambiguous:
+            continue
+        normalized_texts = [
+            normalized
+            for text in texts
+            if (normalized := _canonicalize_clock_text(text))
+        ]
+        if not normalized_texts or normalized_texts == texts:
+            continue
+        normalized_clock = parse_clock_texts(normalized_texts)
+        if normalized_clock.clock_seconds is None or normalized_clock.ambiguous:
+            continue
+        normalized_results[crop_index] = (normalized_texts, confidences)
+        repairs.append(
+            {
+                "frame_index": frame_indices[crop_index],
+                "crop_index": crop_index,
+                "source": source,
+                "raw_texts": list(texts),
+                "normalized_texts": normalized_texts,
+                "clock_seconds": normalized_clock.clock_seconds,
+            }
+        )
+    return normalized_results, repairs
+
+
+def _write_clock_preprocess_variant(
+    source_path: Path,
+    output_path: Path,
+    variant: str,
+) -> None:
+    """Write one enhanced clock crop without importing OpenCV at module load."""
+    try:
+        import cv2
+    except ImportError as exc:
+        raise WorkerError(
+            "ocr_model_unavailable",
+            "OpenCV is unavailable for clock preprocessing",
+            diagnostics={"stage": "clock_preprocessing"},
+        ) from exc
+    image = cv2.imread(str(source_path), cv2.IMREAD_GRAYSCALE)
+    if image is None:
+        raise WorkerError(
+            "ocr_frame_extraction_failed",
+            f"cannot read clock crop for preprocessing: {source_path.name}",
+            diagnostics={"stage": "clock_preprocessing"},
+        )
+    if variant == "gray_contrast_sharp":
+        enhanced = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4)).apply(image)
+        blurred = cv2.GaussianBlur(enhanced, (0, 0), 1.0)
+        processed = cv2.addWeighted(enhanced, 1.6, blurred, -0.6, 0)
+    elif variant == "binary_contrast":
+        enhanced = cv2.equalizeHist(image)
+        _threshold, processed = cv2.threshold(
+            enhanced,
+            0,
+            255,
+            cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+        )
+    else:
+        raise ValueError(f"unsupported clock preprocessing variant: {variant}")
+    if not cv2.imwrite(str(output_path), processed):
+        raise WorkerError(
+            "ocr_frame_extraction_failed",
+            f"cannot write preprocessed clock crop: {output_path.name}",
+            diagnostics={"stage": "clock_preprocessing"},
+        )
+
+
+def _prepare_clock_only_recognition(
+    recognized: Sequence[tuple[list[str], list[float]]],
+    frames: Sequence[Path],
+    crop_kinds: Sequence[str],
+    *,
+    engine: Any | None,
+    batch_worker: BatchOcrWorker | None,
+    request: Mapping[str, Any],
+    profile_id: str,
+    sample_interval: float,
+    minimum_confidence: float,
+    inference_batch_size: int,
+    deadline_monotonic: float | None,
+) -> tuple[list[tuple[list[str], list[float]]], dict[str, Any]]:
+    """Normalize raw OCR, then retry only unreadable clock frames in place."""
+    frame_indices = _frame_indices_for_kinds(crop_kinds)
+    prepared, character_repairs = _normalize_clock_recognition_results(
+        recognized,
+        crop_kinds,
+        source_frame_indices=frame_indices,
+    )
+    remaining = {
+        index
+        for index, ((texts, _confidences), kind) in enumerate(
+            zip(prepared, crop_kinds)
+        )
+        if kind == "clock"
+        and (
+            parse_clock_texts(texts).clock_seconds is None
+            or parse_clock_texts(texts).ambiguous
+        )
+    }
+    initial_unreadable_count = len(remaining)
+    attempts: list[dict[str, Any]] = []
+    selected_variants: list[dict[str, Any]] = []
+    for variant in CLOCK_PREPROCESS_VARIANTS:
+        if not remaining:
+            break
+        retry_paths: list[Path] = []
+        retry_crop_indices: list[int] = []
+        retry_frame_indices: list[int] = []
+        for crop_index in sorted(remaining):
+            source_path = Path(frames[crop_index])
+            variant_path = source_path.with_name(
+                f"{source_path.stem}_{variant}{source_path.suffix}"
+            )
+            try:
+                _write_clock_preprocess_variant(source_path, variant_path, variant)
+            except (OSError, ValueError, WorkerError) as exc:
+                attempts.append(
+                    {
+                        "variant": variant,
+                        "frame_index": frame_indices[crop_index],
+                        "status": "preprocess_failed",
+                        "error": str(exc),
+                    }
+                )
+                continue
+            retry_paths.append(variant_path)
+            retry_crop_indices.append(crop_index)
+            retry_frame_indices.append(frame_indices[crop_index])
+        if not retry_paths:
+            continue
+        try:
+            retry_results, retry_failures = _recognize_request_paths(
+                retry_paths,
+                ["clock"] * len(retry_paths),
+                engine=engine,
+                batch_worker=batch_worker,
+                request=request,
+                profile_id=f"{profile_id}:{variant}",
+                sample_interval=sample_interval,
+                minimum_confidence=minimum_confidence,
+                inference_batch_size=inference_batch_size,
+                deadline_monotonic=deadline_monotonic,
+                source_frame_indices=retry_frame_indices,
+            )
+        except WorkerError as exc:
+            attempts.append(
+                {
+                    "variant": variant,
+                    "status": "ocr_failed",
+                    "error_kind": exc.kind,
+                    "error": exc.message,
+                }
+            )
+            break
+        retry_results, retry_repairs = _normalize_clock_recognition_results(
+            retry_results,
+            ["clock"] * len(retry_results),
+            source_frame_indices=retry_frame_indices,
+            source=variant,
+        )
+        character_repairs.extend(retry_repairs)
+        attempts.append(
+            {
+                "variant": variant,
+                "attempted_frame_count": len(retry_paths),
+                "ocr_failed_frame_count": len(retry_failures),
+            }
+        )
+        for retry_index, crop_index in enumerate(retry_crop_indices):
+            texts, confidences = retry_results[retry_index]
+            parsed = parse_clock_texts(texts)
+            if parsed.clock_seconds is None or parsed.ambiguous:
+                continue
+            prepared[crop_index] = (list(texts), list(confidences))
+            remaining.discard(crop_index)
+            selected_variants.append(
+                {
+                    "frame_index": frame_indices[crop_index],
+                    "variant": variant,
+                    "clock_seconds": parsed.clock_seconds,
+                }
+            )
+    return prepared, {
+        "strategy": "raw_then_failed_frames_only",
+        "initial_unreadable_frame_count": initial_unreadable_count,
+        "recovered_frame_count": initial_unreadable_count - len(remaining),
+        "remaining_unreadable_frame_count": len(remaining),
+        "variant_attempts": attempts,
+        "selected_variants": selected_variants,
+        "character_normalizations": character_repairs,
+        "character_normalization_count": len(character_repairs),
+        "frame_identity_preserved": True,
+    }
 
 
 def run_request(
@@ -1763,6 +4165,13 @@ def run_request(
     minimum_confidence = float(request.get("minimum_confidence", 0.35))
     inference_batch_size = int(request.get("inference_batch_size", 8))
     profile_value = request.get("scoreboard_profile")
+    clock_only = request.get("clock_only", False)
+    maximum_frames = int(
+        request.get(
+            "maximum_frames",
+            max(300, math.ceil(AUTO_MAXIMUM_ANALYSIS_SECONDS / sample_interval) + 2),
+        )
+    )
     if sample_interval <= 0 or (
         profile_value is None
         and (not 0 < roi_width <= 1 or not 0 < roi_height <= 1)
@@ -1772,6 +4181,18 @@ def run_request(
         raise WorkerError("ocr_invalid_request", "invalid OCR confidence threshold")
     if not 1 <= inference_batch_size <= 64:
         raise WorkerError("ocr_invalid_request", "invalid OCR inference batch size")
+    if maximum_frames < 1:
+        raise WorkerError("ocr_invalid_request", "maximum_frames must be positive")
+    if not isinstance(clock_only, bool):
+        raise WorkerError("ocr_invalid_request", "clock_only must be a boolean")
+    raw_event_minute = request.get("event_minute")
+    if clock_only and (
+        raw_event_minute is None or not str(raw_event_minute).strip()
+    ):
+        raise WorkerError(
+            "ocr_invalid_request",
+            "event_minute is required when clock_only is enabled",
+        )
     if request_timeout_seconds is not None and request_timeout_seconds <= 0:
         raise WorkerError("ocr_invalid_request", "request timeout must be positive")
     deadline_monotonic = (
@@ -1784,93 +4205,279 @@ def run_request(
         ffmpeg = str(request.get("ffmpeg") or "ffmpeg")
         profile: ScoreboardProfile | None = None
         profile_diagnostics: dict[str, Any] | None = None
+        auto_diagnostics: dict[str, Any] | None = None
+        auto_tracker: AutoClockTracker | None = None
+        clock_preprocessing_diagnostics: dict[str, Any] | None = None
         if profile_value is not None:
             profile = _resolve_worker_profile(profile_value)
-            frame_pairs, profile_diagnostics = extract_profile_frames(
-                candidate_path,
-                Path(directory),
-                ffmpeg=ffmpeg,
-                sample_interval_seconds=sample_interval,
-                profile=profile,
-                deadline_monotonic=deadline_monotonic,
-            )
-            frames = [path for pair in frame_pairs for path in pair]
-            crop_kinds = [kind for _pair in frame_pairs for kind in ("clock", "score")]
+            if not clock_only and profile.score_roi is None:
+                raise WorkerError(
+                    "ocr_invalid_request",
+                    "scoreboard profile must define score_roi outside clock_only mode",
+                )
+            if clock_only:
+                frames, profile_diagnostics = extract_profile_clock_frames(
+                    candidate_path,
+                    Path(directory),
+                    ffmpeg=ffmpeg,
+                    sample_interval_seconds=sample_interval,
+                    profile=profile,
+                    maximum_frames=maximum_frames,
+                    deadline_monotonic=deadline_monotonic,
+                )
+                crop_kinds = ["clock"] * len(frames)
+            else:
+                frame_pairs, profile_diagnostics = extract_profile_frames(
+                    candidate_path,
+                    Path(directory),
+                    ffmpeg=ffmpeg,
+                    sample_interval_seconds=sample_interval,
+                    profile=profile,
+                    maximum_frames=maximum_frames,
+                    deadline_monotonic=deadline_monotonic,
+                )
+                frames = [path for pair in frame_pairs for path in pair]
+                crop_kinds = [
+                    kind for _pair in frame_pairs for kind in ("clock", "score")
+                ]
         else:
-            frames = extract_scoreboard_frames(
+            auto_tracker, auto_diagnostics = discover_auto_clock(
+                candidate_path,
+                Path(directory),
+                ffmpeg=ffmpeg,
+                language=str(request.get("language") or "en"),
+                sample_interval_seconds=sample_interval,
+                minimum_confidence=minimum_confidence,
+                maximum_frames=maximum_frames,
+                deadline_monotonic=deadline_monotonic,
+                clock_only=clock_only,
+            )
+            assert auto_tracker.clock_roi is not None
+            if clock_only:
+                auto_diagnostics["score_roi"] = None
+                auto_diagnostics["score_rois"] = []
+            frame_width, frame_height = auto_diagnostics["frame_resolution"]
+            frames, crop_kinds, locked_diagnostics = extract_auto_roi_frames(
                 candidate_path,
                 Path(directory),
                 ffmpeg=ffmpeg,
                 sample_interval_seconds=sample_interval,
-                roi_width_ratio=roi_width,
-                roi_height_ratio=roi_height,
-                timeout_seconds=_remaining_seconds(
-                    deadline_monotonic,
-                    stage="frame_extraction",
-                ),
+                frame_width=frame_width,
+                frame_height=frame_height,
+                clock_roi=auto_tracker.clock_roi,
+                score_roi=(None if clock_only else auto_tracker.score_roi),
+                score_rois=(() if clock_only else auto_tracker.score_rois),
+                maximum_frames=maximum_frames,
+                deadline_monotonic=deadline_monotonic,
+                output_prefix="auto_initial",
             )
-            crop_kinds = ["clock"] * len(frames)
+            auto_diagnostics["locked_crops"] = locked_diagnostics
+            auto_diagnostics["clock_score_separate"] = not clock_only
+            auto_diagnostics["clock_only"] = clock_only
+            auto_diagnostics["score_ocr_skipped"] = clock_only
         extraction_seconds = time.perf_counter() - started
         if batch_worker is None and engine is None:
             engine = load_ocr_engine(str(request.get("language") or "en"))
         inference_started = time.perf_counter()
-        if batch_worker is not None:
-            profile_id = profile.profile_id if profile is not None else "legacy_top_left"
-            recognized, failed_frames = _recognize_paths_shared(
-                batch_worker,
-                frames,
-                kinds=crop_kinds,
-                match_id=str(request.get("match_id") or candidate_path.parent.name),
-                profile_id=profile_id,
-                candidate_start_seconds=float(
-                    request.get("candidate_start_seconds", 0.0)
-                ),
-                sample_interval=sample_interval,
-                minimum_confidence=minimum_confidence,
-                deadline_monotonic=(
-                    deadline_monotonic
-                    if deadline_monotonic is not None
-                    else time.monotonic() + 3600.0
-                ),
-            )
-        else:
-            recognized, failed_frames = _recognize_paths(
-                engine,
-                frames,
-                minimum_confidence=minimum_confidence,
-                batch_size=inference_batch_size,
-            )
+        profile_id = profile.profile_id if profile is not None else "auto_discovered"
+        recognized, failed_frames = _recognize_request_paths(
+            frames,
+            crop_kinds,
+            engine=engine,
+            batch_worker=batch_worker,
+            request=request,
+            profile_id=profile_id,
+            sample_interval=sample_interval,
+            minimum_confidence=minimum_confidence,
+            inference_batch_size=inference_batch_size,
+            deadline_monotonic=deadline_monotonic,
+        )
         if failed_frames and len(failed_frames) == len(frames):
             raise WorkerError(
                 "ocr_model_unavailable",
                 "PaddleOCR failed on every extracted scoreboard frame",
                 diagnostics={"failed_frame_count": len(failed_frames)},
             )
+        if clock_only:
+            recognized, clock_preprocessing_diagnostics = (
+                _prepare_clock_only_recognition(
+                    recognized,
+                    frames,
+                    crop_kinds,
+                    engine=engine,
+                    batch_worker=batch_worker,
+                    request=request,
+                    profile_id=profile_id,
+                    sample_interval=sample_interval,
+                    minimum_confidence=minimum_confidence,
+                    inference_batch_size=inference_batch_size,
+                    deadline_monotonic=deadline_monotonic,
+                )
+            )
+        request_period = _request_period(request)
+        if profile is None:
+            assert auto_diagnostics is not None
+            assert auto_tracker is not None
+            assert auto_tracker.clock_roi is not None
+            recovery_records: list[dict[str, Any]] = []
+            missing_start = _first_clock_missing_run(recognized, crop_kinds)
+            if missing_start is not None:
+                recovered_tracker, recovery_diagnostics = _recover_auto_clock(
+                    candidate_path,
+                    Path(directory),
+                    ffmpeg=ffmpeg,
+                    language=str(request.get("language") or "en"),
+                    sample_interval_seconds=sample_interval,
+                    minimum_confidence=minimum_confidence,
+                    maximum_frames=maximum_frames,
+                    start_frame_index=missing_start,
+                    frame_width=auto_tracker.frame_width,
+                    frame_height=auto_tracker.frame_height,
+                    deadline_monotonic=deadline_monotonic,
+                    clock_only=clock_only,
+                )
+                recovery_diagnostics["start_frame_index"] = missing_start
+                recovery_records.append(recovery_diagnostics)
+                if recovered_tracker is not None and recovered_tracker.clock_roi is not None:
+                    if _bbox_similar(auto_tracker.clock_roi, recovered_tracker.clock_roi):
+                        recovery_diagnostics["applied"] = False
+                        recovery_diagnostics["skip_reason"] = "known_clock_roi"
+                    else:
+                        previous_by_frame = _auto_results_by_frame(recognized, crop_kinds)
+                        recovered_frames, recovered_kinds, recovered_crops = extract_auto_roi_frames(
+                            candidate_path,
+                            Path(directory),
+                            ffmpeg=ffmpeg,
+                            sample_interval_seconds=sample_interval,
+                            frame_width=recovered_tracker.frame_width,
+                            frame_height=recovered_tracker.frame_height,
+                            clock_roi=recovered_tracker.clock_roi,
+                            score_roi=(
+                                None if clock_only else recovered_tracker.score_roi
+                            ),
+                            score_rois=(
+                                () if clock_only else recovered_tracker.score_rois
+                            ),
+                            maximum_frames=maximum_frames,
+                            deadline_monotonic=deadline_monotonic,
+                            output_prefix="auto_recovered",
+                        )
+                        recovered_recognized, failed_frames = _recognize_request_paths(
+                            recovered_frames,
+                            recovered_kinds,
+                            engine=engine,
+                            batch_worker=batch_worker,
+                            request=request,
+                            profile_id="auto_rediscovered",
+                            sample_interval=sample_interval,
+                            minimum_confidence=minimum_confidence,
+                            inference_batch_size=inference_batch_size,
+                            deadline_monotonic=deadline_monotonic,
+                        )
+                        if clock_only:
+                            recovered_recognized, recovered_preprocessing = (
+                                _prepare_clock_only_recognition(
+                                    recovered_recognized,
+                                    recovered_frames,
+                                    recovered_kinds,
+                                    engine=engine,
+                                    batch_worker=batch_worker,
+                                    request=request,
+                                    profile_id="auto_rediscovered",
+                                    sample_interval=sample_interval,
+                                    minimum_confidence=minimum_confidence,
+                                    inference_batch_size=inference_batch_size,
+                                    deadline_monotonic=deadline_monotonic,
+                                )
+                            )
+                            assert clock_preprocessing_diagnostics is not None
+                            clock_preprocessing_diagnostics.setdefault(
+                                "recovery_passes", []
+                            ).append(recovered_preprocessing)
+                        recovered_by_frame = _auto_results_by_frame(
+                            recovered_recognized,
+                            recovered_kinds,
+                        )
+                        combined_by_frame = _merge_auto_results(
+                            previous_by_frame,
+                            recovered_by_frame,
+                        )
+                        recognized, crop_kinds = _flatten_auto_results(combined_by_frame)
+                        auto_tracker = recovered_tracker
+                        recovery_diagnostics["applied"] = True
+                        recovery_diagnostics["recovered_crops"] = recovered_crops
+                        auto_diagnostics["status"] = "relocked"
+                        auto_diagnostics["reason"] = "stable_clock_track"
+                        auto_diagnostics["clock_roi"] = list(recovered_tracker.clock_roi)
+                        auto_diagnostics["score_roi"] = (
+                            None
+                            if clock_only
+                            else (
+                                list(recovered_tracker.score_roi)
+                                if recovered_tracker.score_roi is not None
+                                else None
+                            )
+                        )
+            auto_diagnostics["re_search"] = recovery_records
+            auto_diagnostics["re_search_attempt_count"] = len(recovery_records)
+            remaining_missing_start = _first_clock_missing_run(recognized, crop_kinds)
+            auto_diagnostics["remaining_missing_start"] = remaining_missing_start
         continuity_diagnostics: list[dict[str, Any]] | None = None
         profile_quality: dict[str, Any] | None = None
         if profile is not None:
-            readings, continuity_diagnostics = _profile_readings(
-                recognized,
-                profile=profile,
-                sample_interval=sample_interval,
-                period=_request_period(request),
-            )
+            if clock_only:
+                readings, continuity_diagnostics = _profile_clock_readings(
+                    recognized,
+                    profile=profile,
+                    sample_interval=sample_interval,
+                    period=request_period,
+                )
+            else:
+                readings, continuity_diagnostics = _profile_readings(
+                    recognized,
+                    profile=profile,
+                    sample_interval=sample_interval,
+                    period=request_period,
+                )
             profile_quality = _validate_profile_content_quality(
                 readings,
                 profile_id=profile.profile_id,
             )
         else:
-            readings = [
-                frame_reading(
-                    index,
-                    index * sample_interval,
-                    texts,
-                    confidences,
-                )
-                for index, (texts, confidences) in enumerate(recognized)
-            ]
+            readings, continuity_diagnostics = _auto_readings(
+                recognized,
+                kinds=crop_kinds,
+                sample_interval=sample_interval,
+                period=request_period,
+                clock_only=clock_only,
+            )
+            assert auto_diagnostics is not None
+            auto_diagnostics["temporarily_hidden_frame_count"] = sum(
+                item["reason"] == "scoreboard_temporarily_missing"
+                for item in continuity_diagnostics
+            )
+            auto_diagnostics["timeline_discontinuous_frame_count"] = sum(
+                item["reason"] == "clock_discontinuity"
+                for item in continuity_diagnostics
+            )
         inference_seconds = time.perf_counter() - inference_started
-        result = locate_from_readings(readings, request)
+        try:
+            result = locate_from_readings(readings, request)
+        except WorkerError as exc:
+            extra_diagnostics: dict[str, Any] = {}
+            if auto_diagnostics is not None:
+                extra_diagnostics["auto_clock"] = auto_diagnostics
+            if clock_preprocessing_diagnostics is not None:
+                extra_diagnostics["clock_preprocessing"] = (
+                    clock_preprocessing_diagnostics
+                )
+            if not extra_diagnostics:
+                raise
+            raise WorkerError(
+                exc.kind,
+                exc.message,
+                diagnostics={**exc.diagnostics, **extra_diagnostics},
+            ) from exc
         diagnostics = result["diagnostics"]
         diagnostics.update(
             {
@@ -1885,11 +4492,14 @@ def run_request(
         if profile_diagnostics is not None:
             diagnostics["scoreboard_profile"] = profile_diagnostics
             diagnostics["scoreboard_profile"]["content_quality"] = profile_quality
-            diagnostics["clock_score_separate"] = True
+            diagnostics["clock_score_separate"] = not clock_only
             diagnostics["continuity"] = continuity_diagnostics
         else:
-            diagnostics["roi_width_ratio"] = roi_width
-            diagnostics["roi_height_ratio"] = roi_height
+            diagnostics["auto_clock"] = auto_diagnostics
+        diagnostics["clock_only"] = clock_only
+        diagnostics["score_ocr_skipped"] = clock_only
+        if clock_preprocessing_diagnostics is not None:
+            diagnostics["clock_preprocessing"] = clock_preprocessing_diagnostics
         return result
 
 

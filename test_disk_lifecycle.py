@@ -216,6 +216,47 @@ class DiskLifecycleTests(unittest.TestCase):
             self.assertTrue((buffer_dir / "segments_keep.csv").exists())
             self.assertEqual(summary.status, "completed")
 
+    def test_active_database_lease_blocks_terminal_media_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            buffer_dir = root / "buffer"
+            buffer_dir.mkdir()
+            segment = buffer_dir / "leased.ts"
+            segment.write_bytes(b"leased")
+            (buffer_dir / "segments.csv").write_text(
+                "leased.ts,0,2\n", encoding="utf-8"
+            )
+            manifest = buffer_dir / "segment_manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {"version": 1, "generations": [{"list_path": "segments.csv"}]}
+                ),
+                encoding="utf-8",
+            )
+            state_db = root / "pipeline_state.sqlite3"
+            connection = sqlite3.connect(state_db)
+            connection.execute(
+                "CREATE TABLE segment_leases "
+                "(lease_id TEXT, segment_path TEXT, expires_at_unix REAL)"
+            )
+            connection.execute(
+                "INSERT INTO segment_leases VALUES (?, ?, ?)",
+                ("lease-1", str(segment), time.time() + 3600),
+            )
+            connection.commit()
+            connection.close()
+
+            summary = DiskLifecycleManager(root).cleanup_finished_match(
+                buffer_dir=buffer_dir,
+                manifest_path=manifest,
+                event_log_path=root / "pipeline_events.jsonl",
+                state_db_path=state_db,
+            )
+
+            self.assertTrue(segment.exists())
+            self.assertTrue((buffer_dir / "segments.csv").exists())
+            self.assertIn("media_cleanup_skipped_after_active_lease", summary.actions)
+
     def test_malformed_segment_list_is_retained_with_warning(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -285,3 +326,45 @@ class DiskLifecycleTests(unittest.TestCase):
             self.assertTrue((root / "pipeline_events.jsonl.1").exists())
             self.assertEqual(summary.rotated_files, 1)
             self.assertEqual(summary.deleted_files, 1)
+
+    def test_final_gifs_expire_after_24_hours_without_touching_recent_or_nested(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            old_gif = root / "old.gif"
+            recent_gif = root / "recent.gif"
+            nested = root / "vision_candidates"
+            nested.mkdir()
+            nested_gif = nested / "nested.gif"
+            for path in (old_gif, recent_gif, nested_gif):
+                path.write_bytes(path.name.encode())
+            old_time = time.time() - 25 * 60 * 60
+            os.utime(old_gif, (old_time, old_time))
+            os.utime(nested_gif, (old_time, old_time))
+
+            summary = DiskLifecycleManager(root).prune_final_gifs()
+
+            self.assertFalse(old_gif.exists())
+            self.assertTrue(recent_gif.exists())
+            self.assertTrue(nested_gif.exists())
+            self.assertEqual(summary.deleted_files, 1)
+            self.assertEqual(summary.retained_files, 1)
+
+    def test_final_gif_cleanup_does_not_follow_symlinks(self):
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            tempfile.TemporaryDirectory() as outside,
+        ):
+            root = Path(directory)
+            external = Path(outside) / "external.gif"
+            external.write_bytes(b"external")
+            old_time = time.time() - 25 * 60 * 60
+            os.utime(external, (old_time, old_time))
+            link = root / "linked.gif"
+            link.symlink_to(external)
+
+            summary = DiskLifecycleManager(root).prune_final_gifs()
+
+            self.assertTrue(link.is_symlink())
+            self.assertTrue(external.exists())
+            self.assertEqual(summary.deleted_files, 0)
+            self.assertEqual(summary.skipped_files, 1)

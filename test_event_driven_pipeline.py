@@ -12,21 +12,41 @@ from unittest.mock import Mock, patch
 from event_driven_pipeline import (
     EventJob,
     EventRevisionTracker,
+    HttpShotmapGoalSource,
     HttpMatchEventSource,
+    HttpShotmapSecondSource,
     MatchEvent,
     MockMatchEventSource,
+    SegmentGeneration,
+    associate_shotmap_second,
+    cross_source_goal_incident,
     encode_event_job,
     event_timing_diagnostics,
-    heavy_snapshot_has_default_gif_work,
+    evict_terminal_runtime_jobs,
+    maintain_segment_generations,
+    merge_cross_source_goal,
     merge_observed_event_revision,
     main,
     load_scoreboard_profile,
     observe_segment_progress,
+    observed_stream_time_from_wall,
     parse_match_start_play,
     parse_match_events,
+    parse_cumulative_match_second,
+    normalize_shotmap_goal,
+    overview_goal_fallback_status,
+    select_cross_source_goal_incident,
+    shotmap_goal_match_event,
+    refresh_vision_job_event_data,
+    split_vision_pool_task_key,
+    sync_completed_default_job,
+    vision_artifact_ready_for_submission,
+    vision_pool_task_key,
 )
 from live_goal_pipeline import PendingEvent, Segment
 from live_runtime import ProcessExit
+from segment_manifest import new_segment_manifest, save_segment_manifest, upsert_segment_generation
+from vision_runtime import VisionJob
 
 
 class FakeHttpResponse:
@@ -41,6 +61,1026 @@ class FakeHttpResponse:
 
     def read(self):
         return self.body
+
+
+class ShotmapSecondEnrichmentTests(unittest.TestCase):
+    @staticmethod
+    def goal(**changes):
+        values = {
+            "event_key": "match-1:G:goal-1",
+            "code": "G",
+            "event_type": "goal",
+            "minute": "69",
+            "minute_extra": "0",
+            "team": "teamA",
+            "person": "Scorer",
+            "person_id": "50000009",
+            "score": "1-0",
+            "reason": "",
+        }
+        values.update(changes)
+        return MatchEvent(**values)
+
+    def test_shotmap_second_is_cumulative_match_clock_seconds(self):
+        for raw, expected in ((152, 152), ("4177", 4177), (5643.0, 5643)):
+            with self.subTest(raw=raw):
+                self.assertEqual(parse_cumulative_match_second(raw), expected)
+        for raw in (None, "", -1, 12.5, True, "69:37"):
+            with self.subTest(raw=raw):
+                self.assertIsNone(parse_cumulative_match_second(raw))
+
+    def test_shotmap_goal_normalizes_455_to_exact_clock_without_minute_flooring(self):
+        goal = normalize_shotmap_goal(
+            {
+                "outcome": "goal",
+                "person_id": 9,
+                "team_id": 2,
+                "minute": 8,
+                "minute_extra": 0,
+                "second": 455,
+                "situation": "open_play",
+                "start_x": 0.35001,
+                "start_y": 0.5,
+            }
+        )
+        self.assertIsNotNone(goal)
+        self.assertEqual(goal["second"], 455)
+        self.assertEqual(goal["minute"], 8)
+        self.assertEqual(goal["start_x"], 0.35)
+
+    def test_direct_shotmap_event_keeps_api_minute_and_exact_target_clock(self):
+        goal = normalize_shotmap_goal(
+            {
+                "outcome": "goal",
+                "person_id": 9,
+                "team_id": 2,
+                "minute": 8,
+                "minute_extra": 0,
+                "second": 455,
+                "situation": "open_play",
+                "start_x": 0.35,
+                "start_y": 0.5,
+            }
+        )
+
+        event = shotmap_goal_match_event(
+            "match-1",
+            goal,
+            observed_at_unix=1000.0,
+            request_diagnostics={"request_count": 2},
+        )
+
+        self.assertEqual(event.code, "G")
+        self.assertEqual(event.minute, "8")
+        self.assertEqual(event.second, 455)
+        self.assertEqual(event.person_id, "50000009")
+        self.assertEqual(event.metadata["target_clock"], "07:35")
+        self.assertEqual(event.metadata["event_source"]["primary"], "shotmap")
+
+    def test_shotmap_fingerprint_covers_required_incident_fields(self):
+        base = {
+            "outcome": "goal",
+            "person_id": 9,
+            "team_id": 2,
+            "minute": 8,
+            "minute_extra": 0,
+            "second": 455,
+            "situation": "open_play",
+            "start_x": 0.35,
+            "start_y": 0.5,
+        }
+        original = normalize_shotmap_goal(base)
+        self.assertIsNotNone(original)
+
+        for field, replacement in (
+            ("person_id", 10),
+            ("team_id", 3),
+            ("minute", 9),
+            ("second", 456),
+            ("situation", "penalty"),
+            ("start_x", 0.45),
+        ):
+            with self.subTest(field=field):
+                changed = normalize_shotmap_goal({**base, field: replacement})
+                self.assertIsNotNone(changed)
+                self.assertNotEqual(changed["fingerprint"], original["fingerprint"])
+
+    def test_background_response_time_maps_to_the_true_stream_observation(self):
+        self.assertEqual(
+            observed_stream_time_from_wall(
+                120.0,
+                processed_at_unix=1010.0,
+                observed_at_unix=1004.0,
+                stream_rate=1.0,
+            ),
+            114.0,
+        )
+        self.assertEqual(
+            observed_stream_time_from_wall(
+                3.0,
+                processed_at_unix=1010.0,
+                observed_at_unix=1004.0,
+                stream_rate=1.0,
+            ),
+            0.0,
+        )
+
+    def test_independent_shotmap_source_baselines_then_emits_new_goals(self):
+        from pipeline_runtime import PipelineRuntime
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = PipelineRuntime(root / "state.sqlite3", root / "events.jsonl")
+            source = HttpShotmapGoalSource(
+                "https://example.test/shotmap",
+                "match-1",
+                None,
+                runtime.store,
+                timeout=1.0,
+            )
+            source.start = lambda: None
+            baseline = {
+                "shots": [
+                    {
+                        "outcome": "goal",
+                        "person_id": 9,
+                        "team_id": 2,
+                        "minute": 8,
+                        "minute_extra": 0,
+                        "second": 455,
+                        "situation": "open_play",
+                    },
+                    {"outcome": "save", "person_id": 10, "team_id": 2},
+                ]
+            }
+            source._responses.put((baseline, {"http_status": 200}, 1000.0))
+            self.assertEqual(source.poll(0.0, 0.0), [])
+            self.assertTrue(source.initialized)
+
+            updated = {
+                "shots": [
+                    *baseline["shots"],
+                    {
+                        "outcome": "goal",
+                        "person_id": 11,
+                        "team_id": 1,
+                        "minute": 12,
+                        "minute_extra": 0,
+                        "second": 701,
+                        "situation": "penalty",
+                    },
+                ]
+            }
+            source._responses.put((updated, {"http_status": 200}, 1005.0))
+            emitted = source.poll(0.0, 0.0)
+            self.assertEqual(len(emitted), 1)
+            self.assertEqual(emitted[0].code, "PG")
+            self.assertEqual(emitted[0].second, 701)
+            self.assertEqual(emitted[0].metadata["event_source"]["primary"], "shotmap")
+
+            runtime.close()
+            reopened = PipelineRuntime(root / "state.sqlite3", root / "events.jsonl")
+            restored = HttpShotmapGoalSource(
+                "https://example.test/shotmap",
+                "match-1",
+                None,
+                reopened.store,
+                timeout=1.0,
+            )
+            restored.start = lambda: None
+            self.assertEqual(restored.last_shot_count, 3)
+            self.assertEqual(restored.last_goal_count, 2)
+            restored._responses.put((updated, {"http_status": 200}, 1010.0))
+            self.assertEqual(restored.poll(0.0, 0.0), [])
+            reopened.close()
+
+    def test_empty_shotmap_response_establishes_an_empty_baseline(self):
+        from pipeline_runtime import PipelineRuntime
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = PipelineRuntime(root / "state.sqlite3", root / "events.jsonl")
+            source = HttpShotmapGoalSource(
+                "https://example.test/shotmap",
+                "match-empty",
+                None,
+                runtime.store,
+                timeout=1.0,
+            )
+            source.start = lambda: None
+            source._responses.put(({"shots": []}, {"http_status": 200}, 1000.0))
+
+            self.assertEqual(source.poll(0.0, 0.0), [])
+            self.assertTrue(source.initialized)
+            self.assertEqual(source.last_shot_count, 0)
+            self.assertEqual(source.last_goal_count, 0)
+            self.assertTrue(runtime.store.load_shotmap_state("match-empty").initialized)
+            runtime.close()
+
+    def test_non_goal_shot_after_baseline_does_not_emit_a_goal(self):
+        from pipeline_runtime import PipelineRuntime
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = PipelineRuntime(root / "state.sqlite3", root / "events.jsonl")
+            source = HttpShotmapGoalSource(
+                "https://example.test/shotmap",
+                "match-non-goal",
+                None,
+                runtime.store,
+                timeout=1.0,
+            )
+            source.start = lambda: None
+            source._responses.put(({"shots": []}, {"http_status": 200}, 1000.0))
+            self.assertEqual(source.poll(0.0, 0.0), [])
+            source._responses.put(
+                (
+                    {
+                        "shots": [
+                            {
+                                "outcome": "save",
+                                "person_id": 9,
+                                "team_id": 2,
+                                "minute": 8,
+                                "second": 455,
+                            }
+                        ]
+                    },
+                    {"http_status": 200},
+                    1005.0,
+                )
+            )
+
+            self.assertEqual(source.poll(0.0, 0.0), [])
+            self.assertEqual(source.last_shot_count, 1)
+            self.assertEqual(source.last_goal_count, 0)
+            self.assertEqual(
+                runtime.store.load_shotmap_state("match-non-goal").seen_fingerprints,
+                frozenset(),
+            )
+            runtime.close()
+
+    def test_goal_present_in_first_valid_response_is_historical_baseline_only(self):
+        from pipeline_runtime import PipelineRuntime
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = PipelineRuntime(root / "state.sqlite3", root / "events.jsonl")
+            source = HttpShotmapGoalSource(
+                "https://example.test/shotmap",
+                "match-history",
+                None,
+                runtime.store,
+                timeout=1.0,
+            )
+            source.start = lambda: None
+            source._responses.put(
+                (
+                    {
+                        "shots": [
+                            {
+                                "outcome": "goal",
+                                "person_id": 9,
+                                "team_id": 2,
+                                "minute": 8,
+                                "minute_extra": 0,
+                                "second": 455,
+                                "situation": "open_play",
+                            }
+                        ]
+                    },
+                    {"http_status": 200},
+                    1000.0,
+                )
+            )
+
+            self.assertEqual(source.poll(0.0, 0.0), [])
+            self.assertTrue(source.initialized)
+            self.assertEqual(source.last_goal_count, 1)
+            self.assertEqual(
+                len(runtime.store.load_shotmap_state("match-history").seen_fingerprints),
+                1,
+            )
+            runtime.close()
+
+    def test_invalid_shotmap_response_does_not_initialize_or_replace_baseline(self):
+        from pipeline_runtime import PipelineRuntime
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = PipelineRuntime(root / "state.sqlite3", root / "events.jsonl")
+            source = HttpShotmapGoalSource(
+                "https://example.test/shotmap",
+                "match-invalid",
+                None,
+                runtime.store,
+                timeout=1.0,
+            )
+            source.start = lambda: None
+            baseline = {
+                "shots": [
+                    {
+                        "outcome": "save",
+                        "person_id": 9,
+                        "team_id": 2,
+                        "minute": 8,
+                        "second": 455,
+                    }
+                ]
+            }
+            source._responses.put((baseline, {"http_status": 200}, 1000.0))
+            self.assertEqual(source.poll(0.0, 0.0), [])
+            before_invalid = runtime.store.load_shotmap_state("match-invalid")
+            self.assertTrue(before_invalid.initialized)
+            self.assertEqual(before_invalid.last_snapshot, baseline)
+
+            source._responses.put((None, {"error": "timeout"}, 1005.0))
+
+            self.assertEqual(source.poll(0.0, 0.0), [])
+            self.assertTrue(source.initialized)
+            after_invalid = runtime.store.load_shotmap_state("match-invalid")
+            self.assertTrue(after_invalid.initialized)
+            self.assertEqual(after_invalid.last_snapshot, baseline)
+            runtime.close()
+
+    def test_late_matching_shotmap_goal_merges_into_overview_incident(self):
+        overview = self.goal(
+            event_key="match-1:G:overview-goal",
+            minute="8",
+            person_id="50000009",
+            metadata={"team_id": "2", "source": "overview"},
+        )
+        goal = normalize_shotmap_goal(
+            {
+                "outcome": "goal",
+                "person_id": 9,
+                "team_id": 2,
+                "minute": 8,
+                "minute_extra": 0,
+                "second": 455,
+                "situation": "open_play",
+            }
+        )
+        self.assertIsNotNone(goal)
+        shotmap = shotmap_goal_match_event(
+            "match-1",
+            goal,
+            observed_at_unix=1005.0,
+            request_diagnostics={"request_count": 2},
+        )
+
+        self.assertTrue(cross_source_goal_incident(overview, shotmap))
+        merged = merge_cross_source_goal(overview.__dict__, shotmap)
+
+        self.assertEqual(merged.event_key, overview.event_key)
+        self.assertEqual(merged.second, 455)
+        self.assertEqual(merged.metadata["event_source"]["primary"], "shotmap")
+        self.assertTrue(merged.metadata["overview_merged"])
+
+    def test_historical_shotmap_goal_does_not_absorb_a_new_overview_goal(self):
+        historical_goal = normalize_shotmap_goal(
+            {
+                "outcome": "goal",
+                "person_id": 9,
+                "team_id": 2,
+                "minute": 8,
+                "minute_extra": 0,
+                "second": 455,
+                "situation": "open_play",
+            }
+        )
+        self.assertIsNotNone(historical_goal)
+        historical = shotmap_goal_match_event(
+            "match-1",
+            historical_goal,
+            observed_at_unix=1000.0,
+            request_diagnostics={"request_count": 1},
+        )
+        current_overview = self.goal(
+            event_key="match-1:G:overview-current",
+            minute="20",
+            person_id="50000010",
+            metadata={"team_id": "2", "source": "overview"},
+        )
+
+        self.assertFalse(cross_source_goal_incident(historical, current_overview))
+
+    def test_overview_fallback_status_distinguishes_empty_and_non_goal_shotmap(self):
+        self.assertEqual(overview_goal_fallback_status(None), "overview_fallback_no_match")
+        self.assertEqual(
+            overview_goal_fallback_status(
+                SimpleNamespace(initialized=True, last_shot_count=0, last_goal_count=0)
+            ),
+            "overview_fallback_empty",
+        )
+        self.assertEqual(
+            overview_goal_fallback_status(
+                SimpleNamespace(initialized=True, last_shot_count=3, last_goal_count=0)
+            ),
+            "overview_fallback_no_goal",
+        )
+        self.assertEqual(
+            overview_goal_fallback_status(
+                SimpleNamespace(initialized=True, last_shot_count=3, last_goal_count=1)
+            ),
+            "overview_fallback_no_match",
+        )
+
+    def test_unique_cross_source_candidate_is_selected_for_one_default_task(self):
+        overview = self.goal(
+            event_key="match-1:G:overview-goal",
+            minute="8",
+            person_id="50000009",
+            metadata={"team_id": "2", "source": "overview"},
+        )
+        incoming_goal = normalize_shotmap_goal(
+            {
+                "outcome": "goal",
+                "person_id": 9,
+                "team_id": 2,
+                "minute": 8,
+                "second": 455,
+                "situation": "open_play",
+            }
+        )
+        self.assertIsNotNone(incoming_goal)
+        incoming = shotmap_goal_match_event(
+            "match-1",
+            incoming_goal,
+            observed_at_unix=1005.0,
+            request_diagnostics={},
+        )
+
+        selected, method, count = select_cross_source_goal_incident(
+            [SimpleNamespace(event_data=overview.__dict__)], incoming
+        )
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected.event_data["event_key"], overview.event_key)
+        self.assertEqual(method, "strong")
+        self.assertEqual(count, 1)
+
+    def test_ambiguous_cross_source_candidates_are_not_merged(self):
+        first = self.goal(
+            event_key="match-1:G:overview-1",
+            minute="8",
+            person_id="50000009",
+            metadata={"team_id": "2", "source": "overview"},
+        )
+        second = self.goal(
+            event_key="match-1:G:overview-2",
+            minute="8",
+            person_id="50000009",
+            metadata={"team_id": "2", "source": "overview"},
+        )
+        incoming_goal = normalize_shotmap_goal(
+            {
+                "outcome": "goal",
+                "person_id": 9,
+                "team_id": 2,
+                "minute": 8,
+                "second": 455,
+                "situation": "open_play",
+            }
+        )
+        self.assertIsNotNone(incoming_goal)
+        incoming = shotmap_goal_match_event(
+            "match-1",
+            incoming_goal,
+            observed_at_unix=1005.0,
+            request_diagnostics={},
+        )
+
+        selected, method, count = select_cross_source_goal_incident(
+            [
+                SimpleNamespace(event_data=first.__dict__),
+                SimpleNamespace(event_data=second.__dict__),
+            ],
+            incoming,
+        )
+        self.assertIsNone(selected)
+        self.assertEqual(method, "ambiguous")
+        self.assertEqual(count, 2)
+
+    def test_unique_goal_match_enriches_without_changing_event_key(self):
+        event = self.goal()
+        enriched = associate_shotmap_second(
+            event,
+            {
+                "shots": [
+                    {
+                        "outcome": "goal",
+                        "minute": 69,
+                        "minute_extra": 0,
+                        "person_id": 9,
+                        "second": 4177,
+                    }
+                ]
+            },
+        )
+
+        self.assertEqual(enriched.event_key, event.event_key)
+        self.assertEqual(enriched.second, 4177)
+        self.assertEqual(enriched.metadata["second_source"], "shotmap")
+        self.assertEqual(enriched.metadata["shotmap_match_status"], "matched")
+        self.assertEqual(enriched.metadata["shotmap_candidate_count"], 1)
+        self.assertEqual(
+            enriched.metadata["shotmap_candidate_details"][0]["person_id"],
+            "50000009",
+        )
+        self.assertEqual(
+            enriched.metadata["shotmap_candidate_details"][0]["shotmap_person_id"],
+            "9",
+        )
+        self.assertEqual(
+            enriched.metadata["shotmap_candidate_details"][0]["outcome"],
+            "goal",
+        )
+        self.assertIsNone(enriched.metadata["shotmap_required_situation"])
+
+    def test_raw_exact_person_id_does_not_bypass_fixed_namespace_offset(self):
+        enriched = associate_shotmap_second(
+            self.goal(person_id="9"),
+            {
+                "shots": [
+                    {
+                        "outcome": "goal",
+                        "minute": 69,
+                        "minute_extra": 0,
+                        "person_id": 9,
+                        "second": 4177,
+                    }
+                ]
+            },
+        )
+
+        self.assertIsNone(enriched.second)
+        self.assertEqual(enriched.metadata["shotmap_person_candidate_count"], 0)
+        self.assertEqual(
+            enriched.metadata["shotmap_filter_failure_reason"],
+            "person_id_mismatch",
+        )
+
+    def test_penalty_goal_requires_goal_outcome_and_penalty_situation(self):
+        event = self.goal(
+            event_key="match-1:PG:goal-1",
+            code="PG",
+        )
+        enriched = associate_shotmap_second(
+            event,
+            {
+                "shots": [
+                    {
+                        "outcome": "goal",
+                        "situation": "open_play",
+                        "minute": 69,
+                        "minute_extra": 0,
+                        "person_id": 9,
+                        "second": 4161,
+                    },
+                    {
+                        "outcome": "miss",
+                        "situation": "penalty",
+                        "minute": 69,
+                        "minute_extra": 0,
+                        "person_id": 9,
+                        "second": 4168,
+                    },
+                    {
+                        "outcome": "goal",
+                        "situation": "penalty",
+                        "minute": 69,
+                        "minute_extra": 0,
+                        "person_id": 9,
+                        "second": 4177,
+                    },
+                ]
+            },
+        )
+
+        self.assertEqual(enriched.code, "PG")
+        self.assertEqual(enriched.event_type, "goal")
+        self.assertEqual(enriched.second, 4177)
+        self.assertEqual(
+            enriched.metadata["shotmap_match_method"],
+            "outcome+situation+minute+minute_extra+person_id",
+        )
+        self.assertEqual(enriched.metadata["shotmap_required_outcome"], "goal")
+        self.assertEqual(enriched.metadata["shotmap_required_situation"], "penalty")
+        self.assertEqual(enriched.metadata["shotmap_raw_candidate_count"], 3)
+        self.assertEqual(enriched.metadata["shotmap_outcome_candidate_count"], 2)
+        self.assertEqual(enriched.metadata["shotmap_situation_candidate_count"], 1)
+        self.assertEqual(
+            enriched.metadata["shotmap_candidate_details"][0]["situation"],
+            "penalty",
+        )
+
+    def test_penalty_goal_reports_missing_required_situation(self):
+        enriched = associate_shotmap_second(
+            self.goal(event_key="match-1:PG:goal-1", code="PG"),
+            {
+                "shots": [
+                    {
+                        "outcome": "goal",
+                        "situation": "open_play",
+                        "minute": 69,
+                        "minute_extra": 0,
+                        "person_id": 9,
+                        "second": 4177,
+                    }
+                ]
+            },
+        )
+
+        self.assertIsNone(enriched.second)
+        self.assertEqual(enriched.metadata["shotmap_match_status"], "missing")
+        self.assertEqual(
+            enriched.metadata["shotmap_match_reason"],
+            "required_situation_not_found",
+        )
+        self.assertEqual(enriched.metadata["shotmap_outcome_candidate_count"], 1)
+        self.assertEqual(enriched.metadata["shotmap_situation_candidate_count"], 0)
+
+    def test_person_and_team_ids_conservatively_narrow_same_minute_goals(self):
+        event = self.goal(metadata={"team_id": "101"})
+        enriched = associate_shotmap_second(
+            event,
+            {
+                "shots": [
+                    {
+                        "outcome": "goal",
+                        "minute": 69,
+                        "minute_extra": 0,
+                        "person_id": 8,
+                        "team_id": 101,
+                        "second": 4161,
+                    },
+                    {
+                        "outcome": "goal",
+                        "minute": 69,
+                        "minute_extra": 0,
+                        "person_id": 9,
+                        "team_id": 101,
+                        "second": 4177,
+                    },
+                ]
+            },
+        )
+
+        self.assertEqual(enriched.second, 4177)
+        self.assertEqual(
+            enriched.metadata["shotmap_match_method"],
+            "outcome+minute+minute_extra+person_id+team_id",
+        )
+
+    def test_same_player_on_other_team_is_not_associated(self):
+        enriched = associate_shotmap_second(
+            self.goal(metadata={"team_id": "101"}),
+            {
+                "shots": [
+                    {
+                        "outcome": "goal",
+                        "minute": 69,
+                        "minute_extra": 0,
+                        "person_id": 9,
+                        "team_id": 202,
+                        "second": 4177,
+                    }
+                ]
+            },
+        )
+
+        self.assertIsNone(enriched.second)
+        self.assertEqual(enriched.metadata["shotmap_match_status"], "missing")
+        self.assertEqual(enriched.metadata["shotmap_match_reason"], "no_candidate")
+        self.assertEqual(enriched.metadata["shotmap_candidate_count"], 0)
+        self.assertEqual(enriched.metadata["shotmap_clock_candidate_count"], 1)
+        self.assertEqual(enriched.metadata["shotmap_person_candidate_count"], 1)
+        self.assertEqual(enriched.metadata["shotmap_team_candidate_count"], 0)
+        self.assertEqual(
+            enriched.metadata["shotmap_clock_candidate_details"][0]["team_id"],
+            "202",
+        )
+
+    def test_minute_and_stoppage_time_formats_are_normalized(self):
+        enriched = associate_shotmap_second(
+            self.goal(minute="90+6", minute_extra="0", metadata={"team_id": "101"}),
+            {
+                "shots": [
+                    {
+                        "outcome": "goal",
+                        "minute": "90'",
+                        "minute_extra": "6'",
+                        "person_id": 9,
+                        "team_id": "101",
+                        "second": 5763,
+                    }
+                ]
+            },
+        )
+
+        self.assertEqual(enriched.second, 5763)
+        self.assertEqual(enriched.metadata["shotmap_match_status"], "matched")
+
+    def test_elapsed_minute_and_stoppage_minute_are_equivalent(self):
+        enriched = associate_shotmap_second(
+            self.goal(minute="46", minute_extra="0"),
+            {
+                "shots": [
+                    {
+                        "outcome": "goal",
+                        "minute": "45",
+                        "minute_extra": "1",
+                        "person_id": 9,
+                        "second": 2758,
+                    }
+                ]
+            },
+        )
+
+        self.assertEqual(enriched.second, 2758)
+        self.assertEqual(enriched.metadata["shotmap_match_status"], "matched")
+
+    def test_zero_and_integral_float_minutes_remain_valid(self):
+        for event_minute, shot_minute in (("0", 0), (0, 0.0)):
+            with self.subTest(event_minute=event_minute, shot_minute=shot_minute):
+                enriched = associate_shotmap_second(
+                    self.goal(minute=event_minute),
+                    {
+                        "shots": [
+                            {
+                                "outcome": "goal",
+                                "minute": shot_minute,
+                                "minute_extra": 0,
+                                "person_id": 9,
+                                "second": 32,
+                            }
+                        ]
+                    },
+                )
+
+                self.assertEqual(enriched.second, 32)
+
+    def test_known_person_id_does_not_match_a_shot_with_missing_person_id(self):
+        enriched = associate_shotmap_second(
+            self.goal(),
+            {
+                "shots": [
+                    {
+                        "outcome": "goal",
+                        "minute": 69,
+                        "minute_extra": 0,
+                        "second": 4177,
+                    }
+                ]
+            },
+        )
+
+        self.assertIsNone(enriched.second)
+        self.assertEqual(enriched.metadata["shotmap_match_status"], "missing")
+        self.assertEqual(enriched.metadata["shotmap_candidate_count"], 0)
+
+    def test_own_goal_requires_a_unique_clock_candidate(self):
+        event = self.goal(
+            code="OG",
+            event_key="match-1:OG:goal-1",
+            person_id="0",
+            metadata={"team_id": "101"},
+        )
+        enriched = associate_shotmap_second(
+            event,
+            {
+                "shots": [
+                    {
+                        "outcome": "goal",
+                        "minute": 69,
+                        "minute_extra": 0,
+                        "person_id": 8,
+                        "team_id": 101,
+                        "second": 4171,
+                    },
+                    {
+                        "outcome": "goal",
+                        "minute": 69,
+                        "minute_extra": 0,
+                        "person_id": 9,
+                        "team_id": 101,
+                        "second": 4177,
+                    },
+                ]
+            },
+        )
+
+        self.assertIsNone(enriched.second)
+        self.assertEqual(enriched.metadata["shotmap_match_status"], "ambiguous")
+        self.assertEqual(
+            enriched.metadata["shotmap_match_reason"],
+            "multiple_candidates",
+        )
+        self.assertEqual(enriched.metadata["shotmap_candidate_count"], 2)
+        self.assertEqual(
+            [
+                candidate["person_id"]
+                for candidate in enriched.metadata["shotmap_candidate_details"]
+            ],
+            ["50000008", "50000009"],
+        )
+
+    def test_missing_ambiguous_and_invalid_results_are_distinguishable(self):
+        event = self.goal()
+        missing = associate_shotmap_second(event, {"shots": []})
+        invalid = associate_shotmap_second(
+            event,
+            {
+                "shots": [
+                    {
+                        "outcome": "goal",
+                        "minute": 69,
+                        "minute_extra": 0,
+                        "person_id": 9,
+                        "second": "not-a-second",
+                    }
+                ]
+            },
+        )
+        malformed = associate_shotmap_second(event, {"shots": {}})
+
+        self.assertEqual(missing.metadata["shotmap_match_status"], "missing")
+        self.assertEqual(missing.metadata["shotmap_match_reason"], "no_candidate")
+        self.assertEqual(missing.metadata["shotmap_candidate_details"], [])
+        self.assertEqual(invalid.metadata["shotmap_match_status"], "invalid")
+        self.assertEqual(invalid.metadata["shotmap_invalid_reason"], "invalid_second")
+        self.assertEqual(malformed.metadata["shotmap_match_status"], "invalid")
+
+    def test_cumulative_second_must_match_the_shot_minute(self):
+        invalid = associate_shotmap_second(
+            self.goal(),
+            {
+                "shots": [
+                    {
+                        "outcome": "goal",
+                        "minute": 69,
+                        "minute_extra": 0,
+                        "person_id": 9,
+                        "second": 152,
+                    }
+                ]
+            },
+        )
+
+        self.assertIsNone(invalid.second)
+        self.assertEqual(invalid.metadata["shotmap_match_status"], "invalid")
+        self.assertEqual(
+            invalid.metadata["shotmap_invalid_reason"],
+            "second_minute_mismatch",
+        )
+
+    def test_source_retries_missing_goal_and_returns_later_second(self):
+        source = HttpShotmapSecondSource(
+            "https://example.test/shotmap",
+            "match-1",
+            "user@example.test",
+            timeout=1,
+            retry_interval=5,
+            wait_seconds=40,
+        )
+        empty = FakeHttpResponse({"shots": []})
+        matched = FakeHttpResponse(
+            {
+                "shots": [
+                    {
+                        "outcome": "goal",
+                        "minute": 69,
+                        "minute_extra": 0,
+                        "person_id": 9,
+                        "second": 4177,
+                    }
+                ]
+            }
+        )
+        with patch(
+            "event_driven_pipeline.urllib.request.urlopen",
+            side_effect=[empty, matched],
+        ) as urlopen:
+            self.assertIsNone(source.poll(self.goal(), 0.0))
+            self.assertIsNone(source.poll(self.goal(), 4.9))
+            enriched = source.poll(self.goal(), 5.0)
+
+        self.assertEqual(enriched.second, 4177)
+        self.assertEqual(urlopen.call_count, 2)
+        request_url = urlopen.call_args.args[0].full_url
+        self.assertIn("match_id=match-1", request_url)
+        self.assertIn("user=user%40example.test", request_url)
+
+    def test_cached_second_does_not_restore_stale_overview_fields(self):
+        source = HttpShotmapSecondSource(
+            "https://example.test/shotmap",
+            "match-1",
+            None,
+            timeout=1,
+        )
+        payload = {
+            "shots": [
+                {
+                    "outcome": "goal",
+                    "minute": 69,
+                    "minute_extra": 0,
+                    "person_id": 9,
+                    "second": 4177,
+                }
+            ]
+        }
+        with patch(
+            "event_driven_pipeline.urllib.request.urlopen",
+            return_value=FakeHttpResponse(payload),
+        ):
+            original = source.poll(self.goal(score="1-0"), 0.0)
+            refreshed = source.poll(self.goal(score="2-0"), 0.1)
+
+        self.assertEqual(original.second, 4177)
+        self.assertEqual(refreshed.second, 4177)
+        self.assertEqual(refreshed.score, "2-0")
+
+    def test_overview_association_revision_does_not_reuse_stale_second(self):
+        source = HttpShotmapSecondSource(
+            "https://example.test/shotmap",
+            "match-1",
+            None,
+            timeout=1,
+            retry_interval=5,
+        )
+        first_payload = {
+            "shots": [
+                {
+                    "outcome": "goal",
+                    "minute": 69,
+                    "minute_extra": 0,
+                    "person_id": 9,
+                    "second": 4177,
+                }
+            ]
+        }
+        revised_payload = {
+            "shots": [
+                {
+                    "outcome": "goal",
+                    "minute": 70,
+                    "minute_extra": 0,
+                    "person_id": 9,
+                    "second": 4234,
+                }
+            ]
+        }
+        with patch(
+            "event_driven_pipeline.urllib.request.urlopen",
+            side_effect=[
+                FakeHttpResponse(first_payload),
+                FakeHttpResponse(revised_payload),
+            ],
+        ):
+            original = source.poll(self.goal(), 0.0)
+            revised = source.poll(replace(original, minute="70"), 5.0)
+
+        self.assertEqual(original.second, 4177)
+        self.assertEqual(revised.second, 4234)
+        self.assertEqual(
+            revised.metadata["shotmap_association_signature"]["minute"],
+            "70",
+        )
+
+    def test_source_releases_original_minute_path_after_wait_window(self):
+        source = HttpShotmapSecondSource(
+            "https://example.test/shotmap",
+            "match-1",
+            None,
+            timeout=1,
+            retry_interval=5,
+            wait_seconds=40,
+        )
+        with patch(
+            "event_driven_pipeline.urllib.request.urlopen",
+            return_value=FakeHttpResponse({"shots": []}),
+        ):
+            self.assertIsNone(source.poll(self.goal(), 0.0))
+            final = source.poll(self.goal(), 40.0)
+
+        self.assertIsNone(final.second)
+        self.assertEqual(final.metadata["shotmap_match_status"], "missing")
+
+    def test_cards_bypass_shotmap_without_a_request(self):
+        source = HttpShotmapSecondSource(
+            "https://example.test/shotmap",
+            "match-1",
+            None,
+            timeout=1,
+        )
+        card = self.goal(
+            event_key="match-1:YC:card-1",
+            code="YC",
+            event_type="yellow_card",
+        )
+        with patch("event_driven_pipeline.urllib.request.urlopen") as urlopen:
+            self.assertIs(source.poll(card, 0.0), card)
+        urlopen.assert_not_called()
 
 
 class ExitedProcess:
@@ -69,19 +1109,51 @@ class OptionalVisionSchedulingTests(unittest.TestCase):
         self.assertEqual(profile["clock_roi"], [30, 20, 180, 70])
         self.assertEqual(profile["score_roi"], [190, 20, 330, 70])
 
-    def test_default_gif_work_blocks_optional_vision_submission(self):
-        snapshot = {
-            "active": {"items": [{"task_kind": "vision"}]},
-            "waiting": {"items": [{"task_kind": "gif"}]},
-        }
-        self.assertTrue(heavy_snapshot_has_default_gif_work(snapshot))
+    def test_terminal_failed_encode_does_not_become_encoded_in_memory(self):
+        event = MatchEvent(
+            "match:G:failed", "G", "goal", "35", "0", "team", "", "", "1-0", ""
+        )
+        pending = PendingEvent(
+            event_type="goal", stream_time=10.0, source_time=None,
+            detected_wall_time=0.0, change_fraction=0.0,
+            stability_fraction=0.0, output_due_stream_time=12.0,
+        )
+        job = EventJob(event, pending, 10.0, None)
+        stored = SimpleNamespace(status="failed", result={"error_kind": "video_gap"})
+        runtime = SimpleNamespace(store=SimpleNamespace(get=Mock(return_value=stored)))
 
-    def test_only_vision_work_does_not_report_default_gif_pressure(self):
-        snapshot = {
-            "active": {"items": [{"task_kind": "vision"}]},
-            "waiting": {"items": []},
-        }
-        self.assertFalse(heavy_snapshot_has_default_gif_work(snapshot))
+        sync_completed_default_job(job, runtime, event.event_key, completed=True)
+
+        self.assertEqual(job.pending.status, "failed")
+        self.assertEqual(job.pending.result["error_kind"], "video_gap")
+
+    def test_visual_job_uses_latest_event_revision_before_submission(self):
+        vision_job = SimpleNamespace(
+            code="G", event_type="goal",
+            event_minute="35", event_minute_extra="0", target_score="4-0",
+            observed_anchor_stream_time=100.0, observed_anchor_source_time=200.0,
+        )
+        default_task = SimpleNamespace(
+            event_data={
+                "code": "PG",
+                "event_type": "goal",
+                "minute": "41",
+                "minute_extra": "0",
+                "second": 2473,
+                "score": "5-0",
+            },
+            observed_stream_time=120.0,
+            observed_source_time=220.0,
+        )
+
+        refresh_vision_job_event_data(vision_job, default_task)
+
+        self.assertEqual(vision_job.code, "PG")
+        self.assertEqual(vision_job.event_type, "goal")
+        self.assertEqual(vision_job.event_minute, "41")
+        self.assertEqual(vision_job.event_second, 2473)
+        self.assertEqual(vision_job.target_score, "5-0")
+        self.assertEqual(vision_job.observed_anchor_stream_time, 120.0)
 
 
 class ReconnectingSupervisor:
@@ -160,6 +1232,62 @@ class GracefulStopSupervisor:
 
 
 class EventParsingTests(unittest.TestCase):
+    def test_visual_submission_is_independent_from_default_gif_state(self):
+        pending_ocr = SimpleNamespace(
+            status="pending",
+            next_attempt_at_unix=0.0,
+            search_end_stream_time=100.0,
+            deadline_at_unix=2000.0,
+        )
+        self.assertTrue(
+            vision_artifact_ready_for_submission(
+                "ocr_window",
+                pending_ocr,
+                None,
+                stream_time=103.0,
+                segment_slack=2.0,
+                now_unix=1000.0,
+            )
+        )
+
+        pending_tdeed = SimpleNamespace(
+            status="pending",
+            next_attempt_at_unix=0.0,
+        )
+        self.assertFalse(
+            vision_artifact_ready_for_submission(
+                "tdeed_refined",
+                pending_tdeed,
+                pending_ocr,
+                stream_time=103.0,
+                segment_slack=2.0,
+                now_unix=1000.0,
+            )
+        )
+        for upstream_status in ("encoded", "failed"):
+            with self.subTest(upstream_status=upstream_status):
+                self.assertTrue(
+                    vision_artifact_ready_for_submission(
+                        "tdeed_refined",
+                        pending_tdeed,
+                        SimpleNamespace(status=upstream_status),
+                        stream_time=103.0,
+                        segment_slack=2.0,
+                        now_unix=1000.0,
+                    )
+                )
+
+    def test_visual_pool_keys_are_artifact_specific(self):
+        event_key = "match-1:G:event"
+        ocr_key = vision_pool_task_key(event_key, "ocr_window")
+        tdeed_key = vision_pool_task_key(event_key, "tdeed_refined")
+
+        self.assertNotEqual(ocr_key, tdeed_key)
+        self.assertEqual(
+            split_vision_pool_task_key(ocr_key),
+            (event_key, "ocr_window"),
+        )
+
     def test_default_gif_name_uses_latest_persisted_event_revision(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -437,6 +1565,174 @@ class EventParsingTests(unittest.TestCase):
                 0,
             )
             self.assertEqual(supervisor.progress_calls, 1)
+
+    def test_observed_segment_paths_are_bounded_to_recent_media(self):
+        class Supervisor:
+            def __init__(self):
+                self.progress_calls = 0
+
+            def note_media_progress(self):
+                self.progress_calls += 1
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = []
+            segments = []
+            for index in range(4):
+                path = root / f"segment-{index}.ts"
+                path.write_bytes(b"media")
+                paths.append(path)
+                segments.append(Segment(path, float(index), float(index + 1)))
+            observed = set()
+            supervisor = Supervisor()
+
+            self.assertEqual(
+                observe_segment_progress(
+                    supervisor,
+                    segments,
+                    observed,
+                    max_observed_paths=2,
+                ),
+                2,
+            )
+            self.assertEqual(len(observed), 2)
+            self.assertEqual(
+                observed,
+                {str(paths[2].resolve()), str(paths[3].resolve())},
+            )
+
+    def test_closed_empty_generation_is_removed_and_csv_is_compacted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            buffer_dir = root / "buffer"
+            buffer_dir.mkdir()
+            valid_media = buffer_dir / "valid.ts"
+            valid_media.write_bytes(b"media")
+            compacted = buffer_dir / "closed.csv"
+            compacted.write_text(
+                "valid.ts,0,1\nmissing.ts,1,2\n",
+                encoding="utf-8",
+            )
+            stale = buffer_dir / "stale.csv"
+            stale.write_text("missing.ts,0,1\n", encoding="utf-8")
+            manifest_path = buffer_dir / "segment_manifest.json"
+            manifest = new_segment_manifest("match-1", "source", 1000.0)
+            manifest = upsert_segment_generation(
+                manifest,
+                list_path=Path("closed.csv"),
+                stream_offset=0.0,
+                started_at_wall=1000.0,
+            )
+            manifest = upsert_segment_generation(
+                manifest,
+                list_path=Path("stale.csv"),
+                stream_offset=1.0,
+                started_at_wall=1001.0,
+            )
+            save_segment_manifest(manifest_path, manifest)
+            generations = [
+                SegmentGeneration(compacted, 0.0),
+                SegmentGeneration(stale, 1.0),
+            ]
+
+            updated, removed, rows = maintain_segment_generations(
+                generations,
+                manifest,
+                manifest_path=manifest_path,
+                buffer_dir=buffer_dir,
+                active_list_path=None,
+            )
+
+            self.assertEqual(removed, 1)
+            self.assertEqual(rows, 1)
+            self.assertEqual(len(generations), 1)
+            self.assertEqual(len(updated.generations), 1)
+            self.assertEqual(compacted.read_text(encoding="utf-8"), "valid.ts,0,1\n")
+            self.assertFalse(stale.exists())
+
+    def test_terminal_jobs_are_evicted_after_durable_completion(self):
+        event = MatchEvent(
+            event_key="match-1:G:terminal",
+            code="G",
+            event_type="goal",
+            minute="1",
+            minute_extra="0",
+            team="teamA",
+            person="Scorer",
+            person_id="9",
+            score="1-0",
+            reason="",
+        )
+        pending = PendingEvent(
+            event_type="goal",
+            stream_time=10.0,
+            source_time=None,
+            detected_wall_time=100.0,
+            change_fraction=0.0,
+            stability_fraction=0.0,
+            output_due_stream_time=12.0,
+            status="encoded",
+            result={"output": "/tmp/goal.gif"},
+        )
+        job = EventJob(event, pending, 10.0, None)
+        vision_job = VisionJob(
+            event_key=event.event_key,
+            match_id="match-1",
+            code="G",
+            event_type="goal",
+            default_anchor_stream_time=10.0,
+            default_anchor_source_time=None,
+            detected_at_unix=100.0,
+        )
+        visual_statuses = {
+            "ocr_window": "encoded",
+            "tdeed_refined": "pending",
+        }
+        runtime = SimpleNamespace(
+            store=SimpleNamespace(
+                get=lambda key: SimpleNamespace(status="encoded")
+                if key == event.event_key else None,
+                get_vision_task=lambda key, artifact_kind=None: SimpleNamespace(
+                    status=visual_statuses[artifact_kind]
+                )
+                if key == event.event_key else None,
+            )
+        )
+        jobs = [job]
+        vision_jobs = {event.event_key: vision_job}
+        contexts = {}
+
+        self.assertEqual(
+            evict_terminal_runtime_jobs(
+                jobs,
+                vision_jobs,
+                runtime,
+                contexts,
+                before=10.0,
+                after=20.0,
+            ),
+            (1, 0),
+        )
+        self.assertEqual(jobs, [])
+        self.assertEqual(vision_jobs, {event.event_key: vision_job})
+        self.assertEqual(
+            contexts[event.event_key]["clip_anchor_stream_time_sec"],
+            10.0,
+        )
+
+        visual_statuses["tdeed_refined"] = "failed"
+        self.assertEqual(
+            evict_terminal_runtime_jobs(
+                jobs,
+                vision_jobs,
+                runtime,
+                contexts,
+                before=10.0,
+                after=20.0,
+            ),
+            (0, 1),
+        )
+        self.assertEqual(vision_jobs, {})
 
     def test_match_start_play_defaults_naive_values_to_beijing(self):
         expected = parse_match_start_play("2026-05-20T11:00:00+08:00")
@@ -806,6 +2102,37 @@ class EventParsingTests(unittest.TestCase):
         reconciled = tracker.reconcile(second)
         self.assertEqual(len({event.event_key for event in reconciled}), 2)
 
+    def test_adjacent_goal_seconds_never_reuse_the_previous_canonical_key(self):
+        for later_score in ("1-0", ""):
+            with self.subTest(later_score=later_score):
+                tracker = EventRevisionTracker()
+                first = MatchEvent(
+                    event_key="match-1:G:first",
+                    code="G",
+                    event_type="goal",
+                    minute="10",
+                    minute_extra="0",
+                    team="teamA",
+                    person="",
+                    person_id="0",
+                    score="1-0",
+                    reason="",
+                    second=601,
+                    metadata={"second_source": "shotmap"},
+                )
+                later = replace(
+                    first,
+                    event_key="match-1:G:later",
+                    minute="11",
+                    score=later_score,
+                    second=659,
+                )
+                tracker.reconcile([first])
+                reconciled = tracker.reconcile([later])
+
+                self.assertEqual(reconciled[0].event_key, later.event_key)
+                self.assertEqual(len(tracker.canonical_events), 2)
+
     def test_same_snapshot_goal_versions_are_merged_before_task_creation(self):
         tracker = EventRevisionTracker()
         snapshot = {
@@ -962,6 +2289,27 @@ class EventParsingTests(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].code, "OG")
         self.assertEqual(events[0].event_type, "goal")
+
+    def test_penalty_goal_is_preserved_as_pg_and_penalty_miss_is_excluded(self):
+        payload = {
+            "events": {
+                "42": {
+                    "minute": "42",
+                    "teamAEvents": [
+                        {"code": "PG", "person": "A", "person_id": "1"},
+                        {"code": "PM", "person": "B", "person_id": "2"},
+                    ],
+                    "teamBEvents": [],
+                }
+            }
+        }
+
+        events = parse_match_events(payload, "match-1")
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].code, "PG")
+        self.assertEqual(events[0].event_type, "goal")
+        self.assertIn(":PG:", events[0].event_key)
 
     def test_mock_source_emits_once_after_configured_delay(self):
         with tempfile.TemporaryDirectory() as directory:

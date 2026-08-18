@@ -12,6 +12,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
+import queue
 import shutil
 import signal
 import threading
@@ -46,7 +48,9 @@ from live_goal_pipeline import (
     analyze_video_coverage,
     encode_gif,
     prune_buffer,
+    compact_segment_list,
     read_segments,
+    rolling_segment_list_size,
     source_is_local,
 )
 from event_api_response import normalize_event_api_response
@@ -55,6 +59,7 @@ from pipeline_runtime import (
     PipelineRuntime,
     StoredTask,
     TimelineState,
+    VISION_ARTIFACT_KINDS,
     coarse_event_elapsed_seconds,
 )
 from segment_manifest import (
@@ -73,26 +78,51 @@ from vision_runtime import (
     OCR_MINUTE_FALLBACK_BEFORE_SECONDS,
     OCR_MINUTE_FALLBACK_FPS,
     OCR_MINUTE_FALLBACK_WIDTH,
+    OCR_MINUTE_WINDOW_BEFORE_SECONDS,
     OCR_PYTHON,
     VisionJob,
     find_python,
-    refine_event_job,
+    process_vision_artifact,
 )
 from match_event_identity import (
     events_represent_same_incident,
     explicit_event_id,
     meaningful_id,
     merge_event_metadata,
+    stable_event_second,
 )
 
 
 SUPPORTED_EVENT_CODES = {
     "G": "goal",
     "OG": "goal",
+    "PG": "goal",
     "YC": "yellow_card",
     "RC": "red_card",
 }
+GOAL_EVENT_CODES = {"G", "OG", "PG"}
+DEFAULT_SHOTMAP_URL = (
+    "https://openapi.dongqiudi.com/internal/sport-data/"
+    "sport_data/match/shotmap"
+)
+SHOTMAP_RETRY_SECONDS = 5.0
+SHOTMAP_WAIT_SECONDS = 40.0
+SHOTMAP_PLAYER_ID_OFFSET = 50_000_000
+SHOTMAP_COORDINATE_FIELDS = (
+    "start_x",
+    "start_y",
+    "block_x",
+    "block_y",
+    "end_x",
+    "end_y",
+    "goal_x",
+    "goal_y",
+)
 YELLOW_CARD_REVISION_WINDOW_SECONDS = 180.0
+MAX_OBSERVED_SEGMENT_PATHS = 4096
+VISION_POOL_KEY_SEPARATOR = "\x1f"
+EVENT_VISUAL_WINDOW_LEASE_OWNER = "event-visual-window"
+MIN_EVENT_VISUAL_WINDOW_LEASE_TTL_SECONDS = 180.0
 
 
 def load_scoreboard_profile(path: Path | None) -> dict[str, Any] | None:
@@ -125,6 +155,7 @@ class MatchEvent:
     person_id: str
     score: str
     reason: str
+    second: int | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -139,6 +170,198 @@ class EventJob:
     vision_search_end_stream_time: float | None = None
 
 
+def event_job_report_context(
+    job: EventJob,
+    *,
+    before: float,
+    after: float,
+) -> dict[str, Any]:
+    """Capture the small non-durable fields needed by the final report."""
+    return {
+        "observed_stream_time_sec": round(job.observed_stream_time, 3),
+        "observed_source_time_sec": (
+            round(job.observed_source_time, 3)
+            if job.observed_source_time is not None
+            else None
+        ),
+        "clip_anchor_stream_time_sec": round(job.pending.stream_time, 3),
+        "clip_anchor_source_time_sec": job.pending.source_time,
+        "timing_diagnostics": event_timing_diagnostics(
+            job,
+            before=before,
+            after=after,
+        ),
+        "match_clock_anchor_stream_time_sec": (
+            round(job.match_clock_anchor_stream_time, 3)
+            if job.match_clock_anchor_stream_time is not None
+            else None
+        ),
+        "vision_search_start_stream_time_sec": (
+            round(job.vision_search_start_stream_time, 3)
+            if job.vision_search_start_stream_time is not None
+            else None
+        ),
+        "vision_search_end_stream_time_sec": (
+            round(job.vision_search_end_stream_time, 3)
+            if job.vision_search_end_stream_time is not None
+            else None
+        ),
+    }
+
+
+def evict_terminal_runtime_jobs(
+    jobs: list[EventJob],
+    vision_jobs: dict[str, VisionJob],
+    runtime: PipelineRuntime,
+    report_contexts: dict[str, dict[str, Any]],
+    *,
+    before: float,
+    after: float,
+    active_default_keys: set[str] | None = None,
+    active_vision_keys: set[str] | None = None,
+) -> tuple[int, int]:
+    """Drop terminal task objects after their authoritative state is durable."""
+    default_busy = active_default_keys or set()
+    vision_busy = active_vision_keys or set()
+    retained_jobs: list[EventJob] = []
+    removed_jobs = 0
+    for job in jobs:
+        event_key = job.match_event.event_key
+        stored = runtime.store.get(event_key)
+        if event_key in default_busy or stored is None or stored.status not in {
+            "encoded",
+            "failed",
+        }:
+            retained_jobs.append(job)
+            continue
+        report_contexts[event_key] = event_job_report_context(
+            job,
+            before=before,
+            after=after,
+        )
+        removed_jobs += 1
+    jobs[:] = retained_jobs
+
+    removed_vision_jobs = 0
+    for event_key in list(vision_jobs):
+        artifacts = [
+            task
+            for artifact_kind in VISION_ARTIFACT_KINDS
+            if (
+                task := runtime.store.get_vision_task(
+                    event_key,
+                    artifact_kind=artifact_kind,
+                )
+            )
+            is not None
+        ]
+        if (
+            event_key in vision_busy
+            or not artifacts
+            or any(task.status not in {"encoded", "failed"} for task in artifacts)
+        ):
+            continue
+        del vision_jobs[event_key]
+        removed_vision_jobs += 1
+    return removed_jobs, removed_vision_jobs
+
+
+def vision_pool_task_key(event_key: str, artifact_kind: str) -> str:
+    """Return a collision-free in-process key for one visual artifact."""
+    if artifact_kind not in VISION_ARTIFACT_KINDS:
+        raise ValueError(f"unsupported vision artifact kind: {artifact_kind!r}")
+    if VISION_POOL_KEY_SEPARATOR in event_key:
+        raise ValueError("event key contains the reserved vision-pool separator")
+    return f"{artifact_kind}{VISION_POOL_KEY_SEPARATOR}{event_key}"
+
+
+def split_vision_pool_task_key(task_key: str) -> tuple[str, str]:
+    artifact_kind, separator, event_key = task_key.partition(
+        VISION_POOL_KEY_SEPARATOR
+    )
+    if (
+        not separator
+        or not event_key
+        or artifact_kind not in VISION_ARTIFACT_KINDS
+    ):
+        raise ValueError(f"invalid vision pool task key: {task_key!r}")
+    return event_key, artifact_kind
+
+
+def active_vision_event_keys(task_keys: set[str]) -> set[str]:
+    """Collapse artifact-level pool keys to event keys for safe eviction."""
+    return {
+        split_vision_pool_task_key(task_key)[0]
+        for task_key in task_keys
+    }
+
+
+def vision_artifact_ready_for_submission(
+    artifact_kind: str,
+    task: Any,
+    upstream_ocr_task: Any | None,
+    *,
+    stream_time: float,
+    segment_slack: float,
+    now_unix: float,
+) -> bool:
+    """Check one visual artifact without consulting default GIF state."""
+    if artifact_kind not in VISION_ARTIFACT_KINDS:
+        raise ValueError(f"unsupported vision artifact kind: {artifact_kind!r}")
+    if task is None or task.status not in {"pending", "located"}:
+        return False
+    if now_unix < task.next_attempt_at_unix:
+        return False
+    if artifact_kind == "tdeed_refined" and (
+        upstream_ocr_task is None
+        or upstream_ocr_task.status not in {"encoded", "failed"}
+    ):
+        return False
+    if (
+        artifact_kind == "ocr_window"
+        and stream_time < task.search_end_stream_time + segment_slack
+        and now_unix < task.deadline_at_unix
+    ):
+        return False
+    return True
+
+
+def fail_unhandled_vision_worker_error(
+    runtime: PipelineRuntime,
+    *,
+    event_key: str,
+    artifact_kind: str,
+    error: BaseException,
+) -> None:
+    """Persist an unexpected worker escape on only the affected artifact."""
+    current = runtime.store.get_vision_task(event_key, artifact_kind)
+    if current is None or current.status in {"encoded", "failed"}:
+        return
+    message = str(error) or type(error).__name__
+    runtime.transition_vision_task(
+        event_key,
+        "failed",
+        artifact_kind=artifact_kind,
+        result={
+            "artifact_kind": artifact_kind,
+            "stage": "worker_execution",
+            "error_kind": "vision_worker_unhandled_error",
+            "output_kind": "failed",
+            "default_gif_preserved": True,
+            "failure_reason": {
+                "kind": "vision_worker_unhandled_error",
+                "stage": "worker_execution",
+                "message": message,
+                "exception_type": type(error).__name__,
+            },
+        },
+        error=message,
+        error_kind="vision_worker_unhandled_error",
+        failure_stage="worker_execution",
+        failure_reason=message,
+    )
+
+
 BEIJING = ZoneInfo("Asia/Shanghai")
 MATCH_START_NAIVE_TIMEZONES = {
     "beijing": BEIJING,
@@ -150,6 +373,181 @@ TIMELINE_FLOAT_TOLERANCE_SECONDS = 1e-3
 def latest_media_tail_stream_time(segments: list[Any]) -> float | None:
     """Return the latest buffered media timestamp available at observation."""
     return max((float(segment.end) for segment in segments), default=None)
+
+
+def event_visual_window_lease_ttl(
+    *,
+    deadline_at_unix: float,
+    now_unix: float,
+    ocr_timeout_seconds: float,
+    vision_timeout_seconds: float,
+    graceful_stop_timeout_seconds: float,
+) -> float:
+    """Cover queue wait and both visual stages, with TTL as a crash fallback."""
+    remaining_queue_seconds = max(0.0, deadline_at_unix - now_unix)
+    return max(
+        MIN_EVENT_VISUAL_WINDOW_LEASE_TTL_SECONDS,
+        remaining_queue_seconds
+        + max(0.0, ocr_timeout_seconds)
+        + max(0.0, vision_timeout_seconds)
+        + max(0.0, graceful_stop_timeout_seconds),
+    )
+
+
+def ensure_event_visual_window_lease(
+    runtime: PipelineRuntime,
+    *,
+    event_key: str,
+    artifact_kind: str,
+    segments: list[Any],
+    search_start_stream_time: float,
+    search_end_stream_time: float,
+    ttl_seconds: float,
+    now_unix: float | None = None,
+) -> dict[str, Any]:
+    """Lease already-buffered media before an event waits in visual queues."""
+    if ttl_seconds <= 0:
+        raise ValueError("event visual window lease TTL must be positive")
+    if search_end_stream_time < search_start_stream_time:
+        raise ValueError("event visual search end must not precede its start")
+    timestamp = time.time() if now_unix is None else now_unix
+    retention_start = max(
+        0.0,
+        float(search_start_stream_time) - OCR_MINUTE_WINDOW_BEFORE_SECONDS,
+    )
+    retention_end = float(search_end_stream_time)
+    candidate_paths: list[str] = []
+    for segment in segments:
+        if (
+            float(segment.end) <= retention_start
+            or float(segment.start) >= retention_end
+        ):
+            continue
+        path = Path(segment.path)
+        try:
+            if path.is_file() and path.stat().st_size > 0:
+                candidate_paths.append(str(path.resolve()))
+        except OSError:
+            continue
+    candidate_paths = list(dict.fromkeys(candidate_paths))
+
+    active = [
+        lease
+        for lease in runtime.store.list_segment_leases(
+            event_key=event_key,
+            active_at=timestamp,
+        )
+        if lease.owner == EVENT_VISUAL_WINDOW_LEASE_OWNER
+    ]
+    renewed_ids = {
+        lease_id
+        for lease_id in {lease.lease_id for lease in active}
+        if runtime.store.renew_segment_lease(
+            lease_id,
+            ttl_seconds=ttl_seconds,
+            now=timestamp,
+        )
+    }
+    already_leased_paths = {lease.segment_path for lease in active}
+    missing_paths = [
+        path for path in candidate_paths if path not in already_leased_paths
+    ]
+    lease_id = None
+    if missing_paths:
+        lease_id = runtime.store.acquire_segment_lease(
+            event_key,
+            missing_paths,
+            artifact_kind=artifact_kind,
+            owner=EVENT_VISUAL_WINDOW_LEASE_OWNER,
+            ttl_seconds=ttl_seconds,
+            now=timestamp,
+        )
+    return {
+        "event_key": event_key,
+        "lease_id": lease_id,
+        "segment_count": len(candidate_paths),
+        "new_segment_count": len(missing_paths),
+        "renewed_lease_count": len(renewed_ids),
+        "retention_start_stream_time": retention_start,
+        "retention_end_stream_time": retention_end,
+        "ttl_seconds": ttl_seconds,
+    }
+
+
+def protect_incomplete_vision_event_segments(
+    runtime: PipelineRuntime,
+    tasks: list[Any],
+    segments: list[Any],
+    *,
+    ocr_timeout_seconds: float,
+    vision_timeout_seconds: float,
+    graceful_stop_timeout_seconds: float,
+    now_unix: float | None = None,
+) -> list[dict[str, Any]]:
+    """Create or renew one early media reservation per incomplete event."""
+    timestamp = time.time() if now_unix is None else now_unix
+    grouped: dict[str, list[Any]] = {}
+    for task in tasks:
+        if task.status in {"pending", "locating", "located", "encoding"}:
+            grouped.setdefault(task.event_key, []).append(task)
+
+    results: list[dict[str, Any]] = []
+    for event_key, event_tasks in grouped.items():
+        primary = next(
+            (
+                task
+                for task in event_tasks
+                if task.artifact_kind == "ocr_window"
+            ),
+            event_tasks[0],
+        )
+        results.append(
+            ensure_event_visual_window_lease(
+                runtime,
+                event_key=event_key,
+                artifact_kind=primary.artifact_kind,
+                segments=segments,
+                search_start_stream_time=min(
+                    task.search_start_stream_time for task in event_tasks
+                ),
+                search_end_stream_time=max(
+                    task.search_end_stream_time for task in event_tasks
+                ),
+                ttl_seconds=event_visual_window_lease_ttl(
+                    deadline_at_unix=max(
+                        task.deadline_at_unix for task in event_tasks
+                    ),
+                    now_unix=timestamp,
+                    ocr_timeout_seconds=ocr_timeout_seconds,
+                    vision_timeout_seconds=vision_timeout_seconds,
+                    graceful_stop_timeout_seconds=graceful_stop_timeout_seconds,
+                ),
+                now_unix=timestamp,
+            )
+        )
+    return results
+
+
+def release_terminal_event_visual_window_leases(
+    runtime: PipelineRuntime,
+) -> dict[str, int]:
+    """Release early reservations after every visual artifact reaches a terminal state."""
+    event_keys = {
+        lease.event_key
+        for lease in runtime.store.list_segment_leases()
+        if lease.owner == EVENT_VISUAL_WINDOW_LEASE_OWNER
+    }
+    released: dict[str, int] = {}
+    for event_key in event_keys:
+        if runtime.store.has_incomplete_vision_tasks(event_key):
+            continue
+        count = runtime.store.release_segment_leases_for_event(
+            event_key,
+            owner=EVENT_VISUAL_WINDOW_LEASE_OWNER,
+        )
+        if count:
+            released[event_key] = count
+    return released
 
 
 def event_timing_diagnostics(
@@ -204,15 +602,46 @@ def heavy_task_coordinator_database(output_dir: Path) -> Path:
     return DEFAULT_HEAVY_TASK_COORDINATOR_DATABASE
 
 
-def heavy_snapshot_has_default_gif_work(snapshot: dict[str, Any]) -> bool:
-    """Return whether any Worker is running or waiting to run a default GIF."""
-    active = (snapshot.get("active") or {}).get("items") or []
-    waiting = (snapshot.get("waiting") or {}).get("items") or []
-    return any(
-        str(item.get("task_kind") or "") == "gif"
-        for item in [*active, *waiting]
-        if isinstance(item, dict)
+def sync_completed_default_job(
+    job: EventJob,
+    runtime: PipelineRuntime,
+    event_key: str,
+    completed: bool,
+) -> Any:
+    """Synchronize in-memory GIF state with the durable task result.
+
+    ``encode_event_job`` returns ``True`` for both encoded and terminal failed
+    outcomes, so the return value alone cannot drive dashboard counters.
+    """
+    stored = runtime.store.get(event_key)
+    if stored is not None:
+        job.pending.status = stored.status
+        job.pending.result = dict(stored.result)
+    elif completed:
+        job.pending.status = "encoded"
+    else:
+        job.pending.status = "pending"
+    return stored
+
+
+def refresh_vision_job_event_data(vision_job: VisionJob, default_task: StoredTask) -> None:
+    """Apply the latest API revision immediately before visual localization."""
+    event_data = dict(default_task.event_data or {})
+    latest_code = str(event_data.get("code") or vision_job.code).upper()
+    vision_job.code = latest_code
+    vision_job.event_type = str(
+        event_data.get("event_type")
+        or SUPPORTED_EVENT_CODES.get(latest_code)
+        or vision_job.event_type
     )
+    vision_job.event_minute = str(event_data.get("minute") or "")
+    vision_job.event_minute_extra = str(event_data.get("minute_extra") or "0")
+    vision_job.event_second = parse_cumulative_match_second(event_data.get("second"))
+    vision_job.target_score = str(event_data.get("score") or "")
+    if default_task.observed_stream_time is not None:
+        vision_job.observed_anchor_stream_time = default_task.observed_stream_time
+    if default_task.observed_source_time is not None:
+        vision_job.observed_anchor_source_time = default_task.observed_source_time
 
 
 def stream_rate_for_mode(*, simulate_live: bool, replay_speed: float) -> float:
@@ -227,6 +656,18 @@ def stream_rate_for_mode(*, simulate_live: bool, replay_speed: float) -> float:
     if rate <= 0:
         raise ValueError("stream rate must be positive")
     return rate
+
+
+def observed_stream_time_from_wall(
+    processed_stream_time: float,
+    *,
+    processed_at_unix: float,
+    observed_at_unix: float,
+    stream_rate: float,
+) -> float:
+    """Map a background HTTP observation onto the pipeline stream clock."""
+    processing_delay = max(0.0, float(processed_at_unix) - float(observed_at_unix))
+    return max(0.0, float(processed_stream_time) - processing_delay * stream_rate)
 
 
 def resumed_stream_time(
@@ -458,6 +899,28 @@ def recovered_event_job(task: StoredTask) -> EventJob:
     )
 
 
+def default_gif_failure_result(
+    error_kind: str,
+    stage: str,
+    message: str,
+    **diagnostics: Any,
+) -> dict[str, Any]:
+    """Return the stable terminal error contract for the default artifact."""
+    return {
+        "artifact_kind": "default_gif",
+        "stage": stage,
+        "error": message,
+        "error_kind": error_kind,
+        "output_kind": "failed",
+        "failure_reason": {
+            "kind": error_kind,
+            "stage": stage,
+            "message": message,
+        },
+        **diagnostics,
+    }
+
+
 def encode_event_job(
     job: EventJob,
     runtime: PipelineRuntime,
@@ -520,10 +983,12 @@ def encode_event_job(
                     else "buffer_deadline_exceeded"
                 )
                 pending.status = "failed"
-                pending.result = {
-                    "error": error,
-                    "error_kind": error_kind,
-                }
+                pending.result = default_gif_failure_result(
+                    error_kind,
+                    "buffer_coverage",
+                    error,
+                    coverage_reason=coverage.reason,
+                )
                 with lock:
                     runtime.transition(
                         job.match_event.event_key,
@@ -544,7 +1009,11 @@ def encode_event_job(
     if coverage.status == CoverageStatus.UNAVAILABLE:
         error_kind = coverage.error_kind or "video_unavailable"
         pending.status = "failed"
-        pending.result = {"error": coverage.reason, "error_kind": error_kind}
+        pending.result = default_gif_failure_result(
+            error_kind,
+            "buffer_coverage",
+            coverage.reason,
+        )
         with lock:
             runtime.transition(
                 job.match_event.event_key,
@@ -639,10 +1108,11 @@ def encode_event_job(
         if current is not None and time.time() >= current.deadline_at_unix:
             error = f"video window was not ready before the GIF deadline: {exc}"
             pending.status = "failed"
-            pending.result = {
-                "error": error,
-                "error_kind": "buffer_deadline_exceeded",
-            }
+            pending.result = default_gif_failure_result(
+                "buffer_deadline_exceeded",
+                "buffer_coverage",
+                error,
+            )
             with lock:
                 runtime.transition(
                     job.match_event.event_key,
@@ -660,7 +1130,11 @@ def encode_event_job(
         return False
     except BufferUnavailable as exc:
         pending.status = "failed"
-        pending.result = {"error": str(exc), "error_kind": "video_gap"}
+        pending.result = default_gif_failure_result(
+            "video_gap",
+            "encoding_input",
+            str(exc),
+        )
         with lock:
             runtime.transition(
                 job.match_event.event_key,
@@ -673,13 +1147,19 @@ def encode_event_job(
         return True
     except Exception as exc:
         pending.status = "failed"
-        pending.result = {"error": str(exc)}
+        pending.result = default_gif_failure_result(
+            "default_gif_encoding_failed",
+            "encoding",
+            str(exc),
+            exception_type=type(exc).__name__,
+        )
         with lock:
             runtime.transition(
                 job.match_event.event_key,
                 "failed",
                 result=pending.result,
                 error=str(exc),
+                error_kind="default_gif_encoding_failed",
             )
         print(f"[gif:error] code={job.match_event.code} {exc}")
         return True
@@ -705,6 +1185,668 @@ def stable_event_key(
     )
     digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
     return f"{match_id}:{code}:{digest}"
+
+
+def parse_cumulative_match_second(value: Any) -> int | None:
+    """Parse shotmap.second without treating it as a minute-local offset."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, float):
+        if not value.is_integer():
+            return None
+        parsed = int(value)
+    else:
+        text = str(value or "").strip()
+        if not text.isdigit():
+            return None
+        parsed = int(text)
+    return parsed if parsed >= 0 else None
+
+
+def _shotmap_clock_value(value: Any, *, default: int | None = None) -> int | None:
+    if value in (None, ""):
+        return default
+    if isinstance(value, str):
+        value = value.strip().rstrip("'").strip()
+    parsed = parse_cumulative_match_second(value)
+    return parsed
+
+
+def _shotmap_clock_parts(
+    minute: Any,
+    minute_extra: Any,
+) -> tuple[int, int] | None:
+    """Normalize separate and embedded stoppage-time clock formats."""
+    minute_value = minute
+    embedded_extra: int | None = None
+    if isinstance(minute, str):
+        raw_minute = minute.strip().rstrip("'").strip()
+        minute_value = raw_minute
+    else:
+        raw_minute = ""
+    if isinstance(minute_value, str) and "+" in minute_value:
+        parts = [part.strip().rstrip("'").strip() for part in raw_minute.split("+")]
+        if len(parts) != 2 or not all(parts):
+            return None
+        raw_minute, raw_extra = parts
+        minute_value = raw_minute
+        embedded_extra = _shotmap_clock_value(raw_extra)
+        if embedded_extra is None:
+            return None
+
+    normalized_minute = _shotmap_clock_value(minute_value)
+    normalized_extra = _shotmap_clock_value(minute_extra, default=0)
+    if normalized_minute is None or normalized_extra is None:
+        return None
+    if embedded_extra is not None:
+        if normalized_extra not in (0, embedded_extra):
+            return None
+        normalized_extra = embedded_extra
+    if normalized_extra > 0:
+        return normalized_minute + normalized_extra, 0
+    return normalized_minute, 0
+
+
+def _normalized_shotmap_coordinate(value: Any) -> float | None:
+    if value in (None, "") or isinstance(value, bool):
+        return None
+    try:
+        coordinate = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(coordinate):
+        return None
+    return round(coordinate, 3)
+
+
+def normalize_shotmap_goal(shot: Any) -> dict[str, Any] | None:
+    """Normalize one goal row into the durable fingerprint contract."""
+    if not isinstance(shot, dict):
+        return None
+    outcome = str(shot.get("outcome") or "").strip().lower()
+    if outcome != "goal":
+        return None
+    raw_minute = _shotmap_clock_value(shot.get("minute"))
+    raw_minute_extra = _shotmap_clock_value(shot.get("minute_extra"), default=0)
+    second = parse_cumulative_match_second(shot.get("second"))
+    if raw_minute is None and second is not None:
+        raw_minute = 0 if second == 0 else (second + 59) // 60
+    normalized = {
+        "person_id": meaningful_id(shot.get("person_id")),
+        "team_id": meaningful_id(shot.get("team_id")),
+        "minute": raw_minute,
+        "minute_extra": raw_minute_extra,
+        "second": second,
+        "outcome": outcome,
+        "situation": str(shot.get("situation") or "").strip().lower(),
+        "shot_type": str(shot.get("shot_type") or "").strip().lower(),
+        **{
+            field_name: _normalized_shotmap_coordinate(shot.get(field_name))
+            for field_name in SHOTMAP_COORDINATE_FIELDS
+        },
+    }
+    fingerprint_payload = {
+        key: normalized[key]
+        for key in (
+            "person_id",
+            "team_id",
+            "minute",
+            "minute_extra",
+            "second",
+            "situation",
+            *SHOTMAP_COORDINATE_FIELDS,
+        )
+    }
+    fingerprint = hashlib.sha1(
+        json.dumps(
+            fingerprint_payload,
+            sort_keys=True,
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    normalized["fingerprint"] = fingerprint
+    normalized["raw"] = dict(shot)
+    return normalized
+
+
+def _shotmap_goal_core(goal: dict[str, Any]) -> tuple[str, str, int, str] | None:
+    second = parse_cumulative_match_second(goal.get("second"))
+    if second is None:
+        return None
+    return (
+        meaningful_id(goal.get("person_id")),
+        meaningful_id(goal.get("team_id")),
+        second,
+        str(goal.get("situation") or "").strip().lower(),
+    )
+
+
+def shotmap_goal_match_event(
+    match_id: str,
+    goal: dict[str, Any],
+    *,
+    observed_at_unix: float,
+    request_diagnostics: dict[str, Any],
+) -> MatchEvent:
+    """Convert a newly observed shotmap goal into the shared event contract."""
+    fingerprint = str(goal["fingerprint"])
+    second = parse_cumulative_match_second(goal.get("second"))
+    minute = goal.get("minute")
+    if minute is None and second is not None:
+        minute = 0 if second == 0 else (second + 59) // 60
+    minute_text = str(minute if minute is not None else "")
+    minute_extra = str(goal.get("minute_extra") or "0")
+    raw_person_id = meaningful_id(goal.get("person_id"))
+    normalized_person_id = _normalized_shotmap_person_id(raw_person_id) or "0"
+    team_id = meaningful_id(goal.get("team_id"))
+    situation = str(goal.get("situation") or "").strip().lower()
+    code = "PG" if situation == "penalty" else "G"
+    target_clock = None
+    if second is not None:
+        target_minute, target_second = divmod(second, 60)
+        target_clock = f"{target_minute:02d}:{target_second:02d}"
+    metadata = {
+        "match_id": str(match_id),
+        "event_source": {
+            "primary": "shotmap",
+            "state": "provisional",
+        },
+        "source": "shotmap",
+        "second_source": "shotmap",
+        "shotmap_match_status": "direct",
+        "goal_route_status": "shotmap_direct",
+        "shotmap_fingerprint": fingerprint,
+        "shotmap_person_id": raw_person_id,
+        "shotmap_player_id_offset": SHOTMAP_PLAYER_ID_OFFSET,
+        "team_id": team_id,
+        "shotmap_second": second,
+        "target_clock": target_clock,
+        "display_minute": minute,
+        "situation": situation,
+        "shot_type": goal.get("shot_type"),
+        "shotmap_coordinates": {
+            field_name: goal.get(field_name)
+            for field_name in SHOTMAP_COORDINATE_FIELDS
+        },
+        "shotmap_first_observed_at_unix": observed_at_unix,
+        "shotmap_request": dict(request_diagnostics),
+    }
+    return MatchEvent(
+        event_key=stable_event_key(
+            str(match_id),
+            code,
+            minute_text,
+            minute_extra,
+            team_id,
+            normalized_person_id,
+            0,
+            event_id=f"shotmap:{fingerprint}",
+        ),
+        code=code,
+        event_type="goal",
+        minute=minute_text,
+        minute_extra=minute_extra,
+        team=team_id,
+        person="",
+        person_id=normalized_person_id,
+        score="",
+        reason=situation,
+        second=second,
+        metadata=metadata,
+    )
+
+
+def _event_source_name(value: MatchEvent | dict[str, Any]) -> str:
+    payload = asdict(value) if isinstance(value, MatchEvent) else value
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, dict):
+        return "overview"
+    source = metadata.get("event_source")
+    if isinstance(source, dict) and source.get("primary"):
+        return str(source["primary"]).strip().lower()
+    return str(metadata.get("source") or "overview").strip().lower()
+
+
+def cross_source_goal_incident(
+    left: MatchEvent | dict[str, Any],
+    right: MatchEvent | dict[str, Any],
+) -> bool:
+    """Match a direct shotmap goal with its overview representation."""
+    left_data = asdict(left) if isinstance(left, MatchEvent) else dict(left)
+    right_data = asdict(right) if isinstance(right, MatchEvent) else dict(right)
+    if str(left_data.get("event_type") or "") != "goal":
+        return False
+    if str(right_data.get("event_type") or "") != "goal":
+        return False
+    sources = {_event_source_name(left_data), _event_source_name(right_data)}
+    if "shotmap" not in sources or len(sources) < 2:
+        return events_represent_same_incident(left_data, right_data)
+
+    def is_penalty_goal(value: dict[str, Any]) -> bool:
+        metadata = value.get("metadata")
+        situation = (
+            metadata.get("situation") if isinstance(metadata, dict) else None
+        )
+        return (
+            str(value.get("code") or "").upper() == "PG"
+            or str(situation or "").strip().lower() == "penalty"
+            or str(value.get("reason") or "").strip().lower() == "penalty"
+        )
+
+    if is_penalty_goal(left_data) != is_penalty_goal(right_data):
+        return False
+
+    left_second = stable_event_second(left_data)
+    right_second = stable_event_second(right_data)
+    if (
+        left_second is not None
+        and right_second is not None
+        and left_second != right_second
+    ):
+        return False
+    try:
+        left_minute = int(str(left_data.get("minute") or "").strip())
+        right_minute = int(str(right_data.get("minute") or "").strip())
+    except ValueError:
+        return False
+    if abs(left_minute - right_minute) > 1:
+        return False
+
+    left_person = meaningful_id(left_data.get("person_id"))
+    right_person = meaningful_id(right_data.get("person_id"))
+    if left_person and right_person and left_person != right_person:
+        return False
+    left_metadata = left_data.get("metadata")
+    right_metadata = right_data.get("metadata")
+    left_team_id = meaningful_id(
+        left_metadata.get("team_id") if isinstance(left_metadata, dict) else None
+    )
+    right_team_id = meaningful_id(
+        right_metadata.get("team_id") if isinstance(right_metadata, dict) else None
+    )
+    if left_team_id and right_team_id and left_team_id != right_team_id:
+        return False
+    return bool(
+        (left_person and right_person)
+        or (left_team_id and right_team_id)
+        or (left_second is not None and right_second is not None)
+    )
+
+
+def select_cross_source_goal_incident(
+    tasks: list[StoredTask],
+    incoming: MatchEvent,
+) -> tuple[StoredTask | None, str, int]:
+    """Select one incident without guessing between multiple weak matches."""
+    candidates = [
+        task
+        for task in tasks
+        if (
+            _event_source_name(task.event_data)
+            != _event_source_name(incoming)
+            and cross_source_goal_incident(task.event_data, incoming)
+        )
+    ]
+    if not candidates:
+        return None, "none", 0
+
+    incoming_data = asdict(incoming)
+
+    def has_strong_identity(task: StoredTask) -> bool:
+        current = (
+            asdict(task.event_data)
+            if isinstance(task.event_data, MatchEvent)
+            else task.event_data
+        )
+        sources = {_event_source_name(current), _event_source_name(incoming_data)}
+        if "shotmap" not in sources or len(sources) < 2:
+            return False
+        current_person = meaningful_id(current.get("person_id"))
+        incoming_person = meaningful_id(incoming_data.get("person_id"))
+        if current_person and incoming_person and current_person == incoming_person:
+            return True
+        current_second = stable_event_second(current)
+        incoming_second = stable_event_second(incoming_data)
+        return (
+            current_second is not None
+            and incoming_second is not None
+            and current_second == incoming_second
+        )
+
+    strong_candidates = [task for task in candidates if has_strong_identity(task)]
+    if len(strong_candidates) == 1:
+        return strong_candidates[0], "strong", len(candidates)
+    if strong_candidates:
+        return None, "ambiguous", len(candidates)
+    if len(candidates) == 1:
+        return candidates[0], "unique_fallback", 1
+    return None, "ambiguous", len(candidates)
+
+
+def overview_goal_fallback_status(shotmap_source: Any | None) -> str:
+    """Explain why an unmatched overview goal is allowed through immediately."""
+    if shotmap_source is None or not getattr(shotmap_source, "initialized", False):
+        return "overview_fallback_no_match"
+    if getattr(shotmap_source, "last_shot_count", 0) == 0:
+        return "overview_fallback_empty"
+    if getattr(shotmap_source, "last_goal_count", 0) == 0:
+        return "overview_fallback_no_goal"
+    return "overview_fallback_no_match"
+
+
+def merge_cross_source_goal(
+    current: dict[str, Any],
+    update: MatchEvent,
+) -> MatchEvent:
+    """Merge source metadata while keeping shotmap as the clock authority."""
+    incoming = asdict(update)
+    current_source = _event_source_name(current)
+    update_source = _event_source_name(incoming)
+    merged = merge_event_metadata(current, incoming)
+    merged["event_key"] = str(current["event_key"])
+    if current_source != "shotmap" and update_source == "shotmap":
+        for field_name in ("code", "team", "person", "score", "reason"):
+            if current.get(field_name) not in (None, ""):
+                merged[field_name] = current[field_name]
+    shotmap_data = incoming if update_source == "shotmap" else current
+    merged["second"] = stable_event_second(shotmap_data)
+    metadata = dict(merged.get("metadata") or {})
+    metadata["event_source"] = {
+        "primary": "shotmap",
+        "state": "overview_confirmed",
+    }
+    metadata["overview_merged"] = True
+    metadata["goal_route_status"] = (
+        "shotmap_late_match"
+        if current_source != "shotmap" and update_source == "shotmap"
+        else "cross_source_merged"
+    )
+    merged["metadata"] = metadata
+    return MatchEvent(**merged)
+
+
+def _normalized_shotmap_person_id(value: Any) -> str:
+    """Convert shotmap's local player ID to the event-feed ID namespace."""
+    raw = meaningful_id(value)
+    if not raw:
+        return ""
+    try:
+        parsed = int(raw)
+    except ValueError:
+        return ""
+    if parsed < 0:
+        return ""
+    return str(parsed + SHOTMAP_PLAYER_ID_OFFSET)
+
+
+def _shotmap_identifier(shot: dict[str, Any], key: str) -> str:
+    if key == "person_id":
+        return _normalized_shotmap_person_id(shot.get(key))
+    return meaningful_id(shot.get(key))
+
+
+def _shotmap_candidate_details(
+    candidates: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Keep compact association evidence without persisting the full shotmap."""
+    details: list[dict[str, Any]] = []
+    for shot in candidates:
+        clock = _shotmap_clock_parts(shot.get("minute"), shot.get("minute_extra"))
+        details.append(
+            {
+                "outcome": str(shot.get("outcome") or "").strip().lower(),
+                "situation": str(shot.get("situation") or "").strip().lower(),
+                "person_id": _shotmap_identifier(shot, "person_id"),
+                "shotmap_person_id": meaningful_id(shot.get("person_id")),
+                "team_id": _shotmap_identifier(shot, "team_id"),
+                "minute": clock[0] if clock is not None else None,
+                "minute_extra": clock[1] if clock is not None else None,
+                "second": parse_cumulative_match_second(shot.get("second")),
+            }
+        )
+    return details
+
+
+def _shotmap_association_signature(event: MatchEvent) -> dict[str, str]:
+    """Persist the overview fields that make one shotmap match trustworthy."""
+    clock = _shotmap_clock_parts(event.minute, event.minute_extra)
+    return {
+        "code": event.code,
+        "team": event.team,
+        "minute": str(clock[0]) if clock is not None else str(event.minute),
+        "minute_extra": (
+            str(clock[1]) if clock is not None else str(event.minute_extra)
+        ),
+        "person_id": meaningful_id(event.person_id),
+        "team_id": meaningful_id(event.metadata.get("team_id")),
+    }
+
+
+def _narrow_shotmap_candidates(
+    candidates: list[dict[str, Any]],
+    *,
+    expected: str,
+    field: str,
+) -> list[dict[str, Any]]:
+    """Require the configured ID namespace mapping when overview has an ID."""
+    if not expected:
+        return candidates
+    return [
+        shot
+        for shot in candidates
+        if _shotmap_identifier(shot, field) == expected
+    ]
+
+
+def associate_shotmap_second(
+    event: MatchEvent,
+    payload: dict[str, Any],
+) -> MatchEvent:
+    """Conservatively attach one cumulative shotmap second to a goal event."""
+    if event.code not in GOAL_EVENT_CODES:
+        return event
+    association_signature = _shotmap_association_signature(event)
+    base_metadata = {
+        key: value
+        for key, value in event.metadata.items()
+        if key != "second_source" and not key.startswith("shotmap_")
+    }
+
+    raw_shots = payload.get("shots")
+    if raw_shots is None and isinstance(payload.get("data"), dict):
+        raw_shots = payload["data"].get("shots")
+    if not isinstance(raw_shots, list):
+        return replace(
+            event,
+            second=None,
+            metadata={
+                **base_metadata,
+                "shotmap_match_status": "invalid",
+                "shotmap_match_method": "invalid_payload",
+                "shotmap_candidate_count": 0,
+                "shotmap_candidate_details": [],
+                "shotmap_player_id_offset": SHOTMAP_PLAYER_ID_OFFSET,
+                "shotmap_association_signature": association_signature,
+            },
+        )
+
+    event_clock = _shotmap_clock_parts(event.minute, event.minute_extra)
+    if event_clock is None:
+        return replace(
+            event,
+            second=None,
+            metadata={
+                **base_metadata,
+                "shotmap_match_status": "invalid",
+                "shotmap_match_method": "invalid_event_clock",
+                "shotmap_candidate_count": 0,
+                "shotmap_candidate_details": [],
+                "shotmap_player_id_offset": SHOTMAP_PLAYER_ID_OFFSET,
+                "shotmap_association_signature": association_signature,
+            },
+        )
+
+    raw_candidates = [shot for shot in raw_shots if isinstance(shot, dict)]
+    required_outcome = "goal"
+    required_situation = "penalty" if event.code == "PG" else None
+    outcome_candidates = [
+        shot
+        for shot in raw_candidates
+        if str(shot.get("outcome") or "").strip().lower() == required_outcome
+    ]
+    situation_candidates = (
+        [
+            shot
+            for shot in outcome_candidates
+            if str(shot.get("situation") or "").strip().lower()
+            == required_situation
+        ]
+        if required_situation is not None
+        else outcome_candidates
+    )
+    clock_candidates = [
+        shot
+        for shot in situation_candidates
+        if _shotmap_clock_parts(shot.get("minute"), shot.get("minute_extra"))
+        == event_clock
+    ]
+    candidates = clock_candidates
+    match_method = ["outcome"]
+    if required_situation is not None:
+        match_method.append("situation")
+    match_method.extend(["minute", "minute_extra"])
+
+    person_id = meaningful_id(event.person_id)
+    person_candidate_count: int | None = None
+    if person_id:
+        candidates = _narrow_shotmap_candidates(
+            candidates,
+            expected=person_id,
+            field="person_id",
+        )
+        match_method.append("person_id")
+        person_candidate_count = len(candidates)
+    team_id = meaningful_id(event.metadata.get("team_id"))
+    team_candidate_count: int | None = None
+    if team_id:
+        candidates = _narrow_shotmap_candidates(
+            candidates,
+            expected=team_id,
+            field="team_id",
+        )
+        match_method.append("team_id")
+        team_candidate_count = len(candidates)
+
+    filter_failure_reason: str | None = None
+    if not outcome_candidates:
+        filter_failure_reason = "required_outcome_not_found"
+    elif required_situation is not None and not situation_candidates:
+        filter_failure_reason = "required_situation_not_found"
+    elif not clock_candidates:
+        filter_failure_reason = "clock_not_found"
+    elif person_id and person_candidate_count == 0:
+        filter_failure_reason = "person_id_mismatch"
+    elif team_id and team_candidate_count == 0:
+        filter_failure_reason = "team_id_mismatch"
+
+    diagnostics = {
+        "shotmap_match_method": "+".join(match_method),
+        "shotmap_required_outcome": required_outcome,
+        "shotmap_required_situation": required_situation,
+        "shotmap_raw_candidate_count": len(raw_candidates),
+        "shotmap_outcome_candidate_count": len(outcome_candidates),
+        "shotmap_situation_candidate_count": len(situation_candidates),
+        "shotmap_candidate_count": len(candidates),
+        "shotmap_candidate_details": _shotmap_candidate_details(candidates),
+        "shotmap_clock_candidate_count": len(clock_candidates),
+        "shotmap_clock_candidate_details": _shotmap_candidate_details(
+            clock_candidates
+        ),
+        "shotmap_person_candidate_count": person_candidate_count,
+        "shotmap_team_candidate_count": team_candidate_count,
+        "shotmap_expected_person_id": person_id,
+        "shotmap_expected_team_id": team_id,
+        "shotmap_filter_failure_reason": filter_failure_reason,
+        "shotmap_player_id_offset": SHOTMAP_PLAYER_ID_OFFSET,
+        "shotmap_association_signature": association_signature,
+    }
+    if not candidates:
+        return replace(
+            event,
+            second=None,
+            metadata={
+                **base_metadata,
+                **diagnostics,
+                "shotmap_match_status": "missing",
+                "shotmap_match_reason": (
+                    filter_failure_reason
+                    if event.code == "PG" and filter_failure_reason is not None
+                    else "no_candidate"
+                ),
+            },
+        )
+    if len(candidates) != 1:
+        return replace(
+            event,
+            second=None,
+            metadata={
+                **base_metadata,
+                **diagnostics,
+                "shotmap_match_status": "ambiguous",
+                "shotmap_match_reason": "multiple_candidates",
+            },
+        )
+
+    second = parse_cumulative_match_second(candidates[0].get("second"))
+    if second is None:
+        return replace(
+            event,
+            second=None,
+            metadata={
+                **base_metadata,
+                **diagnostics,
+                "shotmap_match_status": "invalid",
+                "shotmap_invalid_reason": "invalid_second",
+            },
+        )
+    shot_clock = _shotmap_clock_parts(
+        candidates[0].get("minute"),
+        candidates[0].get("minute_extra"),
+    )
+    assert shot_clock is not None
+    shot_minute, shot_extra = shot_clock
+    expected_display_minute = shot_minute + shot_extra
+    # Providers may label 02:32 as minute 2 or the third minute. Both are
+    # defensible; a completely different clock is not.
+    if second // 60 not in {
+        expected_display_minute,
+        max(0, expected_display_minute - 1),
+    }:
+        return replace(
+            event,
+            second=None,
+            metadata={
+                **base_metadata,
+                **diagnostics,
+                "shotmap_match_status": "invalid",
+                "shotmap_invalid_reason": "second_minute_mismatch",
+                "shotmap_second": second,
+                "shotmap_expected_minute": expected_display_minute,
+            },
+        )
+    return replace(
+        event,
+        second=second,
+        metadata={
+            **base_metadata,
+            **diagnostics,
+            "shotmap_match_status": "matched",
+            "second_source": "shotmap",
+        },
+    )
 
 
 def parse_match_events(payload: dict[str, Any], match_id: str) -> list[MatchEvent]:
@@ -740,6 +1882,11 @@ def parse_match_events(payload: dict[str, Any], match_id: str) -> list[MatchEven
                         if raw_event.get(key) not in (None, "", "0", 0)
                     },
                 }
+                if (
+                    code in GOAL_EVENT_CODES
+                    and raw_event.get("team_id") not in (None, "", "0", 0)
+                ):
+                    metadata["team_id"] = raw_event["team_id"]
                 event_id = explicit_event_id({"metadata": metadata})
                 identity = (code, minute, minute_extra, team, person_id)
                 occurrence = occurrences.get(identity, 0)
@@ -984,6 +2131,441 @@ class EventRevisionTracker:
         return dict(self.previous_versions)
 
 
+class HttpShotmapGoalSource:
+    """Poll shotmap independently and emit only newly observed goal rows."""
+
+    def __init__(
+        self,
+        url: str,
+        match_id: str,
+        user: str | None,
+        store: Any,
+        *,
+        timeout: float,
+        poll_interval: float = SHOTMAP_RETRY_SECONDS,
+    ) -> None:
+        if timeout <= 0 or poll_interval <= 0:
+            raise ValueError("shotmap timeout and poll interval must be positive")
+        self.url = url.format(match_id=urllib.parse.quote(match_id, safe=""))
+        self.match_id = str(match_id)
+        self.user = user
+        self.store = store
+        self.timeout = float(timeout)
+        self.poll_interval = float(poll_interval)
+        state = store.load_shotmap_state(self.match_id)
+        self.initialized = state.initialized
+        self._seen_fingerprints = set(state.seen_fingerprints)
+        self._known_cores: set[tuple[str, str, int, str]] = set()
+        if state.last_snapshot is not None:
+            for raw_shot in state.last_snapshot.get("shots", []):
+                goal = normalize_shotmap_goal(raw_shot)
+                if goal is not None and (core := _shotmap_goal_core(goal)) is not None:
+                    self._known_cores.add(core)
+        self._responses: queue.SimpleQueue[
+            tuple[Any, dict[str, Any], float]
+        ] = queue.SimpleQueue()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._thread_lock = threading.Lock()
+        self.request_count = 0
+        self.error_count = 0
+        self.last_error: str | None = None
+        self.last_request_started_at_unix: float | None = None
+        self.last_request_finished_at_unix: float | None = None
+        self.last_request_duration_seconds: float | None = None
+        self.last_request_succeeded: bool | None = None
+        self.last_response_headers: dict[str, str | None] = {}
+        self.last_shot_count = (
+            len(state.last_snapshot.get("shots", []))
+            if state.last_snapshot is not None
+            and isinstance(state.last_snapshot.get("shots"), list)
+            else 0
+        )
+        self.last_goal_count = (
+            sum(
+                normalize_shotmap_goal(raw_shot) is not None
+                for raw_shot in state.last_snapshot.get("shots", [])
+            )
+            if state.last_snapshot is not None
+            and isinstance(state.last_snapshot.get("shots"), list)
+            else 0
+        )
+
+    def _request_url(self) -> str:
+        parts = urllib.parse.urlsplit(self.url)
+        query = dict(urllib.parse.parse_qsl(parts.query, keep_blank_values=True))
+        query["match_id"] = self.match_id
+        query.setdefault("lang", "zh-cn")
+        if self.user:
+            query["user"] = self.user
+        return urllib.parse.urlunsplit(
+            (
+                parts.scheme,
+                parts.netloc,
+                parts.path,
+                urllib.parse.urlencode(query),
+                parts.fragment,
+            )
+        )
+
+    def start(self) -> None:
+        with self._thread_lock:
+            if self._thread is not None:
+                return
+            self._thread = threading.Thread(
+                target=self._run,
+                name=f"shotmap-{self.match_id}",
+                daemon=True,
+            )
+            self._thread.start()
+
+    def close(self) -> None:
+        self._stop.set()
+        with self._thread_lock:
+            thread = self._thread
+        if thread is not None:
+            thread.join(timeout=self.timeout + 1.0)
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            self._fetch_once()
+            if self._stop.wait(self.poll_interval):
+                return
+
+    def _fetch_once(self) -> None:
+        started_at_unix = time.time()
+        started_monotonic = time.monotonic()
+        self.request_count += 1
+        self.last_request_started_at_unix = started_at_unix
+        payload: Any = None
+        diagnostics: dict[str, Any] = {
+            "request_count": self.request_count,
+            "request_started_at_unix": started_at_unix,
+            "poll_interval_seconds": self.poll_interval,
+        }
+        try:
+            request = urllib.request.Request(
+                self._request_url(),
+                headers={
+                    "Accept": "application/json",
+                    "Cache-Control": "no-cache",
+                    "Pragma": "no-cache",
+                    "User-Agent": "football-gif-pipeline/1.0",
+                },
+            )
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                response_body = response.read()
+                headers = {
+                    "date": response.headers.get("Date"),
+                    "age": response.headers.get("Age"),
+                    "cache_control": response.headers.get("Cache-Control"),
+                    "etag": response.headers.get("ETag"),
+                }
+                diagnostics["http_status"] = getattr(response, "status", 200)
+            payload = json.loads(response_body.decode("utf-8"))
+            if not isinstance(payload, dict) or not isinstance(payload.get("shots"), list):
+                raise ValueError("shotmap response must contain a shots array")
+            self.last_error = None
+            self.last_request_succeeded = True
+            self.last_response_headers = headers
+            diagnostics.update(headers)
+        except (
+            OSError,
+            ValueError,
+            json.JSONDecodeError,
+            urllib.error.HTTPError,
+            urllib.error.URLError,
+        ) as exc:
+            self.error_count += 1
+            self.last_error = str(exc)
+            self.last_request_succeeded = False
+            diagnostics["error"] = str(exc)
+            diagnostics["error_type"] = type(exc).__name__
+            payload = None
+        finished_at_unix = time.time()
+        duration = max(0.0, time.monotonic() - started_monotonic)
+        self.last_request_finished_at_unix = finished_at_unix
+        self.last_request_duration_seconds = duration
+        diagnostics["request_finished_at_unix"] = finished_at_unix
+        diagnostics["request_duration_seconds"] = round(duration, 3)
+        diagnostics["request_succeeded"] = self.last_request_succeeded
+        self._responses.put((payload, diagnostics, finished_at_unix))
+
+    def poll(self, stream_time: float, now_monotonic: float) -> list[MatchEvent]:
+        del stream_time, now_monotonic
+        self.start()
+        emitted: list[MatchEvent] = []
+        while True:
+            try:
+                payload, diagnostics, observed_at_unix = self._responses.get_nowait()
+            except queue.Empty:
+                break
+            was_initialized = self.initialized
+            valid = self.store.upsert_shotmap_snapshot(
+                self.match_id,
+                payload,
+                diagnostics=diagnostics,
+                observed_at_unix=observed_at_unix,
+            )
+            if not valid:
+                continue
+            assert isinstance(payload, dict)
+            goals = [
+                goal
+                for raw_shot in payload["shots"]
+                if (goal := normalize_shotmap_goal(raw_shot)) is not None
+            ]
+            self.last_shot_count = len(payload["shots"])
+            self.last_goal_count = len(goals)
+            events_by_fingerprint = {
+                str(goal["fingerprint"]): goal for goal in goals
+            }
+            inserted = self.store.mark_shotmap_seen(
+                self.match_id,
+                set(events_by_fingerprint),
+                events=events_by_fingerprint,
+                now=observed_at_unix,
+            )
+            self._seen_fingerprints.update(inserted)
+            self.initialized = True
+            known_before = set(self._known_cores)
+            for goal in goals:
+                if (core := _shotmap_goal_core(goal)) is not None:
+                    self._known_cores.add(core)
+            if not was_initialized:
+                continue
+            for fingerprint in sorted(inserted):
+                goal = events_by_fingerprint[fingerprint]
+                core = _shotmap_goal_core(goal)
+                if core is not None and core in known_before:
+                    continue
+                emitted.append(
+                    shotmap_goal_match_event(
+                        self.match_id,
+                        goal,
+                        observed_at_unix=observed_at_unix,
+                        request_diagnostics=diagnostics,
+                    )
+                )
+        return emitted
+
+    def report(self) -> dict[str, Any]:
+        return {
+            "type": "http_shotmap_goal",
+            "url": self.url,
+            "poll_interval_seconds": self.poll_interval,
+            "initialized": self.initialized,
+            "request_count": self.request_count,
+            "error_count": self.error_count,
+            "last_error": self.last_error,
+            "last_request_started_at_unix": self.last_request_started_at_unix,
+            "last_request_finished_at_unix": self.last_request_finished_at_unix,
+            "last_request_duration_seconds": self.last_request_duration_seconds,
+            "last_request_succeeded": self.last_request_succeeded,
+            "last_response_headers": dict(self.last_response_headers),
+            "last_shot_count": self.last_shot_count,
+            "last_goal_count": self.last_goal_count,
+            "seen_fingerprint_count": len(self._seen_fingerprints),
+        }
+
+
+@dataclass
+class _ShotmapGoalEnrichment:
+    signature: tuple[str, str, str, str, str, str]
+    deadline_at_monotonic: float
+    latest_result: MatchEvent | None = None
+
+
+class HttpShotmapSecondSource:
+    """Poll shotmap only while an optional goal-refinement task is waiting."""
+
+    def __init__(
+        self,
+        url: str,
+        match_id: str,
+        user: str | None,
+        *,
+        timeout: float,
+        retry_interval: float = SHOTMAP_RETRY_SECONDS,
+        wait_seconds: float = SHOTMAP_WAIT_SECONDS,
+    ) -> None:
+        if timeout <= 0 or retry_interval <= 0 or wait_seconds < 0:
+            raise ValueError("shotmap timeout/retry must be positive and wait non-negative")
+        self.url = url.format(match_id=urllib.parse.quote(match_id, safe=""))
+        self.match_id = match_id
+        self.user = user
+        self.timeout = float(timeout)
+        self.retry_interval = float(retry_interval)
+        self.wait_seconds = float(wait_seconds)
+        self.next_request_monotonic = 0.0
+        self.request_count = 0
+        self.last_payload: dict[str, Any] | None = None
+        self.last_error: str | None = None
+        self._pending: dict[str, _ShotmapGoalEnrichment] = {}
+        self._finalized: dict[
+            str,
+            tuple[tuple[str, str, str, str, str, str], MatchEvent],
+        ] = {}
+
+    def _request_url(self) -> str:
+        parts = urllib.parse.urlsplit(self.url)
+        query = dict(urllib.parse.parse_qsl(parts.query, keep_blank_values=True))
+        query["match_id"] = self.match_id
+        query.setdefault("lang", "zh-cn")
+        if self.user:
+            query["user"] = self.user
+        return urllib.parse.urlunsplit(
+            (
+                parts.scheme,
+                parts.netloc,
+                parts.path,
+                urllib.parse.urlencode(query),
+                parts.fragment,
+            )
+        )
+
+    @staticmethod
+    def _signature(event: MatchEvent) -> tuple[str, str, str, str, str, str]:
+        association = _shotmap_association_signature(event)
+        return (
+            association["code"],
+            association["team"],
+            association["minute"],
+            association["minute_extra"],
+            association["person_id"],
+            association["team_id"],
+        )
+
+    @staticmethod
+    def _apply_cached_result(event: MatchEvent, cached: MatchEvent) -> MatchEvent:
+        diagnostics = {
+            key: value
+            for key, value in cached.metadata.items()
+            if key == "second_source" or key.startswith("shotmap_")
+        }
+        return replace(
+            event,
+            second=cached.second,
+            metadata={**event.metadata, **diagnostics},
+        )
+
+    def _fetch(self) -> None:
+        self.request_count += 1
+        try:
+            request = urllib.request.Request(
+                self._request_url(),
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": "football-gif-pipeline/1.0",
+                },
+            )
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                response_body = response.read()
+            payload = json.loads(response_body.decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("shotmap response must be a JSON object")
+            self.last_payload = payload
+            self.last_error = None
+        except (
+            OSError,
+            ValueError,
+            json.JSONDecodeError,
+            urllib.error.HTTPError,
+            urllib.error.URLError,
+        ) as exc:
+            self.last_error = str(exc)
+
+    def poll(
+        self,
+        event: MatchEvent,
+        now_monotonic: float,
+    ) -> MatchEvent | None:
+        """Return enrichment when matched/final, or None while retrying."""
+        if event.code not in GOAL_EVENT_CODES:
+            return event
+
+        if event.second is not None:
+            second_source = event.metadata.get("second_source")
+            stored_signature = event.metadata.get("shotmap_association_signature")
+            current_signature = _shotmap_association_signature(event)
+            if second_source != "shotmap":
+                return event
+            if (
+                event.metadata.get("shotmap_match_status") == "matched"
+                and stored_signature == current_signature
+            ):
+                return event
+            # An overview revision changed an association field. Do not let the
+            # previously matched second survive while the new shot is retried.
+            event = replace(
+                event,
+                second=None,
+                metadata={
+                    **event.metadata,
+                    "second_source": None,
+                    "shotmap_match_status": "stale",
+                    "shotmap_association_signature": current_signature,
+                },
+            )
+
+        signature = self._signature(event)
+        finalized = self._finalized.get(event.event_key)
+        if finalized is not None and finalized[0] == signature:
+            return self._apply_cached_result(event, finalized[1])
+        if finalized is not None:
+            del self._finalized[event.event_key]
+
+        pending = self._pending.get(event.event_key)
+        if pending is None or pending.signature != signature:
+            pending = _ShotmapGoalEnrichment(
+                signature=signature,
+                deadline_at_monotonic=now_monotonic + self.wait_seconds,
+            )
+            self._pending[event.event_key] = pending
+
+        if now_monotonic >= self.next_request_monotonic:
+            self._fetch()
+            self.next_request_monotonic = now_monotonic + self.retry_interval
+
+        if self.last_payload is not None:
+            pending.latest_result = associate_shotmap_second(event, self.last_payload)
+            if pending.latest_result.second is not None:
+                matched = pending.latest_result
+                self._pending.pop(event.event_key, None)
+                self._finalized[event.event_key] = (signature, matched)
+                return matched
+
+        if now_monotonic < pending.deadline_at_monotonic:
+            return None
+
+        result = pending.latest_result or replace(
+            event,
+            metadata={
+                **event.metadata,
+                "shotmap_match_status": "missing",
+                "shotmap_match_method": "request",
+                "shotmap_candidate_count": 0,
+                "shotmap_association_signature": (
+                    _shotmap_association_signature(event)
+                ),
+            },
+        )
+        result = replace(
+            result,
+            metadata={
+                **result.metadata,
+                **(
+                    {"shotmap_fetch_error": self.last_error}
+                    if self.last_error is not None
+                    else {}
+                ),
+            },
+        )
+        self._pending.pop(event.event_key, None)
+        self._finalized[event.event_key] = (signature, result)
+        return result
+
+
 class HttpMatchEventSource:
     def __init__(
         self,
@@ -1224,6 +2806,7 @@ def build_ingest_command(
     buffer_dir: Path,
     segment_list: Path,
     segment_prefix: str = "segment",
+    segment_list_size: int | None = None,
 ) -> list[str]:
     command = [ffmpeg, "-y", "-nostdin", "-hide_banner", "-loglevel", "error"]
     if simulate_live:
@@ -1234,31 +2817,42 @@ def build_ingest_command(
         command.extend(["-t", f"{duration:.3f}"])
     if source.lower().startswith("rtmp://"):
         command.extend(["-rw_timeout", "15000000", "-rtmp_live", "live"])
-    command.extend(
-        [
-            "-i",
-            source,
-            "-map",
-            "0:v:0",
-            "-map",
-            "0:a:0?",
-            "-c",
-            "copy",
-            "-bsf:v",
-            "h264_mp4toannexb,dump_extra",
-            "-f",
-            "segment",
-            "-segment_time",
-            f"{segment_seconds:.3f}",
-            "-reset_timestamps",
-            "1",
-            "-segment_list",
-            str(segment_list),
-            "-segment_list_type",
-            "csv",
-            str(buffer_dir / f"{segment_prefix}_%06d.ts"),
+    segment_options = [
+        "-i",
+        source,
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
+        "-c",
+        "copy",
+        "-bsf:v",
+        "h264_mp4toannexb,dump_extra",
+        "-f",
+        "segment",
+        "-segment_time",
+        f"{segment_seconds:.3f}",
+        "-reset_timestamps",
+        "1",
+        "-segment_list",
+        str(segment_list),
+        "-segment_list_type",
+        "csv",
+        str(buffer_dir / f"{segment_prefix}_%06d.ts"),
+    ]
+    if segment_list_size is not None:
+        if segment_list_size < 1:
+            raise ValueError("segment_list_size must be positive")
+        # FFmpeg owns the active list and safely rotates it as new segments
+        # close. Python only compacts stopped generations below.
+        insertion = segment_options.index("-reset_timestamps")
+        segment_options[insertion:insertion] = [
+            "-segment_list_flags",
+            "+live",
+            "-segment_list_size",
+            str(segment_list_size),
         ]
-    )
+    command.extend(segment_options)
     return command
 
 
@@ -1278,9 +2872,79 @@ def read_all_segments(
                 generation.list_path,
                 buffer_dir,
                 time_offset=generation.stream_offset,
+                existing_only=True,
             )
         )
     return sorted(segments, key=lambda segment: (segment.start, str(segment.path)))
+
+
+def maintain_segment_generations(
+    generations: list[SegmentGeneration],
+    manifest: SegmentManifest,
+    *,
+    manifest_path: Path,
+    buffer_dir: Path,
+    active_list_path: Path | None,
+) -> tuple[SegmentManifest, int, int]:
+    """Compact closed lists and detach generations with no usable media."""
+    active_path = (
+        str(active_list_path.resolve()) if active_list_path is not None else None
+    )
+    retained: list[SegmentGeneration] = []
+    stale: list[SegmentGeneration] = []
+    removed_rows = 0
+    for generation in generations:
+        resolved_list_path = str(generation.list_path.resolve())
+        if resolved_list_path == active_path:
+            retained.append(generation)
+            continue
+        available = read_segments(
+            generation.list_path,
+            buffer_dir,
+            time_offset=generation.stream_offset,
+            existing_only=True,
+        )
+        if not available:
+            stale.append(generation)
+            continue
+        listed_rows, retained_rows = compact_segment_list(
+            generation.list_path,
+            buffer_dir,
+        )
+        removed_rows += max(0, listed_rows - retained_rows)
+        retained.append(generation)
+
+    if not stale:
+        return manifest, 0, removed_rows
+
+    retained_paths = {str(generation.list_path.resolve()) for generation in retained}
+    retained_manifest_generations = tuple(
+        generation
+        for generation in manifest.generations
+        if str(resolve_generation_path(manifest_path, generation.list_path).resolve())
+        in retained_paths
+    )
+    updated_manifest = replace(
+        manifest,
+        generations=retained_manifest_generations,
+        stale_list_paths=(),
+        generation_health=(),
+    )
+    # Persist the detached manifest before deleting list files. A failed write
+    # leaves the in-memory generation set untouched and recovery conservative.
+    save_segment_manifest(manifest_path, updated_manifest)
+    generations[:] = retained
+
+    buffer_root = buffer_dir.resolve()
+    for generation in stale:
+        list_path = generation.list_path
+        try:
+            list_path.resolve().relative_to(buffer_root)
+            if not list_path.is_symlink():
+                list_path.unlink(missing_ok=True)
+        except (OSError, ValueError):
+            continue
+    return updated_manifest, len(stale), removed_rows
 
 
 def successful_segment_paths(segments: list[Any]) -> set[str]:
@@ -1300,11 +2964,24 @@ def observe_segment_progress(
     supervisor: IngestSupervisor,
     segments: list[Any],
     observed_paths: set[str],
+    *,
+    max_observed_paths: int = MAX_OBSERVED_SEGMENT_PATHS,
 ) -> int:
     """Reset reconnect backoff when FFmpeg publishes new usable segments."""
+    if max_observed_paths < 1:
+        raise ValueError("max_observed_paths must be positive")
     successful = successful_segment_paths(segments)
-    new_paths = successful - observed_paths
-    observed_paths.update(successful)
+    tracked: set[str] = set()
+    for segment in sorted(segments, key=lambda item: item.end, reverse=True):
+        resolved = str(Path(segment.path).resolve())
+        if resolved not in successful or resolved in tracked:
+            continue
+        tracked.add(resolved)
+        if len(tracked) >= max_observed_paths:
+            break
+    new_paths = tracked - observed_paths
+    observed_paths.intersection_update(tracked)
+    observed_paths.update(tracked)
     if new_paths:
         supervisor.note_media_progress()
     return len(new_paths)
@@ -1325,11 +3002,28 @@ def main() -> None:
     parser.add_argument("--event-user")
     parser.add_argument("--event-poll-seconds", type=float, default=5.0)
     parser.add_argument("--event-timeout-seconds", type=float, default=8.0)
+    parser.add_argument(
+        "--shotmap-url",
+        default=DEFAULT_SHOTMAP_URL,
+        help="independent goal shotmap API",
+    )
+    parser.add_argument(
+        "--shotmap-poll-seconds",
+        type=float,
+        default=SHOTMAP_RETRY_SECONDS,
+        help="independent shotmap goal polling interval",
+    )
+    parser.add_argument(
+        "--shotmap-offset",
+        type=float,
+        default=0.0,
+        help="default GIF anchor offset from shotmap first observation",
+    )
     parser.add_argument("--emit-existing-events", action="store_true")
     parser.add_argument(
         "--event-to-video-offset",
         type=float,
-        default=-60.0,
+        default=-30.0,
         help="video event time minus the event's first-observed stream time",
     )
     parser.add_argument(
@@ -1396,14 +3090,19 @@ def main() -> None:
         help="maximum simultaneous GIF encodes (default: 2)",
     )
     parser.add_argument("--vision-enabled", action="store_true")
-    parser.add_argument("--vision-search-before", type=float, default=300.0)
+    parser.add_argument("--vision-search-before", type=float, default=120.0)
     parser.add_argument("--vision-search-after", type=float, default=0.0)
     parser.add_argument("--vision-before", type=float, default=8.0)
     parser.add_argument("--vision-after", type=float, default=12.0)
     parser.add_argument("--vision-workers", type=int, default=1)
     parser.add_argument("--vision-timeout-seconds", type=float, default=90.0)
     parser.add_argument("--ocr-python", type=Path, default=OCR_PYTHON)
-    parser.add_argument("--ocr-timeout-seconds", type=float, default=45.0)
+    parser.add_argument("--ocr-timeout-seconds", type=float, default=180.0)
+    parser.add_argument(
+        "--ocr-clock-only",
+        action="store_true",
+        help="locate every AI event from the scoreboard clock without score OCR",
+    )
     parser.add_argument(
         "--scoreboard-profile",
         type=Path,
@@ -1507,6 +3206,7 @@ def main() -> None:
     positive = (
         args.event_poll_seconds,
         args.event_timeout_seconds,
+        args.shotmap_poll_seconds,
         args.replay_speed,
         args.segment_seconds,
         args.buffer_seconds,
@@ -1526,6 +3226,8 @@ def main() -> None:
     )
     if any(value <= 0 for value in positive) or args.before < 0 or args.start < 0:
         raise SystemExit("time, FPS, buffer, and size arguments must be positive")
+    if not math.isfinite(args.shotmap_offset):
+        raise SystemExit("--shotmap-offset must be a finite number")
     if (
         args.broadcast_delay_seconds < 0
         or args.halftime_break_seconds < 0
@@ -1806,13 +3508,49 @@ def main() -> None:
             initial_first_seen=snapshot_first_seen,
         )
 
+    # Shotmap is an independent live-feed companion.  Select it from the
+    # configured source mode instead of isinstance(event_source, ...): tests
+    # and embedders may replace the HTTP source with a compatible mock object.
+    http_event_source_enabled = bool(
+        args.event_url and not args.mock_events and not args.replay_events
+    )
+    shotmap_event_source = (
+        HttpShotmapGoalSource(
+            args.shotmap_url,
+            args.match_id,
+            args.event_user,
+            runtime.store,
+            timeout=args.event_timeout_seconds,
+            poll_interval=args.shotmap_poll_seconds,
+        )
+        if http_event_source_enabled
+        else None
+    )
+
     report_path = args.output_dir / "event_pipeline_report.json"
     jobs = [recovered_event_job(task) for task in runtime.recover_incomplete(args.match_id)]
+    event_report_order = [job.match_event.event_key for job in jobs]
+    event_report_contexts: dict[str, dict[str, Any]] = {}
     vision_jobs: dict[str, VisionJob] = {}
     if args.vision_enabled:
         for task in runtime.recover_incomplete_vision(args.match_id):
             default_task = runtime.store.get(task.event_key)
             event_data = default_task.event_data if default_task is not None else {}
+            if runtime.store.get_vision_task(
+                task.event_key,
+                artifact_kind="ocr_window",
+            ) is None:
+                runtime.enqueue_vision_task(
+                    task.event_key,
+                    artifact_kind="ocr_window",
+                    search_start_stream_time=task.search_start_stream_time,
+                    search_end_stream_time=task.search_end_stream_time,
+                    clip_before_seconds=30.0,
+                    clip_after_seconds=30.0,
+                    model_name="PaddleOCR",
+                    model_version="scoreboard-clock-v2",
+                    deadline_at_unix=task.deadline_at_unix,
+                )
             vision_jobs[task.event_key] = VisionJob(
                 event_key=task.event_key,
                 match_id=task.match_id,
@@ -1831,9 +3569,11 @@ def main() -> None:
                 ),
                 event_minute=str(event_data.get("minute") or ""),
                 event_minute_extra=str(event_data.get("minute_extra") or "0"),
+                event_second=parse_cumulative_match_second(event_data.get("second")),
                 target_score=str(event_data.get("score") or ""),
                 scoreboard_profile=scoreboard_profile,
-                require_scoreboard_profile=True,
+                require_scoreboard_profile=False,
+                clock_only=args.ocr_clock_only,
             )
     recovered_jobs = len(jobs)
     run_id = (
@@ -1841,6 +3581,21 @@ def main() -> None:
         + f"_{uuid.uuid4().hex[:8]}"
     )
     run_report_path = args.output_dir / f"event_pipeline_report_{run_id}.json"
+    segment_list_max_entries = rolling_segment_list_size(
+        args.buffer_seconds,
+        args.segment_seconds,
+        extra_retention_seconds=max(
+            args.gif_deadline_seconds,
+            (
+                args.vision_deadline_seconds
+                + args.ocr_timeout_seconds
+                + args.vision_timeout_seconds
+                + args.graceful_stop_timeout_seconds
+                if args.vision_enabled
+                else 0.0
+            ),
+        ),
+    )
     last_prune_second = -1
     last_heartbeat_monotonic = 0.0
     persisted_snapshot_revision = 0
@@ -1902,6 +3657,7 @@ def main() -> None:
             buffer_dir,
             buffer_dir / f"segments_{run_id}_g{generation:03d}.csv",
             segment_prefix=f"segment_{run_id}_g{generation:03d}",
+            segment_list_size=segment_list_max_entries,
         )
 
     def ingest_log(generation: int) -> Any:
@@ -1950,6 +3706,31 @@ def main() -> None:
         f"log={event_log_path.resolve()}"
     )
 
+    if args.vision_enabled and segment_generations:
+        try:
+            lease_results = protect_incomplete_vision_event_segments(
+                runtime,
+                runtime.store.list_incomplete_vision_tasks(args.match_id),
+                segment_reader(),
+                ocr_timeout_seconds=args.ocr_timeout_seconds,
+                vision_timeout_seconds=args.vision_timeout_seconds,
+                graceful_stop_timeout_seconds=args.graceful_stop_timeout_seconds,
+            )
+            for lease_result in lease_results:
+                runtime.logger.log(
+                    "event_visual_window_leased",
+                    match_id=args.match_id,
+                    reason="process_start_recovery",
+                    **lease_result,
+                )
+        except Exception as exc:
+            runtime.logger.log(
+                "event_visual_window_lease_failed",
+                match_id=args.match_id,
+                reason="process_start_recovery",
+                error=str(exc),
+            )
+
     # A crash may leave enough closed buffer segments to finish an interrupted job.
     # Try those before the new ingest process starts overwriting segment filenames.
     if segment_generations:
@@ -1974,6 +3755,15 @@ def main() -> None:
                 heavy_task_coordinator=heavy_task_coordinator,
                 wait_for_heavy_slot=False,
             )
+
+    evict_terminal_runtime_jobs(
+        jobs,
+        vision_jobs,
+        runtime,
+        event_report_contexts,
+        before=args.before,
+        after=args.after,
+    )
 
     observed_segment_paths = successful_segment_paths(segment_reader())
     reconnect_due_monotonic: float | None = None
@@ -2112,7 +3902,13 @@ def main() -> None:
                 stream_time = current_stream_time()
 
                 previous_error_count = getattr(event_source, "error_count", 0)
-                new_events = event_source.poll(stream_time, now_monotonic)
+                overview_events = event_source.poll(stream_time, now_monotonic)
+                shotmap_events = (
+                    shotmap_event_source.poll(stream_time, now_monotonic)
+                    if shotmap_event_source is not None
+                    else []
+                )
+                new_events = [*shotmap_events, *overview_events]
                 first_observed_wall_time = time.time() if new_events else None
                 current_error_count = getattr(event_source, "error_count", 0)
                 if current_error_count > previous_error_count:
@@ -2132,25 +3928,161 @@ def main() -> None:
                     media_tail_stream_time = None
                 updated_events = list(getattr(event_source, "updated_events", []))
                 for updated_event in updated_events:
-                    if runtime.update_task_event(asdict(updated_event)):
+                    updated = runtime.update_task_event(asdict(updated_event))
+                    canonical_update = updated_event
+                    if not updated and updated_event.event_type == "goal":
+                        (
+                            existing_incident,
+                            selection_status,
+                            candidate_count,
+                        ) = select_cross_source_goal_incident(
+                            runtime.store.list_for_match(args.match_id),
+                            updated_event,
+                        )
+                        if selection_status == "ambiguous":
+                            runtime.logger.log(
+                                "event_cross_source_ambiguous",
+                                match_id=args.match_id,
+                                incoming_event_key=updated_event.event_key,
+                                incoming_source=_event_source_name(updated_event),
+                                candidate_count=candidate_count,
+                                phase="overview_revision",
+                            )
+                        if existing_incident is not None:
+                            canonical_update = merge_cross_source_goal(
+                                existing_incident.event_data,
+                                updated_event,
+                            )
+                            updated = runtime.update_task_event(
+                                asdict(canonical_update),
+                                replace_fields={"second", "metadata"},
+                            )
+                    if updated:
                         for job in jobs:
-                            if job.match_event.event_key == updated_event.event_key:
+                            if job.match_event.event_key == canonical_update.event_key:
                                 job.match_event = merge_observed_event_revision(
                                     job.match_event,
-                                    updated_event,
+                                    canonical_update,
                                 )
                         print(
-                            f"[event:update] code={updated_event.code} "
-                            f"minute={updated_event.minute} "
-                            f"person={updated_event.person or '-'}"
+                            f"[event:update] code={canonical_update.code} "
+                            f"minute={canonical_update.minute} "
+                            f"person={canonical_update.person or '-'}"
                         )
                 for match_event in new_events:
+                    (
+                        existing_incident,
+                        selection_status,
+                        candidate_count,
+                    ) = select_cross_source_goal_incident(
+                        runtime.store.list_for_match(args.match_id),
+                        match_event,
+                    )
+                    if selection_status == "ambiguous":
+                        runtime.logger.log(
+                            "event_cross_source_ambiguous",
+                            match_id=args.match_id,
+                            incoming_event_key=match_event.event_key,
+                            incoming_source=_event_source_name(match_event),
+                            candidate_count=candidate_count,
+                            phase="new_event",
+                        )
+                    if existing_incident is not None:
+                        merged_event = merge_cross_source_goal(
+                            existing_incident.event_data,
+                            match_event,
+                        )
+                        runtime.update_task_event(
+                            asdict(merged_event),
+                            replace_fields={"second", "metadata"},
+                        )
+                        for job in jobs:
+                            if job.match_event.event_key == existing_incident.event_key:
+                                job.match_event = merged_event
+                        runtime.logger.log(
+                            "event_cross_source_merged",
+                            match_id=args.match_id,
+                            event_key=existing_incident.event_key,
+                            incoming_event_key=match_event.event_key,
+                            primary_source="shotmap",
+                            incoming_source=_event_source_name(match_event),
+                            second=merged_event.second,
+                            goal_route_status=(
+                                merged_event.metadata.get("goal_route_status")
+                                if isinstance(merged_event.metadata, dict)
+                                else None
+                            ),
+                        )
+                        print(
+                            f"[event:merge] key={existing_incident.event_key} "
+                            f"incoming={_event_source_name(match_event)}"
+                        )
+                        continue
+                    is_shotmap_event = _event_source_name(match_event) == "shotmap"
+                    if match_event.event_type == "goal" and not is_shotmap_event:
+                        fallback_status = overview_goal_fallback_status(
+                            shotmap_event_source
+                        )
+                        match_event = replace(
+                            match_event,
+                            metadata={
+                                **match_event.metadata,
+                                "goal_route_status": fallback_status,
+                                "shotmap_route_diagnostics": {
+                                    "initialized": bool(
+                                        getattr(
+                                            shotmap_event_source,
+                                            "initialized",
+                                            False,
+                                        )
+                                    ),
+                                    "last_request_succeeded": getattr(
+                                        shotmap_event_source,
+                                        "last_request_succeeded",
+                                        None,
+                                    ),
+                                    "last_shot_count": getattr(
+                                        shotmap_event_source,
+                                        "last_shot_count",
+                                        0,
+                                    ),
+                                    "last_goal_count": getattr(
+                                        shotmap_event_source,
+                                        "last_goal_count",
+                                        0,
+                                    ),
+                                },
+                            },
+                        )
+                    source_ref = (
+                        shotmap_event_source if is_shotmap_event else event_source
+                    )
+                    assert first_observed_wall_time is not None
+                    detected_wall_time = float(
+                        match_event.metadata.get("shotmap_first_observed_at_unix")
+                        or first_observed_wall_time
+                    )
+                    observed_stream_time = (
+                        observed_stream_time_from_wall(
+                            stream_time,
+                            processed_at_unix=first_observed_wall_time,
+                            observed_at_unix=detected_wall_time,
+                            stream_rate=stream_rate,
+                        )
+                        if is_shotmap_event
+                        else stream_time
+                    )
+                    event_offset = (
+                        args.shotmap_offset
+                        if is_shotmap_event
+                        else args.event_to_video_offset
+                    )
                     clip_anchor = max(
-                        0.0, stream_time + args.event_to_video_offset
+                        0.0, observed_stream_time + event_offset
                     )
                     match_clock_anchor = estimate_match_clock_anchor(match_event)
                     vision_search_start, vision_search_end = vision_search_window(
-                        clip_anchor=stream_time,
+                        clip_anchor=observed_stream_time,
                         match_clock_anchor=None,
                         buffer_seconds=args.buffer_seconds,
                         segment_slack=args.segment_slack,
@@ -2160,8 +4092,6 @@ def main() -> None:
                             args.match_minute_uncertainty_seconds
                         ),
                     )
-                    assert first_observed_wall_time is not None
-                    detected_wall_time = first_observed_wall_time
                     (
                         effective_vision_deadline_at,
                         effective_vision_wait_seconds,
@@ -2177,26 +4107,32 @@ def main() -> None:
                     )
                     timing_diagnostics = {
                         "api_request_started_at_unix": getattr(
-                            event_source, "last_request_started_at_unix", None
+                            source_ref, "last_request_started_at_unix", None
                         ),
                         "api_request_finished_at_unix": getattr(
-                            event_source, "last_request_finished_at_unix", None
+                            source_ref, "last_request_finished_at_unix", None
                         ),
                         "api_request_duration_seconds": getattr(
-                            event_source, "last_request_duration_seconds", None
+                            source_ref, "last_request_duration_seconds", None
                         ),
                         "api_request_succeeded": getattr(
-                            event_source, "last_request_succeeded", None
+                            source_ref, "last_request_succeeded", None
+                        ),
+                        "event_source": (
+                            "shotmap" if is_shotmap_event else "overview"
                         ),
                         "first_observed_wall_time_unix": detected_wall_time,
-                        "first_observed_stream_time_sec": stream_time,
+                        "first_observed_stream_time_sec": observed_stream_time,
+                        "event_processing_delay_seconds": max(
+                            0.0, stream_time - observed_stream_time
+                        ),
                         "media_tail_stream_time_sec": media_tail_stream_time,
                         "media_tail_lag_seconds": (
                             stream_time - media_tail_stream_time
                             if media_tail_stream_time is not None else None
                         ),
                         "event_to_video_offset_seconds": (
-                            args.event_to_video_offset
+                            event_offset
                         ),
                         "clip_anchor_stream_time_sec": clip_anchor,
                         "requested_clip_start_stream_time_sec": max(
@@ -2210,7 +4146,11 @@ def main() -> None:
                         match_event,
                         metadata={
                             **match_event.metadata,
-                            "anchor_strategy": "api_first_observed",
+                            "anchor_strategy": (
+                                "shotmap_first_observed"
+                                if is_shotmap_event
+                                else "api_first_observed"
+                            ),
                             "match_clock_anchor_stream_time": match_clock_anchor,
                             "vision_search_start_stream_time": vision_search_start,
                             "vision_search_end_stream_time": vision_search_end,
@@ -2224,7 +4164,7 @@ def main() -> None:
                         args.start + clip_anchor if source_is_local(args.source) else None
                     )
                     observed_source_time = (
-                        args.start + stream_time
+                        args.start + observed_stream_time
                         if source_is_local(args.source)
                         else None
                     )
@@ -2243,7 +4183,7 @@ def main() -> None:
                     if not runtime.discover_task(
                         match_id=args.match_id,
                         event_data=asdict(match_event),
-                        observed_stream_time=stream_time,
+                        observed_stream_time=observed_stream_time,
                         observed_source_time=observed_source_time,
                         clip_anchor_stream_time=clip_anchor,
                         clip_anchor_source_time=source_time,
@@ -2262,18 +4202,19 @@ def main() -> None:
                         EventJob(
                             match_event=match_event,
                             pending=pending,
-                            observed_stream_time=stream_time,
+                            observed_stream_time=observed_stream_time,
                             observed_source_time=observed_source_time,
                             match_clock_anchor_stream_time=match_clock_anchor,
                             vision_search_start_stream_time=vision_search_start,
                             vision_search_end_stream_time=vision_search_end,
                         )
                     )
+                    event_report_order.append(match_event.event_key)
                     runtime.logger.log(
                         "event_timeline_anchor",
                         match_id=args.match_id,
                         event_key=match_event.event_key,
-                        observed_stream_time_sec=round(stream_time, 3),
+                        observed_stream_time_sec=round(observed_stream_time, 3),
                         clip_anchor_stream_time_sec=round(clip_anchor, 3),
                         match_clock_anchor_stream_time_sec=(
                             round(match_clock_anchor, 3)
@@ -2293,12 +4234,26 @@ def main() -> None:
                     if args.vision_enabled:
                         runtime.enqueue_vision_task(
                             match_event.event_key,
+                            artifact_kind="ocr_window",
+                            search_start_stream_time=vision_search_start,
+                            search_end_stream_time=vision_search_end,
+                            clip_before_seconds=30.0,
+                            clip_after_seconds=30.0,
+                            model_name="PaddleOCR",
+                            model_version="scoreboard-clock-v2",
+                            deadline_at_unix=(
+                                effective_vision_deadline_at
+                            ),
+                        )
+                        runtime.enqueue_vision_task(
+                            match_event.event_key,
+                            artifact_kind="tdeed_refined",
                             search_start_stream_time=vision_search_start,
                             search_end_stream_time=vision_search_end,
                             clip_before_seconds=args.vision_before,
                             clip_after_seconds=args.vision_after,
-                            model_name="PaddleOCR -> T-DEED",
-                            model_version="scoreboard-clock-v1",
+                            model_name="T-DEED",
+                            model_version="ocr-window-v1",
                             deadline_at_unix=(
                                 effective_vision_deadline_at
                             ),
@@ -2311,18 +4266,60 @@ def main() -> None:
                             default_anchor_stream_time=clip_anchor,
                             default_anchor_source_time=source_time,
                             detected_at_unix=detected_wall_time,
-                            observed_anchor_stream_time=stream_time,
+                            observed_anchor_stream_time=observed_stream_time,
                             observed_anchor_source_time=observed_source_time,
                             event_minute=match_event.minute,
                             event_minute_extra=match_event.minute_extra,
+                            event_second=match_event.second,
                             target_score=match_event.score,
                             scoreboard_profile=scoreboard_profile,
-                            require_scoreboard_profile=True,
+                            require_scoreboard_profile=False,
+                            clock_only=args.ocr_clock_only,
                         )
+                        try:
+                            lease_results = protect_incomplete_vision_event_segments(
+                                runtime,
+                                [
+                                    task
+                                    for artifact_kind in (
+                                        "ocr_window",
+                                        "tdeed_refined",
+                                    )
+                                    if (
+                                        task := runtime.store.get_vision_task(
+                                            match_event.event_key,
+                                            artifact_kind,
+                                        )
+                                    )
+                                    is not None
+                                ],
+                                segment_reader(),
+                                ocr_timeout_seconds=args.ocr_timeout_seconds,
+                                vision_timeout_seconds=args.vision_timeout_seconds,
+                                graceful_stop_timeout_seconds=(
+                                    args.graceful_stop_timeout_seconds
+                                ),
+                            )
+                            for lease_result in lease_results:
+                                runtime.logger.log(
+                                    "event_visual_window_leased",
+                                    match_id=args.match_id,
+                                    reason="event_discovered",
+                                    **lease_result,
+                                )
+                        except Exception as exc:
+                            runtime.logger.log(
+                                "event_visual_window_lease_failed",
+                                match_id=args.match_id,
+                                event_key=match_event.event_key,
+                                reason="event_discovered",
+                                error=str(exc),
+                            )
                     print(
                         f"[event] code={match_event.code} type={match_event.event_type} "
                         f"minute={match_event.minute} person={match_event.person or '-'} "
-                        f"observed_stream={stream_time:.2f}s clip_anchor={clip_anchor:.2f}s "
+                        f"observed_stream={observed_stream_time:.2f}s "
+                        f"clip_anchor={clip_anchor:.2f}s "
                         f"match_clock_anchor="
                         f"{match_clock_anchor if match_clock_anchor is not None else '-'}"
                     )
@@ -2401,113 +4398,151 @@ def main() -> None:
                     )
                     if error is not None:
                         job.pending.status = "failed"
-                        job.pending.result = {"error": str(error)}
+                        job.pending.result = default_gif_failure_result(
+                            "default_gif_worker_unhandled_error",
+                            "worker_execution",
+                            str(error) or type(error).__name__,
+                            exception_type=type(error).__name__,
+                        )
                         with state_lock:
                             stored = runtime.store.get(event_key)
-                            if stored is not None and stored.status == "encoding":
+                            if stored is not None and stored.status in {
+                                "pending",
+                                "encoding",
+                            }:
                                 runtime.transition(
                                     event_key,
                                     "failed",
                                     result=job.pending.result,
                                     error=str(error),
+                                    error_kind=(
+                                        "default_gif_worker_unhandled_error"
+                                    ),
                                 )
                         print(f"[gif:worker:error] key={event_key} {error}")
-                    elif completed:
-                        job.pending.status = "encoded"
-                    else:
-                        job.pending.status = "pending"
+                    sync_completed_default_job(job, runtime, event_key, completed)
 
                 if vision_pool is not None:
-                    heavy_snapshot = heavy_task_coordinator.snapshot()
-                    default_gif_work_active = (
-                        bool(task_pool.futures)
-                        or heavy_snapshot_has_default_gif_work(heavy_snapshot)
-                    )
                     for event_key, vision_job in vision_jobs.items():
-                        vision_task = runtime.store.get_vision_task(event_key)
-                        if vision_task is None or vision_task.status not in {"pending", "located"}:
-                            continue
                         default_task = runtime.store.get(event_key)
                         if default_task is None:
                             continue
-                        if default_task.status == "failed":
-                            runtime.transition_vision_task(
+                        # Event revisions can arrive after the visual task was
+                        # created. Refresh the OCR request immediately before
+                        # submission so a corrected API minute/score is used.
+                        refresh_vision_job_event_data(vision_job, default_task)
+                        ocr_task = runtime.store.get_vision_task(
+                            event_key,
+                            artifact_kind="ocr_window",
+                        )
+                        for artifact_kind in VISION_ARTIFACT_KINDS:
+                            vision_task = runtime.store.get_vision_task(
                                 event_key,
-                                "failed",
-                                result={
-                                    "stage": "waiting_for_default_gif",
-                                    "error_kind": "default_gif_failed",
-                                    "locator_method": None,
-                                },
-                                error=(
-                                    "精剪未运行：默认 GIF 生成失败，已停止后续视觉任务"
-                                ),
-                                error_kind="default_gif_failed",
+                                artifact_kind=artifact_kind,
                             )
-                            continue
-                        if default_task.status != "encoded":
-                            # The optional branch must never race the default GIF.
-                            continue
-                        if default_gif_work_active:
-                            # Across all matches, keep visual work behind default GIFs.
-                            continue
-                        now_unix = time.time()
-                        if now_unix < vision_task.next_attempt_at_unix:
-                            continue
-                        if (
-                            stream_time
-                            < vision_task.search_end_stream_time + args.segment_slack
-                            and now_unix < vision_task.deadline_at_unix
-                        ):
-                            continue
-                        if vision_pool.submit(
-                            event_key,
-                            run_with_task_slot,
-                            heavy_task_coordinator,
-                            "vision",
-                            args.match_id,
-                            event_key,
-                            refine_event_job,
-                            vision_job,
-                            runtime,
-                            segment_reader,
-                            ffmpeg,
-                            ffprobe,
-                            args.output_dir,
-                            cancel_event=graceful_stop_cancel_encodes,
-                            function_kwargs={
-                                "search_before": args.vision_search_before,
-                                "search_after": args.vision_search_after,
-                                "refined_before": args.vision_before,
-                                "refined_after": args.vision_after,
-                                "width": args.gif_width,
-                                "fps": args.gif_fps,
-                                "colors": args.gif_colors,
-                                "size_reference_bytes": int(
-                                    args.gif_size_reference_mb * 1_000_000
-                                ),
-                                "python": find_python(Path(__file__).resolve().parent),
-                                "timeout_seconds": args.vision_timeout_seconds,
-                                "ocr_python": args.ocr_python,
-                                "ocr_timeout_seconds": args.ocr_timeout_seconds,
-                                "fallback_width": args.fallback_gif_width,
-                                "fallback_fps": args.fallback_gif_fps,
-                                "fallback_colors": args.fallback_gif_colors,
-                                "min_degraded_seconds": args.min_degraded_gif_seconds,
-                                "cancel_event": graceful_stop_cancel_encodes,
-                            },
-                        ):
-                            print(f"[vision] queued code={vision_job.code} key={event_key}")
-                    for event_key, completed, error in vision_pool.collect_done():
+                            upstream = (
+                                ocr_task
+                                if artifact_kind == "tdeed_refined"
+                                else None
+                            )
+                            now_unix = time.time()
+                            if not vision_artifact_ready_for_submission(
+                                artifact_kind,
+                                vision_task,
+                                upstream,
+                                stream_time=stream_time,
+                                segment_slack=args.segment_slack,
+                                now_unix=now_unix,
+                            ):
+                                continue
+                            pool_key = vision_pool_task_key(
+                                event_key,
+                                artifact_kind,
+                            )
+                            if vision_pool.submit(
+                                pool_key,
+                                run_with_task_slot,
+                                heavy_task_coordinator,
+                                "vision",
+                                args.match_id,
+                                event_key,
+                                process_vision_artifact,
+                                vision_job,
+                                runtime,
+                                segment_reader,
+                                ffmpeg,
+                                ffprobe,
+                                args.output_dir,
+                                cancel_event=graceful_stop_cancel_encodes,
+                                function_kwargs={
+                                    "artifact_kind": artifact_kind,
+                                    "search_before": args.vision_search_before,
+                                    "search_after": args.vision_search_after,
+                                    "refined_before": args.vision_before,
+                                    "refined_after": args.vision_after,
+                                    "width": args.gif_width,
+                                    "fps": args.gif_fps,
+                                    "colors": args.gif_colors,
+                                    "size_reference_bytes": int(
+                                        args.gif_size_reference_mb * 1_000_000
+                                    ),
+                                    "python": find_python(
+                                        Path(__file__).resolve().parent
+                                    ),
+                                    "timeout_seconds": args.vision_timeout_seconds,
+                                    "ocr_python": args.ocr_python,
+                                    "ocr_timeout_seconds": args.ocr_timeout_seconds,
+                                    "fallback_width": args.fallback_gif_width,
+                                    "fallback_fps": args.fallback_gif_fps,
+                                    "fallback_colors": args.fallback_gif_colors,
+                                    "min_degraded_seconds": (
+                                        args.min_degraded_gif_seconds
+                                    ),
+                                    "cancel_event": graceful_stop_cancel_encodes,
+                                },
+                            ):
+                                print(
+                                    f"[vision] queued code={vision_job.code} "
+                                    f"artifact={artifact_kind} key={event_key}"
+                                )
+                    for pool_key, _completed, error in vision_pool.collect_done():
+                        event_key, artifact_kind = split_vision_pool_task_key(
+                            pool_key
+                        )
                         if error is not None:
-                            print(f"[vision:worker:error] key={event_key} {error}")
+                            if not isinstance(error, HeavyTaskCancelled):
+                                fail_unhandled_vision_worker_error(
+                                    runtime,
+                                    event_key=event_key,
+                                    artifact_kind=artifact_kind,
+                                    error=error,
+                                )
+                            print(
+                                f"[vision:worker:error] artifact={artifact_kind} "
+                                f"key={event_key} {error}"
+                            )
+
+                evict_terminal_runtime_jobs(
+                    jobs,
+                    vision_jobs,
+                    runtime,
+                    event_report_contexts,
+                    before=args.before,
+                    after=args.after,
+                    active_default_keys=set(task_pool.futures),
+                    active_vision_keys=(
+                        active_vision_event_keys(set(vision_pool.futures))
+                        if vision_pool is not None else set()
+                    ),
+                )
 
                 if now_monotonic - last_heartbeat_monotonic >= 3.0:
                     heartbeat_segments = segment_reader()
                     heavy_task_status = heavy_task_coordinator.snapshot()
                     checkpoint_stream_time(stream_time)
+                    stored_statuses = runtime.store.list_for_match(args.match_id)
                     status_counts = {
-                        status: sum(job.pending.status == status for job in jobs)
+                        status: sum(task.status == status for task in stored_statuses)
                         for status in ("pending", "encoding", "encoded", "failed")
                     }
                     coverage_seconds = 0.0
@@ -2523,6 +4558,18 @@ def main() -> None:
                         event_poll_count=getattr(event_source, "poll_count", 0),
                         event_error_count=getattr(event_source, "error_count", 0),
                         last_event_error=getattr(event_source, "last_error", None),
+                        shotmap_poll_count=getattr(
+                            shotmap_event_source, "request_count", 0
+                        ),
+                        shotmap_error_count=getattr(
+                            shotmap_event_source, "error_count", 0
+                        ),
+                        last_shotmap_error=getattr(
+                            shotmap_event_source, "last_error", None
+                        ),
+                        shotmap_initialized=getattr(
+                            shotmap_event_source, "initialized", False
+                        ),
                         ingest_running=(
                             supervisor.process is not None
                             and supervisor.process.poll() is None
@@ -2616,11 +4663,25 @@ def main() -> None:
 
                 current_second = int(stream_time)
                 if current_second != last_prune_second:
+                    if args.vision_enabled:
+                        released_leases = (
+                            release_terminal_event_visual_window_leases(runtime)
+                        )
+                        runtime.store.purge_expired_segment_leases()
+                        for event_key, released_count in released_leases.items():
+                            runtime.logger.log(
+                                "event_visual_window_lease_released",
+                                match_id=args.match_id,
+                                event_key=event_key,
+                                released_segment_count=released_count,
+                                reason="all_visual_artifacts_terminal",
+                            )
                     current_segments = segment_reader()
                     observe_segment_progress(
                         supervisor,
                         current_segments,
                         observed_segment_paths,
+                        max_observed_paths=MAX_OBSERVED_SEGMENT_PATHS,
                     )
                     prune_buffer(
                         current_segments,
@@ -2637,13 +4698,39 @@ def main() -> None:
                                 max(
                                     0.0,
                                     task.search_start_stream_time
-                                    - OCR_MINUTE_FALLBACK_BEFORE_SECONDS,
+                                    - OCR_MINUTE_WINDOW_BEFORE_SECONDS,
                                 )
                                 for task in runtime.store.list_incomplete_vision_tasks(args.match_id)
                             ]
                             if args.vision_enabled else None
                         ),
                     )
+                    active_generation_path = (
+                        segment_generations[-1].list_path
+                        if segment_generations
+                        and supervisor.process is not None
+                        and supervisor.process.poll() is None
+                        else None
+                    )
+                    manifest, removed_generations, removed_csv_rows = (
+                        maintain_segment_generations(
+                            segment_generations,
+                            manifest,
+                            manifest_path=manifest_path,
+                            buffer_dir=buffer_dir,
+                            active_list_path=active_generation_path,
+                        )
+                    )
+                    if removed_generations or removed_csv_rows:
+                        runtime.logger.log(
+                            "segment_index_compacted",
+                            match_id=args.match_id,
+                            removed_generation_count=removed_generations,
+                            removed_csv_row_count=removed_csv_rows,
+                            retained_generation_count=len(segment_generations),
+                            observed_path_count=len(observed_segment_paths),
+                            segment_list_max_entries=segment_list_max_entries,
+                        )
                     last_prune_second = current_second
                 time.sleep(0.1)
     except KeyboardInterrupt:
@@ -2661,6 +4748,8 @@ def main() -> None:
         task_pool.shutdown(wait=True)
         if vision_pool is not None:
             vision_pool.shutdown(wait=True)
+        if shotmap_event_source is not None:
+            shotmap_event_source.close()
         if graceful_signal is not None and previous_graceful_handler is not None:
             signal.signal(graceful_signal, previous_graceful_handler)
 
@@ -2668,20 +4757,48 @@ def main() -> None:
         job = next(item for item in jobs if item.match_event.event_key == event_key)
         if error is not None:
             job.pending.status = "failed"
-            job.pending.result = {"error": str(error)}
+            job.pending.result = default_gif_failure_result(
+                "default_gif_worker_unhandled_error",
+                "worker_execution",
+                str(error) or type(error).__name__,
+                exception_type=type(error).__name__,
+            )
             with state_lock:
                 stored = runtime.store.get(event_key)
-                if stored is not None and stored.status == "encoding":
+                if stored is not None and stored.status in {"pending", "encoding"}:
                     runtime.transition(
                         event_key,
                         "failed",
                         result=job.pending.result,
                         error=str(error),
+                        error_kind="default_gif_worker_unhandled_error",
                     )
-        elif completed:
-            job.pending.status = "encoded"
-        else:
-            job.pending.status = "pending"
+        sync_completed_default_job(job, runtime, event_key, completed)
+
+    if vision_pool is not None:
+        for pool_key, _completed, error in vision_pool.collect_done():
+            event_key, artifact_kind = split_vision_pool_task_key(pool_key)
+            if error is not None and not isinstance(error, HeavyTaskCancelled):
+                fail_unhandled_vision_worker_error(
+                    runtime,
+                    event_key=event_key,
+                    artifact_kind=artifact_kind,
+                    error=error,
+                )
+            if error is not None:
+                print(
+                    f"[vision:worker:error] artifact={artifact_kind} "
+                    f"key={event_key} {error}"
+                )
+
+    evict_terminal_runtime_jobs(
+        jobs,
+        vision_jobs,
+        runtime,
+        event_report_contexts,
+        before=args.before,
+        after=args.after,
+    )
 
     final_elapsed_wall = time.monotonic() - pipeline_started_mono
     final_stream_time = current_stream_time()
@@ -2715,10 +4832,11 @@ def main() -> None:
             if job.pending.status != "pending":
                 continue
             job.pending.status = "failed"
-            job.pending.result = {
-                "error": "graceful stop timeout before the final video window was available",
-                "error_kind": "graceful_stop_timeout",
-            }
+            job.pending.result = default_gif_failure_result(
+                "graceful_stop_timeout",
+                "shutdown",
+                "graceful stop timeout before the final video window was available",
+            )
             with state_lock:
                 stored = runtime.store.get(job.match_event.event_key)
                 if stored is not None and stored.status == "pending":
@@ -2734,10 +4852,11 @@ def main() -> None:
             if job.pending.status != "pending":
                 continue
             job.pending.status = "failed"
-            job.pending.result = {
-                "error": "live stream ended before the final video window was available",
-                "error_kind": "video_gap",
-            }
+            job.pending.result = default_gif_failure_result(
+                "video_gap",
+                "shutdown",
+                "live stream ended before the final video window was available",
+            )
             with state_lock:
                 stored = runtime.store.get(job.match_event.event_key)
                 if stored is not None and stored.status == "pending":
@@ -2750,19 +4869,28 @@ def main() -> None:
 
     if stop_reason == "ingest_exit":
         stop_reason = "ingest_completed" if return_code == 0 else "ingest_error"
+    stored_default_tasks = {
+        task.event_key: task for task in runtime.store.list_for_match(args.match_id)
+    }
+    for job in jobs:
+        event_report_contexts[job.match_event.event_key] = event_job_report_context(
+            job,
+            before=args.before,
+            after=args.after,
+        )
     completion_state = None
     if stop_reason == "match_played":
         completion_state = (
             "completed_with_warnings"
-            if any(job.pending.status == "failed" for job in jobs)
+            if any(
+                stored_default_tasks.get(event_key) is not None
+                and stored_default_tasks[event_key].status == "failed"
+                for event_key in event_report_order
+            )
             else "completed"
         )
     elif stop_reason == "match_played_stream_incomplete":
         completion_state = "completed_with_warnings"
-
-    stored_default_tasks = {
-        task.event_key: task for task in runtime.store.list_for_match(args.match_id)
-    }
 
     def schedule_fields(event_key: str) -> dict[str, Any]:
         task = stored_default_tasks.get(event_key)
@@ -2775,6 +4903,45 @@ def main() -> None:
             "deadline_at_unix": task.deadline_at_unix,
             "last_error_kind": task.last_error_kind,
         }
+
+    event_reports: list[dict[str, Any]] = []
+    for event_key in event_report_order:
+        context = event_report_contexts.get(event_key, {})
+        stored = stored_default_tasks.get(event_key)
+        event_data = (
+            dict(stored.event_data)
+            if stored is not None
+            else {"event_key": event_key}
+        )
+        report_event = {
+            **event_data,
+            "observed_stream_time_sec": context.get("observed_stream_time_sec"),
+            "observed_source_time_sec": context.get("observed_source_time_sec"),
+            "clip_anchor_stream_time_sec": context.get("clip_anchor_stream_time_sec"),
+            "clip_anchor_source_time_sec": context.get("clip_anchor_source_time_sec"),
+            "timing_diagnostics": context.get("timing_diagnostics", {}),
+            "match_clock_anchor_stream_time_sec": context.get(
+                "match_clock_anchor_stream_time_sec"
+            ),
+            "vision_search_start_stream_time_sec": context.get(
+                "vision_search_start_stream_time_sec"
+            ),
+            "vision_search_end_stream_time_sec": context.get(
+                "vision_search_end_stream_time_sec"
+            ),
+            "status": (
+                stored.status
+                if stored is not None
+                else "pending"
+            ),
+            **schedule_fields(event_key),
+            **(
+                dict(stored.result)
+                if stored is not None
+                else {}
+            ),
+        }
+        event_reports.append(report_event)
 
     report = {
         "source": args.source,
@@ -2791,6 +4958,11 @@ def main() -> None:
         "graceful_stop_requested": graceful_stop_started_monotonic is not None,
         "graceful_stop_timed_out": graceful_stop_timed_out,
         "event_source": event_source.report(),
+        "shotmap_source": (
+            shotmap_event_source.report()
+            if shotmap_event_source is not None
+            else None
+        ),
         "runtime": {
             "state_database": str(state_db_path.resolve()),
             "event_log": str(event_log_path.resolve()),
@@ -2802,6 +4974,9 @@ def main() -> None:
             "ocr_python": str(args.ocr_python) if args.vision_enabled else None,
             "ocr_timeout_seconds": (
                 args.ocr_timeout_seconds if args.vision_enabled else None
+            ),
+            "ocr_clock_only": (
+                args.ocr_clock_only if args.vision_enabled else False
             ),
             "scoreboard_profile_path": (
                 str(args.scoreboard_profile.resolve())
@@ -2819,6 +4994,7 @@ def main() -> None:
         "timeline": {
             "source_start_seconds": args.start if source_is_local(args.source) else None,
             "event_to_video_offset_seconds": args.event_to_video_offset,
+            "shotmap_offset_seconds": args.shotmap_offset,
             "match_start_play": args.match_start_play,
             "match_start_naive_timezone": args.match_start_naive_timezone,
             "match_start_normalized_unix": match_start_at_unix,
@@ -2856,40 +5032,7 @@ def main() -> None:
             "fps": args.fallback_gif_fps,
             "colors": args.fallback_gif_colors,
         },
-        "events": [
-            {
-                **asdict(job.match_event),
-                "observed_stream_time_sec": round(job.observed_stream_time, 3),
-                "observed_source_time_sec": (
-                    round(job.observed_source_time, 3)
-                    if job.observed_source_time is not None
-                    else None
-                ),
-                "clip_anchor_stream_time_sec": round(job.pending.stream_time, 3),
-                "clip_anchor_source_time_sec": job.pending.source_time,
-                "timing_diagnostics": event_timing_diagnostics(
-                    job,
-                    before=args.before,
-                    after=args.after,
-                ),
-                "match_clock_anchor_stream_time_sec": (
-                    round(job.match_clock_anchor_stream_time, 3)
-                    if job.match_clock_anchor_stream_time is not None else None
-                ),
-                "vision_search_start_stream_time_sec": (
-                    round(job.vision_search_start_stream_time, 3)
-                    if job.vision_search_start_stream_time is not None else None
-                ),
-                "vision_search_end_stream_time_sec": (
-                    round(job.vision_search_end_stream_time, 3)
-                    if job.vision_search_end_stream_time is not None else None
-                ),
-                "status": job.pending.status,
-                **schedule_fields(job.match_event.event_key),
-                **job.pending.result,
-            }
-            for job in jobs
-        ],
+        "events": event_reports,
         "vision": [
             {
                 "event_key": task.event_key,
@@ -2931,12 +5074,23 @@ def main() -> None:
         processing_wall_seconds=round(final_elapsed_wall, 3),
         event_poll_count=getattr(event_source, "poll_count", 0),
         event_error_count=getattr(event_source, "error_count", 0),
+        shotmap_poll_count=getattr(shotmap_event_source, "request_count", 0),
+        shotmap_error_count=getattr(shotmap_event_source, "error_count", 0),
     )
     print(f"[report] {run_report_path.resolve()}")
     print(f"[report:latest] {report_path.resolve()}")
     protected_segment_paths: set[str] = set()
     lease_query_ok = True
     try:
+        released_leases = release_terminal_event_visual_window_leases(runtime)
+        for event_key, released_count in released_leases.items():
+            runtime.logger.log(
+                "event_visual_window_lease_released",
+                match_id=args.match_id,
+                event_key=event_key,
+                released_segment_count=released_count,
+                reason="pipeline_stopped",
+            )
         runtime.store.purge_expired_segment_leases()
         protected_segment_paths = runtime.store.protected_segment_paths()
     except Exception:

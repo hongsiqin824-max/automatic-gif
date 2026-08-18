@@ -255,6 +255,7 @@ function eventPresentation(event) {
   const definitions = {
     G: { label: '进球', kind: 'goal' },
     OG: { label: '乌龙球', kind: 'own-goal' },
+    PG: { label: '点球进球', kind: 'goal' },
     YC: { label: '黄牌', kind: 'yellow-card' },
     RC: { label: '红牌', kind: 'red-card' },
   };
@@ -287,12 +288,24 @@ function visionLocatorMethodLabel(vision) {
 
 function visionPresentation(vision, enabled = true) {
   if (!vision) return enabled ? {label:'等待 AI 任务', cls:'off'} : {label:'AI 已关闭', cls:'off'};
+  if (vision.artifact_kind === 'ocr_window') {
+    const degraded = vision.degraded === true || vision.localization_quality === 'degraded';
+    return ({
+      pending:{label:'等待时钟定位',cls:'pending'}, locating:{label:'OCR 时钟定位中',cls:'encoding'},
+      located:{label:degraded ? '分钟降级定位已完成' : '目标时刻已定位',cls:'encoding'},
+      encoding:{label:degraded ? '分钟降级 GIF 编码中' : '60秒 GIF 编码中',cls:'encoding'},
+      encoded:{label:degraded ? '分钟降级 GIF 已生成' : '60秒 GIF 已生成',cls:'encoded'},
+      failed:{label:'OCR 链路失败',cls:'failed'}
+    })[vision.status] || {label:vision.status || '等待 OCR 任务', cls:'off'};
+  }
   const method = visionLocatorMethodLabel(vision);
   const minuteFallback = vision.minute_fallback === true;
+  const fragmentedFallback = minuteFallback && vision.fallback_complete === false;
+  const fallbackLabel = fragmentedFallback ? 'OCR 分钟范围残缺片段' : 'OCR 分钟兜底';
   return ({
     pending:{label:'等待搜索窗口',cls:'pending'}, locating:{label:'画面定位中',cls:'encoding'},
-    located:{label:minuteFallback ? 'OCR 分钟锚点已定位' : `${method ? `${method} · ` : ''}锚点已定位`,cls:'encoding'}, encoding:{label:minuteFallback ? 'OCR 分钟兜底编码中' : '精剪编码中',cls:'encoding'},
-    encoded:{label:minuteFallback ? 'OCR 分钟兜底已生成' : `${method ? `${method} 定位 · ` : ''}精剪已生成`,cls:'encoded'}, failed:{label:'精剪失败',cls:'failed'}
+    located:{label:minuteFallback ? (fragmentedFallback ? 'OCR 分钟范围残缺片段定位' : 'OCR 分钟锚点已定位') : `${method ? `${method} · ` : ''}锚点已定位`,cls:'encoding'}, encoding:{label:minuteFallback ? `${fallbackLabel}编码中` : '精剪编码中',cls:'encoding'},
+    encoded:{label:minuteFallback ? (fragmentedFallback ? 'OCR 分钟范围残缺片段已生成' : 'OCR 分钟兜底已生成') : `${method ? `${method} 定位 · ` : ''}精剪已生成`,cls:'encoded'}, failed:{label:'精剪失败',cls:'failed'}
   })[vision.status] || {label:vision.status || '等待 AI 任务', cls:'off'};
 }
 
@@ -308,7 +321,12 @@ function visionFailureDetail(vision) {
     tdeed_fallback:'T-DEED 回退', failed:'画面定位', buffer:'视频缓存',
     encoding:'精剪编码', encode:'精剪编码',
     waiting_for_default_gif:'等待默认 GIF', scoreboard_profile:'比分牌布局配置',
-    event_second_localization:'事件秒级定位', event_localization:'事件定位'
+    event_second_localization:'事件秒级定位', event_localization:'事件定位',
+    fragmented_search:'视频连续片段扫描', buffer_coverage:'视频窗口覆盖检查',
+    ocr_clock_discovery:'OCR 时钟识别', ocr_target_localization:'OCR 目标时刻定位',
+    ocr_window_encoding:'OCR 60秒 GIF 编码',
+    tdeed_model_unavailable:'T-DEED 模型加载', tdeed_inference:'T-DEED 推理',
+    tdeed_candidate_selection:'T-DEED 候选选择', tdeed_output_encoding:'T-DEED 20秒 GIF 编码'
   })[stage] || stage || '未知阶段';
   const reasonLabel = ({
     waiting_for_video:'视频窗口未就绪', video_unavailable:'搜索窗口没有可用视频',
@@ -317,17 +335,25 @@ function visionFailureDetail(vision) {
     ocr_no_match:'OCR 没有找到匹配时刻', ocr_processing_failed:'OCR 处理失败',
     scoreboard_missing:'画面中未检测到比分牌', ocr_clock_unreadable:'OCR 无法读取比赛时钟',
     ocr_score_unreadable:'OCR 无法读取比分', ocr_no_score_transition:'未检测到稳定比分变化',
-    ocr_ambiguous:'OCR 结果存在歧义', ocr_model_unavailable:'PaddleOCR 不可用',
+    ocr_ambiguous:'OCR 结果存在歧义', ocr_no_target:'OCR 未返回目标锚点', ocr_model_unavailable:'PaddleOCR 不可用',
     clock_profile_mismatch:'比分牌布局未配置或不匹配',
     tdeed_model_unavailable:'T-DEED 模型不可用', tdeed_no_candidate:'T-DEED 未找到候选动作',
     tdeed_inference_failed:'T-DEED 推理失败', inference_timeout:'视觉推理超时',
     encode_failed:'精剪 GIF 编码失败',
     model_inference_failed:'T-DEED 推理失败', vision_processing_failed:'视觉处理失败',
     video_gap:'视频分片存在缺口', anchor_gap:'定位锚点附近存在视频缺口',
-    degraded_clip_too_short:'可用精剪片段过短', default_gif_failed:'默认 GIF 生成失败'
+    degraded_clip_too_short:'可用精剪片段过短', default_gif_failed:'默认 GIF 生成失败',
+    fragmented_minute_fallback:'OCR 分钟范围只生成了残缺片段'
+    ,ocr_target_localization_failed:'OCR 未定位到目标比赛时钟'
+    ,ocr_window_encoding_failed:'OCR 60秒 GIF 编码失败'
+    ,tdeed_candidate_selection_failed:'T-DEED 候选位置无效'
+    ,tdeed_output_encoding_failed:'T-DEED 20秒 GIF 编码失败'
+    ,upstream_ocr_window_failed:'OCR 60秒链路失败，T-DEED 未运行'
   })[kind] || kind || String(vision.error || '').trim() || '未提供原因';
   const message = String(structured.message || '').trim();
-  return `阶段：${stageLabel} · 原因：${reasonLabel}${message ? ` · ${message}` : ''}`;
+  const attempts = Array.isArray(vision.fragment_attempts) ? vision.fragment_attempts : [];
+  const fragmentDetail = attempts.length ? ` · 已扫描 ${attempts.length} 个连续片段` : '';
+  return `阶段：${stageLabel} · 原因：${reasonLabel}${message ? ` · ${message}` : ''}${fragmentDetail}`;
 }
 
 function visionOcrDiagnosticsText(vision) {
@@ -349,7 +375,36 @@ function visionOcrDiagnosticsText(vision) {
     if (diagnostics[key] == null || seen.has(label)) continue;
     seen.add(label); parts.push(`${label} ${diagnostics[key]}`);
   }
+  if (diagnostics.target_clock) parts.unshift(`目标时钟 ${diagnostics.target_clock}`);
+  if (diagnostics.exact_second_failure_reason) {
+    const reason = ({
+      target_clock_not_found:'未找到目标秒',
+      no_trustworthy_clock_readings:'没有可信时钟读数',
+      multiple_disjoint_occurrences:'目标秒多处出现'
+    })[diagnostics.exact_second_failure_reason] || diagnostics.exact_second_failure_reason;
+    parts.push(`秒级降级 ${reason}`);
+  }
   return parts.join(' · ');
+}
+
+function matchClockText(value) {
+  const seconds = Number(value);
+  if (!Number.isInteger(seconds) || seconds < 0) return '';
+  const minute = Math.floor(seconds / 60);
+  return `${String(minute).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`;
+}
+
+// The worker persists this value in event.metadata so the dashboard can
+// explain which source supplied the goal without inferring from timing fields.
+function goalRouteStatusLabel(value) {
+  return ({
+    shotmap_direct: 'shotmap 直接触发',
+    overview_fallback_empty: 'overview 兜底 · shotmap 空数据',
+    overview_fallback_no_goal: 'overview 兜底 · shotmap 无进球',
+    overview_fallback_no_match: 'overview 兜底 · 未匹配 shotmap 进球',
+    cross_source_merged: '两路来源已合并',
+    shotmap_late_match: 'shotmap 延迟匹配'
+  })[String(value || '').trim()] || '';
 }
 
 function setStep(id, status) { $(id).className = `pipeline-step ${status || ''}`; }
@@ -373,6 +428,12 @@ function logPresentation(record) {
     worker_restart_scheduled:'已安排自动恢复', worker_restart_failed:'自动恢复失败', live_source_restart_failed:'切源恢复失败',
     process_group_stop_requested:'正在清理旧进程', process_group_term_timeout:'旧进程未按时退出', process_group_killed:'已强制清理旧进程', process_group_cleanup_complete:'旧进程清理完成', process_group_cleanup_failed:'旧进程清理失败',
     event_discovered:'捕获新增事件', event_duplicate:'重复事件已忽略', event_accepted:'事件已入队',
+    goal_route_status:'进球路由判定', shotmap_direct:'shotmap 直接触发',
+    overview_fallback_empty:'overview 兜底 · shotmap 空数据',
+    overview_fallback_no_goal:'overview 兜底 · shotmap 无进球',
+    overview_fallback_no_match:'overview 兜底 · 未匹配 shotmap 进球',
+    cross_source_merged:'两路来源已合并', shotmap_late_match:'shotmap 延迟匹配',
+    event_cross_source_merged:'进球来源已合并', overview_goal_ignored_shotmap_primary:'overview 进球由 shotmap 接管',
     task_transition:'任务状态变化', gif_ready:'默认 GIF 已生成', api_error:'事件接口异常',
     vision_task_enqueued:'AI 精剪已入队', vision_task_transition:'AI 精剪状态变化', refined_gif_ready:'AI 精剪已生成',
     ingest_restart:'直播断开重连', live_source_changed:'直播源已切换', pipeline_stopped:'处理链路已结束',
@@ -390,7 +451,22 @@ function logPresentation(record) {
     const failure = visionFailureDetail(visionRecord);
     detail = `${visionPresentation(visionRecord).label}${failure ? ` · ${failure}` : record.error ? ` · ${record.error}` : ''}`;
   }
-  if (record.event === 'event_discovered') detail = `${record.code || ''}${record.minute ? ` · ${record.minute}'` : ''}${record.person ? ` · ${record.person}` : ''}`;
+  if (record.event === 'event_discovered') {
+    const metadata = record.metadata && typeof record.metadata === 'object' ? record.metadata : {};
+    const route = goalRouteStatusLabel(record.goal_route_status || record.route_status || metadata.goal_route_status);
+    detail = `${record.code || ''}${record.minute ? ` · ${record.minute}'` : ''}${record.person ? ` · ${record.person}` : ''}${route ? ` · ${route}` : ''}`;
+  }
+  if (record.event === 'event_cross_source_merged') {
+    const metadata = record.metadata && typeof record.metadata === 'object' ? record.metadata : {};
+    const route = goalRouteStatusLabel(record.goal_route_status || record.route_status || metadata.goal_route_status);
+    detail = `${route || '主来源 shotmap'}${record.second != null ? ` · ${matchClockText(record.second)}` : ''}`;
+  }
+  if (['goal_route_status', 'shotmap_direct', 'overview_fallback_empty', 'overview_fallback_no_goal', 'overview_fallback_no_match', 'cross_source_merged', 'shotmap_late_match'].includes(record.event)) {
+    const route = goalRouteStatusLabel(record.goal_route_status || record.route_status || record.status || record.event);
+    detail = route || detail;
+    if (record.second != null) detail += ` · ${matchClockText(record.second)}`;
+  }
+  if (record.event === 'overview_goal_ignored_shotmap_primary') detail = `${record.minute ? `${record.minute}' · ` : ''}等待 shotmap 新增数据`;
   if (record.event === 'worker_started') detail = `${record.mode === 'demo' ? '演示验收' : '实时处理'} · PID ${record.pid || '--'}`;
   if (record.event === 'worker_exited') detail = `返回码 ${record.return_code ?? '--'}`;
   if (record.event === 'ingest_restart') {
@@ -470,16 +546,35 @@ function render(data) {
   const list = $('events'); const events = data.events || [];
   list.innerHTML = events.length ? events.map(e => {
     const type = eventPresentation(e); const task = taskPresentation(e.status);
-    const vision = e.status === 'history' && !e.vision ? {label:'历史事件 · 未运行',cls:'off'} : visionPresentation(e.vision, worker.running ? workerVisionEnabled : configuredVisionEnabled);
-    const confidence = e.vision && e.vision.confidence != null ? ` · 置信度 ${(Number(e.vision.confidence) * 100).toFixed(1)}%` : '';
-    const delta = e.vision && e.vision.anchor_delta_seconds != null ? ` · 偏移 ${Number(e.vision.anchor_delta_seconds).toFixed(1)}秒` : '';
+    const artifacts = e.vision_artifacts && typeof e.vision_artifacts === 'object' ? e.vision_artifacts : {};
+    const ocrWindow = e.ocr_window || artifacts.ocr_window || null;
+    const tdeed = e.vision || artifacts.tdeed_refined || null;
+    const visionEnabled = worker.running ? workerVisionEnabled : configuredVisionEnabled;
+    const ocr = e.status === 'history' && !ocrWindow ? {label:'历史事件 · 未运行',cls:'off'} : visionPresentation(ocrWindow, visionEnabled);
+    const vision = e.status === 'history' && !tdeed ? {label:'历史事件 · 未运行',cls:'off'} : visionPresentation(tdeed, visionEnabled);
+    const confidence = tdeed && tdeed.confidence != null ? ` · 置信度 ${(Number(tdeed.confidence) * 100).toFixed(1)}%` : '';
+    const delta = tdeed && tdeed.anchor_delta_seconds != null ? ` · 偏移 ${Number(tdeed.anchor_delta_seconds).toFixed(1)}秒` : '';
     const defaultDegraded = e.coverage_status === 'ready_degraded' ? ' · 短片降级' : '';
-    const visionDegraded = e.vision && e.vision.coverage_status === 'ready_degraded' ? ' · 短片降级' : '';
-    const visionFallback = e.vision && e.vision.minute_fallback ? ' · 分钟级兜底（前60秒+后60秒）' : '';
-    const failureDetail = visionFailureDetail(e.vision);
-    const ocrDiagnostics = visionOcrDiagnosticsText(e.vision);
-    const visionDetail = [failureDetail, ocrDiagnostics ? `OCR：${ocrDiagnostics}` : ''].filter(Boolean).join(' · ');
-    return `<div class="event-row ${escapeHtml(task.cls)}"><div class="event-type event-type-${escapeHtml(type.kind)}"><span class="event-symbol" aria-hidden="true"></span><span class="event-type-text"><b>${escapeHtml(type.label)}</b><small>${escapeHtml(type.code)}</small></span></div><div class="event-minute">${escapeHtml(e.minute || '--')}'${e.minute_extra && e.minute_extra !== '0' ? `+${escapeHtml(e.minute_extra)}` : ''}</div><div class="event-person">${escapeHtml(e.person || '未提供球员')}<small>${escapeHtml(e.team || '')}${e.score ? ` · ${escapeHtml(e.score)}` : ''}${e.reason ? ` · ${escapeHtml(e.reason)}` : ''}</small></div><div class="artifact-list"><div class="artifact"><span>默认 · ${escapeHtml(task.label)}${defaultDegraded}</span>${e.output ? `<a class="gif-link" href="/api/gif/${encodeURIComponent(data.match_id)}/${encodeURIComponent(e.output.split('/').pop())}" target="_blank">预览</a>` : ''}</div><div class="artifact ${escapeHtml(vision.cls)}"><span>AI · ${escapeHtml(vision.label)}${escapeHtml(confidence)}${escapeHtml(delta)}${visionDegraded}${visionFallback}${e.vision && e.vision.experimental ? ' · 实验' : ''}${visionDetail ? `<small>${escapeHtml(visionDetail)}</small>` : ''}</span>${e.vision && e.vision.output ? `<a class="gif-link" href="/api/gif/${encodeURIComponent(data.match_id)}/${encodeURIComponent(e.vision.output.split('/').pop())}" target="_blank">预览</a>` : ''}</div></div></div>`;
+    const ocrDegraded = ocrWindow && ocrWindow.coverage_status === 'ready_degraded' ? ' · 短片降级' : '';
+    const visionDegraded = tdeed && tdeed.coverage_status === 'ready_degraded' ? ' · 短片降级' : '';
+    const ocrFailureDetail = visionFailureDetail(ocrWindow);
+    const failureDetail = visionFailureDetail(tdeed);
+    const ocrDiagnostics = visionOcrDiagnosticsText(ocrWindow);
+    const metadata = e.metadata && typeof e.metadata === 'object' ? e.metadata : {};
+    const targetClock = (ocrWindow && ocrWindow.target_clock) || matchClockText(e.second);
+    const routeStatus = goalRouteStatusLabel(metadata.goal_route_status || metadata.route_status);
+    const shotmapStatus = ({
+      direct:'shotmap 直接触发', matched:'shotmap 已匹配', missing:'shotmap 暂无秒',
+      ambiguous:'shotmap 匹配歧义', invalid:'shotmap 秒无效', stale:'shotmap 等待重新匹配'
+    })[metadata.shotmap_match_status] || '';
+    const secondDetail = (e.code === 'G' || e.code === 'OG' || e.code === 'PG')
+      ? [targetClock ? `目标时钟 ${targetClock}` : '', routeStatus, shotmapStatus].filter(Boolean).join(' · ')
+      : '';
+    const ocrSource = ocrWindow && ocrWindow.localization_source === 'exact_second' ? '秒级定位' : ocrWindow && ocrWindow.localization_source === 'minute_boundary' ? '分钟定位' : '';
+    const ocrDetail = [secondDetail, ocrSource, ocrFailureDetail, ocrDiagnostics ? `OCR：${ocrDiagnostics}` : ''].filter(Boolean).join(' · ');
+    const visionDetail = [failureDetail, tdeed && tdeed.source_ocr_artifact ? '基于 OCR 60秒窗口' : ''].filter(Boolean).join(' · ');
+    const gifLink = artifact => artifact && artifact.output ? `<a class="gif-link" href="/api/gif/${encodeURIComponent(data.match_id)}/${encodeURIComponent(artifact.output.split('/').pop())}" target="_blank">预览</a>` : '';
+    return `<div class="event-row ${escapeHtml(task.cls)}"><div class="event-type event-type-${escapeHtml(type.kind)}"><span class="event-symbol" aria-hidden="true"></span><span class="event-type-text"><b>${escapeHtml(type.label)}</b><small>${escapeHtml(type.code)}</small></span></div><div class="event-minute">${escapeHtml(e.minute || '--')}'${e.minute_extra && e.minute_extra !== '0' ? `+${escapeHtml(e.minute_extra)}` : ''}</div><div class="event-person">${escapeHtml(e.person || '未提供球员')}<small>${escapeHtml(e.team || '')}${e.score ? ` · ${escapeHtml(e.score)}` : ''}${e.reason ? ` · ${escapeHtml(e.reason)}` : ''}</small></div><div class="artifact-list"><div class="artifact"><span>默认 · ${escapeHtml(task.label)}${defaultDegraded}</span>${e.output ? `<a class="gif-link" href="/api/gif/${encodeURIComponent(data.match_id)}/${encodeURIComponent(e.output.split('/').pop())}" target="_blank">预览</a>` : ''}</div><div class="artifact ${escapeHtml(ocr.cls)}"><span>OCR 60秒 · ${escapeHtml(ocr.label)}${ocrDegraded}${ocrDetail ? `<small>${escapeHtml(ocrDetail)}</small>` : ''}</span>${gifLink(ocrWindow)}</div><div class="artifact ${escapeHtml(vision.cls)}"><span>T-DEED 20秒 · ${escapeHtml(vision.label)}${escapeHtml(confidence)}${escapeHtml(delta)}${visionDegraded}${tdeed && tdeed.experimental ? ' · 实验' : ''}${visionDetail ? `<small>${escapeHtml(visionDetail)}</small>` : ''}</span>${gifLink(tdeed)}</div></div></div>`;
   }).join('') : '<div class="empty">暂无已发现事件。启动处理后，进球、黄牌、红牌和乌龙球会在这里显示。</div>';
   const logs = $('logs'); const records = data.logs || []; let heartbeatSeen = false; const visibleRecords = records.filter(record => record.event !== 'runtime_heartbeat' || (!heartbeatSeen && (heartbeatSeen = true))); logs.innerHTML = visibleRecords.length ? visibleRecords.slice(0, 40).map(l => { const presentation = logPresentation(l); return `<div class="log-line log-${escapeHtml(l.event || '')}"><time>${escapeHtml((l.timestamp || '').replace('T',' ').replace('Z','').slice(0,19))}</time><b>${escapeHtml(presentation.name)}</b><span>${escapeHtml(presentation.detail)}</span></div>`; }).join('') : '<div class="empty">暂无日志</div>';
   $('last-refresh').textContent = `更新于 ${new Date().toLocaleTimeString('zh-CN', {hour12:false})}`;

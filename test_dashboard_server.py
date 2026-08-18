@@ -4,12 +4,15 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, call, patch
 
 import dashboard_server
 from heavy_task_coordinator import HeavyTaskCoordinator
+from pipeline_runtime import PipelineRuntime
 
 
 class DashboardTests(unittest.TestCase):
@@ -112,6 +115,22 @@ class DashboardTests(unittest.TestCase):
         events = dashboard_server.flatten_events(payload)
         self.assertEqual(events[0]["code"], "OG")
         self.assertEqual(events[0]["label"], "乌龙球")
+
+    def test_flatten_events_includes_penalty_goal(self):
+        payload = {
+            "events": {
+                "67": {
+                    "minute": "67",
+                    "teamAEvents": [{"code": "PG", "person": "A", "person_id": "1"}],
+                    "teamBEvents": [],
+                }
+            }
+        }
+
+        events = dashboard_server.flatten_events(payload)
+
+        self.assertEqual(events[0]["code"], "PG")
+        self.assertEqual(events[0]["label"], "点球进球")
 
     def test_query_events_accepts_empty_event_array(self):
         with patch(
@@ -522,6 +541,153 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(tasks[0]["coverage_status"], "ready_degraded")
         self.assertEqual(tasks[0]["vision"]["coverage_status"], "ready_degraded")
 
+    def test_database_exposes_ocr_and_tdeed_artifacts_without_overwrite(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = PipelineRuntime(root / "pipeline_state.sqlite3", root / "events.jsonl")
+            event_key = "m:G:three-path"
+            runtime.discover_task(
+                match_id="m",
+                event_data={
+                    "event_key": event_key,
+                    "code": "G",
+                    "event_type": "goal",
+                    "minute": "8",
+                    "minute_extra": "0",
+                    "team": "A",
+                    "person": "Player",
+                    "person_id": "50000001",
+                    "score": "1-0",
+                    "reason": "",
+                    "metadata": {},
+                },
+                observed_stream_time=100.0,
+                observed_source_time=None,
+                clip_anchor_stream_time=90.0,
+                clip_anchor_source_time=None,
+                output_due_stream_time=110.0,
+                detected_at_unix=time.time(),
+            )
+            for artifact_kind, output in (
+                ("ocr_window", "/tmp/ocr.gif"),
+                ("tdeed_refined", "/tmp/tdeed.gif"),
+            ):
+                runtime.enqueue_vision_task(
+                    event_key,
+                    artifact_kind=artifact_kind,
+                    search_start_stream_time=0.0,
+                    search_end_stream_time=100.0,
+                    clip_before_seconds=30.0,
+                    clip_after_seconds=30.0,
+                )
+                runtime.transition_vision_task(
+                    event_key, "locating", artifact_kind=artifact_kind
+                )
+                runtime.transition_vision_task(
+                    event_key,
+                    "located",
+                    artifact_kind=artifact_kind,
+                    result={"anchor_stream_time": 80.0},
+                )
+                runtime.transition_vision_task(
+                    event_key, "encoding", artifact_kind=artifact_kind
+                )
+                runtime.transition_vision_task(
+                    event_key,
+                    "encoded",
+                    artifact_kind=artifact_kind,
+                    result={
+                        "output": output,
+                        "bytes": 10,
+                        **(
+                            {
+                                "localization_quality": "degraded",
+                                "degraded": True,
+                                "degradation_mode": "minute_boundary_fallback",
+                                "degradation_reason": {
+                                    "kind": "ocr_exact_second_not_found",
+                                    "message": "target second was not found",
+                                },
+                            }
+                            if artifact_kind == "ocr_window"
+                            else {}
+                        ),
+                    },
+                )
+            runtime.close()
+
+            tasks, _, _ = dashboard_server._tasks_from_database(
+                root / "pipeline_state.sqlite3"
+            )
+
+        self.assertEqual(tasks[0]["ocr_window"]["output"], "/tmp/ocr.gif")
+        self.assertEqual(
+            tasks[0]["ocr_window"]["localization_quality"],
+            "degraded",
+        )
+        self.assertTrue(tasks[0]["ocr_window"]["degraded"])
+        self.assertEqual(
+            tasks[0]["ocr_window"]["degradation_mode"],
+            "minute_boundary_fallback",
+        )
+        self.assertEqual(
+            tasks[0]["ocr_window"]["degradation_reason"]["kind"],
+            "ocr_exact_second_not_found",
+        )
+        self.assertEqual(tasks[0]["vision"]["output"], "/tmp/tdeed.gif")
+        self.assertEqual(
+            set(tasks[0]["vision_artifacts"]),
+            {"ocr_window", "tdeed_refined"},
+        )
+
+    def test_legacy_minute_fallback_uses_duration_for_fragment_label(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            runtime = dashboard_server.sqlite3.connect(output / "pipeline_state.sqlite3")
+            runtime.executescript(
+                """
+                CREATE TABLE event_tasks (
+                    event_key TEXT, code TEXT, event_type TEXT, event_json TEXT,
+                    status TEXT, discovered_at_unix REAL, updated_at_unix REAL,
+                    output_path TEXT, output_bytes INTEGER, result_json TEXT,
+                    error TEXT
+                );
+                CREATE TABLE vision_tasks (
+                    event_key TEXT, status TEXT, located_anchor_stream_time REAL,
+                    confidence REAL, inference_seconds REAL, model_name TEXT,
+                    model_version TEXT, output_path TEXT, output_bytes INTEGER,
+                    result_json TEXT, error TEXT, created_at_unix REAL
+                );
+                """
+            )
+            event = {"event_key": "m:G:legacy", "code": "G", "event_type": "goal"}
+            runtime.execute(
+                "INSERT INTO event_tasks VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                ("m:G:legacy", "G", "goal", json.dumps(event), "failed", 1, 2,
+                 None, None, json.dumps({"error_kind": "anchor_gap"}), "anchor gap"),
+            )
+            runtime.execute(
+                "INSERT INTO vision_tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("m:G:legacy", "encoded", 10.0, None, 1.0, "PaddleOCR", "1",
+                 "/tmp/legacy-fallback.gif", 7,
+                 json.dumps({
+                     "minute_fallback": True,
+                     "fallback_generated": True,
+                     "duration_sec": 7.0,
+                 }), None, 1),
+            )
+            runtime.commit()
+            runtime.close()
+
+            tasks, _, _ = dashboard_server._tasks_from_database(
+                output / "pipeline_state.sqlite3"
+            )
+
+        vision = tasks[0]["vision"]
+        self.assertFalse(vision["fallback_complete"])
+        self.assertEqual(vision["available_fallback_seconds"], 7.0)
+        self.assertEqual(vision["requested_fallback_seconds"], 60.0)
+
     def test_database_vision_failure_exposes_structured_ocr_diagnostics(self):
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "pipeline_state.sqlite3"
@@ -556,6 +722,17 @@ class DashboardTests(unittest.TestCase):
                      "stage": "ocr",
                      "locator_method": "ocr",
                      "fallback_used": False,
+                     "ocr": {
+                         "target_clock": "69:37",
+                         "exact_second_error": {
+                             "kind": "ocr_exact_second_not_found",
+                             "diagnostics": {
+                                 "exact_second_failure_reason": (
+                                     "target_clock_not_found"
+                                 )
+                             },
+                         },
+                     },
                      "ocr_diagnostics": {
                          "sampled_frames": 120,
                          "valid_clock_frames": 0,
@@ -573,6 +750,11 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(vision["stage"], "ocr")
         self.assertFalse(vision["fallback_used"])
         self.assertEqual(vision["ocr_diagnostics"]["sampled_frames"], 120)
+        self.assertEqual(vision["target_clock"], "69:37")
+        self.assertEqual(
+            vision["ocr_diagnostics"]["exact_second_failure_reason"],
+            "target_clock_not_found",
+        )
         self.assertEqual(vision["error"], "no valid clock")
 
     def test_new_session_defaults_to_calibrated_candidate_window(self):
@@ -581,7 +763,7 @@ class DashboardTests(unittest.TestCase):
 
         self.assertEqual(session.before_seconds, 30.0)
         self.assertEqual(session.after_seconds, 20.0)
-        self.assertEqual(session.event_to_video_offset_seconds, -60.0)
+        self.assertEqual(session.event_to_video_offset_seconds, -30.0)
         self.assertEqual(session.gif_width, 768)
         self.assertEqual(session.gif_fps, 16.0)
         self.assertEqual(session.gif_colors, 256)
@@ -589,13 +771,13 @@ class DashboardTests(unittest.TestCase):
         payload = dashboard_server._session_json(session)
         self.assertEqual(payload["gif"]["before_seconds"], 30.0)
         self.assertEqual(payload["gif"]["after_seconds"], 20.0)
-        self.assertEqual(payload["gif"]["event_to_video_offset_seconds"], -60.0)
+        self.assertEqual(payload["gif"]["event_to_video_offset_seconds"], -30.0)
         self.assertEqual(payload["gif"]["width"], 768)
         self.assertEqual(payload["gif"]["fps"], 16.0)
         self.assertEqual(payload["gif"]["colors"], 256)
         self.assertTrue(payload["vision"]["enabled"])
         self.assertFalse(payload["vision"]["worker_enabled"])
-        self.assertEqual(payload["vision"]["search_before_seconds"], 300.0)
+        self.assertEqual(payload["vision"]["search_before_seconds"], 120.0)
         self.assertEqual(payload["vision"]["search_after_seconds"], 0.0)
         self.assertEqual(payload["vision"]["fallback_gif"]["width"], 384)
         self.assertEqual(payload["vision"]["fallback_gif"]["fps"], 6.0)
@@ -889,7 +1071,7 @@ class DashboardTests(unittest.TestCase):
 
         self.assertIn('id="before" type="number" value="30"', html)
         self.assertIn('id="after" type="number" value="20"', html)
-        self.assertIn('id="event-offset" type="number" value="-60"', html)
+        self.assertIn('id="event-offset" type="number" value="-30"', html)
         self.assertIn('id="width" type="number" value="768"', html)
         self.assertIn('id="vision-enabled" type="checkbox" checked', html)
         self.assertIn('id="vision-state">默认开启', html)
@@ -921,7 +1103,7 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(command[command.index("--after") + 1], "20.0")
         self.assertEqual(
             command[command.index("--event-to-video-offset") + 1],
-            "-60.0",
+            "-30.0",
         )
         self.assertEqual(
             command[command.index("--buffer-seconds") + 1],
@@ -937,7 +1119,7 @@ class DashboardTests(unittest.TestCase):
         self.assertIn("--vision-enabled", command)
         self.assertEqual(
             command[command.index("--vision-search-before") + 1],
-            "300.0",
+            "120.0",
         )
         self.assertEqual(
             command[command.index("--vision-search-after") + 1],
@@ -976,6 +1158,7 @@ class DashboardTests(unittest.TestCase):
         session = manager.get("vision-runtime-state")
         session.source = {"resource": "rtmp://example/live"}
         session.vision_enabled = True
+        session.vision_clock_only = True
         worker = Mock(pid=125, returncode=None)
         worker.poll.return_value = None
 
@@ -986,12 +1169,15 @@ class DashboardTests(unittest.TestCase):
         payload = dashboard_server._session_json(session)
         self.assertFalse(payload["vision"]["enabled"])
         self.assertTrue(payload["vision"]["worker_enabled"])
+        self.assertTrue(payload["vision"]["clock_only"])
+        self.assertTrue(payload["vision"]["worker_clock_only"])
 
     def test_dashboard_passes_vision_configuration_to_worker(self):
         manager = dashboard_server.Dashboard(background_monitors=False)
         session = manager.get("vision-command")
         session.source = {"resource": "rtmp://example/live"}
         session.vision_enabled = True
+        session.vision_clock_only = True
         session.vision_before_seconds = 7
         session.vision_after_seconds = 11
         worker = Mock(pid=123, returncode=None)
@@ -1000,11 +1186,12 @@ class DashboardTests(unittest.TestCase):
             manager.start(session)
         command = popen.call_args.args[0]
         self.assertIn("--vision-enabled", command)
+        self.assertIn("--ocr-clock-only", command)
         self.assertEqual(command[command.index("--vision-before") + 1], "7")
         self.assertEqual(command[command.index("--vision-after") + 1], "11")
         self.assertEqual(
             command[command.index("--vision-search-before") + 1],
-            "300.0",
+            "120.0",
         )
         self.assertEqual(
             command[command.index("--vision-search-after") + 1],
@@ -1019,6 +1206,29 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(command[command.index("--gif-colors") + 1], "256")
         self.assertEqual(command[command.index("--fallback-gif-width") + 1], "384")
         self.assertEqual(command[command.index("--fallback-gif-fps") + 1], "6.0")
+
+    def test_dashboard_can_disable_clock_only_without_disabling_ai(self):
+        manager = dashboard_server.Dashboard(background_monitors=False)
+        session = manager.get("vision-legacy-command")
+        session.source = {"resource": "rtmp://example/live"}
+        session.vision_enabled = True
+        session.vision_clock_only = False
+        worker = Mock(pid=128, returncode=None)
+        worker.poll.return_value = None
+
+        with patch("dashboard_server.subprocess.Popen", return_value=worker) as popen:
+            manager.start(session)
+
+        command = popen.call_args.args[0]
+        self.assertIn("--vision-enabled", command)
+        self.assertNotIn("--ocr-clock-only", command)
+
+    def test_dashboard_keeps_clock_only_behind_replay_validation_gate(self):
+        manager = dashboard_server.Dashboard(background_monitors=False)
+        session = manager.get("vision-validation-gate")
+
+        self.assertTrue(session.vision_enabled)
+        self.assertFalse(session.vision_clock_only)
 
     def test_dashboard_passes_explicit_scoreboard_profile_path(self):
         manager = dashboard_server.Dashboard(background_monitors=False)
@@ -1928,6 +2138,288 @@ class DashboardTests(unittest.TestCase):
         popen.assert_not_called()
         self.assertEqual(session.lifecycle_state, "completed")
         self.assertEqual(session.played_confirmation_count, 2)
+
+    def test_terminal_monitor_thread_exits_and_removes_its_registry_entry(self):
+        manager = dashboard_server.Dashboard(background_monitors=False)
+        session = manager.get("terminal-monitor")
+
+        def finish_match(current):
+            current.lifecycle_state = "stopped"
+
+        with patch.object(manager, "refresh", side_effect=finish_match):
+            thread = threading.Thread(target=manager._monitor, args=(session,))
+            manager.monitor_threads[session.match_id] = thread
+            thread.start()
+            thread.join(timeout=2)
+
+        self.assertFalse(thread.is_alive())
+        self.assertNotIn(session.match_id, manager.monitor_threads)
+        self.assertIsNotNone(session.terminal_at)
+
+    def test_start_reinstates_monitor_after_terminal_monitor_exit(self):
+        manager = dashboard_server.Dashboard(background_monitors=True)
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                with patch.object(manager, "_monitor") as monitor:
+                    session = manager.get("restart-monitor")
+                    session.output_dir = Path(directory) / session.match_id
+                    first_thread = manager.monitor_threads.pop(session.match_id)
+                    first_thread.join(timeout=2)
+                    session.lifecycle_state = "stopped"
+
+                    fake_worker = Mock(pid=1234, returncode=None)
+                    fake_worker.poll.return_value = None
+                    with patch.object(
+                        dashboard_server.subprocess,
+                        "Popen",
+                        return_value=fake_worker,
+                    ):
+                        manager.start(session, demo=True)
+
+                    self.assertIn(session.match_id, manager.monitor_threads)
+                    monitor_thread = manager.monitor_threads.pop(session.match_id)
+                    monitor_thread.join(timeout=2)
+                    self.assertEqual(monitor.call_count, 2)
+        finally:
+            manager.close()
+
+    def test_session_ttl_only_evicts_terminal_inactive_sessions(self):
+        manager = dashboard_server.Dashboard(
+            background_monitors=False,
+            session_retention_seconds=24 * 60 * 60,
+        )
+        terminal_at = time.time()
+        expired = manager.get("expired-session")
+        expired.lifecycle_state = "completed"
+        expired.terminal_at = terminal_at
+        active = manager.get("active-session")
+        active.lifecycle_state = "completed"
+        active.terminal_at = terminal_at
+        active.desired_running = True
+
+        with manager.lock:
+            removed = manager._prune_terminal_sessions_locked(
+                terminal_at + 24 * 60 * 60
+            )
+
+        self.assertEqual(removed, [expired.match_id])
+        self.assertNotIn(expired.match_id, manager.sessions)
+        self.assertIn(active.match_id, manager.sessions)
+
+    def test_idle_session_ttl_evicts_unstarted_session(self):
+        manager = dashboard_server.Dashboard(
+            background_monitors=False,
+            session_retention_seconds=60,
+        )
+        session = manager.get("idle-session")
+        session.last_access_at = 100.0
+
+        with manager.lock:
+            removed = manager._prune_idle_sessions_locked(161.0)
+
+        self.assertEqual(removed, [session.match_id])
+        self.assertNotIn(session.match_id, manager.sessions)
+
+    def test_terminal_maintenance_cleans_manual_stop_buffer_after_lease_expires(self):
+        manager = dashboard_server.Dashboard(background_monitors=False)
+        session = manager.get("manual-stop-cleanup")
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / session.match_id
+            buffer_dir = output / "buffer"
+            buffer_dir.mkdir(parents=True)
+            segment = buffer_dir / "old.ts"
+            segment.write_bytes(b"segment")
+            segment_list = buffer_dir / "segments.csv"
+            segment_list.write_text("old.ts,0,2\n", encoding="utf-8")
+            manifest = buffer_dir / "segment_manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {"version": 1, "generations": [{"list_path": "segments.csv"}]}
+                ),
+                encoding="utf-8",
+            )
+            database = output / "pipeline_state.sqlite3"
+            connection = dashboard_server.sqlite3.connect(database)
+            connection.execute(
+                "CREATE TABLE segment_leases "
+                "(segment_path TEXT, expires_at_unix REAL)"
+            )
+            connection.execute(
+                "INSERT INTO segment_leases VALUES (?, ?)",
+                (str(segment), 200.0),
+            )
+            connection.commit()
+            connection.close()
+            session.output_dir = output
+            session.lifecycle_state = "stopped"
+            session.terminal_at = 90.0
+
+            with patch.object(dashboard_server, "DEFAULT_OUTPUT", Path(directory)):
+                manager.run_maintenance(now=100.0)
+                self.assertTrue(segment.exists())
+                self.assertTrue(segment_list.exists())
+                self.assertFalse(session.terminal_cleanup_done)
+
+                manager.run_maintenance(now=300.0)
+
+            self.assertFalse(segment.exists())
+            self.assertFalse(segment_list.exists())
+            self.assertEqual(json.loads(manifest.read_text())["generations"], [])
+            self.assertTrue(session.terminal_cleanup_done)
+
+    def test_maintenance_never_cleans_an_active_worker_session(self):
+        manager = dashboard_server.Dashboard(background_monitors=False)
+        session = manager.get("active-cleanup-guard")
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / session.match_id
+            buffer_dir = output / "buffer"
+            buffer_dir.mkdir(parents=True)
+            segment = buffer_dir / "active.ts"
+            segment.write_bytes(b"active")
+            session.output_dir = output
+            session.lifecycle_state = "playing"
+            session.desired_running = True
+            session.worker = Mock(pid=991, returncode=None)
+            session.worker.poll.return_value = None
+
+            with patch.object(dashboard_server, "DEFAULT_OUTPUT", Path(directory)):
+                manager.run_maintenance(now=time.time())
+
+            self.assertTrue(segment.exists())
+            self.assertFalse(session.terminal_cleanup_done)
+
+    def test_maintenance_cleans_stale_orphan_output_without_session(self):
+        manager = dashboard_server.Dashboard(
+            background_monitors=False,
+            orphan_cleanup_grace_seconds=60,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "orphan-match"
+            buffer_dir = output / "buffer"
+            buffer_dir.mkdir(parents=True)
+            segment = buffer_dir / "orphan.ts"
+            segment.write_bytes(b"segment")
+            (buffer_dir / "segments.csv").write_text(
+                "orphan.ts,0,2\n", encoding="utf-8"
+            )
+            (buffer_dir / "segment_manifest.json").write_text(
+                json.dumps(
+                    {"version": 1, "generations": [{"list_path": "segments.csv"}]}
+                ),
+                encoding="utf-8",
+            )
+            (output / "pipeline_events.jsonl").write_text(
+                json.dumps(
+                    {
+                        "timestamp_unix": 100.0,
+                        "event": "worker_started",
+                        "pid": 999999,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with patch.object(dashboard_server, "DEFAULT_OUTPUT", root):
+                manager.run_maintenance(now=200.0)
+
+            self.assertFalse(segment.exists())
+            self.assertFalse((buffer_dir / "segments.csv").exists())
+            self.assertEqual(
+                json.loads((buffer_dir / "segment_manifest.json").read_text())["generations"],
+                [],
+            )
+
+    def test_maintenance_keeps_fresh_orphan_output_for_later_pass(self):
+        manager = dashboard_server.Dashboard(
+            background_monitors=False,
+            orphan_cleanup_grace_seconds=60,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "fresh-orphan"
+            buffer_dir = output / "buffer"
+            buffer_dir.mkdir(parents=True)
+            segment = buffer_dir / "fresh.ts"
+            segment.write_bytes(b"segment")
+            (output / "pipeline_events.jsonl").write_text(
+                json.dumps(
+                    {
+                        "timestamp_unix": 190.0,
+                        "event": "runtime_heartbeat",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with patch.object(dashboard_server, "DEFAULT_OUTPUT", root):
+                manager.run_maintenance(now=200.0)
+
+            self.assertTrue(segment.exists())
+
+    def test_orphan_cleanup_never_touches_a_directory_with_a_session(self):
+        manager = dashboard_server.Dashboard(
+            background_monitors=False,
+            orphan_cleanup_grace_seconds=60,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            session = manager.get("stopped-session")
+            session.output_dir = root / session.match_id
+            session.lifecycle_state = "stopped"
+            session.terminal_at = 90.0
+            session.output_dir.mkdir(parents=True)
+            (session.output_dir / "pipeline_events.jsonl").write_text(
+                json.dumps(
+                    {
+                        "timestamp_unix": 100.0,
+                        "event": "pipeline_stopped",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with patch.object(dashboard_server, "DEFAULT_OUTPUT", root):
+                with patch.object(
+                    dashboard_server.DiskLifecycleManager,
+                    "cleanup_finished_match",
+                ) as cleanup:
+                    manager._prune_orphan_outputs(200.0)
+
+            cleanup.assert_not_called()
+
+    def test_maintenance_keeps_orphan_output_when_worker_pid_is_alive(self):
+        manager = dashboard_server.Dashboard(
+            background_monitors=False,
+            orphan_cleanup_grace_seconds=60,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "live-orphan"
+            buffer_dir = output / "buffer"
+            buffer_dir.mkdir(parents=True)
+            segment = buffer_dir / "live.ts"
+            segment.write_bytes(b"segment")
+            (output / "pipeline_events.jsonl").write_text(
+                json.dumps(
+                    {
+                        "timestamp_unix": 100.0,
+                        "event": "worker_started",
+                        "pid": 1234,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with patch.object(dashboard_server, "DEFAULT_OUTPUT", root):
+                with patch.object(dashboard_server.os, "kill", return_value=None):
+                    manager.run_maintenance(now=200.0)
+
+            self.assertTrue(segment.exists())
 
     def test_recovery_start_is_allowed_after_single_unconfirmed_played_response(self):
         manager = dashboard_server.Dashboard(background_monitors=False)

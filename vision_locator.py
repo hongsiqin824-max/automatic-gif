@@ -50,6 +50,7 @@ DEFAULT_MAX_ANCHOR_DISTANCE_SECONDS = 15.0
 EVENT_LABELS: dict[str, tuple[str, ...]] = {
     "G": ("Goal",),
     "OG": ("Goal",),
+    "PG": ("Goal",),
     "YC": ("Yellow card",),
     "RC": ("Red card", "Yellow->red card"),
 }

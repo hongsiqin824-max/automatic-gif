@@ -11,7 +11,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Collection, Mapping
 
 from match_event_identity import events_represent_same_incident, merge_event_metadata
 
@@ -35,6 +35,9 @@ VISION_TASK_STATUSES = (
     "failed",
 )
 VISION_INCOMPLETE_STATUSES = ("pending", "locating", "located", "encoding")
+VISION_ARTIFACT_KINDS = ("ocr_window", "tdeed_refined")
+DEFAULT_VISION_ARTIFACT_KIND = "tdeed_refined"
+LEGACY_VISION_ARTIFACT_KIND = "refined"
 DEFAULT_GIF_DEADLINE_SECONDS = 55.0
 DEFAULT_VISION_DEADLINE_SECONDS = 60.0
 READINESS_RETRY_DELAYS_SECONDS = (2.0, 4.0, 8.0)
@@ -47,6 +50,17 @@ _ALLOWED_VISION_TRANSITIONS = {
     "encoded": set(),
     "failed": {"pending"},
 }
+
+
+def normalize_vision_artifact_kind(value: str | None) -> str:
+    """Return the durable artifact kind while accepting the legacy name."""
+    normalized = str(value or DEFAULT_VISION_ARTIFACT_KIND).strip().lower()
+    if normalized == LEGACY_VISION_ARTIFACT_KIND:
+        return DEFAULT_VISION_ARTIFACT_KIND
+    if normalized not in VISION_ARTIFACT_KINDS:
+        supported = ", ".join(VISION_ARTIFACT_KINDS)
+        raise ValueError(f"vision artifact kind must be one of: {supported}")
+    return normalized
 
 
 def _readiness_retry_delay(check_count: int) -> float:
@@ -203,6 +217,10 @@ class StoredVisionTask:
     deadline_at_unix: float
     readiness_check_count: int
     last_error_kind: str | None
+    failure_stage: str | None
+    failure_reason: str | None
+    location_metadata: dict[str, Any]
+    window_metadata: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -214,6 +232,19 @@ class StoredSegmentLease:
     acquired_at_unix: float
     renewed_at_unix: float
     expires_at_unix: float
+
+
+@dataclass(frozen=True)
+class StoredShotmapState:
+    match_id: str
+    initialized: bool
+    initialized_at_unix: float | None
+    updated_at_unix: float | None
+    last_snapshot: dict[str, Any] | None
+    last_snapshot_at_unix: float | None
+    last_response_at_unix: float | None
+    diagnostics: dict[str, Any]
+    seen_fingerprints: frozenset[str]
 
 
 @dataclass(frozen=True)
@@ -357,12 +388,73 @@ class TaskStateStore:
         self.connection.execute("PRAGMA busy_timeout=30000")
         self._create_schema()
 
+    @staticmethod
+    def _vision_tasks_table_sql(
+        table_name: str,
+        vision_statuses: str,
+        *,
+        if_not_exists: bool,
+    ) -> str:
+        if table_name not in {"vision_tasks", "vision_tasks_legacy"}:
+            raise ValueError("unsupported vision task table name")
+        create_guard = "IF NOT EXISTS " if if_not_exists else ""
+        artifact_kinds = ",".join(f"'{kind}'" for kind in VISION_ARTIFACT_KINDS)
+        return f"""
+            CREATE TABLE {create_guard}{table_name} (
+                event_key TEXT NOT NULL,
+                match_id TEXT NOT NULL,
+                code TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                artifact_kind TEXT NOT NULL
+                    CHECK (artifact_kind IN ({artifact_kinds})),
+                status TEXT NOT NULL CHECK (status IN ({vision_statuses})),
+                source_anchor_stream_time REAL NOT NULL,
+                source_anchor_source_time REAL,
+                search_start_stream_time REAL NOT NULL,
+                search_end_stream_time REAL NOT NULL,
+                clip_before_seconds REAL NOT NULL,
+                clip_after_seconds REAL NOT NULL,
+                model_name TEXT,
+                model_version TEXT,
+                model_weights_sha256 TEXT,
+                created_at_unix REAL NOT NULL,
+                updated_at_unix REAL NOT NULL,
+                locating_started_at_unix REAL,
+                located_at_unix REAL,
+                encoding_started_at_unix REAL,
+                encoded_at_unix REAL,
+                failed_at_unix REAL,
+                locate_attempt_count INTEGER NOT NULL DEFAULT 0,
+                encode_attempt_count INTEGER NOT NULL DEFAULT 0,
+                located_anchor_stream_time REAL,
+                located_anchor_source_time REAL,
+                confidence REAL,
+                inference_seconds REAL,
+                output_path TEXT,
+                output_bytes INTEGER,
+                result_json TEXT NOT NULL DEFAULT '{{}}',
+                error TEXT,
+                next_attempt_at_unix REAL,
+                deadline_at_unix REAL,
+                readiness_check_count INTEGER NOT NULL DEFAULT 0,
+                last_error_kind TEXT,
+                failure_stage TEXT,
+                failure_reason TEXT,
+                location_json TEXT NOT NULL DEFAULT '{{}}',
+                window_json TEXT NOT NULL DEFAULT '{{}}',
+                PRIMARY KEY (event_key, artifact_kind)
+            );
+        """
+
     def _create_schema(self) -> None:
         statuses = ",".join(f"'{status}'" for status in TASK_STATUSES)
         vision_statuses = ",".join(
             f"'{status}'" for status in VISION_TASK_STATUSES
         )
-        with self._lock:
+        vision_tasks_sql = self._vision_tasks_table_sql(
+            "vision_tasks", vision_statuses, if_not_exists=True
+        )
+        with self._lock, self.connection:
             self.connection.executescript(
                 f"""
             CREATE TABLE IF NOT EXISTS event_tasks (
@@ -423,6 +515,27 @@ class TaskStateStore:
                 last_seen_at_unix REAL NOT NULL,
                 PRIMARY KEY (match_id, version_key)
             );
+            CREATE TABLE IF NOT EXISTS shotmap_feed_state (
+                match_id TEXT PRIMARY KEY,
+                initialized INTEGER NOT NULL DEFAULT 0 CHECK (initialized IN (0, 1)),
+                initialized_at_unix REAL,
+                updated_at_unix REAL NOT NULL,
+                last_valid_response_at_unix REAL,
+                last_snapshot_json TEXT,
+                last_snapshot_at_unix REAL,
+                last_response_at_unix REAL,
+                diagnostics_json TEXT NOT NULL DEFAULT '{{}}'
+            );
+            CREATE TABLE IF NOT EXISTS shotmap_feed_events (
+                match_id TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                event_json TEXT NOT NULL DEFAULT '{{}}',
+                first_seen_at_unix REAL NOT NULL,
+                last_seen_at_unix REAL NOT NULL,
+                PRIMARY KEY (match_id, fingerprint)
+            );
+            CREATE INDEX IF NOT EXISTS shotmap_feed_events_match_seen
+                ON shotmap_feed_events(match_id, first_seen_at_unix);
             CREATE TABLE IF NOT EXISTS timeline_states (
                 match_id TEXT PRIMARY KEY,
                 timeline_origin_wall_unix REAL NOT NULL,
@@ -434,45 +547,7 @@ class TaskStateStore:
                 created_at_unix REAL NOT NULL,
                 updated_at_unix REAL NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS vision_tasks (
-                event_key TEXT PRIMARY KEY,
-                match_id TEXT NOT NULL,
-                code TEXT NOT NULL,
-                event_type TEXT NOT NULL,
-                artifact_kind TEXT NOT NULL DEFAULT 'refined'
-                    CHECK (artifact_kind = 'refined'),
-                status TEXT NOT NULL CHECK (status IN ({vision_statuses})),
-                source_anchor_stream_time REAL NOT NULL,
-                source_anchor_source_time REAL,
-                search_start_stream_time REAL NOT NULL,
-                search_end_stream_time REAL NOT NULL,
-                clip_before_seconds REAL NOT NULL,
-                clip_after_seconds REAL NOT NULL,
-                model_name TEXT,
-                model_version TEXT,
-                model_weights_sha256 TEXT,
-                created_at_unix REAL NOT NULL,
-                updated_at_unix REAL NOT NULL,
-                locating_started_at_unix REAL,
-                located_at_unix REAL,
-                encoding_started_at_unix REAL,
-                encoded_at_unix REAL,
-                failed_at_unix REAL,
-                locate_attempt_count INTEGER NOT NULL DEFAULT 0,
-                encode_attempt_count INTEGER NOT NULL DEFAULT 0,
-                located_anchor_stream_time REAL,
-                located_anchor_source_time REAL,
-                confidence REAL,
-                inference_seconds REAL,
-                output_path TEXT,
-                output_bytes INTEGER,
-                result_json TEXT NOT NULL DEFAULT '{{}}',
-                error TEXT,
-                next_attempt_at_unix REAL,
-                deadline_at_unix REAL,
-                readiness_check_count INTEGER NOT NULL DEFAULT 0,
-                last_error_kind TEXT
-            );
+            {vision_tasks_sql}
             CREATE INDEX IF NOT EXISTS vision_tasks_match_status
                 ON vision_tasks(match_id, status);
             CREATE TABLE IF NOT EXISTS segment_leases (
@@ -518,16 +593,95 @@ class TaskStateStore:
                 for row in self.connection.execute("PRAGMA table_info(vision_tasks)")
             }
             vision_migrations = {
+                "artifact_kind": "TEXT NOT NULL DEFAULT 'refined'",
                 "next_attempt_at_unix": "REAL",
                 "deadline_at_unix": "REAL",
                 "readiness_check_count": "INTEGER NOT NULL DEFAULT 0",
                 "last_error_kind": "TEXT",
+                "failure_stage": "TEXT",
+                "failure_reason": "TEXT",
+                "location_json": "TEXT NOT NULL DEFAULT '{}'",
+                "window_json": "TEXT NOT NULL DEFAULT '{}'",
             }
             for name, definition in vision_migrations.items():
                 if name not in vision_columns:
                     self.connection.execute(
                         f"ALTER TABLE vision_tasks ADD COLUMN {name} {definition}"
                     )
+            vision_table = self.connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+                ("vision_tasks",),
+            ).fetchone()
+            vision_info = self.connection.execute(
+                "PRAGMA table_info(vision_tasks)"
+            ).fetchall()
+            vision_primary_key = [
+                str(row["name"])
+                for row in sorted(vision_info, key=lambda row: int(row["pk"]))
+                if int(row["pk"]) > 0
+            ]
+            vision_table_sql = str(vision_table["sql"] or "") if vision_table else ""
+            if (
+                vision_primary_key != ["event_key", "artifact_kind"]
+                or "tdeed_refined" not in vision_table_sql
+                or "ocr_window" not in vision_table_sql
+            ):
+                self.connection.execute("DROP INDEX IF EXISTS vision_tasks_match_status")
+                self.connection.execute(
+                    "ALTER TABLE vision_tasks RENAME TO vision_tasks_legacy"
+                )
+                self.connection.execute(
+                    self._vision_tasks_table_sql(
+                        "vision_tasks", vision_statuses, if_not_exists=False
+                    )
+                )
+                self.connection.execute(
+                    """
+                    INSERT INTO vision_tasks (
+                        event_key, match_id, code, event_type, artifact_kind, status,
+                        source_anchor_stream_time, source_anchor_source_time,
+                        search_start_stream_time, search_end_stream_time,
+                        clip_before_seconds, clip_after_seconds,
+                        model_name, model_version, model_weights_sha256,
+                        created_at_unix, updated_at_unix,
+                        locating_started_at_unix, located_at_unix,
+                        encoding_started_at_unix, encoded_at_unix, failed_at_unix,
+                        locate_attempt_count, encode_attempt_count,
+                        located_anchor_stream_time, located_anchor_source_time,
+                        confidence, inference_seconds, output_path, output_bytes,
+                        result_json, error, next_attempt_at_unix, deadline_at_unix,
+                        readiness_check_count, last_error_kind,
+                        failure_stage, failure_reason, location_json, window_json
+                    )
+                    SELECT
+                        event_key, match_id, code, event_type,
+                        CASE artifact_kind
+                            WHEN 'refined' THEN 'tdeed_refined'
+                            ELSE artifact_kind
+                        END,
+                        status, source_anchor_stream_time, source_anchor_source_time,
+                        search_start_stream_time, search_end_stream_time,
+                        clip_before_seconds, clip_after_seconds,
+                        model_name, model_version, model_weights_sha256,
+                        created_at_unix, updated_at_unix,
+                        locating_started_at_unix, located_at_unix,
+                        encoding_started_at_unix, encoded_at_unix, failed_at_unix,
+                        locate_attempt_count, encode_attempt_count,
+                        located_anchor_stream_time, located_anchor_source_time,
+                        confidence, inference_seconds, output_path, output_bytes,
+                        result_json, error, next_attempt_at_unix, deadline_at_unix,
+                        readiness_check_count, last_error_kind,
+                        failure_stage, failure_reason, location_json, window_json
+                    FROM vision_tasks_legacy
+                    """
+                )
+                self.connection.execute("DROP TABLE vision_tasks_legacy")
+            self.connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS vision_tasks_match_status
+                ON vision_tasks(match_id, status)
+                """
+            )
             self.connection.execute(
                 """
                 UPDATE event_tasks SET
@@ -605,7 +759,7 @@ class TaskStateStore:
             match_id=row["match_id"],
             code=row["code"],
             event_type=row["event_type"],
-            artifact_kind=row["artifact_kind"],
+            artifact_kind=normalize_vision_artifact_kind(row["artifact_kind"]),
             status=row["status"],
             source_anchor_stream_time=row["source_anchor_stream_time"],
             source_anchor_source_time=row["source_anchor_source_time"],
@@ -637,6 +791,10 @@ class TaskStateStore:
             deadline_at_unix=row["deadline_at_unix"],
             readiness_check_count=row["readiness_check_count"],
             last_error_kind=row["last_error_kind"],
+            failure_stage=row["failure_stage"],
+            failure_reason=row["failure_reason"],
+            location_metadata=json.loads(row["location_json"] or "{}"),
+            window_metadata=json.loads(row["window_json"] or "{}"),
         )
 
     @staticmethod
@@ -773,15 +931,25 @@ class TaskStateStore:
         event_data: Mapping[str, Any],
         *,
         now: float | None = None,
+        replace_fields: Collection[str] = (),
     ) -> StoredTask | None:
-        """Update mutable feed metadata without changing task processing state."""
+        """Update feed metadata, optionally replacing selected nullable fields."""
         event_key = str(event_data["event_key"])
+        replacement_keys = {str(key) for key in replace_fields}
+        if "event_key" in replacement_keys:
+            raise ValueError("event_key cannot be replaced")
+        missing_replacements = replacement_keys.difference(event_data)
+        if missing_replacements:
+            missing = ", ".join(sorted(missing_replacements))
+            raise ValueError(f"replacement fields are missing from event data: {missing}")
         timestamp = time.time() if now is None else now
         with self._lock:
             current = self.get(event_key)
             if current is None:
                 return None
             merged = merge_event_metadata(current.event_data, event_data)
+            for key in replacement_keys:
+                merged[key] = event_data[key]
             if merged == current.event_data:
                 return current
             with self.connection:
@@ -916,6 +1084,326 @@ class TaskStateStore:
                 (match_id,),
             ).fetchall()
         return initialized, {str(row["event_key"]) for row in rows}
+
+    @staticmethod
+    def is_valid_shotmap_payload(payload: Any) -> bool:
+        """Return whether *payload* is a decoded, usable shotmap response.
+
+        The feed cursor is deliberately stricter than a generic HTTP success:
+        only a JSON object with a list-valued ``shots`` member is valid. An
+        empty list is valid and is allowed to establish an empty baseline.
+        """
+        if not isinstance(payload, Mapping):
+            return False
+        return isinstance(payload.get("shots"), list)
+
+    def load_shotmap_cursor(self, match_id: str) -> tuple[bool, set[str]]:
+        """Return shotmap initialization state and durable fingerprints."""
+        normalized_match_id = str(match_id)
+        with self._lock:
+            state = self.connection.execute(
+                "SELECT initialized FROM shotmap_feed_state WHERE match_id = ?",
+                (normalized_match_id,),
+            ).fetchone()
+            rows = self.connection.execute(
+                """
+                SELECT fingerprint FROM shotmap_feed_events
+                WHERE match_id = ? ORDER BY fingerprint
+                """,
+                (normalized_match_id,),
+            ).fetchall()
+        return bool(state and int(state["initialized"])), {
+            str(row["fingerprint"]) for row in rows
+        }
+
+    def load_shotmap_fingerprints(self, match_id: str) -> set[str]:
+        """Load only the fingerprints remembered for one match."""
+        return self.load_shotmap_cursor(match_id)[1]
+
+    @staticmethod
+    def _decode_json_object(raw: str | None) -> dict[str, Any]:
+        if not raw:
+            return {}
+        try:
+            value = json.loads(raw)
+        except (TypeError, ValueError):
+            return {}
+        return dict(value) if isinstance(value, Mapping) else {}
+
+    def load_shotmap_state(self, match_id: str) -> StoredShotmapState:
+        """Load the persisted snapshot, diagnostics and cursor for a match."""
+        normalized_match_id = str(match_id)
+        with self._lock:
+            row = self.connection.execute(
+                """
+                SELECT initialized, initialized_at_unix, updated_at_unix,
+                       last_snapshot_json, last_snapshot_at_unix,
+                       last_response_at_unix, diagnostics_json
+                FROM shotmap_feed_state WHERE match_id = ?
+                """,
+                (normalized_match_id,),
+            ).fetchone()
+            fingerprint_rows = self.connection.execute(
+                """
+                SELECT fingerprint FROM shotmap_feed_events
+                WHERE match_id = ? ORDER BY fingerprint
+                """,
+                (normalized_match_id,),
+            ).fetchall()
+        snapshot: dict[str, Any] | None = None
+        if row is not None and row["last_snapshot_json"]:
+            try:
+                decoded = json.loads(row["last_snapshot_json"])
+            except (TypeError, ValueError):
+                decoded = None
+            if isinstance(decoded, Mapping):
+                snapshot = dict(decoded)
+        return StoredShotmapState(
+            match_id=normalized_match_id,
+            initialized=bool(row and int(row["initialized"])),
+            initialized_at_unix=(
+                float(row["initialized_at_unix"])
+                if row is not None and row["initialized_at_unix"] is not None
+                else None
+            ),
+            updated_at_unix=(
+                float(row["updated_at_unix"])
+                if row is not None and row["updated_at_unix"] is not None
+                else None
+            ),
+            last_snapshot=snapshot,
+            last_snapshot_at_unix=(
+                float(row["last_snapshot_at_unix"])
+                if row is not None and row["last_snapshot_at_unix"] is not None
+                else None
+            ),
+            last_response_at_unix=(
+                float(row["last_response_at_unix"])
+                if row is not None and row["last_response_at_unix"] is not None
+                else None
+            ),
+            diagnostics=(
+                self._decode_json_object(row["diagnostics_json"])
+                if row is not None
+                else {}
+            ),
+            seen_fingerprints=frozenset(
+                str(item["fingerprint"]) for item in fingerprint_rows
+            ),
+        )
+
+    def load_shotmap_snapshot(
+        self, match_id: str
+    ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+        """Load the last valid shotmap snapshot and latest diagnostics."""
+        state = self.load_shotmap_state(match_id)
+        return state.last_snapshot, state.diagnostics
+
+    def upsert_shotmap_snapshot(
+        self,
+        match_id: str,
+        payload: Any,
+        *,
+        diagnostics: Mapping[str, Any] | None = None,
+        observed_at_unix: float | None = None,
+        now: float | None = None,
+    ) -> bool:
+        """Persist one shotmap response and return whether it was valid.
+
+        Invalid responses update only response diagnostics and timestamps. In
+        particular they cannot create an initialized cursor or overwrite the
+        last valid snapshot. Call :meth:`mark_shotmap_seen` separately after
+        comparing the response with the durable fingerprint cursor.
+        """
+        normalized_match_id = str(match_id)
+        timestamp = time.time() if now is None else float(now)
+        response_at = timestamp if observed_at_unix is None else float(observed_at_unix)
+        valid = self.is_valid_shotmap_payload(payload)
+        encoded_payload: str | None = None
+        validation_error: str | None = None
+        if valid:
+            try:
+                encoded_payload = json.dumps(
+                    dict(payload), ensure_ascii=False, separators=(",", ":")
+                )
+            except (TypeError, ValueError):
+                valid = False
+                validation_error = "payload_not_json_serializable"
+        elif not isinstance(payload, Mapping):
+            validation_error = "payload_not_json_object"
+        else:
+            validation_error = "shots_missing_or_not_list"
+
+        diagnostic_value: dict[str, Any] = dict(diagnostics or {})
+        diagnostic_value["valid"] = valid
+        if validation_error:
+            diagnostic_value["validation_error"] = validation_error
+        try:
+            encoded_diagnostics = json.dumps(
+                diagnostic_value, ensure_ascii=False, separators=(",", ":")
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("shotmap diagnostics must be JSON serializable") from exc
+
+        with self._lock, self.connection:
+            row = self.connection.execute(
+                """
+                SELECT initialized, initialized_at_unix
+                FROM shotmap_feed_state WHERE match_id = ?
+                """,
+                (normalized_match_id,),
+            ).fetchone()
+            initialized = bool(row and int(row["initialized"]))
+            initialized_at = (
+                float(row["initialized_at_unix"])
+                if row is not None and row["initialized_at_unix"] is not None
+                else None
+            )
+            if valid and not initialized:
+                initialized = True
+                initialized_at = timestamp
+            if row is None:
+                self.connection.execute(
+                    """
+                    INSERT INTO shotmap_feed_state (
+                        match_id, initialized, initialized_at_unix,
+                        updated_at_unix, last_snapshot_json,
+                        last_snapshot_at_unix, last_response_at_unix,
+                        diagnostics_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        normalized_match_id,
+                        int(initialized),
+                        initialized_at,
+                        timestamp,
+                        encoded_payload if valid else None,
+                        response_at if valid else None,
+                        response_at,
+                        encoded_diagnostics,
+                    ),
+                )
+            elif valid:
+                self.connection.execute(
+                    """
+                    UPDATE shotmap_feed_state
+                    SET initialized = ?, initialized_at_unix = ?,
+                        updated_at_unix = ?, last_snapshot_json = ?,
+                        last_snapshot_at_unix = ?, last_response_at_unix = ?,
+                        diagnostics_json = ?
+                    WHERE match_id = ?
+                    """,
+                    (
+                        int(initialized),
+                        initialized_at,
+                        timestamp,
+                        encoded_payload,
+                        response_at,
+                        response_at,
+                        encoded_diagnostics,
+                        normalized_match_id,
+                    ),
+                )
+            else:
+                self.connection.execute(
+                    """
+                    UPDATE shotmap_feed_state
+                    SET updated_at_unix = ?, last_response_at_unix = ?,
+                        diagnostics_json = ?
+                    WHERE match_id = ?
+                    """,
+                    (
+                        timestamp,
+                        response_at,
+                        encoded_diagnostics,
+                        normalized_match_id,
+                    ),
+                )
+        return valid
+
+    def mark_shotmap_seen(
+        self,
+        match_id: str,
+        fingerprints: Collection[str],
+        *,
+        events: Mapping[str, Mapping[str, Any]] | None = None,
+        now: float | None = None,
+    ) -> set[str]:
+        """Durably add shotmap fingerprints and return newly inserted keys.
+
+        This method never initializes the feed. Call it after a valid
+        :meth:`upsert_shotmap_snapshot`; accidental calls before initialization
+        leave the cursor uninitialized while retaining the fingerprints.
+        """
+        normalized_match_id = str(match_id)
+        timestamp = time.time() if now is None else float(now)
+        unique = {str(value) for value in fingerprints if str(value)}
+        if not unique:
+            return set()
+        event_values: list[tuple[str, str]] = []
+        for fingerprint in sorted(unique):
+            event_data = (events or {}).get(fingerprint, {})
+            try:
+                encoded = json.dumps(
+                    dict(event_data), ensure_ascii=False, separators=(",", ":")
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError("shotmap event data must be JSON serializable") from exc
+            event_values.append((fingerprint, encoded))
+        inserted: set[str] = set()
+        with self._lock, self.connection:
+            self.connection.execute(
+                """
+                INSERT OR IGNORE INTO shotmap_feed_state (
+                    match_id, initialized, initialized_at_unix,
+                    updated_at_unix, diagnostics_json
+                ) VALUES (?, 0, NULL, ?, '{}')
+                """,
+                (normalized_match_id, timestamp),
+            )
+            existing = {
+                str(row["fingerprint"])
+                for row in self.connection.execute(
+                    """
+                    SELECT fingerprint FROM shotmap_feed_events
+                    WHERE match_id = ? AND fingerprint IN (%s)
+                    """ % ",".join("?" for _ in unique),
+                    (normalized_match_id, *sorted(unique)),
+                ).fetchall()
+            }
+            self.connection.executemany(
+                """
+                INSERT INTO shotmap_feed_events (
+                    match_id, fingerprint, event_json,
+                    first_seen_at_unix, last_seen_at_unix
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(match_id, fingerprint) DO UPDATE SET
+                    event_json = CASE
+                        WHEN excluded.event_json != '{}' THEN excluded.event_json
+                        ELSE shotmap_feed_events.event_json
+                    END,
+                    last_seen_at_unix = excluded.last_seen_at_unix
+                """,
+                [
+                    (
+                        normalized_match_id,
+                        fingerprint,
+                        encoded,
+                        timestamp,
+                        timestamp,
+                    )
+                    for fingerprint, encoded in event_values
+                ],
+            )
+            inserted = unique - existing
+            self.connection.execute(
+                """
+                UPDATE shotmap_feed_state SET updated_at_unix = ?
+                WHERE match_id = ?
+                """,
+                (timestamp, normalized_match_id),
+            )
+        return inserted
 
     def load_event_aliases(self, match_id: str) -> dict[str, dict[str, Any]]:
         """Load persisted feed versions and migrate existing task variants."""
@@ -1223,6 +1711,7 @@ class TaskStateStore:
         self,
         event_key: str,
         *,
+        artifact_kind: str = DEFAULT_VISION_ARTIFACT_KIND,
         search_start_stream_time: float,
         search_end_stream_time: float,
         clip_before_seconds: float,
@@ -1230,14 +1719,25 @@ class TaskStateStore:
         model_name: str | None = None,
         model_version: str | None = None,
         model_weights_sha256: str | None = None,
+        location_metadata: Mapping[str, Any] | None = None,
+        window_metadata: Mapping[str, Any] | None = None,
         deadline_at_unix: float | None = None,
         now: float | None = None,
     ) -> bool:
-        """Create the event's sole refined-artifact task without changing its default task."""
+        """Create one independently recoverable visual artifact task."""
         if search_end_stream_time < search_start_stream_time:
             raise ValueError("vision search end must not precede search start")
         if clip_before_seconds < 0 or clip_after_seconds < 0:
             raise ValueError("vision clip durations must be non-negative")
+        normalized_artifact_kind = normalize_vision_artifact_kind(artifact_kind)
+        initial_location = dict(location_metadata or {})
+        initial_window = {
+            "search_start_stream_time": search_start_stream_time,
+            "search_end_stream_time": search_end_stream_time,
+            "clip_before_seconds": clip_before_seconds,
+            "clip_after_seconds": clip_after_seconds,
+            **dict(window_metadata or {}),
+        }
         timestamp = time.time() if now is None else now
         with self._lock, self.connection:
             event = self.connection.execute(
@@ -1254,14 +1754,16 @@ class TaskStateStore:
                     clip_before_seconds, clip_after_seconds,
                     model_name, model_version, model_weights_sha256,
                     created_at_unix, updated_at_unix,
-                    next_attempt_at_unix, deadline_at_unix
-                ) VALUES (?, ?, ?, ?, 'refined', 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    next_attempt_at_unix, deadline_at_unix,
+                    location_json, window_json
+                ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     event_key,
                     event["match_id"],
                     event["code"],
                     event["event_type"],
+                    normalized_artifact_kind,
                     event["clip_anchor_stream_time"],
                     event["clip_anchor_source_time"],
                     search_start_stream_time,
@@ -1279,38 +1781,90 @@ class TaskStateStore:
                         if deadline_at_unix is None
                         else deadline_at_unix
                     ),
+                    json.dumps(
+                        initial_location, ensure_ascii=False, separators=(",", ":")
+                    ),
+                    json.dumps(
+                        initial_window, ensure_ascii=False, separators=(",", ":")
+                    ),
                 ),
             )
         return cursor.rowcount == 1
 
-    def get_vision_task(self, event_key: str) -> StoredVisionTask | None:
+    def get_vision_task(
+        self,
+        event_key: str,
+        artifact_kind: str = DEFAULT_VISION_ARTIFACT_KIND,
+    ) -> StoredVisionTask | None:
+        normalized_artifact_kind = normalize_vision_artifact_kind(artifact_kind)
         with self._lock:
             row = self.connection.execute(
-                "SELECT * FROM vision_tasks WHERE event_key = ?", (event_key,)
+                """
+                SELECT * FROM vision_tasks
+                WHERE event_key = ? AND artifact_kind = ?
+                """,
+                (event_key, normalized_artifact_kind),
             ).fetchone()
         return self._decode_vision_row(row) if row is not None else None
 
-    def list_vision_tasks(self, match_id: str) -> list[StoredVisionTask]:
+    def list_vision_tasks(
+        self,
+        match_id: str,
+        artifact_kind: str | None = None,
+    ) -> list[StoredVisionTask]:
+        normalized_artifact_kind = (
+            normalize_vision_artifact_kind(artifact_kind)
+            if artifact_kind is not None
+            else None
+        )
         with self._lock:
-            rows = self.connection.execute(
-                """
-                SELECT * FROM vision_tasks
-                WHERE match_id = ? ORDER BY created_at_unix, event_key
-                """,
-                (match_id,),
-            ).fetchall()
+            if normalized_artifact_kind is None:
+                rows = self.connection.execute(
+                    """
+                    SELECT * FROM vision_tasks
+                    WHERE match_id = ?
+                    ORDER BY created_at_unix, event_key, artifact_kind
+                    """,
+                    (match_id,),
+                ).fetchall()
+            else:
+                rows = self.connection.execute(
+                    """
+                    SELECT * FROM vision_tasks
+                    WHERE match_id = ? AND artifact_kind = ?
+                    ORDER BY created_at_unix, event_key, artifact_kind
+                    """,
+                    (match_id, normalized_artifact_kind),
+                ).fetchall()
         return [self._decode_vision_row(row) for row in rows]
 
-    def list_incomplete_vision_tasks(self, match_id: str) -> list[StoredVisionTask]:
+    def list_incomplete_vision_tasks(
+        self,
+        match_id: str,
+        artifact_kind: str | None = None,
+    ) -> list[StoredVisionTask]:
         placeholders = ",".join("?" for _ in VISION_INCOMPLETE_STATUSES)
+        normalized_artifact_kind = (
+            normalize_vision_artifact_kind(artifact_kind)
+            if artifact_kind is not None
+            else None
+        )
         with self._lock:
+            artifact_filter = (
+                " AND artifact_kind = ?" if normalized_artifact_kind is not None else ""
+            )
+            parameters: tuple[Any, ...] = (
+                match_id,
+                *VISION_INCOMPLETE_STATUSES,
+                *((normalized_artifact_kind,) if normalized_artifact_kind else ()),
+            )
             rows = self.connection.execute(
                 f"""
                 SELECT * FROM vision_tasks
-                WHERE match_id = ? AND status IN ({placeholders})
-                ORDER BY created_at_unix, event_key
+                WHERE match_id = ? AND status IN ({placeholders}){artifact_filter}
+                ORDER BY created_at_unix, event_key, artifact_kind
                 """,
-                (match_id, *VISION_INCOMPLETE_STATUSES),
+                parameters,
             ).fetchall()
         return [self._decode_vision_row(row) for row in rows]
 
@@ -1319,19 +1873,27 @@ class TaskStateStore:
         event_key: str,
         new_status: str,
         *,
+        artifact_kind: str = DEFAULT_VISION_ARTIFACT_KIND,
         result: Mapping[str, Any] | None = None,
         error: str | None = None,
         error_kind: str | None = None,
+        failure_stage: str | None = None,
+        failure_reason: str | None = None,
+        location_metadata: Mapping[str, Any] | None = None,
+        window_metadata: Mapping[str, Any] | None = None,
         now: float | None = None,
     ) -> StoredVisionTask:
-        """Durably advance one refined task while preserving earlier stage results."""
+        """Durably advance one artifact without touching sibling artifact rows."""
         if new_status not in VISION_TASK_STATUSES:
             raise ValueError(f"unknown vision task status: {new_status}")
+        normalized_artifact_kind = normalize_vision_artifact_kind(artifact_kind)
         timestamp = time.time() if now is None else now
         with self._lock:
-            current = self.get_vision_task(event_key)
+            current = self.get_vision_task(event_key, normalized_artifact_kind)
             if current is None:
-                raise KeyError(f"unknown vision task: {event_key}")
+                raise KeyError(
+                    f"unknown vision task: {event_key} ({normalized_artifact_kind})"
+                )
             if new_status not in _ALLOWED_VISION_TRANSITIONS[current.status]:
                 raise ValueError(
                     f"invalid vision task transition: {current.status} -> {new_status}"
@@ -1340,6 +1902,73 @@ class TaskStateStore:
             merged_result = dict(current.result)
             if result is not None:
                 merged_result.update(result)
+            merged_location = dict(current.location_metadata)
+            result_location = merged_result.get("location_metadata")
+            if isinstance(result_location, Mapping):
+                merged_location.update(result_location)
+            if location_metadata is not None:
+                merged_location.update(location_metadata)
+            if new_status in ("located", "encoding", "encoded"):
+                for key in (
+                    "anchor_stream_time",
+                    "anchor_source_time",
+                    "confidence",
+                    "inference_seconds",
+                    "locator_method",
+                    "model_name",
+                    "model_version",
+                    "model_weights_sha256",
+                ):
+                    value = merged_result.get(key)
+                    if value is not None:
+                        merged_location[key] = value
+            merged_window = dict(current.window_metadata)
+            result_window = merged_result.get("window_metadata")
+            if isinstance(result_window, Mapping):
+                merged_window.update(result_window)
+            search_window = merged_result.get("search_window")
+            if isinstance(search_window, Mapping):
+                merged_window["search_window"] = dict(search_window)
+            fragment_window = merged_result.get("fragment_window")
+            if isinstance(fragment_window, Mapping):
+                merged_window["fragment_window"] = dict(fragment_window)
+            if window_metadata is not None:
+                merged_window.update(window_metadata)
+
+            structured_failure = (
+                result.get("failure_reason") if result is not None else None
+            )
+            derived_failure_stage: str | None = None
+            derived_failure_reason: str | None = None
+            if isinstance(structured_failure, Mapping):
+                if structured_failure.get("stage") is not None:
+                    derived_failure_stage = str(structured_failure["stage"])
+                if structured_failure.get("message") is not None:
+                    derived_failure_reason = str(structured_failure["message"])
+            elif structured_failure is not None:
+                derived_failure_reason = str(structured_failure)
+            has_failure_details = any(
+                value is not None
+                for value in (
+                    failure_stage,
+                    failure_reason,
+                    derived_failure_stage,
+                    derived_failure_reason,
+                )
+            )
+            if new_status == "failed" or has_failure_details:
+                stored_failure_stage = (
+                    failure_stage or derived_failure_stage or error_kind
+                )
+                stored_failure_reason = (
+                    failure_reason or derived_failure_reason or error
+                )
+            elif current.status == "failed" or new_status == "encoded":
+                stored_failure_stage = None
+                stored_failure_reason = None
+            else:
+                stored_failure_stage = current.failure_stage
+                stored_failure_reason = current.failure_reason
             located_anchor = merged_result.get(
                 "anchor_stream_time", current.located_anchor_stream_time
             )
@@ -1356,11 +1985,21 @@ class TaskStateStore:
                 "status = ?",
                 "updated_at_unix = ?",
                 "result_json = ?",
+                "location_json = ?",
+                "window_json = ?",
+                "failure_stage = ?",
+                "failure_reason = ?",
             ]
             values: list[Any] = [
                 new_status,
                 timestamp,
                 json.dumps(merged_result, ensure_ascii=False, separators=(",", ":")),
+                json.dumps(
+                    merged_location, ensure_ascii=False, separators=(",", ":")
+                ),
+                json.dumps(merged_window, ensure_ascii=False, separators=(",", ":")),
+                stored_failure_stage,
+                stored_failure_reason,
             ]
             if new_status == "locating":
                 assignments.extend(
@@ -1435,13 +2074,16 @@ class TaskStateStore:
                 values.append(error_kind)
             elif new_status == "encoded":
                 assignments.append("last_error_kind = NULL")
-            values.append(event_key)
+            values.extend((event_key, normalized_artifact_kind))
             with self.connection:
                 self.connection.execute(
-                    f"UPDATE vision_tasks SET {', '.join(assignments)} WHERE event_key = ?",
+                    f"""
+                    UPDATE vision_tasks SET {', '.join(assignments)}
+                    WHERE event_key = ? AND artifact_kind = ?
+                    """,
                     values,
                 )
-            updated = self.get_vision_task(event_key)
+            updated = self.get_vision_task(event_key, normalized_artifact_kind)
         assert updated is not None
         return updated
 
@@ -1450,15 +2092,19 @@ class TaskStateStore:
         event_key: str,
         error: str,
         *,
+        artifact_kind: str = DEFAULT_VISION_ARTIFACT_KIND,
         error_kind: str,
         now: float | None = None,
     ) -> StoredVisionTask:
         """Schedule visual input rechecks independently from model/encode attempts."""
+        normalized_artifact_kind = normalize_vision_artifact_kind(artifact_kind)
         timestamp = time.time() if now is None else now
         with self._lock:
-            current = self.get_vision_task(event_key)
+            current = self.get_vision_task(event_key, normalized_artifact_kind)
             if current is None:
-                raise KeyError(f"unknown vision task: {event_key}")
+                raise KeyError(
+                    f"unknown vision task: {event_key} ({normalized_artifact_kind})"
+                )
             if current.status not in {"pending", "located"}:
                 raise ValueError(
                     f"cannot schedule visual readiness retry from {current.status}"
@@ -1473,7 +2119,7 @@ class TaskStateStore:
                         readiness_check_count = readiness_check_count + 1,
                         last_error_kind = ?,
                         error = ?
-                    WHERE event_key = ?
+                    WHERE event_key = ? AND artifact_kind = ?
                     """,
                     (
                         timestamp,
@@ -1481,9 +2127,10 @@ class TaskStateStore:
                         error_kind,
                         error,
                         event_key,
+                        normalized_artifact_kind,
                     ),
                 )
-            updated = self.get_vision_task(event_key)
+            updated = self.get_vision_task(event_key, normalized_artifact_kind)
         assert updated is not None
         return updated
 
@@ -1492,6 +2139,7 @@ class TaskStateStore:
         event_key: str,
         segment_paths: list[str] | tuple[str, ...] | set[str],
         *,
+        artifact_kind: str = DEFAULT_VISION_ARTIFACT_KIND,
         owner: str,
         ttl_seconds: float,
         now: float | None = None,
@@ -1504,8 +2152,11 @@ class TaskStateStore:
             raise ValueError("segment lease requires at least one non-empty path")
         if not owner:
             raise ValueError("segment lease owner must not be empty")
-        if self.get_vision_task(event_key) is None:
-            raise KeyError(f"unknown vision task: {event_key}")
+        normalized_artifact_kind = normalize_vision_artifact_kind(artifact_kind)
+        if self.get_vision_task(event_key, normalized_artifact_kind) is None:
+            raise KeyError(
+                f"unknown vision task: {event_key} ({normalized_artifact_kind})"
+            )
         timestamp = time.time() if now is None else now
         expires_at = timestamp + ttl_seconds
         lease_id = uuid.uuid4().hex
@@ -1560,6 +2211,38 @@ class TaskStateStore:
                 "DELETE FROM segment_leases WHERE lease_id = ?", (lease_id,)
             )
         return cursor.rowcount
+
+    def release_segment_leases_for_event(
+        self,
+        event_key: str,
+        *,
+        owner: str | None = None,
+    ) -> int:
+        """Release one event's leases, optionally limited to a named owner."""
+        clauses = ["event_key = ?"]
+        values: list[Any] = [event_key]
+        if owner is not None:
+            clauses.append("owner = ?")
+            values.append(owner)
+        with self._lock, self.connection:
+            cursor = self.connection.execute(
+                f"DELETE FROM segment_leases WHERE {' AND '.join(clauses)}",
+                values,
+            )
+        return cursor.rowcount
+
+    def has_incomplete_vision_tasks(self, event_key: str) -> bool:
+        placeholders = ",".join("?" for _ in VISION_INCOMPLETE_STATUSES)
+        with self._lock:
+            row = self.connection.execute(
+                f"""
+                SELECT 1 FROM vision_tasks
+                WHERE event_key = ? AND status IN ({placeholders})
+                LIMIT 1
+                """,
+                (event_key, *VISION_INCOMPLETE_STATUSES),
+            ).fetchone()
+        return row is not None
 
     def list_segment_leases(
         self,
@@ -1620,6 +2303,12 @@ class PipelineRuntime:
     def discover_task(self, **fields: Any) -> bool:
         event_data = fields["event_data"]
         event_key = str(event_data["event_key"])
+        metadata = event_data.get("metadata")
+        metadata = metadata if isinstance(metadata, Mapping) else {}
+        event_source = metadata.get("event_source")
+        if isinstance(event_source, Mapping):
+            event_source = event_source.get("primary")
+        event_source = str(event_source or metadata.get("source") or "overview")
         inserted = self.store.discover(**fields)
         if not inserted:
             existing = self.store.get(event_key)
@@ -1648,15 +2337,27 @@ class PipelineRuntime:
             or (event_data.get("metadata") or {}).get("id"),
             observed_stream_time_sec=fields["observed_stream_time"],
             clip_anchor_stream_time_sec=fields["clip_anchor_stream_time"],
+            event_source=event_source,
+            second=event_data.get("second"),
+            goal_route_status=metadata.get("goal_route_status"),
+            shotmap_route_diagnostics=metadata.get("shotmap_route_diagnostics"),
         )
         self.transition(event_key, "pending", reason="event_accepted")
         return True
 
-    def update_task_event(self, event_data: Mapping[str, Any]) -> bool:
+    def update_task_event(
+        self,
+        event_data: Mapping[str, Any],
+        *,
+        replace_fields: Collection[str] = (),
+    ) -> bool:
         previous = self.store.get(str(event_data["event_key"]))
         if previous is None:
             return False
-        updated = self.store.update_event_data(event_data)
+        updated = self.store.update_event_data(
+            event_data,
+            replace_fields=replace_fields,
+        )
         if updated is None or updated.event_data == previous.event_data:
             return False
         self.logger.log(
@@ -1741,8 +2442,10 @@ class PipelineRuntime:
         return updated
 
     def enqueue_vision_task(self, event_key: str, **fields: Any) -> bool:
+        artifact_kind = normalize_vision_artifact_kind(fields.get("artifact_kind"))
+        fields["artifact_kind"] = artifact_kind
         inserted = self.store.enqueue_vision_task(event_key, **fields)
-        task = self.store.get_vision_task(event_key)
+        task = self.store.get_vision_task(event_key, artifact_kind)
         assert task is not None
         self.logger.log(
             "vision_task_enqueued" if inserted else "vision_task_duplicate",
@@ -1754,24 +2457,43 @@ class PipelineRuntime:
         )
         return inserted
 
-    def start_vision(self, event_key: str) -> StoredVisionTask:
+    def start_vision(
+        self,
+        event_key: str,
+        *,
+        artifact_kind: str = DEFAULT_VISION_ARTIFACT_KIND,
+    ) -> StoredVisionTask:
         """Compatibility helper for the single-worker visual refinement runner."""
-        current = self.store.get_vision_task(event_key)
+        normalized_artifact_kind = normalize_vision_artifact_kind(artifact_kind)
+        current = self.store.get_vision_task(event_key, normalized_artifact_kind)
         if current is None:
-            raise KeyError(f"unknown vision task: {event_key}")
+            raise KeyError(
+                f"unknown vision task: {event_key} ({normalized_artifact_kind})"
+            )
         if current.status == "pending":
-            return self.transition_vision_task(event_key, "locating")
+            return self.transition_vision_task(
+                event_key, "locating", artifact_kind=normalized_artifact_kind
+            )
         if current.status == "located":
-            return self.transition_vision_task(event_key, "encoding")
+            return self.transition_vision_task(
+                event_key, "encoding", artifact_kind=normalized_artifact_kind
+            )
         raise ValueError(f"vision task cannot start from {current.status}")
 
     def complete_vision(
-        self, event_key: str, result: Mapping[str, Any]
+        self,
+        event_key: str,
+        result: Mapping[str, Any],
+        *,
+        artifact_kind: str = DEFAULT_VISION_ARTIFACT_KIND,
     ) -> StoredVisionTask:
         """Persist a located anchor and refined GIF returned by a combined runner."""
-        current = self.store.get_vision_task(event_key)
+        normalized_artifact_kind = normalize_vision_artifact_kind(artifact_kind)
+        current = self.store.get_vision_task(event_key, normalized_artifact_kind)
         if current is None:
-            raise KeyError(f"unknown vision task: {event_key}")
+            raise KeyError(
+                f"unknown vision task: {event_key} ({normalized_artifact_kind})"
+            )
         normalized = dict(result)
         if "anchor_stream_time" not in normalized:
             normalized["anchor_stream_time"] = normalized.get(
@@ -1779,27 +2501,64 @@ class PipelineRuntime:
             )
         if current.status == "locating":
             current = self.transition_vision_task(
-                event_key, "located", result=normalized
+                event_key,
+                "located",
+                artifact_kind=normalized_artifact_kind,
+                result=normalized,
             )
         if current.status == "located":
-            current = self.transition_vision_task(event_key, "encoding")
+            current = self.transition_vision_task(
+                event_key, "encoding", artifact_kind=normalized_artifact_kind
+            )
         if current.status != "encoding":
             raise ValueError(f"vision task cannot complete from {current.status}")
-        return self.transition_vision_task(event_key, "encoded", result=normalized)
-
-    def retry_vision(self, event_key: str, error: str) -> StoredVisionTask:
-        """Return transient visual work to the nearest restartable stage."""
-        current = self.store.get_vision_task(event_key)
-        if current is None:
-            raise KeyError(f"unknown vision task: {event_key}")
-        target = "located" if current.status == "encoding" else "pending"
         return self.transition_vision_task(
-            event_key, target, error=error, reason="visual_input_not_ready"
+            event_key,
+            "encoded",
+            artifact_kind=normalized_artifact_kind,
+            result=normalized,
         )
 
-    def fail_vision(self, event_key: str, error: str) -> StoredVisionTask:
+    def retry_vision(
+        self,
+        event_key: str,
+        error: str,
+        *,
+        artifact_kind: str = DEFAULT_VISION_ARTIFACT_KIND,
+    ) -> StoredVisionTask:
+        """Return transient visual work to the nearest restartable stage."""
+        normalized_artifact_kind = normalize_vision_artifact_kind(artifact_kind)
+        current = self.store.get_vision_task(event_key, normalized_artifact_kind)
+        if current is None:
+            raise KeyError(
+                f"unknown vision task: {event_key} ({normalized_artifact_kind})"
+            )
+        target = "located" if current.status == "encoding" else "pending"
         return self.transition_vision_task(
-            event_key, "failed", error=error, reason="visual_refinement_failed"
+            event_key,
+            target,
+            artifact_kind=normalized_artifact_kind,
+            error=error,
+            reason="visual_input_not_ready",
+        )
+
+    def fail_vision(
+        self,
+        event_key: str,
+        error: str,
+        *,
+        artifact_kind: str = DEFAULT_VISION_ARTIFACT_KIND,
+        failure_stage: str | None = None,
+        failure_reason: str | None = None,
+    ) -> StoredVisionTask:
+        return self.transition_vision_task(
+            event_key,
+            "failed",
+            artifact_kind=artifact_kind,
+            error=error,
+            failure_stage=failure_stage,
+            failure_reason=failure_reason,
+            reason="visual_refinement_failed",
         )
 
     def acquire_segment_lease(
@@ -1807,12 +2566,14 @@ class PipelineRuntime:
         event_key: str,
         segment_paths: list[str] | tuple[str, ...] | set[str],
         *,
+        artifact_kind: str = DEFAULT_VISION_ARTIFACT_KIND,
         owner: str = "vision-worker",
         expires_in_seconds: float,
     ) -> str:
         return self.store.acquire_segment_lease(
             event_key,
             segment_paths,
+            artifact_kind=artifact_kind,
             owner=owner,
             ttl_seconds=expires_in_seconds,
         )
@@ -1827,31 +2588,56 @@ class PipelineRuntime:
     def release_segment_lease(self, lease_id: str) -> int:
         return self.store.release_segment_lease(lease_id)
 
+    def release_segment_leases_for_event(
+        self,
+        event_key: str,
+        *,
+        owner: str | None = None,
+    ) -> int:
+        return self.store.release_segment_leases_for_event(
+            event_key,
+            owner=owner,
+        )
+
     def transition_vision_task(
         self,
         event_key: str,
         new_status: str,
         *,
+        artifact_kind: str = DEFAULT_VISION_ARTIFACT_KIND,
         result: Mapping[str, Any] | None = None,
         error: str | None = None,
         error_kind: str | None = None,
+        failure_stage: str | None = None,
+        failure_reason: str | None = None,
+        location_metadata: Mapping[str, Any] | None = None,
+        window_metadata: Mapping[str, Any] | None = None,
         reason: str | None = None,
     ) -> StoredVisionTask:
-        previous = self.store.get_vision_task(event_key)
+        normalized_artifact_kind = normalize_vision_artifact_kind(artifact_kind)
+        previous = self.store.get_vision_task(event_key, normalized_artifact_kind)
         if previous is None:
-            raise KeyError(f"unknown vision task: {event_key}")
+            raise KeyError(
+                f"unknown vision task: {event_key} ({normalized_artifact_kind})"
+            )
         updated = self.store.transition_vision_task(
             event_key,
             new_status,
+            artifact_kind=normalized_artifact_kind,
             result=result,
             error=error,
             error_kind=error_kind,
+            failure_stage=failure_stage,
+            failure_reason=failure_reason,
+            location_metadata=location_metadata,
+            window_metadata=window_metadata,
         )
         self.logger.log(
             "vision_task_transition",
             event_key=event_key,
             match_id=updated.match_id,
             code=updated.code,
+            artifact_kind=updated.artifact_kind,
             from_status=previous.status,
             to_status=new_status,
             locate_attempt_count=updated.locate_attempt_count,
@@ -1859,6 +2645,8 @@ class PipelineRuntime:
             reason=reason,
             error=error,
             error_kind=error_kind,
+            failure_stage=updated.failure_stage,
+            failure_reason=updated.failure_reason,
         )
         if new_status == "encoded":
             self.logger.log(
@@ -1866,6 +2654,7 @@ class PipelineRuntime:
                 event_key=event_key,
                 match_id=updated.match_id,
                 code=updated.code,
+                artifact_kind=updated.artifact_kind,
                 output=updated.output_path,
                 bytes=updated.output_bytes,
                 anchor_stream_time=updated.located_anchor_stream_time,
@@ -1877,16 +2666,26 @@ class PipelineRuntime:
         return updated
 
     def record_vision_readiness_wait(
-        self, event_key: str, error: str, *, error_kind: str
+        self,
+        event_key: str,
+        error: str,
+        *,
+        artifact_kind: str = DEFAULT_VISION_ARTIFACT_KIND,
+        error_kind: str,
     ) -> StoredVisionTask:
+        normalized_artifact_kind = normalize_vision_artifact_kind(artifact_kind)
         updated = self.store.record_vision_readiness_wait(
-            event_key, error, error_kind=error_kind
+            event_key,
+            error,
+            artifact_kind=normalized_artifact_kind,
+            error_kind=error_kind,
         )
         self.logger.log(
             "vision_buffer_readiness_wait",
             event_key=event_key,
             match_id=updated.match_id,
             code=updated.code,
+            artifact_kind=updated.artifact_kind,
             status=updated.status,
             readiness_check_count=updated.readiness_check_count,
             next_attempt_at_unix=updated.next_attempt_at_unix,
@@ -1896,21 +2695,27 @@ class PipelineRuntime:
         )
         return updated
 
-    def recover_incomplete_vision(self, match_id: str) -> list[StoredVisionTask]:
+    def recover_incomplete_vision(
+        self,
+        match_id: str,
+        artifact_kind: str | None = None,
+    ) -> list[StoredVisionTask]:
         """Make interrupted visual stages runnable without duplicating artifacts."""
         recovered: list[StoredVisionTask] = []
-        for task in self.store.list_incomplete_vision_tasks(match_id):
+        for task in self.store.list_incomplete_vision_tasks(match_id, artifact_kind):
             previous_status = task.status
             if task.status == "locating":
                 task = self.transition_vision_task(
                     task.event_key,
                     "pending",
+                    artifact_kind=task.artifact_kind,
                     reason="process_restart_recovery",
                 )
             elif task.status == "encoding":
                 task = self.transition_vision_task(
                     task.event_key,
                     "located",
+                    artifact_kind=task.artifact_kind,
                     reason="process_restart_recovery",
                 )
             self.logger.log(
@@ -1918,6 +2723,7 @@ class PipelineRuntime:
                 event_key=task.event_key,
                 match_id=task.match_id,
                 code=task.code,
+                artifact_kind=task.artifact_kind,
                 previous_status=previous_status,
                 status=task.status,
                 locate_attempt_count=task.locate_attempt_count,

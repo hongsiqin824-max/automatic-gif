@@ -12,17 +12,30 @@ from unittest.mock import patch
 
 from scoreboard_ocr import ClockContinuityStateMachine, ScoreboardProfile
 from scoreboard_ocr_worker import (
+    AutoClockTracker,
     BatchOcrWorker,
+    DetectedText,
     WorkerError,
+    _auto_results_by_frame,
+    _auto_readings,
+    _extract_detected_texts,
+    _first_clock_missing_run,
+    _merge_auto_results,
+    _normalize_clock_recognition_results,
+    _prepare_clock_only_recognition,
+    _profile_clock_readings,
     _profile_readings,
     _recognize_paths_shared,
     _validate_profile_content_quality,
+    extract_auto_roi_frames,
+    extract_profile_clock_frames,
     extract_profile_frames,
     extract_scoreboard_frames,
     frame_reading,
     locate_from_readings,
     probe_video_dimensions,
     recognize_batch,
+    run_request,
     serve_socket,
     split_frame_reading,
 )
@@ -68,6 +81,369 @@ class BatchRecognitionTests(unittest.TestCase):
             )
 
         self.assertEqual(raised.exception.kind, "ocr_inference_failed")
+
+    def test_clock_character_normalization_is_limited_to_unreadable_clock_crops(self):
+        recognized, repairs = _normalize_clock_recognition_results(
+            [(["7O：O1"], [0.9]), (["TEAM"], [0.8])],
+            ["clock", "score"],
+        )
+
+        self.assertEqual(recognized[0][0], ["70:01"])
+        self.assertEqual(recognized[1][0], ["TEAM"])
+        self.assertEqual(repairs[0]["frame_index"], 0)
+        self.assertEqual(repairs[0]["clock_seconds"], 70 * 60 + 1)
+
+    def test_clock_preprocessing_retries_only_failed_frames_in_original_slots(self):
+        with tempfile.TemporaryDirectory() as directory:
+            frames = [Path(directory) / f"clock-{index}.png" for index in range(3)]
+            for frame in frames:
+                frame.write_bytes(b"crop")
+            recognized = [
+                (["12:00"], [0.9]),
+                ([], []),
+                (["12:02"], [0.9]),
+            ]
+
+            def write_variant(_source, output, _variant):
+                output.write_bytes(b"enhanced")
+
+            with (
+                patch(
+                    "scoreboard_ocr_worker._write_clock_preprocess_variant",
+                    side_effect=write_variant,
+                ),
+                patch(
+                    "scoreboard_ocr_worker._recognize_request_paths",
+                    return_value=([(["12:01"], [0.95])], []),
+                ) as retry,
+            ):
+                prepared, diagnostics = _prepare_clock_only_recognition(
+                    recognized,
+                    frames,
+                    ["clock"] * 3,
+                    engine=object(),
+                    batch_worker=None,
+                    request={"candidate_path": "candidate.mp4"},
+                    profile_id="profile-a",
+                    sample_interval=1.0,
+                    minimum_confidence=0.35,
+                    inference_batch_size=8,
+                    deadline_monotonic=None,
+                )
+
+        self.assertEqual(
+            [item[0] for item in prepared],
+            [["12:00"], ["12:01"], ["12:02"]],
+        )
+        self.assertEqual(retry.call_args.kwargs["source_frame_indices"], [1])
+        self.assertEqual(diagnostics["initial_unreadable_frame_count"], 1)
+        self.assertEqual(diagnostics["recovered_frame_count"], 1)
+        self.assertTrue(diagnostics["frame_identity_preserved"])
+
+
+class AutoClockDiscoveryTests(unittest.TestCase):
+    @staticmethod
+    def _clock(text: str, x: float = 10, y: float = 8) -> DetectedText:
+        return DetectedText(text, 0.97, (x, y, x + 60, y + 20))
+
+    def test_extracts_v2_and_v3_bboxes_without_losing_alignment(self):
+        clock_box = [[10, 8], [70, 8], [70, 28], [10, 28]]
+        score_box = [[80, 8], [110, 8], [110, 28], [80, 28]]
+        v2 = [[[clock_box, ("12:34", 0.97)], [score_box, ("1-0", 0.94)]]]
+
+        class V3Result:
+            json = {
+                "res": {
+                    "rec_texts": ["12:34", "1-0"],
+                    "rec_scores": [0.97, 0.94],
+                    "rec_polys": [clock_box, score_box],
+                }
+            }
+
+        expected = [
+            DetectedText("12:34", 0.97, (10.0, 8.0, 70.0, 28.0)),
+            DetectedText("1-0", 0.94, (80.0, 8.0, 110.0, 28.0)),
+        ]
+        self.assertEqual(_extract_detected_texts(v2), expected)
+        self.assertEqual(_extract_detected_texts(V3Result()), expected)
+
+    def test_v3_uses_dt_polys_and_skips_text_without_a_bbox(self):
+        detected = _extract_detected_texts(
+            {
+                "rec_texts": ["12:34", "orphan"],
+                "rec_scores": [0.91, 0.99],
+                "dt_polys": [[[2, 3], [12, 3], [12, 9], [2, 9]]],
+            }
+        )
+
+        self.assertEqual(
+            detected,
+            [DetectedText("12:34", 0.91, (2.0, 3.0, 12.0, 9.0))],
+        )
+
+    def test_three_stable_frames_lock_padded_clamped_clock_and_score_rois(self):
+        tracker = AutoClockTracker(1280, 720)
+        decisions = []
+        for index, text in enumerate(("12:34", "12:35", "12:36")):
+            decisions.append(
+                tracker.observe_search(
+                    index,
+                    index,
+                    [
+                        self._clock(text, x=2 + index, y=2),
+                        DetectedText("1-0", 0.94, (72, 2, 102, 22)),
+                    ],
+                )
+            )
+
+        locked = decisions[-1]
+        self.assertEqual(locked.status, "locked")
+        self.assertEqual(locked.reason, "stable_clock_track")
+        self.assertEqual(locked.clock_roi[0], 0)
+        self.assertIsNotNone(locked.score_roi)
+        self.assertLessEqual(locked.clock_roi[2], 1280)
+
+    def test_two_stable_clock_tracks_are_ambiguous(self):
+        tracker = AutoClockTracker(1280, 720)
+        decision = None
+        for index in range(3):
+            decision = tracker.observe_search(
+                index,
+                index,
+                [
+                    self._clock(f"12:{34 + index:02d}", x=10),
+                    self._clock(f"42:{10 + index:02d}", x=300),
+                ],
+            )
+
+        self.assertIsNotNone(decision)
+        self.assertEqual(decision.status, "ambiguous")
+        self.assertEqual(decision.reason, "ambiguous")
+        self.assertEqual(decision.candidate_count, 2)
+
+    def test_static_clock_like_text_cannot_establish_initial_lock(self):
+        tracker = AutoClockTracker(1280, 720)
+
+        decisions = [
+            tracker.observe_search(index, index, [self._clock("00:10")])
+            for index in range(6)
+        ]
+
+        self.assertTrue(all(decision.status == "searching" for decision in decisions))
+
+    def test_clock_pause_is_accepted_after_a_progressing_track_locks(self):
+        tracker = AutoClockTracker(1280, 720)
+        for index, text in enumerate(("12:34", "12:35", "12:36")):
+            tracker.observe_search(index, index, [self._clock(text)])
+
+        paused = tracker.observe_locked(3, ["12:36"])
+
+        self.assertEqual(paused.status, "locked")
+        self.assertEqual(paused.reason, "accepted")
+        self.assertEqual(paused.clock_seconds, 12 * 60 + 36)
+
+    def test_short_miss_keeps_roi_and_third_miss_expands_search(self):
+        tracker = AutoClockTracker(1280, 720)
+        for index, text in enumerate(("12:34", "12:35", "12:36")):
+            tracker.observe_search(index, index, [self._clock(text)])
+
+        first = tracker.observe_locked(3, [])
+        second = tracker.observe_locked(4, [])
+        third = tracker.observe_locked(5, [])
+
+        self.assertEqual(first.reason, "temporarily_hidden")
+        self.assertIsNone(first.clock_seconds)
+        self.assertIsNotNone(first.clock_roi)
+        self.assertEqual(second.reason, "temporarily_hidden")
+        self.assertEqual(third.status, "searching")
+        self.assertTrue(third.expanded_search)
+        self.assertEqual(third.search_roi, (0.0, 0.0, 1280.0, 180.0))
+
+    def test_expanded_search_can_relock_at_the_right(self):
+        tracker = AutoClockTracker(1280, 720)
+        for index, text in enumerate(("12:34", "12:35", "12:36")):
+            tracker.observe_search(index, index, [self._clock(text)])
+        for second in (3, 4, 5):
+            tracker.observe_locked(second, [])
+
+        decision = None
+        for index, text in enumerate(("12:39", "12:40", "12:41"), start=6):
+            decision = tracker.observe_search(
+                index, index, [self._clock(text, x=900, y=10)]
+            )
+
+        self.assertEqual(decision.status, "locked")
+        self.assertTrue(decision.expanded_search)
+        self.assertGreater(decision.clock_roi[0], 800)
+
+    def test_discontinuous_locked_value_does_not_replace_last_good_clock(self):
+        tracker = AutoClockTracker(1280, 720)
+        for index, text in enumerate(("12:34", "12:35", "12:36")):
+            tracker.observe_search(index, index, [self._clock(text)])
+
+        bad = tracker.observe_locked(3, ["40:00"])
+        recovered = tracker.observe_locked(4, ["12:38"])
+
+        self.assertEqual(bad.reason, "timeline_discontinuous")
+        self.assertIsNone(bad.clock_seconds)
+        self.assertEqual(recovered.reason, "accepted")
+        self.assertEqual(recovered.clock_seconds, 12 * 60 + 38)
+
+    def test_score_failure_does_not_block_clock_lock_or_clock_reading(self):
+        tracker = AutoClockTracker(1280, 720)
+        for index, text in enumerate(("12:34", "12:35", "12:36")):
+            decision = tracker.observe_search(index, index, [self._clock(text)])
+        self.assertEqual(decision.status, "locked")
+        self.assertGreaterEqual(len(decision.score_rois), 1)
+        self.assertEqual(decision.score_roi, decision.score_rois[0])
+
+        readings, _diagnostics = _auto_readings(
+            [(["12:34"], [0.9]), ([], []), (["12:36"], [0.9])],
+            kinds=["clock", "clock", "clock"],
+            sample_interval=1,
+            period=1,
+        )
+        self.assertIsNone(readings[1].clock_seconds)
+        self.assertEqual(readings[1].continuity_reason, "scoreboard_temporarily_missing")
+        self.assertEqual(readings[2].clock_seconds, 12 * 60 + 36)
+
+    def test_multiple_score_rois_merge_split_score_digits_per_frame(self):
+        frames = _auto_results_by_frame(
+            [
+                (["12:34"], [0.9]), (["4"], [0.8]), (["0"], [0.85]),
+                (["12:35"], [0.9]), (["4"], [0.8]), (["0"], [0.85]),
+            ],
+            ["clock", "score", "score", "clock", "score", "score"],
+        )
+        self.assertEqual(frames[0]["score"], (["4", "0"], [0.8, 0.85]))
+        readings, _diagnostics = _auto_readings(
+            [
+                (["12:34"], [0.9]), (["4"], [0.8]), (["0"], [0.85]),
+                (["12:35"], [0.9]), (["4"], [0.8]), (["0"], [0.85]),
+            ],
+            kinds=["clock", "score", "score", "clock", "score", "score"],
+            sample_interval=1.0,
+            period=1,
+        )
+        self.assertEqual([reading.score for reading in readings], [(4, 0), (4, 0)])
+
+    def test_extract_auto_roi_frames_emits_all_score_candidates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory)
+            candidate = output_dir / "candidate.mp4"
+            candidate.write_bytes(b"video")
+
+            def runner(command, **_kwargs):
+                (output_dir / "multi_clock_000001.png").write_bytes(b"clock")
+                (output_dir / "multi_score_0_000001.png").write_bytes(b"home")
+                (output_dir / "multi_score_1_000001.png").write_bytes(b"away")
+                return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+            with patch("scoreboard_ocr_worker.subprocess.run", side_effect=runner):
+                paths, kinds, diagnostics = extract_auto_roi_frames(
+                    candidate,
+                    output_dir,
+                    ffmpeg="ffmpeg",
+                    sample_interval_seconds=1.0,
+                    frame_width=1280,
+                    frame_height=720,
+                    clock_roi=(100, 20, 180, 60),
+                    score_roi=None,
+                    score_rois=((10, 20, 90, 60), (190, 20, 270, 60)),
+                    maximum_frames=5,
+                    deadline_monotonic=None,
+                    output_prefix="multi",
+                )
+
+        self.assertEqual(kinds, ["clock", "score", "score"])
+        self.assertEqual([path.name for path in paths], [
+            "multi_clock_000001.png",
+            "multi_score_0_000001.png",
+            "multi_score_1_000001.png",
+        ])
+        self.assertEqual(len(diagnostics["score_rois"]), 2)
+
+    def test_explicit_profile_never_calls_auto_discovery(self):
+        profile = ScoreboardProfile(
+            "source-a", 1280, 720, (10, 10, 80, 40), (80, 10, 130, 40)
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            candidate = Path(directory) / "candidate.mp4"
+            candidate.write_bytes(b"video")
+            recognized = [
+                (["12:34"], [0.9]),
+                (["0-0"], [0.9]),
+                (["12:35"], [0.9]),
+                (["0-0"], [0.9]),
+            ]
+            located = {"diagnostics": {}}
+            with (
+                patch(
+                    "scoreboard_ocr_worker.discover_auto_clock",
+                    side_effect=AssertionError("auto discovery must not run"),
+                ),
+                patch(
+                    "scoreboard_ocr_worker.extract_profile_frames",
+                    return_value=([
+                        (Path("clock-1"), Path("score-1")),
+                        (Path("clock-2"), Path("score-2")),
+                    ], {"profile_id": "source-a"}),
+                ),
+                patch(
+                    "scoreboard_ocr_worker._recognize_paths",
+                    return_value=(recognized, []),
+                ),
+                patch(
+                    "scoreboard_ocr_worker._validate_profile_content_quality",
+                    return_value={"trusted_clock_frame_count": 2},
+                ),
+                patch(
+                    "scoreboard_ocr_worker.locate_from_readings",
+                    return_value=located,
+                ),
+            ):
+                result = run_request(
+                    {
+                        "candidate_path": str(candidate),
+                        "event_code": "YC",
+                        "event_minute": 12,
+                        "scoreboard_profile": profile,
+                    },
+                    engine=object(),
+                )
+
+        self.assertIs(result, located)
+
+    def test_recovery_only_replaces_frames_the_primary_roi_cannot_parse(self):
+        primary = [
+            {"clock": (["90:20"], [0.9]), "score": (["1-2"], [0.9])},
+            {"clock": (["bad"], [0.9]), "score": (["1-2"], [0.9])},
+            {"clock": (["90:22"], [0.9]), "score": (["1-2"], [0.9])},
+        ]
+        recovered = [
+            {"clock": (["90:19"], [0.9]), "score": (["2-2"], [0.9])},
+            {"clock": (["90:21"], [0.9]), "score": (["2-2"], [0.9])},
+            {"clock": (["90:23"], [0.9]), "score": (["2-2"], [0.9])},
+        ]
+
+        merged = _merge_auto_results(primary, recovered)
+
+        self.assertEqual(merged[0]["clock"][0], ["90:20"])
+        self.assertEqual(merged[1]["clock"][0], ["90:21"])
+        self.assertEqual(merged[2]["clock"][0], ["90:22"])
+        self.assertEqual(merged[0]["score"][0], ["1-2"])
+
+    def test_short_broadcast_graphic_does_not_trigger_full_reacquisition(self):
+        seven_missing = [(["90:20"], [0.9]), *[([], []) for _ in range(7)]]
+        eight_missing = [(["90:20"], [0.9]), *[([], []) for _ in range(8)]]
+
+        self.assertIsNone(
+            _first_clock_missing_run(seven_missing, ["clock"] * 8)
+        )
+        self.assertEqual(
+            _first_clock_missing_run(eight_missing, ["clock"] * 9),
+            1,
+        )
 
 
 class ProfileCropTests(unittest.TestCase):
@@ -124,6 +500,45 @@ class ProfileCropTests(unittest.TestCase):
         self.assertIn("crop=74:33:153:27", filter_graph)
         self.assertIn("split=2", filter_graph)
 
+    def test_clock_only_profile_extracts_one_clock_crop_per_frame(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory)
+            candidate = output_dir / "candidate.mp4"
+            candidate.write_bytes(b"video")
+            commands = []
+
+            def runner(command, **_kwargs):
+                commands.append(command)
+                if command[0] == "ffprobe":
+                    return subprocess.CompletedProcess(
+                        command,
+                        0,
+                        stdout=json.dumps(
+                            {"streams": [{"width": 1280, "height": 720}]}
+                        ),
+                        stderr="",
+                    )
+                (output_dir / "clock_only_000001.png").write_bytes(b"clock")
+                return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+            with patch("scoreboard_ocr_worker.subprocess.run", side_effect=runner):
+                frames, diagnostics = extract_profile_clock_frames(
+                    candidate,
+                    output_dir,
+                    ffmpeg="ffmpeg",
+                    sample_interval_seconds=1,
+                    profile=self._profile(),
+                )
+
+        self.assertEqual([frame.name for frame in frames], ["clock_only_000001.png"])
+        self.assertTrue(diagnostics["clock_only"])
+        self.assertTrue(diagnostics["score_ocr_skipped"])
+        self.assertIsNone(diagnostics["score_roi"])
+        ffmpeg_command = commands[1]
+        self.assertIn("-vf", ffmpeg_command)
+        self.assertNotIn("-filter_complex", ffmpeg_command)
+        self.assertNotIn("[score]", ffmpeg_command)
+
     def test_profile_aspect_mismatch_fails_closed_before_extraction(self):
         probe = subprocess.CompletedProcess(
             ["ffprobe"],
@@ -175,6 +590,314 @@ class ProfileCropTests(unittest.TestCase):
             continuity[2]["reason"], "scoreboard_temporarily_missing"
         )
         self.assertEqual(readings[3].clock_seconds, 68 * 60 + 58)
+
+    def test_clock_only_readings_keep_raw_repairs_and_jump_diagnostics(self):
+        readings, continuity = _profile_clock_readings(
+            [
+                (["12:00"], [0.9]),
+                ([], []),
+                (["12:20"], [0.9]),
+                (["35:00"], [0.9]),
+                (["12:04"], [0.9]),
+            ],
+            profile=self._profile(),
+            sample_interval=1,
+            period=1,
+        )
+
+        result = locate_from_readings(
+            readings,
+            {
+                "event_code": "G",
+                "event_minute": 12,
+                "clock_only": True,
+                "sample_interval_seconds": 1,
+            },
+        )
+        diagnostics = result["diagnostics"]
+
+        self.assertEqual(
+            [reading.frame_index for reading in readings], [0, 1, 2, 3, 4]
+        )
+        self.assertTrue(all(reading.score is None for reading in readings))
+        self.assertTrue(all(not reading.score_texts for reading in readings))
+        self.assertEqual(readings[1].clock_seconds, 12 * 60 + 1)
+        self.assertEqual(readings[1].continuity_status, "repaired")
+        self.assertEqual(readings[2].observed_clock_seconds, 12 * 60 + 20)
+        self.assertEqual(readings[2].clock_seconds, 12 * 60 + 2)
+        self.assertEqual(readings[2].continuity_status, "repaired")
+        self.assertEqual(readings[3].observed_clock_seconds, 35 * 60)
+        self.assertIsNone(readings[3].clock_seconds)
+        self.assertEqual(len(diagnostics["clock_raw_observations"]), 5)
+        self.assertEqual(diagnostics["clock_continuity_repair_count"], 2)
+        self.assertEqual(
+            diagnostics["clock_continuity_repairs"][0]["frame_index"], 1
+        )
+        self.assertEqual(diagnostics["abnormal_clock_jump_count"], 2)
+        self.assertEqual(
+            [item["frame_index"] for item in diagnostics["abnormal_clock_jumps"]],
+            [2, 3],
+        )
+
+    @staticmethod
+    def _clock_readings():
+        return [
+            frame_reading(0, 0, ["58:59"], [0.9]),
+            frame_reading(1, 1, ["59:00"], [0.9]),
+            frame_reading(2, 2, ["59:01"], [0.9]),
+        ]
+
+    def test_clock_only_uses_goal_second_and_card_minute_boundary(self):
+        for code in ("G", "OG", "PG", "YC", "RC"):
+            with self.subTest(code=code):
+                result = locate_from_readings(
+                    self._clock_readings(),
+                    {
+                        "event_code": code,
+                        "event_minute": 59,
+                        "event_second": 58 * 60 + 59,
+                        "target_score": "9-9",
+                        "candidate_start_seconds": 100,
+                        "sample_interval_seconds": 1,
+                        "clock_only": True,
+                    },
+                )
+
+                expected_anchor = 100 if code in {"G", "OG", "PG"} else 101
+                self.assertEqual(result["anchor_seconds"], expected_anchor)
+                self.assertEqual(
+                    result["location_kind"],
+                    "match_clock_second"
+                    if code in {"G", "OG", "PG"}
+                    else "match_clock_minute_boundary",
+                )
+                self.assertTrue(result["clock_only"])
+                self.assertTrue(result["diagnostics"]["score_ocr_skipped"])
+                self.assertEqual(result["localization_quality"], "exact")
+                self.assertFalse(result["degraded"])
+                self.assertIsNone(result["degradation_mode"])
+                self.assertIsNone(result["degradation_reason"])
+
+    def test_clock_only_goal_falls_back_from_missing_second_to_minute_boundary(self):
+        result = locate_from_readings(
+            self._clock_readings(),
+            {
+                "event_code": "G",
+                "event_minute": 59,
+                "event_second": 58 * 60 + 30,
+                "candidate_start_seconds": 100,
+                "sample_interval_seconds": 1,
+                "clock_only": True,
+            },
+        )
+
+        self.assertEqual(result["anchor_seconds"], 101)
+        self.assertEqual(result["location_kind"], "match_clock_minute_boundary")
+        self.assertEqual(result["method"], "paddleocr_minute_boundary")
+        self.assertEqual(result["localization_quality"], "degraded")
+        self.assertTrue(result["degraded"])
+        self.assertEqual(
+            result["degradation_mode"],
+            "minute_boundary_fallback",
+        )
+        self.assertEqual(
+            result["exact_second_error"]["kind"],
+            "ocr_exact_second_not_found",
+        )
+        self.assertEqual(
+            result["degradation_reason"],
+            result["exact_second_error"],
+        )
+        self.assertEqual(result["minute_window_start_clock"], "58:00")
+        self.assertEqual(result["minute_window_end_clock"], "59:00")
+
+    def test_clock_only_penalty_goal_falls_back_from_missing_second(self):
+        result = locate_from_readings(
+            self._clock_readings(),
+            {
+                "event_code": "PG",
+                "event_minute": 59,
+                "event_second": 58 * 60 + 30,
+                "candidate_start_seconds": 100,
+                "sample_interval_seconds": 1,
+                "clock_only": True,
+            },
+        )
+
+        self.assertEqual(result["anchor_seconds"], 101)
+        self.assertEqual(result["location_kind"], "match_clock_minute_boundary")
+        self.assertEqual(result["degradation_mode"], "minute_boundary_fallback")
+        self.assertEqual(result["exact_second_error"]["kind"], "ocr_exact_second_not_found")
+
+    def test_clock_only_unreadable_ocr_still_fails(self):
+        with self.assertRaises(WorkerError) as raised:
+            locate_from_readings(
+                [frame_reading(0, 0, [], [])],
+                {
+                    "event_code": "G",
+                    "event_minute": 59,
+                    "event_second": 58 * 60 + 30,
+                    "clock_only": True,
+                },
+            )
+
+        self.assertEqual(raised.exception.kind, "scoreboard_missing")
+
+    def test_clock_only_requires_minute_and_boolean_flag(self):
+        for request in (
+            {"event_code": "G", "clock_only": True},
+            {"event_code": "G", "clock_only": "true", "event_minute": 59},
+            {"event_code": "PM", "clock_only": True, "event_minute": 59},
+        ):
+            with self.subTest(request=request):
+                with self.assertRaises(WorkerError) as raised:
+                    locate_from_readings(self._clock_readings(), request)
+                self.assertEqual(raised.exception.kind, "ocr_invalid_request")
+
+    def test_default_goal_behavior_still_uses_score_transition(self):
+        readings = [
+            frame_reading(0, 0, ["59:05", "0-0"], [0.9, 0.9]),
+            frame_reading(1, 1, ["59:06", "1-0"], [0.9, 0.9]),
+            frame_reading(2, 2, ["59:07", "1-0"], [0.9, 0.9]),
+        ]
+
+        result = locate_from_readings(
+            readings,
+            {
+                "event_code": "G",
+                "event_minute": 59,
+                "target_score": "1-0",
+            },
+        )
+
+        self.assertEqual(result["method"], "paddleocr_score_transition")
+        self.assertNotIn("clock_only", result)
+
+    def test_default_penalty_goal_behavior_still_uses_score_transition(self):
+        readings = [
+            frame_reading(0, 0, ["59:05", "0-0"], [0.9, 0.9]),
+            frame_reading(1, 1, ["59:06", "1-0"], [0.9, 0.9]),
+            frame_reading(2, 2, ["59:07", "1-0"], [0.9, 0.9]),
+        ]
+
+        result = locate_from_readings(
+            readings,
+            {
+                "event_code": "PG",
+                "event_minute": 59,
+                "target_score": "1-0",
+            },
+        )
+
+        self.assertEqual(result["method"], "paddleocr_score_transition")
+
+    def test_profile_run_submits_only_clock_crops(self):
+        profile = ProfileCropTests._profile()
+        captured = {}
+        with tempfile.TemporaryDirectory() as directory:
+            candidate = Path(directory) / "candidate.mp4"
+            candidate.write_bytes(b"video")
+            clock_paths = [Path(f"clock-{index}.png") for index in range(4)]
+
+            def recognize(frames, crop_kinds, **_kwargs):
+                captured["frames"] = list(frames)
+                captured["crop_kinds"] = list(crop_kinds)
+                return (
+                    [
+                        ([f"12:0{index}"], [0.9])
+                        for index in range(len(frames))
+                    ],
+                    [],
+                )
+
+            with (
+                patch(
+                    "scoreboard_ocr_worker.extract_profile_clock_frames",
+                    return_value=(
+                        clock_paths,
+                        {"profile_id": profile.profile_id, "clock_only": True},
+                    ),
+                ),
+                patch(
+                    "scoreboard_ocr_worker.extract_profile_frames",
+                    side_effect=AssertionError("score crops must not be extracted"),
+                ),
+                patch(
+                    "scoreboard_ocr_worker._recognize_request_paths",
+                    side_effect=recognize,
+                ),
+            ):
+                result = run_request(
+                    {
+                        "candidate_path": str(candidate),
+                        "event_code": "G",
+                        "event_minute": 12,
+                        "clock_only": True,
+                        "scoreboard_profile": profile,
+                    },
+                    engine=object(),
+                )
+
+        self.assertEqual(captured["frames"], clock_paths)
+        self.assertEqual(captured["crop_kinds"], ["clock"] * 4)
+        self.assertTrue(result["clock_only"])
+        self.assertTrue(result["diagnostics"]["score_ocr_skipped"])
+
+    def test_auto_run_disables_discovered_score_rois(self):
+        tracker = AutoClockTracker(1280, 720)
+        tracker.clock_roi = (10, 10, 80, 40)
+        tracker.score_roi = (80, 10, 120, 40)
+        tracker.score_rois = ((80, 10, 120, 40),)
+        captured = {}
+        with tempfile.TemporaryDirectory() as directory:
+            candidate = Path(directory) / "candidate.mp4"
+            candidate.write_bytes(b"video")
+            clock_paths = [Path(f"auto-clock-{index}.png") for index in range(4)]
+
+            def extract(*_args, **kwargs):
+                captured.update(kwargs)
+                return clock_paths, ["clock"] * 4, {"clock_roi": [10, 10, 80, 40]}
+
+            with (
+                patch(
+                    "scoreboard_ocr_worker.discover_auto_clock",
+                    return_value=(
+                        tracker,
+                        {
+                            "frame_resolution": [1280, 720],
+                            "score_roi": [80, 10, 120, 40],
+                        },
+                    ),
+                ),
+                patch(
+                    "scoreboard_ocr_worker.extract_auto_roi_frames",
+                    side_effect=extract,
+                ),
+                patch(
+                    "scoreboard_ocr_worker._recognize_request_paths",
+                    return_value=(
+                        [
+                            ([f"12:0{index}"], [0.9])
+                            for index in range(4)
+                        ],
+                        [],
+                    ),
+                ),
+            ):
+                result = run_request(
+                    {
+                        "candidate_path": str(candidate),
+                        "event_code": "RC",
+                        "event_minute": 12,
+                        "clock_only": True,
+                    },
+                    engine=object(),
+                )
+
+        self.assertIsNone(captured["score_roi"])
+        self.assertEqual(captured["score_rois"], ())
+        self.assertTrue(result["clock_only"])
+        self.assertIsNone(result["diagnostics"]["auto_clock"]["score_roi"])
 
     def test_replay_scoreboard_gap_stays_in_one_minute_interval(self):
         readings = [
