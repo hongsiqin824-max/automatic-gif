@@ -213,15 +213,14 @@ class MatchSession:
     detail_poll_seconds: float = 10.0
     before_seconds: float = 30.0
     after_seconds: float = 20.0
-    event_to_video_offset_seconds: float = -30.0
+    event_to_video_offset_seconds: float = -10.0
     shotmap_offset_seconds: float = 0.0
     gif_width: int = 768
     gif_fps: float = 16.0
     gif_colors: int = 256
     vision_enabled: bool = True
-    # Keep the new clock-only production path behind an explicit opt-in until
-    # replay validation has been completed. AI refinement itself remains on.
-    vision_clock_only: bool = False
+    tdeed_enabled: bool = False
+    vision_clock_only: bool = True
     vision_before_seconds: float = 8.0
     vision_after_seconds: float = 12.0
     scoreboard_profile_path: str = field(
@@ -743,6 +742,26 @@ def _tasks_from_database(
                 if "failure_reason" in vision_columns
                 else "NULL AS persisted_failure_reason"
             )
+            vision_location_field = (
+                "location_json"
+                if "location_json" in vision_columns
+                else "'{}' AS location_json"
+            )
+            vision_window_field = (
+                "window_json"
+                if "window_json" in vision_columns
+                else "'{}' AS window_json"
+            )
+            vision_next_attempt_field = (
+                "next_attempt_at_unix"
+                if "next_attempt_at_unix" in vision_columns
+                else "NULL AS next_attempt_at_unix"
+            )
+            vision_deadline_field = (
+                "deadline_at_unix"
+                if "deadline_at_unix" in vision_columns
+                else "NULL AS deadline_at_unix"
+            )
             vision_rows = (
                 connection.execute(
                     """
@@ -757,6 +776,14 @@ def _tasks_from_database(
                     + vision_failure_stage_field
                     + ", "
                     + vision_failure_reason_field
+                    + ", "
+                    + vision_location_field
+                    + ", "
+                    + vision_window_field
+                    + ", "
+                    + vision_next_attempt_field
+                    + ", "
+                    + vision_deadline_field
                     + """
                     FROM vision_tasks
                     ORDER BY created_at_unix, event_key, artifact_kind
@@ -814,6 +841,21 @@ def _tasks_from_database(
             vision_result = {}
         if not isinstance(vision_result, dict):
             vision_result = {}
+        try:
+            location_metadata = json.loads(row["location_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            location_metadata = {}
+        if not isinstance(location_metadata, dict):
+            location_metadata = {}
+        try:
+            window_metadata = json.loads(row["window_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            window_metadata = {}
+        if not isinstance(window_metadata, dict):
+            window_metadata = {}
+        progressive_scan = window_metadata.get("progressive_scan")
+        if not isinstance(progressive_scan, dict):
+            progressive_scan = {}
         error_kind = vision_result.get("error_kind") or row["last_error_kind"]
         locator_method = (
             vision_result.get("locator_method")
@@ -893,6 +935,143 @@ def _tasks_from_database(
                 exact_error_diagnostics.get("exact_second_failure_reason")
                 or nested_diagnostics.get("exact_second_failure_reason"),
             )
+        ocr_pipeline_statuses = {
+            "waiting_for_clock_target",
+            "waiting_for_postroll",
+            "ocr_second_exact",
+            "ocr_second_estimated",
+            "ocr_minute_fallback",
+            "ocr_no_clock_detected",
+            "ocr_target_timeout",
+            "ocr_window_evicted",
+            "ocr_discontinuous_clock",
+            "ocr_encode_failed",
+            "ocr_dependency_unavailable",
+        }
+
+        def first_ocr_value(*keys: str) -> Any:
+            for source in (
+                vision_result,
+                ocr_payload,
+                nested_diagnostics,
+                ocr_diagnostics if isinstance(ocr_diagnostics, dict) else {},
+                location_metadata,
+                progressive_scan,
+                window_metadata,
+            ):
+                for key in keys:
+                    value = source.get(key)
+                    if value not in (None, ""):
+                        return value
+            return None
+
+        ocr_pipeline_status = next(
+            (
+                candidate
+                for key in (
+                    "ocr_pipeline_status",
+                    "ocr_status",
+                    "workflow_status",
+                    "pipeline_status",
+                    "stage",
+                    "visual_resolution",
+                )
+                if (
+                    candidate := str(first_ocr_value(key) or "").strip()
+                ) in ocr_pipeline_statuses
+            ),
+            "",
+        )
+        if ocr_pipeline_status not in ocr_pipeline_statuses:
+            structured_failure = vision_result.get("failure_reason")
+            failure_kind = str(
+                (
+                    structured_failure.get("kind")
+                    if isinstance(structured_failure, dict)
+                    else structured_failure
+                    if isinstance(structured_failure, str)
+                    else ""
+                )
+                or error_kind
+                or row["last_error_kind"]
+                or ""
+            ).strip()
+            normalized_failure_status = {
+                "ocr_no_trustworthy_clock_before_deadline": "ocr_no_clock_detected",
+                "ocr_clock_unreadable": "ocr_no_clock_detected",
+                "scoreboard_missing": "ocr_no_clock_detected",
+                "ocr_clock_target_timeout": "ocr_target_timeout",
+                "ocr_clock_target_not_located": "ocr_target_timeout",
+                "ocr_postroll_timeout": "ocr_target_timeout",
+                "ocr_output_window_timeout": "ocr_target_timeout",
+                "ocr_search_history_evicted": "ocr_window_evicted",
+                "ocr_output_history_evicted": "ocr_window_evicted",
+                "ocr_buffer_never_available": "ocr_window_evicted",
+                "buffer_history_missing": "ocr_window_evicted",
+                "ocr_output_video_gap": "ocr_window_evicted",
+                "buffer_gap": "ocr_discontinuous_clock",
+                "ocr_ambiguous": "ocr_discontinuous_clock",
+                "ocr_window_encoding_failed": "ocr_encode_failed",
+                "ocr_model_unavailable": "ocr_dependency_unavailable",
+                "ocr_inference_failed": "ocr_dependency_unavailable",
+                "ocr_processing_failed": "ocr_dependency_unavailable",
+            }.get(failure_kind)
+            if failure_kind in ocr_pipeline_statuses:
+                ocr_pipeline_status = failure_kind
+            elif normalized_failure_status is not None:
+                ocr_pipeline_status = normalized_failure_status
+            elif vision_result.get("localization_source") == "exact_second":
+                ocr_pipeline_status = (
+                    "ocr_second_estimated"
+                    if vision_result.get("localization_quality") == "estimated"
+                    or vision_result.get("degraded") is True
+                    else "ocr_second_exact"
+                )
+            elif (
+                vision_result.get("localization_source") == "minute_boundary"
+                or vision_result.get("minute_fallback") is True
+            ):
+                ocr_pipeline_status = "ocr_minute_fallback"
+            else:
+                ocr_pipeline_status = ""
+        scan_window = first_ocr_value("scan_window", "scanning_window")
+        if not isinstance(scan_window, dict):
+            scan_window = window_metadata.get("search_window")
+        if not isinstance(scan_window, dict):
+            scan_window = vision_result.get("search_window")
+        if not isinstance(scan_window, dict) and (
+            progressive_scan.get("last_scan_start_stream_time") is not None
+            or progressive_scan.get("last_scan_end_stream_time") is not None
+        ):
+            scan_window = {
+                "start_stream_time": progressive_scan.get(
+                    "last_scan_start_stream_time"
+                ),
+                "end_stream_time": progressive_scan.get(
+                    "last_scan_end_stream_time"
+                ),
+            }
+        if not isinstance(scan_window, dict):
+            scan_window = None
+        final_clip_window = first_ocr_value("final_clip_window", "clip_window")
+        if not isinstance(final_clip_window, dict):
+            final_clip_window = vision_result.get("actual_media_window")
+        if not isinstance(final_clip_window, dict):
+            final_clip_window = vision_result.get("requested_media_window")
+        if not isinstance(final_clip_window, dict) and (
+            progressive_scan.get("requested_output_start_stream_time") is not None
+            or progressive_scan.get("requested_output_end_stream_time") is not None
+        ):
+            final_clip_window = {
+                "start_stream_time": progressive_scan.get(
+                    "requested_output_start_stream_time"
+                ),
+                "end_stream_time": progressive_scan.get(
+                    "requested_output_end_stream_time"
+                ),
+            }
+        if not isinstance(final_clip_window, dict):
+            final_clip_window = None
         minute_fallback = bool(vision_result.get("minute_fallback"))
         fallback_requested_seconds = vision_result.get(
             "requested_fallback_seconds"
@@ -949,6 +1128,38 @@ def _tasks_from_database(
             "coverage_status": vision_result.get("coverage_status"),
             "coverage_reason": vision_result.get("coverage_reason"),
             "experimental": bool(vision_result.get("experimental")),
+            "disabled": bool(vision_result.get("disabled")),
+            "ocr_pipeline_status": ocr_pipeline_status or None,
+            "scan_window": scan_window,
+            "scan_cursor": first_ocr_value(
+                "scan_cursor",
+                "scan_cursor_stream_time",
+                "cursor_stream_time",
+                "last_scanned_stream_time",
+            ),
+            "last_trusted_clock": first_ocr_value(
+                "last_trusted_clock",
+                "latest_trusted_clock",
+                "last_trustworthy_clock",
+                "trusted_clock",
+                "last_clock_reading",
+            ),
+            "last_trusted_clock_seconds": first_ocr_value(
+                "last_trusted_clock_seconds",
+                "latest_trusted_clock_seconds",
+            ),
+            "target_clock_seconds": first_ocr_value("target_clock_seconds"),
+            "scan_attempt_count": first_ocr_value("scan_attempt_count"),
+            "next_attempt_at_unix": (
+                first_ocr_value("next_attempt_at_unix")
+                or row["next_attempt_at_unix"]
+            ),
+            "deadline_at_unix": (
+                first_ocr_value("deadline_at_unix") or row["deadline_at_unix"]
+            ),
+            "final_clip_window": final_clip_window,
+            "location_metadata": location_metadata,
+            "window_metadata": window_metadata,
             "error_kind": error_kind,
             "last_error_kind": row["last_error_kind"],
             "locator_method": locator_method,
@@ -957,6 +1168,7 @@ def _tasks_from_database(
                 or vision_result.get("failed_stage")
                 or row["failure_stage"]
             ),
+            "progressive_status": first_ocr_value("progressive_status", "state"),
             "fallback_used": vision_result.get("fallback_used"),
             "minute_fallback": minute_fallback,
             "fallback_generated": bool(vision_result.get("fallback_generated")),
@@ -1524,6 +1736,8 @@ def _session_json(session: MatchSession) -> dict[str, Any]:
         "vision": {
             "enabled": session.vision_enabled,
             "worker_enabled": "--vision-enabled" in session.worker_command,
+            "tdeed_enabled": session.tdeed_enabled,
+            "worker_tdeed_enabled": "--tdeed-enabled" in session.worker_command,
             "clock_only": session.vision_clock_only,
             "worker_clock_only": "--ocr-clock-only" in session.worker_command,
             "before_seconds": session.vision_before_seconds,
@@ -1531,11 +1745,14 @@ def _session_json(session: MatchSession) -> dict[str, Any]:
             "search_before_seconds": VISION_SEARCH_BEFORE_SECONDS,
             "search_after_seconds": VISION_SEARCH_AFTER_SECONDS,
             "scoreboard_profile_path": session.scoreboard_profile_path or None,
-            "model": "OCR + T-DEED fallback",
+            "model": "PaddleOCR",
             "workers": 1,
             "fallback_gif": {
-                "before_seconds": 60.0,
-                "after_seconds": 60.0,
+                "duration_seconds": 60.0,
+                "exact_second_before_seconds": 30.0,
+                "exact_second_after_seconds": 30.0,
+                "minute_boundary_before_seconds": 60.0,
+                "minute_boundary_after_seconds": 0.0,
                 "width": FALLBACK_GIF_WIDTH,
                 "fps": FALLBACK_GIF_FPS,
                 "colors": FALLBACK_GIF_COLORS,
@@ -2797,6 +3014,8 @@ class Dashboard:
                 ])
                 if session.vision_clock_only:
                     command.append("--ocr-clock-only")
+                if session.tdeed_enabled:
+                    command.append("--tdeed-enabled")
                 configured_profile = session.scoreboard_profile_path
                 if demo and not configured_profile:
                     configured_profile = str(DEFAULT_DEMO_SCOREBOARD_PROFILE)
@@ -3081,6 +3300,11 @@ def session_configure():
             session.shotmap_offset_seconds = value
         if "vision_enabled" in body:
             session.vision_enabled = bool(body["vision_enabled"])
+        if "tdeed_enabled" in body:
+            value = body["tdeed_enabled"]
+            if not isinstance(value, bool):
+                return jsonify({"error": "tdeed_enabled 必须是 JSON 布尔值"}), 400
+            session.tdeed_enabled = value
         if "vision_clock_only" in body:
             value = body["vision_clock_only"]
             if not isinstance(value, bool):

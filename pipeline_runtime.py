@@ -80,6 +80,13 @@ def _finite_float(value: Any, field_name: str) -> float:
     return result
 
 
+def _validated_vision_anchor(value: Any) -> float:
+    anchor = _finite_float(value, "vision anchor_stream_time")
+    if anchor < 0:
+        raise ValueError("vision anchor_stream_time must be non-negative")
+    return anchor
+
+
 def _minute_parts(
     minute: str | int | float,
     minute_extra: str | int | float | None,
@@ -1969,13 +1976,19 @@ class TaskStateStore:
             else:
                 stored_failure_stage = current.failure_stage
                 stored_failure_reason = current.failure_reason
-            located_anchor = merged_result.get(
-                "anchor_stream_time", current.located_anchor_stream_time
-            )
-            if new_status in ("located", "encoding", "encoded") and located_anchor is None:
-                raise ValueError(
-                    f"vision task must have an anchor before entering {new_status}"
-                )
+            located_anchor = merged_result.get("anchor_stream_time")
+            if located_anchor is None:
+                located_anchor = current.located_anchor_stream_time
+            if new_status in ("located", "encoding", "encoded"):
+                if located_anchor is None:
+                    raise ValueError(
+                        f"vision task must have an anchor before entering {new_status}"
+                    )
+                located_anchor = _validated_vision_anchor(located_anchor)
+                # Keep JSON and the dedicated column aligned when a later result
+                # omits the anchor or explicitly reports it as null.
+                merged_result["anchor_stream_time"] = located_anchor
+                merged_location["anchor_stream_time"] = located_anchor
             if new_status == "encoded" and not (
                 merged_result.get("output") or current.output_path
             ):
@@ -2094,6 +2107,10 @@ class TaskStateStore:
         *,
         artifact_kind: str = DEFAULT_VISION_ARTIFACT_KIND,
         error_kind: str,
+        result: Mapping[str, Any] | None = None,
+        window_metadata: Mapping[str, Any] | None = None,
+        next_attempt_at_unix: float | None = None,
+        deadline_at_unix: float | None = None,
         now: float | None = None,
     ) -> StoredVisionTask:
         """Schedule visual input rechecks independently from model/encode attempts."""
@@ -2110,22 +2127,144 @@ class TaskStateStore:
                     f"cannot schedule visual readiness retry from {current.status}"
                 )
             delay = _readiness_retry_delay(current.readiness_check_count)
+            merged_result = dict(current.result)
+            if result is not None:
+                merged_result.update(result)
+            merged_window = dict(current.window_metadata)
+            if window_metadata is not None:
+                merged_window.update(window_metadata)
+            effective_deadline = (
+                current.deadline_at_unix
+                if deadline_at_unix is None
+                else _finite_float(deadline_at_unix, "vision wait deadline")
+            )
+            scheduled_attempt = (
+                timestamp + delay
+                if next_attempt_at_unix is None
+                else _finite_float(
+                    next_attempt_at_unix,
+                    "vision wait next attempt",
+                )
+            )
             with self.connection:
                 self.connection.execute(
                     """
                     UPDATE vision_tasks SET
                         updated_at_unix = ?,
                         next_attempt_at_unix = ?,
+                        deadline_at_unix = ?,
                         readiness_check_count = readiness_check_count + 1,
                         last_error_kind = ?,
-                        error = ?
+                        error = ?,
+                        result_json = ?,
+                        window_json = ?
                     WHERE event_key = ? AND artifact_kind = ?
                     """,
                     (
                         timestamp,
-                        min(timestamp + delay, current.deadline_at_unix),
+                        min(scheduled_attempt, effective_deadline),
+                        effective_deadline,
                         error_kind,
                         error,
+                        json.dumps(
+                            merged_result, ensure_ascii=False, separators=(",", ":")
+                        ),
+                        json.dumps(
+                            merged_window, ensure_ascii=False, separators=(",", ":")
+                        ),
+                        event_key,
+                        normalized_artifact_kind,
+                    ),
+                )
+            updated = self.get_vision_task(event_key, normalized_artifact_kind)
+        assert updated is not None
+        return updated
+
+    def record_vision_queue_phase(
+        self,
+        event_key: str,
+        phase: str,
+        *,
+        artifact_kind: str = DEFAULT_VISION_ARTIFACT_KIND,
+        queued_at_unix: float | None = None,
+        now: float | None = None,
+    ) -> StoredVisionTask:
+        """Persist queue timing and exclude actual queue wait from the deadline."""
+        if phase not in {"queued", "acquired", "executing"}:
+            raise ValueError(f"unknown vision queue phase: {phase}")
+        normalized_artifact_kind = normalize_vision_artifact_kind(artifact_kind)
+        timestamp = (
+            time.time()
+            if now is None
+            else _finite_float(now, "queue phase time")
+        )
+        with self._lock:
+            current = self.get_vision_task(event_key, normalized_artifact_kind)
+            if current is None:
+                raise KeyError(
+                    f"unknown vision task: {event_key} ({normalized_artifact_kind})"
+                )
+            queue_timing = dict(current.window_metadata.get("queue_timing") or {})
+            deadline = current.deadline_at_unix
+            if phase == "queued":
+                total_queue_wait = float(
+                    queue_timing.get("total_queue_wait_seconds") or 0.0
+                )
+                queue_timing = {
+                    "phase": phase,
+                    "queued_at_unix": timestamp,
+                    "queue_attempt_count": int(
+                        queue_timing.get("queue_attempt_count") or 0
+                    ) + 1,
+                    "deadline_before_queue_wait": deadline,
+                    "total_queue_wait_seconds": total_queue_wait,
+                }
+            else:
+                submitted_at = (
+                    _finite_float(queued_at_unix, "queued_at_unix")
+                    if queued_at_unix is not None
+                    else float(queue_timing.get("queued_at_unix") or timestamp)
+                )
+                queue_wait = max(0.0, timestamp - submitted_at)
+                queue_timing.update(
+                    {
+                        "phase": phase,
+                        "queued_at_unix": submitted_at,
+                    }
+                )
+                if phase == "acquired":
+                    already_acquired = "acquired_at_unix" in queue_timing
+                    deadline_extension = 0.0 if already_acquired else queue_wait
+                    deadline += deadline_extension
+                    total_queue_wait = float(
+                        queue_timing.get("total_queue_wait_seconds") or 0.0
+                    ) + deadline_extension
+                    queue_timing.update(
+                        {
+                            "acquired_at_unix": timestamp,
+                            "queue_wait_seconds": queue_wait,
+                            "deadline_extension_seconds": deadline_extension,
+                            "total_queue_wait_seconds": total_queue_wait,
+                            "deadline_after_queue_wait": deadline,
+                        }
+                    )
+                else:
+                    queue_timing["execution_started_at_unix"] = timestamp
+            merged_window = dict(current.window_metadata)
+            merged_window["queue_timing"] = queue_timing
+            with self.connection:
+                self.connection.execute(
+                    """
+                    UPDATE vision_tasks SET
+                        updated_at_unix = ?, deadline_at_unix = ?, window_json = ?
+                    WHERE event_key = ? AND artifact_kind = ?
+                    """,
+                    (
+                        timestamp,
+                        deadline,
+                        json.dumps(
+                            merged_window, ensure_ascii=False, separators=(",", ":")
+                        ),
                         event_key,
                         normalized_artifact_kind,
                     ),
@@ -2495,9 +2634,20 @@ class PipelineRuntime:
                 f"unknown vision task: {event_key} ({normalized_artifact_kind})"
             )
         normalized = dict(result)
-        if "anchor_stream_time" not in normalized:
-            normalized["anchor_stream_time"] = normalized.get(
-                "vision_anchor_stream_time_sec"
+        effective_anchor = normalized.get("anchor_stream_time")
+        if effective_anchor is None:
+            effective_anchor = normalized.get("vision_anchor_stream_time_sec")
+        if effective_anchor is None:
+            effective_anchor = current.located_anchor_stream_time
+        if effective_anchor is None:
+            effective_anchor = current.result.get("anchor_stream_time")
+        if effective_anchor is None:
+            normalized.pop("anchor_stream_time", None)
+        else:
+            # Validate before any transition so malformed completion results
+            # cannot leave a located task partially advanced to encoding.
+            normalized["anchor_stream_time"] = _validated_vision_anchor(
+                effective_anchor
             )
         if current.status == "locating":
             current = self.transition_vision_task(
@@ -2672,6 +2822,11 @@ class PipelineRuntime:
         *,
         artifact_kind: str = DEFAULT_VISION_ARTIFACT_KIND,
         error_kind: str,
+        result: Mapping[str, Any] | None = None,
+        window_metadata: Mapping[str, Any] | None = None,
+        next_attempt_at_unix: float | None = None,
+        deadline_at_unix: float | None = None,
+        now: float | None = None,
     ) -> StoredVisionTask:
         normalized_artifact_kind = normalize_vision_artifact_kind(artifact_kind)
         updated = self.store.record_vision_readiness_wait(
@@ -2679,6 +2834,11 @@ class PipelineRuntime:
             error,
             artifact_kind=normalized_artifact_kind,
             error_kind=error_kind,
+            result=result,
+            window_metadata=window_metadata,
+            next_attempt_at_unix=next_attempt_at_unix,
+            deadline_at_unix=deadline_at_unix,
+            now=now,
         )
         self.logger.log(
             "vision_buffer_readiness_wait",
@@ -2692,6 +2852,45 @@ class PipelineRuntime:
             deadline_at_unix=updated.deadline_at_unix,
             error_kind=error_kind,
             error=error,
+        )
+        return updated
+
+    def record_vision_queue_phase(
+        self,
+        event_key: str,
+        phase: str,
+        *,
+        artifact_kind: str = DEFAULT_VISION_ARTIFACT_KIND,
+        queued_at_unix: float | None = None,
+        now: float | None = None,
+    ) -> StoredVisionTask:
+        normalized_artifact_kind = normalize_vision_artifact_kind(artifact_kind)
+        previous = self.store.get_vision_task(event_key, normalized_artifact_kind)
+        if previous is None:
+            raise KeyError(
+                f"unknown vision task: {event_key} ({normalized_artifact_kind})"
+            )
+        updated = self.store.record_vision_queue_phase(
+            event_key,
+            phase,
+            artifact_kind=normalized_artifact_kind,
+            queued_at_unix=queued_at_unix,
+            now=now,
+        )
+        queue_timing = updated.window_metadata.get("queue_timing") or {}
+        self.logger.log(
+            "vision_task_queue_phase",
+            event_key=event_key,
+            match_id=updated.match_id,
+            code=updated.code,
+            artifact_kind=updated.artifact_kind,
+            status=updated.status,
+            phase=phase,
+            queue_wait_seconds=queue_timing.get("queue_wait_seconds"),
+            deadline_extension_seconds=queue_timing.get(
+                "deadline_extension_seconds"
+            ),
+            deadline_at_unix=updated.deadline_at_unix,
         )
         return updated
 

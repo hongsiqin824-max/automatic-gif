@@ -117,6 +117,41 @@ class HeavyTaskCoordinatorTests(unittest.TestCase):
                 first.close()
                 second.close()
 
+    def test_single_slot_compatibility_still_allows_vision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            coordinator = self.make_coordinator(root, heavy=1, vision=1)
+            try:
+                with coordinator.acquire(
+                    "vision",
+                    match_id="m1",
+                    event_key="v1",
+                    wait=False,
+                ):
+                    snapshot = coordinator.snapshot()
+                    self.assertEqual(snapshot["active"]["heavy"], 1)
+                    self.assertEqual(snapshot["active"]["vision"], 1)
+            finally:
+                coordinator.close()
+
+    def test_default_gif_can_start_while_the_single_vision_slot_is_active(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            coordinator = self.make_coordinator(root, heavy=2, vision=1)
+            try:
+                with coordinator.acquire("vision", match_id="m1", event_key="v1"):
+                    with coordinator.acquire(
+                        "gif",
+                        match_id="m2",
+                        event_key="g1",
+                        wait=False,
+                    ):
+                        snapshot = coordinator.snapshot()
+                        self.assertEqual(snapshot["active"]["heavy"], 2)
+                        self.assertEqual(snapshot["active"]["vision"], 1)
+            finally:
+                coordinator.close()
+
     def test_limits_apply_across_worker_processes(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -300,6 +335,82 @@ class HeavyTaskCoordinatorTests(unittest.TestCase):
                 holder.close()
                 vision_coordinator.close()
                 gif_coordinator.close()
+
+    def test_ocr_waiter_has_priority_over_older_tdeed_waiter(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            holder = self.make_coordinator(root, heavy=1, vision=1)
+            tdeed = self.make_coordinator(root, heavy=1, vision=1)
+            ocr = self.make_coordinator(root, heavy=1, vision=1)
+            holder_lease = holder.acquire("gif", match_id="holder", event_key="g0")
+            order = []
+            errors = []
+
+            def wait(coordinator, task_kind, name):
+                try:
+                    with coordinator.acquire(
+                        task_kind, match_id="m", event_key=name
+                    ):
+                        order.append(name)
+                except BaseException as exc:
+                    errors.append(exc)
+
+            tdeed_thread = threading.Thread(
+                target=wait,
+                args=(tdeed, "vision_tdeed", "tdeed"),
+            )
+            ocr_thread = threading.Thread(
+                target=wait,
+                args=(ocr, "vision_ocr", "ocr"),
+            )
+            tdeed_thread.start()
+            try:
+                deadline = time.time() + 2.0
+                while tdeed.snapshot()["waiting"]["tasks"] != 1:
+                    self.assertLess(time.time(), deadline)
+                    time.sleep(0.01)
+                ocr_thread.start()
+                while ocr.snapshot()["waiting"]["tasks"] != 2:
+                    self.assertLess(time.time(), deadline)
+                    time.sleep(0.01)
+                holder_lease.release()
+                tdeed_thread.join(timeout=2.0)
+                ocr_thread.join(timeout=2.0)
+                self.assertEqual(order, ["ocr", "tdeed"])
+                self.assertEqual(errors, [])
+            finally:
+                holder_lease.release()
+                if not ocr_thread.ident:
+                    ocr_thread.start()
+                tdeed_thread.join(timeout=2.0)
+                ocr_thread.join(timeout=2.0)
+                holder.close()
+                tdeed.close()
+                ocr.close()
+
+    def test_task_runner_reports_acquired_before_executing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            coordinator = self.make_coordinator(Path(directory), heavy=1, vision=1)
+            phases = []
+            try:
+                result = run_with_task_slot(
+                    coordinator,
+                    "vision_ocr",
+                    "m1",
+                    "v1",
+                    lambda: "done",
+                    on_state_change=lambda phase, timestamp: phases.append(
+                        (phase, timestamp)
+                    ),
+                )
+                self.assertEqual(result, "done")
+                self.assertEqual(
+                    [phase for phase, _ in phases],
+                    ["acquired", "executing"],
+                )
+                self.assertLessEqual(phases[0][1], phases[1][1])
+            finally:
+                coordinator.close()
 
     def test_same_kind_waiters_keep_fifo_order(self):
         with tempfile.TemporaryDirectory() as directory:

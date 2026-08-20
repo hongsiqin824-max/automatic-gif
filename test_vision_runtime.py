@@ -18,6 +18,8 @@ from vision_runtime import (
     _continuous_search_components,
     _locate_across_search_components,
     _locate_ocr_window_across_components,
+    _normalized_ocr_clip_window,
+    _ocr_output_shape,
     _vision_failure_result,
     locate_with_ocr_fallback,
     materialize_analysis_clip,
@@ -27,6 +29,99 @@ from vision_runtime import (
 
 
 class VisionRuntimeTests(unittest.TestCase):
+    @staticmethod
+    def _create_progressive_ocr_job(
+        root: Path,
+        suffix: str,
+        *,
+        observed_stream_time: float = 200.0,
+        event_minute: str = "2",
+        event_second: int | None = 120,
+        search_start_stream_time: float = 80.0,
+        deadline_at_unix: float | None = None,
+    ) -> tuple[PipelineRuntime, VisionJob]:
+        runtime = PipelineRuntime(root / "state.sqlite3", root / "events.jsonl")
+        event_key = f"match:G:{suffix}"
+        runtime.discover_task(
+            match_id="match",
+            event_data={
+                "event_key": event_key,
+                "code": "G",
+                "event_type": "goal",
+                "minute": event_minute,
+                "minute_extra": "0",
+                "second": event_second,
+                "team": "teamA",
+                "person": "A",
+                "person_id": "1",
+                "score": "1-0",
+                "reason": "",
+                "metadata": {},
+            },
+            observed_stream_time=observed_stream_time,
+            observed_source_time=None,
+            clip_anchor_stream_time=observed_stream_time,
+            clip_anchor_source_time=None,
+            output_due_stream_time=observed_stream_time + 30.0,
+            detected_at_unix=time.time(),
+        )
+        runtime.enqueue_vision_task(
+            event_key,
+            artifact_kind="ocr_window",
+            search_start_stream_time=search_start_stream_time,
+            search_end_stream_time=observed_stream_time + 30.0,
+            clip_before_seconds=30.0,
+            clip_after_seconds=30.0,
+            deadline_at_unix=(
+                time.time() + 300.0
+                if deadline_at_unix is None
+                else deadline_at_unix
+            ),
+        )
+        return runtime, VisionJob(
+            event_key,
+            "match",
+            "G",
+            "goal",
+            observed_stream_time,
+            None,
+            time.time(),
+            observed_anchor_stream_time=observed_stream_time,
+            event_minute=event_minute,
+            event_second=event_second,
+            target_score="1-0",
+            clock_only=True,
+        )
+
+    @staticmethod
+    def _run_progressive_ocr(
+        job: VisionJob,
+        runtime: PipelineRuntime,
+        segment_reader,
+        root: Path,
+    ) -> bool:
+        return process_vision_artifact(
+            job,
+            runtime,
+            segment_reader,
+            "ffmpeg",
+            "ffprobe",
+            root,
+            artifact_kind="ocr_window",
+            search_before=120.0,
+            search_after=30.0,
+            refined_before=8.0,
+            refined_after=12.0,
+            width=768,
+            fps=16.0,
+            colors=256,
+            size_reference_bytes=10_000_000,
+            python=Path("python"),
+            timeout_seconds=3.0,
+            ocr_python=root / "ocr-python",
+            ocr_timeout_seconds=3.0,
+        )
+
     def test_process_vision_artifact_advances_only_requested_artifact(self):
         with (
             patch("vision_runtime._process_ocr_window", return_value=True) as ocr,
@@ -55,6 +150,797 @@ class VisionRuntimeTests(unittest.TestCase):
         self.assertTrue(completed)
         ocr.assert_called_once()
         tdeed.assert_not_called()
+
+    def test_progressive_ocr_persists_cursor_and_resumes_with_overlap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime, job = self._create_progressive_ocr_job(root, "progressive")
+            segment_path = root / "segment.ts"
+            segment_path.write_bytes(b"video")
+            segments = [Segment(segment_path, 80.0, 220.0)]
+            misses = [
+                VisualLocationFailed(
+                    "ocr_exact_second_not_found",
+                    "target clock not reached",
+                    {
+                        "clock_raw_observations": [
+                            {"clock": "01:30", "continuity_status": "accepted"}
+                        ]
+                    },
+                ),
+                VisualLocationFailed(
+                    "ocr_exact_second_not_found",
+                    "target clock still not reached",
+                    {
+                        "clock_raw_observations": [
+                            {"clock": "01:50", "continuity_status": "accepted"}
+                        ]
+                    },
+                ),
+            ]
+
+            with patch(
+                "vision_runtime._locate_ocr_window_across_components",
+                side_effect=misses,
+            ) as locate:
+                self.assertFalse(
+                    self._run_progressive_ocr(job, runtime, lambda: segments, root)
+                )
+                first = runtime.store.get_vision_task(job.event_key, "ocr_window")
+                first_progress = first.window_metadata["progressive_scan"]
+                self.assertEqual(first.last_error_kind, "waiting_for_clock_target")
+                self.assertEqual(first_progress["last_scan_start_stream_time"], 80.0)
+                self.assertEqual(first_progress["scan_cursor_stream_time"], 220.0)
+                self.assertEqual(first_progress["latest_trusted_clock_seconds"], 90)
+                self.assertEqual(first_progress["scan_attempt_count"], 1)
+
+                runtime.close()
+                runtime = PipelineRuntime(root / "state.sqlite3", root / "events.jsonl")
+                runtime.recover_incomplete_vision("match", "ocr_window")
+                segments[:] = [Segment(segment_path, 80.0, 240.0)]
+                retry_at = runtime.store.get_vision_task(
+                    job.event_key, "ocr_window"
+                ).next_attempt_at_unix
+                with patch("vision_runtime.time.time", return_value=retry_at + 0.1):
+                    self.assertFalse(
+                        self._run_progressive_ocr(job, runtime, lambda: segments, root)
+                    )
+
+            second = runtime.store.get_vision_task(job.event_key, "ocr_window")
+            second_progress = second.window_metadata["progressive_scan"]
+            self.assertEqual(locate.call_args.kwargs["window_start"], 215.0)
+            self.assertEqual(locate.call_args.kwargs["window_end"], 240.0)
+            self.assertEqual(second_progress["latest_trusted_clock_seconds"], 110)
+            self.assertEqual(second_progress["scan_attempt_count"], 2)
+            runtime.close()
+
+    def test_target_clock_gap_extends_deadline_and_throttles_far_retry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime, job = self._create_progressive_ocr_job(root, "dynamic-wait")
+            segment_path = root / "segment.ts"
+            segment_path.write_bytes(b"video")
+            task = runtime.store.get_vision_task(job.event_key, "ocr_window")
+            now_unix = task.created_at_unix + 40.0
+            miss = VisualLocationFailed(
+                "ocr_exact_second_not_found",
+                "target clock is still ahead",
+                {
+                    "clock_raw_observations": [
+                        {"clock": "00:30", "continuity_status": "accepted"}
+                    ]
+                },
+            )
+
+            with (
+                patch(
+                    "vision_runtime._locate_ocr_window_across_components",
+                    side_effect=miss,
+                ) as locate,
+                patch("vision_runtime.time.time", return_value=now_unix),
+            ):
+                self.assertFalse(
+                    self._run_progressive_ocr(
+                        job,
+                        runtime,
+                        lambda: [Segment(segment_path, 80.0, 220.0)],
+                        root,
+                    )
+                )
+
+            waiting = runtime.store.get_vision_task(job.event_key, "ocr_window")
+            policy = waiting.window_metadata["progressive_scan"]["deadline_policy"]
+            self.assertEqual(policy["target_clock_gap_seconds"], 90)
+            self.assertAlmostEqual(
+                waiting.deadline_at_unix,
+                task.created_at_unix + 150.0,
+                places=3,
+            )
+            self.assertAlmostEqual(
+                policy["hard_deadline_at_unix"],
+                task.created_at_unix + 180.0,
+                places=3,
+            )
+            self.assertAlmostEqual(
+                waiting.next_attempt_at_unix,
+                now_unix + 30.0,
+                places=3,
+            )
+
+            with patch("vision_runtime.time.time", return_value=now_unix + 1.0):
+                self.assertFalse(
+                    self._run_progressive_ocr(
+                        job,
+                        runtime,
+                        lambda: [Segment(segment_path, 80.0, 225.0)],
+                        root,
+                    )
+                )
+            locate.assert_called_once()
+            runtime.close()
+
+    def test_postroll_starts_independent_sixty_second_phase_near_target_hard_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime, job = self._create_progressive_ocr_job(root, "late-postroll")
+            segment_path = root / "segment.ts"
+            segment_path.write_bytes(b"video")
+            task = runtime.store.get_vision_task(job.event_key, "ocr_window")
+            late_now = task.created_at_unix + 175.0
+            located = {
+                "anchor_stream_time": 200.0,
+                "anchor_seconds": 200.0,
+                "location_kind": "match_clock_second",
+                "method": "paddleocr_exact_clock",
+                "precision": "observed_second",
+                "target_clock": "02:00",
+                "target_clock_seconds": 120,
+                "diagnostics": {},
+            }
+
+            with (
+                patch(
+                    "vision_runtime._locate_ocr_window_across_components",
+                    return_value=(
+                        located,
+                        {
+                            "window_start_stream_time": 80.0,
+                            "window_end_stream_time": 215.0,
+                        },
+                        [str(segment_path)],
+                    ),
+                ),
+                patch("vision_runtime.time.time", return_value=late_now),
+            ):
+                self.assertFalse(
+                    self._run_progressive_ocr(
+                        job,
+                        runtime,
+                        lambda: [Segment(segment_path, 80.0, 215.0)],
+                        root,
+                    )
+                )
+
+            waiting = runtime.store.get_vision_task(job.event_key, "ocr_window")
+            policy = waiting.window_metadata["progressive_scan"]["deadline_policy"]
+            self.assertEqual(policy["phase"], "postroll_wait")
+            self.assertAlmostEqual(
+                policy["postroll_deadline_at_unix"],
+                late_now + 35.0,
+                places=3,
+            )
+            self.assertAlmostEqual(
+                policy["postroll_hard_deadline_at_unix"],
+                late_now + 60.0,
+                places=3,
+            )
+            self.assertGreater(
+                policy["postroll_deadline_at_unix"],
+                policy["hard_deadline_at_unix"],
+            )
+            self.assertEqual(waiting.last_error_kind, "waiting_for_postroll")
+            runtime.close()
+
+    def test_exact_ocr_anchor_waits_for_postroll_then_encodes_without_relocation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime, job = self._create_progressive_ocr_job(root, "postroll")
+            segment_path = root / "segment.ts"
+            segment_path.write_bytes(b"video")
+            segments = [Segment(segment_path, 80.0, 215.0)]
+            located = {
+                "anchor_stream_time": 200.0,
+                "anchor_seconds": 200.0,
+                "location_kind": "match_clock_second",
+                "method": "paddleocr_exact_clock",
+                "precision": "observed_second",
+                "target_clock": "02:00",
+                "target_clock_seconds": 120,
+                "diagnostics": {},
+            }
+
+            with (
+                patch(
+                    "vision_runtime._locate_ocr_window_across_components",
+                    return_value=(
+                        located,
+                        {
+                            "window_start_stream_time": 80.0,
+                            "window_end_stream_time": 215.0,
+                        },
+                        [str(segment_path)],
+                    ),
+                ) as locate,
+                patch(
+                    "vision_runtime.encode_gif",
+                    return_value={
+                        "output": str(root / "ocr.gif"),
+                        "bytes": 1234,
+                        "duration_sec": 60.0,
+                    },
+                ) as encode,
+            ):
+                self.assertFalse(
+                    self._run_progressive_ocr(job, runtime, lambda: segments, root)
+                )
+                waiting = runtime.store.get_vision_task(job.event_key, "ocr_window")
+                self.assertEqual(waiting.status, "located")
+                self.assertEqual(waiting.last_error_kind, "waiting_for_postroll")
+                self.assertEqual(
+                    waiting.window_metadata["progressive_scan"]["state"],
+                    "waiting_for_postroll",
+                )
+                self.assertEqual(
+                    waiting.window_metadata["progressive_scan"][
+                        "requested_output_end_stream_time"
+                    ],
+                    230.0,
+                )
+                encode.assert_not_called()
+
+                segments[:] = [Segment(segment_path, 80.0, 240.0)]
+                with patch(
+                    "vision_runtime.time.time",
+                    return_value=waiting.next_attempt_at_unix + 0.1,
+                ):
+                    self.assertTrue(
+                        self._run_progressive_ocr(job, runtime, lambda: segments, root)
+                    )
+
+            locate.assert_called_once()
+            encode.assert_called_once()
+            self.assertEqual(
+                (encode.call_args.kwargs["before"], encode.call_args.kwargs["after"]),
+                (30.0, 30.0),
+            )
+            encoded = runtime.store.get_vision_task(job.event_key, "ocr_window")
+            self.assertEqual(encoded.status, "encoded")
+            self.assertEqual(encoded.result["anchor_provenance"], "ocr_verified_match_clock")
+            self.assertEqual(encoded.result["progressive_status"], "encoded")
+            self.assertEqual(
+                encoded.window_metadata["progressive_scan"]["state"], "encoded"
+            )
+            runtime.close()
+
+    def test_progressive_ocr_deadline_distinguishes_clock_failures(self):
+        cases = (
+            (
+                "no-trusted-clock",
+                80.0,
+                {},
+                "ocr_no_trustworthy_clock_before_deadline",
+            ),
+            (
+                "target-timeout",
+                80.0,
+                {
+                    "clock_raw_observations": [
+                        {"clock": "01:30", "continuity_status": "accepted"}
+                    ]
+                },
+                "ocr_clock_target_timeout",
+            ),
+            (
+                "history-evicted",
+                100.0,
+                {
+                    "clock_raw_observations": [
+                        {"clock": "02:05", "continuity_status": "accepted"}
+                    ]
+                },
+                "ocr_search_history_evicted",
+            ),
+        )
+        for suffix, search_start, diagnostics, expected_kind in cases:
+            with self.subTest(expected_kind=expected_kind):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    runtime, job = self._create_progressive_ocr_job(
+                        root,
+                        suffix,
+                        search_start_stream_time=search_start,
+                        deadline_at_unix=time.time() - 1.0,
+                    )
+                    created = runtime.store.get_vision_task(
+                        job.event_key,
+                        "ocr_window",
+                    ).created_at_unix
+                    runtime.record_vision_queue_phase(
+                        job.event_key,
+                        "queued",
+                        artifact_kind="ocr_window",
+                        now=created,
+                    )
+                    runtime.record_vision_queue_phase(
+                        job.event_key,
+                        "acquired",
+                        artifact_kind="ocr_window",
+                        queued_at_unix=created,
+                        now=created + 1.0,
+                    )
+                    segment_path = root / "segment.ts"
+                    segment_path.write_bytes(b"video")
+                    with (
+                        patch(
+                            "vision_runtime._locate_ocr_window_across_components",
+                            side_effect=VisualLocationFailed(
+                                "ocr_exact_second_not_found",
+                                "target clock was not located",
+                                diagnostics,
+                            ),
+                        ),
+                        patch(
+                            "vision_runtime.time.time",
+                            return_value=created + 182.0,
+                        ),
+                    ):
+                        self.assertTrue(
+                            self._run_progressive_ocr(
+                                job,
+                                runtime,
+                                lambda: [Segment(segment_path, search_start, 230.0)],
+                                root,
+                            )
+                        )
+                    failed = runtime.store.get_vision_task(
+                        job.event_key, "ocr_window"
+                    )
+                    self.assertEqual(failed.status, "failed")
+                    self.assertEqual(failed.last_error_kind, expected_kind)
+                    self.assertTrue(failed.result["default_gif_preserved"])
+                    runtime.close()
+
+    def test_acquired_expired_target_wait_runs_one_final_scan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime, job = self._create_progressive_ocr_job(
+                root,
+                "final-scan",
+                deadline_at_unix=time.time() - 1.0,
+            )
+            segment_path = root / "segment.ts"
+            segment_path.write_bytes(b"video")
+            task = runtime.store.get_vision_task(job.event_key, "ocr_window")
+            created = task.created_at_unix
+            runtime.record_vision_readiness_wait(
+                job.event_key,
+                "waiting for new media",
+                artifact_kind="ocr_window",
+                error_kind="waiting_for_clock_target",
+                deadline_at_unix=task.deadline_at_unix,
+                window_metadata={
+                    "progressive_scan": {
+                        "state": "waiting_for_clock_target",
+                        "scan_cursor_stream_time": 220.0,
+                        "latest_trusted_clock_seconds": 90,
+                    },
+                },
+                now=created,
+            )
+            runtime.record_vision_queue_phase(
+                job.event_key,
+                "queued",
+                artifact_kind="ocr_window",
+                now=created,
+            )
+            runtime.record_vision_queue_phase(
+                job.event_key,
+                "acquired",
+                artifact_kind="ocr_window",
+                queued_at_unix=created,
+                now=created + 1.0,
+            )
+            miss = VisualLocationFailed(
+                "ocr_exact_second_not_found",
+                "target clock was not located",
+                {
+                    "clock_raw_observations": [
+                        {"clock": "02:05", "continuity_status": "accepted"}
+                    ]
+                },
+            )
+            with (
+                patch(
+                    "vision_runtime._locate_ocr_window_across_components",
+                    side_effect=miss,
+                ) as locate,
+                patch(
+                    "vision_runtime.time.time",
+                    return_value=created + 182.0,
+                ),
+            ):
+                self.assertTrue(
+                    self._run_progressive_ocr(
+                        job,
+                        runtime,
+                        lambda: [Segment(segment_path, 80.0, 220.0)],
+                        root,
+                    )
+                )
+
+            locate.assert_called_once()
+            self.assertEqual(locate.call_args.kwargs["window_start"], 215.0)
+            self.assertEqual(locate.call_args.kwargs["window_end"], 220.0)
+            failed = runtime.store.get_vision_task(job.event_key, "ocr_window")
+            self.assertEqual(failed.status, "failed")
+            self.assertEqual(
+                failed.result["final_scan_completed_at_unix"],
+                created + 182.0,
+            )
+            self.assertTrue(failed.result["final_scan_was_forced"])
+            runtime.close()
+
+    def test_progressive_ocr_preserves_non_scan_failure_reason(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime, job = self._create_progressive_ocr_job(root, "model-missing")
+            segment_path = root / "segment.ts"
+            segment_path.write_bytes(b"video")
+
+            self.assertTrue(
+                self._run_progressive_ocr(
+                    job,
+                    runtime,
+                    lambda: [Segment(segment_path, 80.0, 230.0)],
+                    root,
+                )
+            )
+
+            failed = runtime.store.get_vision_task(job.event_key, "ocr_window")
+            self.assertEqual(failed.status, "failed")
+            self.assertEqual(failed.last_error_kind, "ocr_model_unavailable")
+            self.assertEqual(
+                failed.result["failure_reason"]["kind"], "ocr_model_unavailable"
+            )
+            self.assertTrue(failed.result["default_gif_preserved"])
+            runtime.close()
+
+    def test_ocr_output_shape_accepts_only_verified_clock_anchors(self):
+        job = VisionJob(
+            "match:G:shape",
+            "match",
+            "G",
+            "goal",
+            100.0,
+            None,
+            time.time(),
+            event_minute="2",
+            event_second=120,
+            clock_only=True,
+        )
+        self.assertEqual(
+            _ocr_output_shape(job, {"location_kind": "match_clock_second"}),
+            (30.0, 30.0, "exact_second"),
+        )
+        self.assertEqual(
+            _ocr_output_shape(
+                job, {"location_kind": "match_clock_minute_boundary"}
+            ),
+            (60.0, 0.0, "minute_boundary"),
+        )
+        with self.assertRaises(VisualLocationFailed) as raised:
+            _ocr_output_shape(job, {"location_kind": "score_transition"})
+        self.assertEqual(raised.exception.kind, "ocr_target_localization_failed")
+
+    def test_normalized_ocr_clip_window_rejects_malformed_values(self):
+        job = VisionJob(
+            "match:G:invalid-window",
+            "match",
+            "G",
+            "goal",
+            100.0,
+            None,
+            time.time(),
+            event_minute="2",
+            event_second=120,
+            clock_only=True,
+        )
+        for field, value in (
+            ("clip_before_seconds", "not-a-number"),
+            ("clip_after_seconds", -1),
+            ("clip_before_seconds", float("nan")),
+        ):
+            with self.subTest(field=field, value=value):
+                located = {
+                    "location_kind": "match_clock_second",
+                    "clip_before_seconds": 30.0,
+                    "clip_after_seconds": 30.0,
+                    field: value,
+                }
+                with self.assertRaises(VisualLocationFailed) as raised:
+                    _normalized_ocr_clip_window(
+                        job,
+                        located,
+                        stage="test_window_validation",
+                    )
+                self.assertEqual(raised.exception.kind, "ocr_invalid_clip_window")
+                self.assertEqual(
+                    raised.exception.diagnostics["stage"],
+                    "test_window_validation",
+                )
+                self.assertIn(
+                    field,
+                    raised.exception.diagnostics["invalid_fields"],
+                )
+
+    def test_exact_second_located_restart_recovers_null_window_and_encodes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime, job = self._create_progressive_ocr_job(
+                root,
+                "restart-exact-null-window",
+                observed_stream_time=120.0,
+            )
+            runtime.transition_vision_task(
+                job.event_key,
+                "locating",
+                artifact_kind="ocr_window",
+            )
+            runtime.transition_vision_task(
+                job.event_key,
+                "located",
+                artifact_kind="ocr_window",
+                result={
+                    "anchor_stream_time": 120.0,
+                    "localization_source": "exact_second",
+                    "location_kind": "match_clock_second",
+                    "clip_after_seconds": None,
+                    "target_clock_seconds": 120,
+                },
+            )
+            runtime.close()
+
+            runtime = PipelineRuntime(root / "state.sqlite3", root / "events.jsonl")
+            recovered = runtime.recover_incomplete_vision("match", "ocr_window")
+            self.assertEqual(recovered[0].status, "located")
+            segment_path = root / "segment.ts"
+            segment_path.write_bytes(b"video")
+            with patch(
+                "vision_runtime.encode_gif",
+                return_value={"output": str(root / "exact.gif"), "bytes": 1234},
+            ) as encode:
+                self.assertTrue(
+                    self._run_progressive_ocr(
+                        job,
+                        runtime,
+                        lambda: [Segment(segment_path, 0.0, 180.0)],
+                        root,
+                    )
+                )
+
+            self.assertEqual(
+                (encode.call_args.kwargs["before"], encode.call_args.kwargs["after"]),
+                (30.0, 30.0),
+            )
+            task = runtime.store.get_vision_task(job.event_key, "ocr_window")
+            self.assertEqual(task.status, "encoded")
+            self.assertEqual(task.result["clip_before_seconds"], 30.0)
+            self.assertEqual(task.result["clip_after_seconds"], 30.0)
+            runtime.close()
+
+    def test_minute_located_restart_accepts_string_before_and_recovers_zero_after(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime, job = self._create_progressive_ocr_job(
+                root,
+                "restart-minute-null-window",
+                observed_stream_time=120.0,
+                event_second=None,
+            )
+            runtime.transition_vision_task(
+                job.event_key,
+                "locating",
+                artifact_kind="ocr_window",
+            )
+            runtime.transition_vision_task(
+                job.event_key,
+                "located",
+                artifact_kind="ocr_window",
+                result={
+                    "anchor_stream_time": 120.0,
+                    "localization_source": "minute_boundary",
+                    "location_kind": "match_clock_minute_boundary",
+                    "clip_before_seconds": "60",
+                    "clip_after_seconds": None,
+                    "target_clock_seconds": 120,
+                },
+            )
+            runtime.close()
+
+            runtime = PipelineRuntime(root / "state.sqlite3", root / "events.jsonl")
+            runtime.recover_incomplete_vision("match", "ocr_window")
+            segment_path = root / "segment.ts"
+            segment_path.write_bytes(b"video")
+            with patch(
+                "vision_runtime.encode_gif",
+                return_value={"output": str(root / "minute.gif"), "bytes": 1234},
+            ) as encode:
+                self.assertTrue(
+                    self._run_progressive_ocr(
+                        job,
+                        runtime,
+                        lambda: [Segment(segment_path, 0.0, 180.0)],
+                        root,
+                    )
+                )
+
+            self.assertEqual(
+                (encode.call_args.kwargs["before"], encode.call_args.kwargs["after"]),
+                (60.0, 0.0),
+            )
+            task = runtime.store.get_vision_task(job.event_key, "ocr_window")
+            self.assertEqual(task.status, "encoded")
+            self.assertEqual(task.result["clip_before_seconds"], 60.0)
+            self.assertEqual(task.result["clip_after_seconds"], 0.0)
+            self.assertEqual(
+                task.result["requested_media_window"],
+                {"start_stream_time": 60.0, "end_stream_time": 120.0},
+            )
+            runtime.close()
+
+    def test_invalid_persisted_ocr_window_fails_with_structured_reason(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime, job = self._create_progressive_ocr_job(
+                root,
+                "restart-invalid-window",
+                observed_stream_time=120.0,
+            )
+            runtime.transition_vision_task(
+                job.event_key,
+                "locating",
+                artifact_kind="ocr_window",
+            )
+            runtime.transition_vision_task(
+                job.event_key,
+                "located",
+                artifact_kind="ocr_window",
+                result={
+                    "anchor_stream_time": 120.0,
+                    "localization_source": "exact_second",
+                    "location_kind": "match_clock_second",
+                    "clip_before_seconds": "invalid",
+                    "clip_after_seconds": 30.0,
+                },
+            )
+
+            with patch("vision_runtime.encode_gif") as encode:
+                self.assertTrue(
+                    self._run_progressive_ocr(job, runtime, lambda: [], root)
+                )
+
+            encode.assert_not_called()
+            task = runtime.store.get_vision_task(job.event_key, "ocr_window")
+            self.assertEqual(task.status, "failed")
+            self.assertEqual(task.last_error_kind, "ocr_invalid_clip_window")
+            self.assertEqual(
+                task.result["failure_reason"]["stage"],
+                "ocr_output_window_validation",
+            )
+            self.assertEqual(
+                task.result["invalid_fields"],
+                {"clip_before_seconds": "invalid"},
+            )
+            self.assertTrue(task.result["default_gif_preserved"])
+            runtime.close()
+
+    def test_tdeed_consumes_encoded_minute_ocr_with_null_window(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = PipelineRuntime(root / "state.sqlite3", root / "events.jsonl")
+            event_key = "match:G:tdeed-null-ocr-window"
+            self._discover_three_path_event(runtime, event_key, second=None)
+            job = VisionJob(
+                event_key,
+                "match",
+                "G",
+                "goal",
+                140.0,
+                None,
+                time.time(),
+                observed_anchor_stream_time=150.0,
+                event_minute="2",
+                event_second=None,
+                target_score="1-0",
+                clock_only=True,
+            )
+            ocr_result = {
+                "anchor_stream_time": 120.0,
+                "localization_source": "minute_boundary",
+                "location_kind": "match_clock_minute_boundary",
+                "clip_before_seconds": None,
+                "clip_after_seconds": None,
+                "output": str(root / "ocr.gif"),
+                "bytes": 1234,
+            }
+            for status in ("locating", "located", "encoding", "encoded"):
+                runtime.transition_vision_task(
+                    event_key,
+                    status,
+                    artifact_kind="ocr_window",
+                    result=ocr_result,
+                )
+
+            segment_path = root / "segment.ts"
+            segment_path.write_bytes(b"video")
+            with (
+                patch(
+                    "vision_runtime.materialize_analysis_clip",
+                    return_value={
+                        "path": str(root / "candidate.mp4"),
+                        "window_start_stream_time": 60.0,
+                        "window_end_stream_time": 120.0,
+                    },
+                ) as materialize,
+                patch(
+                    "vision_runtime.locate_candidate_video",
+                    return_value={
+                        "anchor_stream_time": 100.0,
+                        "confidence": 0.9,
+                        "label": "Goal",
+                    },
+                ) as locate,
+                patch(
+                    "vision_runtime.encode_gif",
+                    return_value={"output": str(root / "ai.gif"), "bytes": 456},
+                ),
+            ):
+                self.assertTrue(
+                    process_vision_artifact(
+                        job,
+                        runtime,
+                        lambda: [Segment(segment_path, 0.0, 180.0)],
+                        "ffmpeg",
+                        "ffprobe",
+                        root,
+                        artifact_kind="tdeed_refined",
+                        search_before=120.0,
+                        search_after=30.0,
+                        refined_before=8.0,
+                        refined_after=12.0,
+                        width=768,
+                        fps=16.0,
+                        colors=256,
+                        size_reference_bytes=10_000_000,
+                        python=Path("python"),
+                        timeout_seconds=3.0,
+                    )
+                )
+
+            self.assertEqual(materialize.call_args.kwargs["window_start"], 60.0)
+            self.assertEqual(materialize.call_args.kwargs["window_end"], 120.0)
+            self.assertEqual(
+                locate.call_args.kwargs["candidate_window_start_seconds"],
+                60.0,
+            )
+            self.assertEqual(
+                locate.call_args.kwargs["candidate_window_end_seconds"],
+                120.0,
+            )
+            refined = runtime.store.get_vision_task(event_key, "tdeed_refined")
+            self.assertEqual(refined.status, "encoded")
+            self.assertEqual(refined.result["locator_method"], "tdeed_within_ocr_window")
+            runtime.close()
 
     def test_legacy_clock_only_false_reaches_score_ocr_contract(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -156,6 +1042,170 @@ class VisionRuntimeTests(unittest.TestCase):
             self.assertEqual(located["anchor_seconds"], 15.0)
             self.assertEqual(located["location_kind"], "match_clock_minute_interval")
             self.assertTrue(located["ocr_anchor_from_interval"])
+
+    def test_profile_clock_only_reads_leased_ts_without_materializing_full_mp4(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "first.ts"
+            second = root / "second.ts"
+            first.write_bytes(b"first")
+            second.write_bytes(b"second")
+            ocr_python = root / "ocr-python"
+            ocr_python.write_bytes(b"python")
+            job = VisionJob(
+                "match:YC:direct-ts", "match", "YC", "yellow_card",
+                125.0, None, 1.0, event_minute="2", clock_only=True,
+                scoreboard_profile={
+                    "profile_id": "feed-a",
+                    "reference_resolution": [1920, 1080],
+                    "clock_roi": [40, 20, 220, 90],
+                },
+            )
+            segments = [Segment(first, 100.0, 110.0), Segment(second, 110.0, 120.0)]
+            with (
+                patch("vision_runtime.materialize_analysis_clip", side_effect=AssertionError("MP4 path used")),
+                patch(
+                    "vision_runtime.locate_scoreboard_event",
+                    return_value={
+                        "anchor_seconds": 115.0,
+                        "location_kind": "match_clock_minute_boundary",
+                        "method": "paddleocr_clock_boundary",
+                    },
+                ) as ocr,
+            ):
+                located, materialized, _paths = _locate_ocr_window_across_components(
+                    job, segments, window_start=105.0, window_end=120.0,
+                    analysis_path=root / "candidate.mp4", ffmpeg="ffmpeg",
+                    ocr_python=ocr_python, ocr_timeout_seconds=5.0,
+                    minimum_component_seconds=3.0,
+                )
+
+            self.assertEqual(located["anchor_stream_time"], 115.0)
+            self.assertTrue(materialized["direct_clock_roi"])
+            self.assertEqual(ocr.call_args.kwargs["candidate_start_seconds"], 105.0)
+            self.assertEqual(ocr.call_args.kwargs["candidate_seek_seconds"], 5.0)
+            self.assertEqual(ocr.call_args.kwargs["candidate_duration_seconds"], 15.0)
+            self.assertEqual(list(root.glob("*.ffconcat")), [])
+
+    def test_direct_ts_ocr_failure_falls_back_to_existing_mp4_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            segment = root / "segment.ts"
+            segment.write_bytes(b"video")
+            ocr_python = root / "ocr-python"
+            ocr_python.write_bytes(b"python")
+            job = VisionJob(
+                "match:YC:direct-fallback", "match", "YC", "yellow_card",
+                10.0, None, 1.0, event_minute="1", clock_only=True,
+                scoreboard_profile={
+                    "profile_id": "feed-a", "reference_resolution": [1920, 1080],
+                    "clock_roi": [40, 20, 220, 90],
+                },
+            )
+            mp4_result = {
+                "path": str(root / "part.mp4"),
+                "window_start_stream_time": 0.0,
+                "window_end_stream_time": 10.0,
+            }
+            with (
+                patch("vision_runtime.materialize_analysis_clip", return_value=mp4_result) as materialize,
+                patch(
+                    "vision_runtime.locate_scoreboard_event",
+                    side_effect=[
+                        ScoreboardOcrError("ocr_frame_extraction_failed", "direct failed"),
+                        {"anchor_seconds": 8.0, "location_kind": "match_clock_minute_boundary"},
+                    ],
+                ) as ocr,
+            ):
+                located, materialized, _paths = _locate_ocr_window_across_components(
+                    job, [Segment(segment, 0.0, 10.0)], window_start=0.0,
+                    window_end=10.0, analysis_path=root / "candidate.mp4",
+                    ffmpeg="ffmpeg", ocr_python=ocr_python,
+                    ocr_timeout_seconds=5.0, minimum_component_seconds=3.0,
+                )
+
+            materialize.assert_called_once()
+            self.assertGreater(
+                materialize.call_args.kwargs["timeout_seconds"],
+                0.0,
+            )
+            self.assertLessEqual(
+                materialize.call_args.kwargs["timeout_seconds"],
+                5.0,
+            )
+            self.assertEqual(materialized, mp4_result)
+            self.assertEqual(located["anchor_stream_time"], 8.0)
+            direct_timeout = ocr.call_args_list[0].kwargs["timeout_seconds"]
+            fallback_timeout = ocr.call_args_list[1].kwargs["timeout_seconds"]
+            self.assertGreater(direct_timeout, 0.0)
+            self.assertGreater(fallback_timeout, 0.0)
+            self.assertLessEqual(fallback_timeout, direct_timeout)
+            self.assertEqual(
+                located["diagnostics"]["direct_clock_roi"]["error_kind"],
+                "ocr_frame_extraction_failed",
+            )
+
+    def test_direct_ts_mp4_fallback_timeout_is_reported_as_inference_timeout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            segment = root / "segment.ts"
+            segment.write_bytes(b"video")
+            ocr_python = root / "ocr-python"
+            ocr_python.write_bytes(b"python")
+            job = VisionJob(
+                "match:YC:direct-fallback-timeout",
+                "match",
+                "YC",
+                "yellow_card",
+                10.0,
+                None,
+                1.0,
+                event_minute="1",
+                clock_only=True,
+                scoreboard_profile={
+                    "profile_id": "feed-a",
+                    "reference_resolution": [1920, 1080],
+                    "clock_roi": [40, 20, 220, 90],
+                },
+            )
+            timeout = subprocess.TimeoutExpired(["ffmpeg"], 5.0)
+            with (
+                patch(
+                    "vision_runtime.materialize_analysis_clip",
+                    side_effect=timeout,
+                ) as materialize,
+                patch(
+                    "vision_runtime.locate_scoreboard_event",
+                    side_effect=ScoreboardOcrError(
+                        "ocr_frame_extraction_failed",
+                        "direct failed",
+                    ),
+                ),
+            ):
+                with self.assertRaises(VisualLocationFailed) as captured:
+                    _locate_ocr_window_across_components(
+                        job,
+                        [Segment(segment, 0.0, 10.0)],
+                        window_start=0.0,
+                        window_end=10.0,
+                        analysis_path=root / "candidate.mp4",
+                        ffmpeg="ffmpeg",
+                        ocr_python=ocr_python,
+                        ocr_timeout_seconds=5.0,
+                        minimum_component_seconds=3.0,
+                    )
+
+            self.assertEqual(captured.exception.kind, "inference_timeout")
+            self.assertEqual(
+                captured.exception.diagnostics["fragment_attempts"][-1][
+                    "error_kind"
+                ],
+                "inference_timeout",
+            )
+            self.assertGreater(
+                materialize.call_args.kwargs["timeout_seconds"],
+                0.0,
+            )
 
     def test_ocr_without_anchor_or_interval_is_explicit_no_target(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -513,7 +1563,7 @@ class VisionRuntimeTests(unittest.TestCase):
             self.assertEqual(encode.call_count, 2)
             self.assertEqual(
                 (encode.call_args_list[0].kwargs["before"], encode.call_args_list[0].kwargs["after"]),
-                (60.0, 60.0),
+                (60.0, 0.0),
             )
             self.assertEqual(
                 (encode.call_args_list[1].kwargs["before"], encode.call_args_list[1].kwargs["after"]),
@@ -528,6 +1578,15 @@ class VisionRuntimeTests(unittest.TestCase):
             self.assertEqual(ocr_task.result["localization_source"], "minute_boundary")
             self.assertEqual(ocr_task.result["localization_quality"], "degraded")
             self.assertTrue(ocr_task.result["degraded"])
+            self.assertEqual(ocr_task.result["clip_before_seconds"], 60.0)
+            self.assertEqual(ocr_task.result["clip_after_seconds"], 0.0)
+            self.assertEqual(
+                ocr_task.result["requested_media_window"],
+                {
+                    "start_stream_time": 60.0,
+                    "end_stream_time": 120.0,
+                },
+            )
             self.assertEqual(
                 ocr_task.result["degradation_mode"],
                 "minute_boundary_fallback",
@@ -1407,6 +2466,34 @@ class VisionRuntimeTests(unittest.TestCase):
                     materialize_analysis_clip(
                         "ffmpeg", [Segment(segment_path, 0.0, 10.0)], output,
                         window_start=2.0, window_end=6.0, anchor=4.0,
+                    )
+
+            self.assertFalse(output.exists())
+            self.assertEqual(list(root.glob("vision_segments_*.txt")), [])
+
+    def test_materialize_analysis_clip_enforces_optional_timeout_and_cleans_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            segment_path = root / "segment.ts"
+            segment_path.write_bytes(b"video")
+            output = root / "analysis.mp4"
+            output.write_bytes(b"stale")
+
+            def fake_run(command, **kwargs):
+                self.assertEqual(kwargs["timeout"], 2.5)
+                Path(command[-1]).write_bytes(b"partial")
+                raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+            with patch("vision_runtime.subprocess.run", side_effect=fake_run):
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    materialize_analysis_clip(
+                        "ffmpeg",
+                        [Segment(segment_path, 0.0, 10.0)],
+                        output,
+                        window_start=2.0,
+                        window_end=6.0,
+                        anchor=4.0,
+                        timeout_seconds=2.5,
                     )
 
             self.assertFalse(output.exists())

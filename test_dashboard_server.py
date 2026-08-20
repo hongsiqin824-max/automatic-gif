@@ -757,28 +757,311 @@ class DashboardTests(unittest.TestCase):
         )
         self.assertEqual(vision["error"], "no valid clock")
 
+    def test_database_exposes_incremental_ocr_dashboard_diagnostics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "pipeline_state.sqlite3"
+            runtime = dashboard_server.sqlite3.connect(database)
+            runtime.executescript(
+                """
+                CREATE TABLE event_tasks (
+                    event_key TEXT, code TEXT, event_type TEXT, event_json TEXT,
+                    status TEXT, discovered_at_unix REAL, updated_at_unix REAL,
+                    output_path TEXT, output_bytes INTEGER, result_json TEXT,
+                    error TEXT
+                );
+                CREATE TABLE vision_tasks (
+                    event_key TEXT, status TEXT, located_anchor_stream_time REAL,
+                    confidence REAL, inference_seconds REAL, model_name TEXT,
+                    model_version TEXT, output_path TEXT, output_bytes INTEGER,
+                    result_json TEXT, error TEXT, last_error_kind TEXT,
+                    failure_stage TEXT, failure_reason TEXT,
+                    location_json TEXT, window_json TEXT,
+                    next_attempt_at_unix REAL, deadline_at_unix REAL,
+                    artifact_kind TEXT, created_at_unix REAL
+                );
+                """
+            )
+            event = {"event_key": "m:G:incremental-ocr", "code": "G", "event_type": "goal"}
+            runtime.execute(
+                "INSERT INTO event_tasks VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                ("m:G:incremental-ocr", "G", "goal", json.dumps(event),
+                 "encoded", 1, 2, "/tmp/default.gif", 10, "{}", None),
+            )
+            runtime.execute(
+                "INSERT INTO vision_tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("m:G:incremental-ocr", "pending", None, None, None,
+                 "PaddleOCR", "1", None, None,
+                 json.dumps({
+                     "stage": "waiting_for_clock_target",
+                 }), "waiting", "waiting_for_clock_target", None, None,
+                 json.dumps({}),
+                 json.dumps({
+                     "progressive_scan": {
+                         "state": "waiting_for_clock_target",
+                         "scan_cursor_stream_time": 88.5,
+                         "latest_trusted_clock": "07:35",
+                         "latest_trusted_clock_seconds": 455,
+                         "scan_attempt_count": 3,
+                         "last_scan_start_stream_time": 20.0,
+                         "last_scan_end_stream_time": 100.0,
+                     },
+                 }), 30.0, 120.0, "ocr_window", 1),
+            )
+            runtime.commit()
+            runtime.close()
+            tasks, _, _ = dashboard_server._tasks_from_database(database)
+
+        self.assertEqual(tasks[0]["status"], "encoded")
+        ocr = tasks[0]["ocr_window"]
+        self.assertEqual(ocr["status"], "pending")
+        self.assertEqual(ocr["ocr_pipeline_status"], "waiting_for_clock_target")
+        self.assertEqual(ocr["scan_cursor"], 88.5)
+        self.assertEqual(ocr["last_trusted_clock"], "07:35")
+        self.assertEqual(ocr["last_trusted_clock_seconds"], 455)
+        self.assertEqual(ocr["scan_attempt_count"], 3)
+        self.assertEqual(ocr["next_attempt_at_unix"], 30.0)
+        self.assertEqual(ocr["deadline_at_unix"], 120.0)
+        self.assertEqual(ocr["scan_window"]["start_stream_time"], 20.0)
+
+    def test_database_normalizes_progressive_ocr_failure_kind(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "pipeline_state.sqlite3"
+            runtime = dashboard_server.sqlite3.connect(database)
+            runtime.executescript(
+                """
+                CREATE TABLE event_tasks (
+                    event_key TEXT, code TEXT, event_type TEXT, event_json TEXT,
+                    status TEXT, discovered_at_unix REAL, updated_at_unix REAL,
+                    output_path TEXT, output_bytes INTEGER, result_json TEXT,
+                    error TEXT
+                );
+                CREATE TABLE vision_tasks (
+                    event_key TEXT, status TEXT, located_anchor_stream_time REAL,
+                    confidence REAL, inference_seconds REAL, model_name TEXT,
+                    model_version TEXT, output_path TEXT, output_bytes INTEGER,
+                    result_json TEXT, error TEXT, last_error_kind TEXT,
+                    failure_stage TEXT, failure_reason TEXT,
+                    artifact_kind TEXT, created_at_unix REAL
+                );
+                """
+            )
+            event = {"event_key": "m:G:ocr-timeout", "code": "G", "event_type": "goal"}
+            runtime.execute(
+                "INSERT INTO event_tasks VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                ("m:G:ocr-timeout", "G", "goal", json.dumps(event),
+                 "encoded", 1, 2, "/tmp/default.gif", 10, "{}", None),
+            )
+            runtime.execute(
+                "INSERT INTO vision_tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("m:G:ocr-timeout", "failed", None, None, None,
+                 "PaddleOCR", "1", None, None,
+                 json.dumps({
+                     "error_kind": "ocr_clock_target_timeout",
+                     "failure_reason": {
+                         "kind": "ocr_clock_target_timeout",
+                         "stage": "ocr_progressive_scan",
+                         "message": "target not reached",
+                     },
+                 }), "target not reached", "ocr_clock_target_timeout",
+                 "ocr_progressive_scan", "target not reached",
+                 "ocr_window", 1),
+            )
+            runtime.commit()
+            runtime.close()
+            tasks, _, _ = dashboard_server._tasks_from_database(database)
+
+        self.assertEqual(
+            tasks[0]["ocr_window"]["ocr_pipeline_status"],
+            "ocr_target_timeout",
+        )
+
+    def test_database_normalizes_ocr_window_failure_families(self):
+        mappings = {
+            "ocr_output_video_gap": "ocr_window_evicted",
+            "ocr_inference_failed": "ocr_dependency_unavailable",
+            "ocr_processing_failed": "ocr_dependency_unavailable",
+            "ocr_window_encoding_failed": "ocr_encode_failed",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "pipeline_state.sqlite3"
+            runtime = dashboard_server.sqlite3.connect(database)
+            runtime.executescript(
+                """
+                CREATE TABLE event_tasks (
+                    event_key TEXT, code TEXT, event_type TEXT, event_json TEXT,
+                    status TEXT, discovered_at_unix REAL, updated_at_unix REAL,
+                    output_path TEXT, output_bytes INTEGER, result_json TEXT,
+                    error TEXT
+                );
+                CREATE TABLE vision_tasks (
+                    event_key TEXT, status TEXT, located_anchor_stream_time REAL,
+                    confidence REAL, inference_seconds REAL, model_name TEXT,
+                    model_version TEXT, output_path TEXT, output_bytes INTEGER,
+                    result_json TEXT, error TEXT, last_error_kind TEXT,
+                    failure_stage TEXT, failure_reason TEXT,
+                    artifact_kind TEXT, created_at_unix REAL
+                );
+                """
+            )
+            for index, error_kind in enumerate(mappings):
+                event_key = f"m:G:ocr-family-{index}"
+                event = {"event_key": event_key, "code": "G", "event_type": "goal"}
+                runtime.execute(
+                    "INSERT INTO event_tasks VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (event_key, "G", "goal", json.dumps(event),
+                     "encoded", index + 1, index + 2, "/tmp/default.gif", 10, "{}", None),
+                )
+                runtime.execute(
+                    "INSERT INTO vision_tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (event_key, "failed", None, None, None, "PaddleOCR", "1",
+                     None, None, json.dumps({"error_kind": error_kind}),
+                     error_kind, error_kind, "ocr_progressive_scan", error_kind,
+                     "ocr_window", index + 1),
+                )
+            runtime.commit()
+            runtime.close()
+            tasks, _, _ = dashboard_server._tasks_from_database(database)
+
+        actual = {
+            task["event_key"]: task["ocr_window"]["ocr_pipeline_status"]
+            for task in tasks
+        }
+        for index, (error_kind, expected) in enumerate(mappings.items()):
+            self.assertEqual(actual[f"m:G:ocr-family-{index}"], expected)
+
+    def test_database_maps_ocr_resolution_and_final_clip_window(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "pipeline_state.sqlite3"
+            runtime = dashboard_server.sqlite3.connect(database)
+            runtime.executescript(
+                """
+                CREATE TABLE event_tasks (
+                    event_key TEXT, code TEXT, event_type TEXT, event_json TEXT,
+                    status TEXT, discovered_at_unix REAL, updated_at_unix REAL,
+                    output_path TEXT, output_bytes INTEGER, result_json TEXT,
+                    error TEXT
+                );
+                CREATE TABLE vision_tasks (
+                    event_key TEXT, status TEXT, located_anchor_stream_time REAL,
+                    confidence REAL, inference_seconds REAL, model_name TEXT,
+                    model_version TEXT, output_path TEXT, output_bytes INTEGER,
+                    result_json TEXT, error TEXT, artifact_kind TEXT,
+                    created_at_unix REAL
+                );
+                """
+            )
+            event = {"event_key": "m:G:exact-ocr", "code": "G", "event_type": "goal"}
+            runtime.execute(
+                "INSERT INTO event_tasks VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                ("m:G:exact-ocr", "G", "goal", json.dumps(event),
+                 "encoded", 1, 2, "/tmp/default.gif", 10, "{}", None),
+            )
+            runtime.execute(
+                "INSERT INTO vision_tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("m:G:exact-ocr", "encoded", 80.0, None, 1.0,
+                 "PaddleOCR", "1", "/tmp/ocr.gif", 8,
+                 json.dumps({
+                     "stage": "encoded",
+                     "visual_resolution": "ocr_second_exact",
+                     "requested_media_window": {
+                         "start_stream_time": 50.0,
+                         "end_stream_time": 110.0,
+                     },
+                 }), None, "ocr_window", 1),
+            )
+            runtime.commit()
+            runtime.close()
+            tasks, _, _ = dashboard_server._tasks_from_database(database)
+
+        ocr = tasks[0]["ocr_window"]
+        self.assertEqual(ocr["ocr_pipeline_status"], "ocr_second_exact")
+        self.assertEqual(ocr["final_clip_window"]["start_stream_time"], 50.0)
+
+    def test_database_marks_near_neighbor_ocr_as_estimated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "pipeline_state.sqlite3"
+            runtime = dashboard_server.sqlite3.connect(database)
+            runtime.executescript(
+                """
+                CREATE TABLE event_tasks (
+                    event_key TEXT, code TEXT, event_type TEXT, event_json TEXT,
+                    status TEXT, discovered_at_unix REAL, updated_at_unix REAL,
+                    output_path TEXT, output_bytes INTEGER, result_json TEXT,
+                    error TEXT
+                );
+                CREATE TABLE vision_tasks (
+                    event_key TEXT, status TEXT, located_anchor_stream_time REAL,
+                    confidence REAL, inference_seconds REAL, model_name TEXT,
+                    model_version TEXT, output_path TEXT, output_bytes INTEGER,
+                    result_json TEXT, error TEXT, artifact_kind TEXT,
+                    created_at_unix REAL
+                );
+                """
+            )
+            event = {"event_key": "m:G:estimated-ocr", "code": "G", "event_type": "goal"}
+            runtime.execute(
+                "INSERT INTO event_tasks VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                ("m:G:estimated-ocr", "G", "goal", json.dumps(event),
+                 "encoded", 1, 2, "/tmp/default.gif", 10, "{}", None),
+            )
+            runtime.execute(
+                "INSERT INTO vision_tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("m:G:estimated-ocr", "encoded", 80.0, None, 1.0,
+                 "PaddleOCR", "1", "/tmp/ocr.gif", 8,
+                 json.dumps({
+                     "stage": "encoded",
+                     "localization_source": "exact_second",
+                     "localization_quality": "estimated",
+                     "degraded": True,
+                     "estimated_error_bound_seconds": 2,
+                 }), None, "ocr_window", 1),
+            )
+            runtime.commit()
+            runtime.close()
+            tasks, _, _ = dashboard_server._tasks_from_database(database)
+
+        ocr = tasks[0]["ocr_window"]
+        self.assertEqual(ocr["ocr_pipeline_status"], "ocr_second_estimated")
+        self.assertFalse(ocr["precise_location"])
+
     def test_new_session_defaults_to_calibrated_candidate_window(self):
         manager = dashboard_server.Dashboard(background_monitors=False)
         session = manager.get("default-gif-only")
 
         self.assertEqual(session.before_seconds, 30.0)
         self.assertEqual(session.after_seconds, 20.0)
-        self.assertEqual(session.event_to_video_offset_seconds, -30.0)
+        self.assertEqual(session.event_to_video_offset_seconds, -10.0)
         self.assertEqual(session.gif_width, 768)
         self.assertEqual(session.gif_fps, 16.0)
         self.assertEqual(session.gif_colors, 256)
         self.assertTrue(session.vision_enabled)
+        self.assertFalse(session.tdeed_enabled)
         payload = dashboard_server._session_json(session)
         self.assertEqual(payload["gif"]["before_seconds"], 30.0)
         self.assertEqual(payload["gif"]["after_seconds"], 20.0)
-        self.assertEqual(payload["gif"]["event_to_video_offset_seconds"], -30.0)
+        self.assertEqual(payload["gif"]["event_to_video_offset_seconds"], -10.0)
         self.assertEqual(payload["gif"]["width"], 768)
         self.assertEqual(payload["gif"]["fps"], 16.0)
         self.assertEqual(payload["gif"]["colors"], 256)
         self.assertTrue(payload["vision"]["enabled"])
         self.assertFalse(payload["vision"]["worker_enabled"])
+        self.assertFalse(payload["vision"]["tdeed_enabled"])
+        self.assertFalse(payload["vision"]["worker_tdeed_enabled"])
         self.assertEqual(payload["vision"]["search_before_seconds"], 120.0)
         self.assertEqual(payload["vision"]["search_after_seconds"], 0.0)
+        self.assertEqual(payload["vision"]["fallback_gif"]["duration_seconds"], 60.0)
+        self.assertEqual(
+            payload["vision"]["fallback_gif"]["exact_second_before_seconds"],
+            30.0,
+        )
+        self.assertEqual(
+            payload["vision"]["fallback_gif"]["minute_boundary_before_seconds"],
+            60.0,
+        )
+        self.assertEqual(
+            payload["vision"]["fallback_gif"]["minute_boundary_after_seconds"],
+            0.0,
+        )
         self.assertEqual(payload["vision"]["fallback_gif"]["width"], 384)
         self.assertEqual(payload["vision"]["fallback_gif"]["fps"], 6.0)
 
@@ -1071,7 +1354,7 @@ class DashboardTests(unittest.TestCase):
 
         self.assertIn('id="before" type="number" value="30"', html)
         self.assertIn('id="after" type="number" value="20"', html)
-        self.assertIn('id="event-offset" type="number" value="-30"', html)
+        self.assertIn('id="event-offset" type="number" value="-10"', html)
         self.assertIn('id="width" type="number" value="768"', html)
         self.assertIn('id="vision-enabled" type="checkbox" checked', html)
         self.assertIn('id="vision-state">默认开启', html)
@@ -1103,7 +1386,7 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(command[command.index("--after") + 1], "20.0")
         self.assertEqual(
             command[command.index("--event-to-video-offset") + 1],
-            "-30.0",
+            "-10.0",
         )
         self.assertEqual(
             command[command.index("--buffer-seconds") + 1],
@@ -1117,6 +1400,7 @@ class DashboardTests(unittest.TestCase):
             dashboard_server.WORKER_FINISH_GRACE_SECONDS,
         )
         self.assertIn("--vision-enabled", command)
+        self.assertNotIn("--tdeed-enabled", command)
         self.assertEqual(
             command[command.index("--vision-search-before") + 1],
             "120.0",
@@ -1128,6 +1412,8 @@ class DashboardTests(unittest.TestCase):
         payload = response.get_json()
         self.assertTrue(payload["vision"]["enabled"])
         self.assertTrue(payload["vision"]["worker_enabled"])
+        self.assertFalse(payload["vision"]["tdeed_enabled"])
+        self.assertFalse(payload["vision"]["worker_tdeed_enabled"])
 
     def test_live_start_passes_match_start_play_to_worker(self):
         manager = dashboard_server.Dashboard(background_monitors=False)
@@ -1187,6 +1473,7 @@ class DashboardTests(unittest.TestCase):
         command = popen.call_args.args[0]
         self.assertIn("--vision-enabled", command)
         self.assertIn("--ocr-clock-only", command)
+        self.assertNotIn("--tdeed-enabled", command)
         self.assertEqual(command[command.index("--vision-before") + 1], "7")
         self.assertEqual(command[command.index("--vision-after") + 1], "11")
         self.assertEqual(
@@ -1223,12 +1510,12 @@ class DashboardTests(unittest.TestCase):
         self.assertIn("--vision-enabled", command)
         self.assertNotIn("--ocr-clock-only", command)
 
-    def test_dashboard_keeps_clock_only_behind_replay_validation_gate(self):
+    def test_dashboard_enables_clock_only_by_default(self):
         manager = dashboard_server.Dashboard(background_monitors=False)
-        session = manager.get("vision-validation-gate")
+        session = manager.get("vision-clock-only-default")
 
         self.assertTrue(session.vision_enabled)
-        self.assertFalse(session.vision_clock_only)
+        self.assertTrue(session.vision_clock_only)
 
     def test_dashboard_passes_explicit_scoreboard_profile_path(self):
         manager = dashboard_server.Dashboard(background_monitors=False)

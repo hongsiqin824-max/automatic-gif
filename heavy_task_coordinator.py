@@ -16,6 +16,7 @@ from typing import Any, Callable
 
 DEFAULT_MAX_CONCURRENT_HEAVY_TASKS = 2
 DEFAULT_MAX_CONCURRENT_VISION_TASKS = 1
+DEFAULT_RESERVED_GIF_SLOTS = 1
 DEFAULT_LEASE_SECONDS = 15.0
 DEFAULT_POLL_SECONDS = 0.1
 DEFAULT_DATABASE_PATH = (
@@ -288,7 +289,7 @@ class HeavyTaskCoordinator:
     def _requirements(task_kind: str) -> tuple[int, int]:
         if task_kind == "gif":
             return 1, 0
-        if task_kind == "vision":
+        if task_kind in {"vision", "vision_ocr", "vision_tdeed"}:
             return 1, 1
         raise ValueError(f"unsupported heavy task kind: {task_kind!r}")
 
@@ -442,16 +443,34 @@ class HeavyTaskCoordinator:
             ).fetchone()
             heavy_available = int(config["max_heavy_tasks"]) - int(usage[0])
             vision_available = int(config["max_vision_tasks"]) - int(usage[1])
+            maximum_active_vision = max(
+                1,
+                int(config["max_heavy_tasks"]) - DEFAULT_RESERVED_GIF_SLOTS,
+            )
             eligible = False
             for queued in connection.execute(
-                "SELECT request_id, heavy_units, vision_units "
+                "SELECT request_id, task_kind, heavy_units, vision_units "
                 "FROM task_slot_requests ORDER BY "
-                "CASE task_kind WHEN 'gif' THEN 0 ELSE 1 END, "
+                "CASE task_kind "
+                "WHEN 'gif' THEN 0 "
+                "WHEN 'vision_ocr' THEN 1 "
+                "WHEN 'vision' THEN 1 "
+                "WHEN 'vision_tdeed' THEN 2 "
+                "ELSE 3 END, "
                 "requested_at_unix, rowid"
             ):
                 fits = (
                     queued["heavy_units"] <= heavy_available
                     and queued["vision_units"] <= vision_available
+                    and (
+                        queued["task_kind"] not in {
+                            "vision",
+                            "vision_ocr",
+                            "vision_tdeed",
+                        }
+                        or int(usage[1]) + int(queued["vision_units"])
+                        <= maximum_active_vision
+                    )
                 )
                 if queued["request_id"] == request_id:
                     eligible = fits
@@ -700,6 +719,7 @@ def run_with_task_slot(
     *args: Any,
     cancel_event: threading.Event | None = None,
     function_kwargs: dict[str, Any] | None = None,
+    on_state_change: Callable[[str, float], None] | None = None,
 ) -> Any:
     """Run a callable while holding the requested cross-process slot."""
     with coordinator.acquire(
@@ -708,4 +728,7 @@ def run_with_task_slot(
         event_key=event_key,
         cancel_event=cancel_event,
     ):
+        if on_state_change is not None:
+            on_state_change("acquired", time.time())
+            on_state_change("executing", time.time())
         return function(*args, **(function_kwargs or {}))

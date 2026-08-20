@@ -11,6 +11,8 @@ from event_driven_pipeline import (
     EVENT_VISUAL_WINDOW_LEASE_OWNER,
     EventRevisionTracker,
     MatchEvent,
+    disable_incomplete_tdeed_tasks,
+    enabled_vision_artifact_kinds,
     encode_event_job,
     protect_incomplete_vision_event_segments,
     parse_match_events,
@@ -766,6 +768,35 @@ class PipelineRuntimeTests(unittest.TestCase):
         self.assertEqual(default_after.output_path, default_before.output_path)
         reopened.close()
 
+    def test_disabling_tdeed_keeps_ocr_runnable_and_makes_refinement_terminal(self):
+        runtime = PipelineRuntime(self.database_path, self.log_path)
+        self.assertTrue(discover(runtime))
+        self.assertTrue(enqueue_vision(runtime))
+        self.assertTrue(runtime.enqueue_vision_task(
+            "match-1:G:key",
+            artifact_kind="ocr_window",
+            search_start_stream_time=10.0,
+            search_end_stream_time=40.0,
+            clip_before_seconds=30.0,
+            clip_after_seconds=30.0,
+            model_name="PaddleOCR",
+        ))
+
+        self.assertEqual(enabled_vision_artifact_kinds(tdeed_enabled=False), ("ocr_window",))
+        self.assertEqual(disable_incomplete_tdeed_tasks(runtime, "match-1"), 1)
+
+        ocr = runtime.store.get_vision_task("match-1:G:key", "ocr_window")
+        tdeed = runtime.store.get_vision_task("match-1:G:key", "tdeed_refined")
+        self.assertEqual(ocr.status, "pending")
+        self.assertEqual(tdeed.status, "failed")
+        self.assertTrue(tdeed.result["disabled"])
+        self.assertEqual(tdeed.last_error_kind, "tdeed_disabled")
+        self.assertEqual(
+            runtime.store.list_incomplete_vision_tasks("match-1"),
+            [ocr],
+        )
+        runtime.close()
+
     def test_recovery_updates_each_visual_artifact_row_independently(self):
         runtime = PipelineRuntime(self.database_path, self.log_path)
         discover(runtime)
@@ -942,6 +973,150 @@ class PipelineRuntimeTests(unittest.TestCase):
         self.assertEqual(completed.status, "encoded")
         self.assertEqual(completed.located_anchor_stream_time, 26.0)
         self.assertEqual(completed.output_path, "/tmp/helper-refined.gif")
+        runtime.close()
+
+    def test_complete_vision_preserves_existing_anchor_when_result_omits_it(self):
+        runtime = PipelineRuntime(self.database_path, self.log_path)
+        discover(runtime)
+        enqueue_vision(runtime)
+        runtime.transition_vision_task("match-1:G:key", "locating")
+        runtime.transition_vision_task(
+            "match-1:G:key",
+            "located",
+            result={"anchor_stream_time": 25.0},
+        )
+        runtime.transition_vision_task("match-1:G:key", "encoding")
+
+        completed = runtime.complete_vision(
+            "match-1:G:key",
+            {
+                "anchor_stream_time": None,
+                "vision_anchor_stream_time_sec": None,
+                "output": "/tmp/preserved-anchor.gif",
+                "bytes": 55,
+            },
+        )
+
+        self.assertEqual(completed.status, "encoded")
+        self.assertEqual(completed.located_anchor_stream_time, 25.0)
+        self.assertEqual(completed.result["anchor_stream_time"], 25.0)
+        self.assertEqual(completed.location_metadata["anchor_stream_time"], 25.0)
+        runtime.close()
+
+    def test_complete_vision_accepts_zero_anchor(self):
+        runtime = PipelineRuntime(self.database_path, self.log_path)
+        discover(runtime)
+        enqueue_vision(runtime)
+        runtime.start_vision("match-1:G:key")
+
+        completed = runtime.complete_vision(
+            "match-1:G:key",
+            {
+                "anchor_stream_time": 0.0,
+                "output": "/tmp/zero-anchor.gif",
+                "bytes": 55,
+            },
+        )
+
+        self.assertEqual(completed.status, "encoded")
+        self.assertEqual(completed.located_anchor_stream_time, 0.0)
+        self.assertEqual(completed.result["anchor_stream_time"], 0.0)
+        runtime.close()
+
+    def test_complete_vision_without_any_anchor_does_not_advance_state(self):
+        runtime = PipelineRuntime(self.database_path, self.log_path)
+        discover(runtime)
+        enqueue_vision(runtime)
+        runtime.start_vision("match-1:G:key")
+
+        with self.assertRaisesRegex(ValueError, "must have an anchor"):
+            runtime.complete_vision(
+                "match-1:G:key",
+                {"output": "/tmp/missing-anchor.gif", "bytes": 55},
+            )
+
+        task = runtime.store.get_vision_task("match-1:G:key")
+        self.assertEqual(task.status, "locating")
+        self.assertIsNone(task.located_anchor_stream_time)
+        self.assertNotIn("anchor_stream_time", task.result)
+        runtime.close()
+
+    def test_complete_vision_rejects_invalid_anchor_before_advancing_state(self):
+        runtime = PipelineRuntime(self.database_path, self.log_path)
+        discover(runtime)
+        enqueue_vision(runtime)
+        runtime.transition_vision_task("match-1:G:key", "locating")
+        runtime.transition_vision_task(
+            "match-1:G:key",
+            "located",
+            result={"anchor_stream_time": 25.0},
+        )
+
+        with self.assertRaisesRegex(ValueError, "finite number"):
+            runtime.complete_vision(
+                "match-1:G:key",
+                {
+                    "anchor_stream_time": float("nan"),
+                    "output": "/tmp/invalid-anchor.gif",
+                    "bytes": 55,
+                },
+            )
+
+        task = runtime.store.get_vision_task("match-1:G:key")
+        self.assertEqual(task.status, "located")
+        self.assertEqual(task.located_anchor_stream_time, 25.0)
+        self.assertEqual(task.result["anchor_stream_time"], 25.0)
+        runtime.close()
+
+    def test_encoded_transition_preserves_anchor_when_result_reports_none(self):
+        runtime = PipelineRuntime(self.database_path, self.log_path)
+        discover(runtime)
+        enqueue_vision(runtime)
+        runtime.transition_vision_task("match-1:G:key", "locating")
+        runtime.transition_vision_task(
+            "match-1:G:key",
+            "located",
+            result={"anchor_stream_time": 25.0},
+        )
+        runtime.transition_vision_task("match-1:G:key", "encoding")
+
+        encoded = runtime.transition_vision_task(
+            "match-1:G:key",
+            "encoded",
+            result={
+                "anchor_stream_time": None,
+                "output": "/tmp/direct-encoded.gif",
+                "bytes": 55,
+            },
+        )
+
+        self.assertEqual(encoded.located_anchor_stream_time, 25.0)
+        self.assertEqual(encoded.result["anchor_stream_time"], 25.0)
+        self.assertEqual(encoded.location_metadata["anchor_stream_time"], 25.0)
+        runtime.close()
+
+    def test_vision_transition_rejects_invalid_anchor_without_advancing_state(self):
+        runtime = PipelineRuntime(self.database_path, self.log_path)
+        for index, invalid_anchor in enumerate(
+            (float("nan"), float("inf"), float("-inf"), -1.0, True)
+        ):
+            event_key = f"match-1:G:invalid-{index}"
+            with self.subTest(anchor=invalid_anchor):
+                discover(runtime, event_key)
+                enqueue_vision(runtime, event_key)
+                runtime.transition_vision_task(event_key, "locating")
+                with self.assertRaisesRegex(
+                    ValueError, "finite number|non-negative"
+                ):
+                    runtime.transition_vision_task(
+                        event_key,
+                        "located",
+                        result={"anchor_stream_time": invalid_anchor},
+                    )
+
+                task = runtime.store.get_vision_task(event_key)
+                self.assertEqual(task.status, "locating")
+                self.assertIsNone(task.located_anchor_stream_time)
         runtime.close()
 
     def test_combined_vision_runner_retry_keeps_task_recoverable(self):
@@ -1493,6 +1668,128 @@ class PipelineRuntimeTests(unittest.TestCase):
         self.assertEqual(task.status, "failed")
         self.assertEqual(task.last_error_kind, "degraded_clip_too_short")
         runtime.close()
+
+
+class VisionQueueTimingTests(unittest.TestCase):
+    def test_stage_wait_persists_custom_retry_and_deadline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = PipelineRuntime(root / "state.sqlite3", root / "events.jsonl")
+            try:
+                discover(runtime)
+                runtime.enqueue_vision_task(
+                    "match-1:G:key",
+                    artifact_kind="ocr_window",
+                    search_start_stream_time=0.0,
+                    search_end_stream_time=80.0,
+                    clip_before_seconds=60.0,
+                    clip_after_seconds=0.0,
+                    deadline_at_unix=1060.0,
+                    now=1000.0,
+                )
+                waited = runtime.record_vision_readiness_wait(
+                    "match-1:G:key",
+                    "target clock is still 70 seconds away",
+                    artifact_kind="ocr_window",
+                    error_kind="waiting_for_clock_target",
+                    next_attempt_at_unix=1030.0,
+                    deadline_at_unix=1090.0,
+                    window_metadata={
+                        "progressive_scan": {
+                            "state": "waiting_for_clock_target",
+                            "deadline_policy": {
+                                "target_deadline_at_unix": 1090.0,
+                            },
+                        },
+                    },
+                    now=1000.0,
+                )
+
+                self.assertEqual(waited.next_attempt_at_unix, 1030.0)
+                self.assertEqual(waited.deadline_at_unix, 1090.0)
+                runtime.close()
+                runtime = PipelineRuntime(
+                    root / "state.sqlite3",
+                    root / "events.jsonl",
+                )
+                reopened = runtime.store.get_vision_task(
+                    "match-1:G:key",
+                    "ocr_window",
+                )
+                self.assertEqual(reopened.next_attempt_at_unix, 1030.0)
+                self.assertEqual(reopened.deadline_at_unix, 1090.0)
+                self.assertEqual(
+                    reopened.window_metadata["progressive_scan"][
+                        "deadline_policy"
+                    ]["target_deadline_at_unix"],
+                    1090.0,
+                )
+            finally:
+                runtime.close()
+
+    def test_actual_queue_wait_extends_only_the_artifact_deadline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = PipelineRuntime(root / "state.sqlite3", root / "events.jsonl")
+            try:
+                discover(runtime)
+                runtime.enqueue_vision_task(
+                    "match-1:G:key",
+                    artifact_kind="ocr_window",
+                    search_start_stream_time=0.0,
+                    search_end_stream_time=80.0,
+                    clip_before_seconds=60.0,
+                    clip_after_seconds=0.0,
+                    deadline_at_unix=1060.0,
+                    now=1000.0,
+                )
+                runtime.enqueue_vision_task(
+                    "match-1:G:key",
+                    artifact_kind="tdeed_refined",
+                    search_start_stream_time=0.0,
+                    search_end_stream_time=80.0,
+                    clip_before_seconds=8.0,
+                    clip_after_seconds=12.0,
+                    deadline_at_unix=1070.0,
+                    now=1000.0,
+                )
+                runtime.record_vision_queue_phase(
+                    "match-1:G:key",
+                    "queued",
+                    artifact_kind="ocr_window",
+                    now=1010.0,
+                )
+                acquired = runtime.record_vision_queue_phase(
+                    "match-1:G:key",
+                    "acquired",
+                    artifact_kind="ocr_window",
+                    queued_at_unix=1010.0,
+                    now=1035.0,
+                )
+                executing = runtime.record_vision_queue_phase(
+                    "match-1:G:key",
+                    "executing",
+                    artifact_kind="ocr_window",
+                    queued_at_unix=1010.0,
+                    now=1036.0,
+                )
+
+                self.assertEqual(acquired.deadline_at_unix, 1085.0)
+                self.assertEqual(executing.deadline_at_unix, 1085.0)
+                self.assertEqual(
+                    runtime.store.get_vision_task(
+                        "match-1:G:key",
+                        "tdeed_refined",
+                    ).deadline_at_unix,
+                    1070.0,
+                )
+                timing = executing.window_metadata["queue_timing"]
+                self.assertEqual(timing["phase"], "executing")
+                self.assertEqual(timing["queue_wait_seconds"], 25.0)
+                self.assertEqual(timing["deadline_extension_seconds"], 25.0)
+                self.assertEqual(timing["execution_started_at_unix"], 1036.0)
+            finally:
+                runtime.close()
 
 
 if __name__ == "__main__":

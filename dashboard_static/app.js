@@ -288,7 +288,23 @@ function visionLocatorMethodLabel(vision) {
 
 function visionPresentation(vision, enabled = true) {
   if (!vision) return enabled ? {label:'等待 AI 任务', cls:'off'} : {label:'AI 已关闭', cls:'off'};
+  if (vision.disabled === true || vision.last_error_kind === 'tdeed_disabled' || vision.error_kind === 'tdeed_disabled') return {label:'已停用', cls:'off'};
   if (vision.artifact_kind === 'ocr_window') {
+    const pipelineStatus = String(vision.ocr_pipeline_status || '').trim();
+    const pipelinePresentation = ({
+      waiting_for_clock_target:{label:'正在扫描目标时钟',cls:'encoding'},
+      waiting_for_postroll:{label:'目标已定位 · 等待后置画面',cls:'pending'},
+      ocr_second_exact:{label:'秒级时钟精确定位',cls:vision.status === 'encoded' ? 'encoded' : 'encoding'},
+      ocr_second_estimated:{label:'秒级时钟近邻估算（±2秒）',cls:vision.status === 'encoded' ? 'encoded' : 'encoding'},
+      ocr_minute_fallback:{label:'分钟级兜底定位',cls:vision.status === 'encoded' ? 'encoded' : 'encoding'},
+      ocr_no_clock_detected:{label:'OCR 未检测到时钟',cls:'failed'},
+      ocr_target_timeout:{label:'目标时钟定位超时',cls:'failed'},
+      ocr_window_evicted:{label:'OCR 搜索窗口已被淘汰',cls:'failed'},
+      ocr_discontinuous_clock:{label:'比赛时钟不连续',cls:'failed'},
+      ocr_encode_failed:{label:'OCR GIF 编码失败',cls:'failed'},
+      ocr_dependency_unavailable:{label:'OCR 依赖不可用',cls:'failed'}
+    })[pipelineStatus];
+    if (pipelinePresentation) return pipelinePresentation;
     const degraded = vision.degraded === true || vision.localization_quality === 'degraded';
     return ({
       pending:{label:'等待时钟定位',cls:'pending'}, locating:{label:'OCR 时钟定位中',cls:'encoding'},
@@ -324,7 +340,12 @@ function visionFailureDetail(vision) {
     event_second_localization:'事件秒级定位', event_localization:'事件定位',
     fragmented_search:'视频连续片段扫描', buffer_coverage:'视频窗口覆盖检查',
     ocr_clock_discovery:'OCR 时钟识别', ocr_target_localization:'OCR 目标时刻定位',
-    ocr_window_encoding:'OCR 60秒 GIF 编码',
+    ocr_window_encoding:'OCR 60秒 GIF 编码', waiting_for_clock_target:'等待目标时钟',
+    waiting_for_postroll:'等待目标后的画面', ocr_second_exact:'秒级时钟定位', ocr_second_estimated:'秒级时钟近邻估算（±2秒）',
+    ocr_minute_fallback:'分钟级兜底定位', ocr_no_clock_detected:'OCR 时钟检测',
+    ocr_target_timeout:'OCR 目标定位', ocr_window_evicted:'OCR 搜索窗口',
+    ocr_discontinuous_clock:'OCR 时钟连续性校验', ocr_encode_failed:'OCR GIF 编码',
+    ocr_dependency_unavailable:'OCR 依赖检查', ocr_progressive_scan:'OCR 渐进扫描',
     tdeed_model_unavailable:'T-DEED 模型加载', tdeed_inference:'T-DEED 推理',
     tdeed_candidate_selection:'T-DEED 候选选择', tdeed_output_encoding:'T-DEED 20秒 GIF 编码'
   })[stage] || stage || '未知阶段';
@@ -349,11 +370,87 @@ function visionFailureDetail(vision) {
     ,tdeed_candidate_selection_failed:'T-DEED 候选位置无效'
     ,tdeed_output_encoding_failed:'T-DEED 20秒 GIF 编码失败'
     ,upstream_ocr_window_failed:'OCR 60秒链路失败，T-DEED 未运行'
+    ,tdeed_disabled:'已按配置停用'
+    ,ocr_no_clock_detected:'扫描范围内没有可信比赛时钟'
+    ,ocr_target_timeout:'在截止时间前没有定位到目标时钟'
+    ,ocr_window_evicted:'所需缓存视频已被淘汰'
+    ,ocr_discontinuous_clock:'识别到的比赛时钟不连续'
+    ,ocr_encode_failed:'OCR GIF 编码失败'
+    ,ocr_dependency_unavailable:'PaddleOCR 或运行依赖不可用'
+    ,ocr_clock_target_timeout:'截止前没有到达目标比赛时钟'
+    ,ocr_clock_target_not_located:'目标时钟已经过但没有形成可信锚点'
+    ,ocr_no_trustworthy_clock_before_deadline:'截止前没有可信比赛时钟'
+    ,ocr_postroll_timeout:'目标后的后置画面未进入缓存'
+    ,ocr_output_window_timeout:'OCR 输出窗口未在截止前就绪'
+    ,ocr_search_history_evicted:'目标所需历史缓存已淘汰'
+    ,ocr_output_history_evicted:'OCR 输出所需历史缓存已淘汰'
+    ,ocr_buffer_never_available:'截止前没有可用视频缓存'
+    ,ocr_output_video_gap:'OCR 输出窗口存在视频缺口'
+    ,ocr_window_encoding_failed:'OCR GIF 编码阶段失败'
   })[kind] || kind || String(vision.error || '').trim() || '未提供原因';
   const message = String(structured.message || '').trim();
   const attempts = Array.isArray(vision.fragment_attempts) ? vision.fragment_attempts : [];
   const fragmentDetail = attempts.length ? ` · 已扫描 ${attempts.length} 个连续片段` : '';
   return `阶段：${stageLabel} · 原因：${reasonLabel}${message ? ` · ${message}` : ''}${fragmentDetail}`;
+}
+
+function streamTimeText(value) {
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds) || seconds < 0) return '';
+  const minute = Math.floor(seconds / 60);
+  return `${minute}:${String(Math.floor(seconds % 60)).padStart(2, '0')}`;
+}
+
+function ocrClockValue(value, secondsValue) {
+  if (value != null && String(value).trim()) {
+    if (typeof value === 'object') {
+      const text = value.text || value.clock || value.clock_text;
+      if (text != null && String(text).trim()) return String(text).trim();
+      const nestedSeconds = value.seconds ?? value.clock_seconds;
+      if (nestedSeconds != null) return matchClockText(nestedSeconds);
+      return matchClockText(secondsValue);
+    }
+    return String(value).trim();
+  }
+  return matchClockText(secondsValue);
+}
+
+function streamWindowText(window) {
+  if (!window || typeof window !== 'object') return '';
+  const start = window.start_stream_time ?? window.window_start_stream_time ?? window.requested_window_start_stream_time ?? window.start;
+  const end = window.end_stream_time ?? window.window_end_stream_time ?? window.requested_window_end_stream_time ?? window.end;
+  const startText = streamTimeText(start); const endText = streamTimeText(end);
+  return startText && endText ? `${startText}-${endText}` : startText || endText;
+}
+
+function ocrPipelineDiagnosticsText(vision) {
+  if (!vision) return '';
+  const parts = [];
+  const scanWindow = streamWindowText(vision.scan_window);
+  if (scanWindow) parts.push(`扫描 ${scanWindow}`);
+  const cursor = streamTimeText(vision.scan_cursor);
+  if (cursor) parts.push(`游标 ${cursor}`);
+  const trustedClock = ocrClockValue(vision.last_trusted_clock, vision.last_trusted_clock_seconds);
+  if (trustedClock) parts.push(`最后可信时钟 ${trustedClock}`);
+  if (vision.scan_attempt_count != null) parts.push(`扫描 ${vision.scan_attempt_count} 次`);
+  const finalWindow = streamWindowText(vision.final_clip_window);
+  if (finalWindow) parts.push(`最终剪辑 ${finalWindow}`);
+  const structuredStage = vision.failure_reason && typeof vision.failure_reason === 'object' ? vision.failure_reason.stage : '';
+  const stage = String(structuredStage || vision.stage || '').trim();
+  if (vision.status === 'failed' && stage) {
+    const stageText = ({
+      ocr_clock_discovery:'时钟识别', ocr_target_localization:'目标定位',
+      ocr_window_encoding:'GIF 编码', buffer_coverage:'缓存覆盖',
+      waiting_for_clock_target:'等待目标时钟', waiting_for_postroll:'等待后置画面',
+      ocr_no_clock_detected:'时钟检测', ocr_target_timeout:'目标定位',
+      ocr_window_evicted:'缓存窗口', ocr_discontinuous_clock:'时钟连续性',
+      ocr_encode_failed:'GIF 编码', ocr_dependency_unavailable:'依赖检查'
+    })[stage] || stage;
+    parts.push(`失败阶段 ${stageText}`);
+  }
+  if (vision.next_attempt_at_unix && ['pending', 'locating', 'located'].includes(vision.status)) parts.push(`下次尝试 ${fmtTime(vision.next_attempt_at_unix)}`);
+  if (vision.deadline_at_unix && ['pending', 'locating', 'located'].includes(vision.status)) parts.push(`截止 ${fmtTime(vision.deadline_at_unix)}`);
+  return parts.join(' · ');
 }
 
 function visionOcrDiagnosticsText(vision) {
@@ -494,8 +591,8 @@ function render(data) {
   const statusEl = $('match-status'); statusEl.textContent = `${data.status_label || ''} · ${status}`; statusEl.className = `status-pill ${statusClass(status)}`;
   const pollingConfig = data.polling || {}; const gifConfig = data.gif || {};
   syncInputValue('event-poll', pollingConfig.events_seconds); syncInputValue('source-poll', pollingConfig.source_seconds); syncInputValue('detail-poll', pollingConfig.detail_seconds); syncInputValue('before', gifConfig.before_seconds); syncInputValue('after', gifConfig.after_seconds); syncInputValue('event-offset', gifConfig.event_to_video_offset_seconds); syncInputValue('width', gifConfig.width);
-  const visionConfig = data.vision || {}; const configuredVisionEnabled = visionConfig.enabled === true; const workerVisionEnabled = visionConfig.worker_enabled === true; if (document.activeElement !== $('vision-enabled')) $('vision-enabled').checked = configuredVisionEnabled; if (document.activeElement !== $('vision-before') && visionConfig.before_seconds != null) $('vision-before').value = visionConfig.before_seconds; if (document.activeElement !== $('vision-after') && visionConfig.after_seconds != null) $('vision-after').value = visionConfig.after_seconds;
-  const workerConfigKnown = Boolean(data.worker && Array.isArray(data.worker.command) && data.worker.command.length); $('vision-state').textContent = workerConfigKnown ? `当前 Worker：${workerVisionEnabled ? '开启' : '关闭'}` : configuredVisionEnabled ? '下次启动：开启' : '默认关闭';
+  const visionConfig = data.vision || {}; const configuredVisionEnabled = visionConfig.enabled === true; const configuredTdeedEnabled = visionConfig.tdeed_enabled === true; const configuredClockOnly = visionConfig.clock_only === true; const workerVisionEnabled = visionConfig.worker_enabled === true; const workerTdeedEnabled = visionConfig.worker_tdeed_enabled === true; const workerClockOnly = visionConfig.worker_clock_only === true; if (document.activeElement !== $('vision-enabled')) $('vision-enabled').checked = configuredVisionEnabled; if (document.activeElement !== $('vision-clock-only')) $('vision-clock-only').checked = configuredClockOnly; if (document.activeElement !== $('vision-before') && visionConfig.before_seconds != null) $('vision-before').value = visionConfig.before_seconds; if (document.activeElement !== $('vision-after') && visionConfig.after_seconds != null) $('vision-after').value = visionConfig.after_seconds;
+  const workerConfigKnown = Boolean(data.worker && Array.isArray(data.worker.command) && data.worker.command.length); $('vision-state').textContent = workerConfigKnown ? `当前 Worker：${workerVisionEnabled ? '开启' : '关闭'}` : configuredVisionEnabled ? '下次启动：开启' : '默认关闭'; $('vision-clock-only-state').textContent = workerConfigKnown ? `当前 Worker：${workerClockOnly ? '仅时钟' : '全识别'}` : configuredClockOnly ? '下次启动：仅时钟' : '下次启动：全识别';
   $('team-a').textContent = detail.team_A_name || '主队待加载'; $('team-b').textContent = detail.team_B_name || '客队待加载';
   $('score').textContent = detail.fs_A != null && detail.fs_A !== '' ? `${detail.fs_A} - ${detail.fs_B || 0}` : '-';
   $('match-minute').textContent = detail.minute ? `${detail.minute}' ${detail.minute_period || ''}` : '--';
@@ -550,8 +647,9 @@ function render(data) {
     const ocrWindow = e.ocr_window || artifacts.ocr_window || null;
     const tdeed = e.vision || artifacts.tdeed_refined || null;
     const visionEnabled = worker.running ? workerVisionEnabled : configuredVisionEnabled;
+    const tdeedEnabled = worker.running ? workerTdeedEnabled : configuredTdeedEnabled;
     const ocr = e.status === 'history' && !ocrWindow ? {label:'历史事件 · 未运行',cls:'off'} : visionPresentation(ocrWindow, visionEnabled);
-    const vision = e.status === 'history' && !tdeed ? {label:'历史事件 · 未运行',cls:'off'} : visionPresentation(tdeed, visionEnabled);
+    const vision = !tdeed && !tdeedEnabled ? {label:'已停用',cls:'off'} : e.status === 'history' && !tdeed ? {label:'历史事件 · 未运行',cls:'off'} : visionPresentation(tdeed, tdeedEnabled);
     const confidence = tdeed && tdeed.confidence != null ? ` · 置信度 ${(Number(tdeed.confidence) * 100).toFixed(1)}%` : '';
     const delta = tdeed && tdeed.anchor_delta_seconds != null ? ` · 偏移 ${Number(tdeed.anchor_delta_seconds).toFixed(1)}秒` : '';
     const defaultDegraded = e.coverage_status === 'ready_degraded' ? ' · 短片降级' : '';
@@ -560,6 +658,7 @@ function render(data) {
     const ocrFailureDetail = visionFailureDetail(ocrWindow);
     const failureDetail = visionFailureDetail(tdeed);
     const ocrDiagnostics = visionOcrDiagnosticsText(ocrWindow);
+    const ocrPipelineDiagnostics = ocrPipelineDiagnosticsText(ocrWindow);
     const metadata = e.metadata && typeof e.metadata === 'object' ? e.metadata : {};
     const targetClock = (ocrWindow && ocrWindow.target_clock) || matchClockText(e.second);
     const routeStatus = goalRouteStatusLabel(metadata.goal_route_status || metadata.route_status);
@@ -571,7 +670,7 @@ function render(data) {
       ? [targetClock ? `目标时钟 ${targetClock}` : '', routeStatus, shotmapStatus].filter(Boolean).join(' · ')
       : '';
     const ocrSource = ocrWindow && ocrWindow.localization_source === 'exact_second' ? '秒级定位' : ocrWindow && ocrWindow.localization_source === 'minute_boundary' ? '分钟定位' : '';
-    const ocrDetail = [secondDetail, ocrSource, ocrFailureDetail, ocrDiagnostics ? `OCR：${ocrDiagnostics}` : ''].filter(Boolean).join(' · ');
+    const ocrDetail = [secondDetail, ocrSource, ocrPipelineDiagnostics, ocrFailureDetail, ocrDiagnostics ? `OCR：${ocrDiagnostics}` : ''].filter(Boolean).join(' · ');
     const visionDetail = [failureDetail, tdeed && tdeed.source_ocr_artifact ? '基于 OCR 60秒窗口' : ''].filter(Boolean).join(' · ');
     const gifLink = artifact => artifact && artifact.output ? `<a class="gif-link" href="/api/gif/${encodeURIComponent(data.match_id)}/${encodeURIComponent(artifact.output.split('/').pop())}" target="_blank">预览</a>` : '';
     return `<div class="event-row ${escapeHtml(task.cls)}"><div class="event-type event-type-${escapeHtml(type.kind)}"><span class="event-symbol" aria-hidden="true"></span><span class="event-type-text"><b>${escapeHtml(type.label)}</b><small>${escapeHtml(type.code)}</small></span></div><div class="event-minute">${escapeHtml(e.minute || '--')}'${e.minute_extra && e.minute_extra !== '0' ? `+${escapeHtml(e.minute_extra)}` : ''}</div><div class="event-person">${escapeHtml(e.person || '未提供球员')}<small>${escapeHtml(e.team || '')}${e.score ? ` · ${escapeHtml(e.score)}` : ''}${e.reason ? ` · ${escapeHtml(e.reason)}` : ''}</small></div><div class="artifact-list"><div class="artifact"><span>默认 · ${escapeHtml(task.label)}${defaultDegraded}</span>${e.output ? `<a class="gif-link" href="/api/gif/${encodeURIComponent(data.match_id)}/${encodeURIComponent(e.output.split('/').pop())}" target="_blank">预览</a>` : ''}</div><div class="artifact ${escapeHtml(ocr.cls)}"><span>OCR 60秒 · ${escapeHtml(ocr.label)}${ocrDegraded}${ocrDetail ? `<small>${escapeHtml(ocrDetail)}</small>` : ''}</span>${gifLink(ocrWindow)}</div><div class="artifact ${escapeHtml(vision.cls)}"><span>T-DEED 20秒 · ${escapeHtml(vision.label)}${escapeHtml(confidence)}${escapeHtml(delta)}${visionDegraded}${tdeed && tdeed.experimental ? ' · 实验' : ''}${visionDetail ? `<small>${escapeHtml(visionDetail)}</small>` : ''}</span>${gifLink(tdeed)}</div></div></div>`;
@@ -612,7 +711,7 @@ async function refreshMatches() {
     state.matchesLoading = false;
   }
 }
-async function configure(id = matchId()) { const body = {match_id:id, event_poll_seconds:+$('event-poll').value, source_poll_seconds:+$('source-poll').value, detail_poll_seconds:+$('detail-poll').value, before_seconds:+$('before').value, after_seconds:+$('after').value, event_to_video_offset_seconds:+$('event-offset').value, gif_width:+$('width').value, vision_enabled:$('vision-enabled').checked, vision_before_seconds:+$('vision-before').value, vision_after_seconds:+$('vision-after').value}; return requestJson('/api/session', {method:'POST', body:JSON.stringify(body)}); }
+async function configure(id = matchId()) { const body = {match_id:id, event_poll_seconds:+$('event-poll').value, source_poll_seconds:+$('source-poll').value, detail_poll_seconds:+$('detail-poll').value, before_seconds:+$('before').value, after_seconds:+$('after').value, event_to_video_offset_seconds:+$('event-offset').value, gif_width:+$('width').value, vision_enabled:$('vision-enabled').checked, vision_clock_only:$('vision-clock-only').checked, vision_before_seconds:+$('vision-before').value, vision_after_seconds:+$('vision-after').value}; return requestJson('/api/session', {method:'POST', body:JSON.stringify(body)}); }
 function selectViewedMatch(id, {syncInput = true} = {}) {
   const normalized = String(id || '').trim();
   if (!normalized) return;

@@ -144,6 +144,24 @@ class _ClockSecondCandidate:
 
 
 @dataclass(frozen=True)
+class _ClockSecondEstimate:
+    frame_seconds: float
+    segment_index: int
+    nearest: FrameReading
+    evidence: tuple[FrameReading, ...]
+    direction: str
+    clock_distance_seconds: int
+    clock_video_slope: float
+
+
+NEAR_NEIGHBOR_MAX_CLOCK_DISTANCE_SECONDS = 2
+NEAR_NEIGHBOR_MIN_DIRECT_READINGS = 3
+NEAR_NEIGHBOR_MAX_DIRECT_READINGS = 5
+NEAR_NEIGHBOR_MIN_CLOCK_VIDEO_SLOPE = 0.8
+NEAR_NEIGHBOR_MAX_CLOCK_VIDEO_SLOPE = 1.2
+
+
+@dataclass(frozen=True)
 class DetectedText:
     """One OCR detection with its text, confidence, and quadrilateral bounds."""
 
@@ -1303,6 +1321,127 @@ def _clock_segments(
     return segments
 
 
+def _direct_estimate_clock_reading(reading: FrameReading) -> bool:
+    """Return whether a raw OCR clock can support a bounded extrapolation."""
+    return (
+        _trustworthy_clock_reading(reading)
+        and reading.observed_clock_seconds is not None
+        and reading.observed_clock_seconds == reading.clock_seconds
+        and reading.continuity_status not in {"repaired", "resynchronized"}
+        and reading.continuity_reason
+        not in {
+            "clock_discontinuity",
+            "continuous_observations_resynchronized",
+            "period_boundary_resynchronized",
+        }
+    )
+
+
+def _near_one_to_one_pair(left: FrameReading, right: FrameReading) -> bool:
+    if (
+        left.clock_seconds is None
+        or right.clock_seconds is None
+        or right.frame_index != left.frame_index + 1
+    ):
+        return False
+    video_delta = right.frame_seconds - left.frame_seconds
+    clock_delta = right.clock_seconds - left.clock_seconds
+    if video_delta <= 0 or clock_delta <= 0:
+        return False
+    slope = clock_delta / video_delta
+    return (
+        NEAR_NEIGHBOR_MIN_CLOCK_VIDEO_SLOPE
+        <= slope
+        <= NEAR_NEIGHBOR_MAX_CLOCK_VIDEO_SLOPE
+    )
+
+
+def _direct_estimate_runs(
+    segment: Sequence[FrameReading],
+) -> list[list[FrameReading]]:
+    """Split one continuity segment into gap-free direct 1:1 OCR runs."""
+    runs: list[list[FrameReading]] = []
+    for reading in segment:
+        if not _direct_estimate_clock_reading(reading):
+            continue
+        if not runs or not _near_one_to_one_pair(runs[-1][-1], reading):
+            runs.append([reading])
+        else:
+            runs[-1].append(reading)
+    return runs
+
+
+def _one_sided_clock_estimates(
+    segments: Sequence[Sequence[FrameReading]],
+    *,
+    event_second: int,
+) -> list[_ClockSecondEstimate]:
+    estimates: list[_ClockSecondEstimate] = []
+    for segment_index, segment in enumerate(segments):
+        if any(
+            reading.continuity_status == "resynchronized"
+            or reading.continuity_reason
+            in {
+                "continuous_observations_resynchronized",
+                "period_boundary_resynchronized",
+            }
+            for reading in segment
+        ):
+            continue
+        for run in _direct_estimate_runs(segment):
+            if len(run) < NEAR_NEIGHBOR_MIN_DIRECT_READINGS:
+                continue
+            assert run[0].clock_seconds is not None
+            assert run[-1].clock_seconds is not None
+            if run[-1].clock_seconds < event_second:
+                evidence = tuple(run[-NEAR_NEIGHBOR_MAX_DIRECT_READINGS:])
+                nearest = evidence[-1]
+                direction = "forward_from_preceding_reading"
+            elif run[0].clock_seconds > event_second:
+                evidence = tuple(run[:NEAR_NEIGHBOR_MAX_DIRECT_READINGS])
+                nearest = evidence[0]
+                direction = "backward_from_following_reading"
+            else:
+                # Target is inside the observed run. Only direct observation or
+                # two-sided interpolation may locate it in that case.
+                continue
+            assert nearest.clock_seconds is not None
+            signed_clock_delta = event_second - nearest.clock_seconds
+            clock_distance = abs(signed_clock_delta)
+            if not 1 <= clock_distance <= NEAR_NEIGHBOR_MAX_CLOCK_DISTANCE_SECONDS:
+                continue
+            first = evidence[0]
+            last = evidence[-1]
+            assert first.clock_seconds is not None
+            assert last.clock_seconds is not None
+            video_span = last.frame_seconds - first.frame_seconds
+            clock_span = last.clock_seconds - first.clock_seconds
+            if video_span <= 0:
+                continue
+            slope = clock_span / video_span
+            if not (
+                NEAR_NEIGHBOR_MIN_CLOCK_VIDEO_SLOPE
+                <= slope
+                <= NEAR_NEIGHBOR_MAX_CLOCK_VIDEO_SLOPE
+            ):
+                continue
+            projected_frame_seconds = nearest.frame_seconds + signed_clock_delta
+            if projected_frame_seconds < 0:
+                continue
+            estimates.append(
+                _ClockSecondEstimate(
+                    frame_seconds=projected_frame_seconds,
+                    segment_index=segment_index,
+                    nearest=nearest,
+                    evidence=evidence,
+                    direction=direction,
+                    clock_distance_seconds=clock_distance,
+                    clock_video_slope=slope,
+                )
+            )
+    return estimates
+
+
 def _locate_goal_second(
     readings: Sequence[FrameReading],
     *,
@@ -1334,7 +1473,8 @@ def _locate_goal_second(
             },
         )
 
-    candidates: list[_ClockSecondCandidate] = []
+    observed_candidates: list[_ClockSecondCandidate] = []
+    interpolated_candidates: list[_ClockSecondCandidate] = []
     isolated_target_reading_count = 0
     for segment_index, segment in enumerate(segments):
         for reading in segment:
@@ -1342,7 +1482,7 @@ def _locate_goal_second(
                 if len(segment) < 2:
                     isolated_target_reading_count += 1
                     continue
-                candidates.append(
+                observed_candidates.append(
                     _ClockSecondCandidate(
                         reading.frame_seconds,
                         "paddleocr_exact_clock",
@@ -1367,7 +1507,7 @@ def _locate_goal_second(
             ):
                 continue
             fraction = (event_second - left.clock_seconds) / clock_delta
-            candidates.append(
+            interpolated_candidates.append(
                 _ClockSecondCandidate(
                     left.frame_seconds + fraction * video_delta,
                     "paddleocr_interpolated_clock",
@@ -1378,10 +1518,23 @@ def _locate_goal_second(
                 )
             )
 
+    # A direct trusted OCR observation is authoritative. Interpolation is only
+    # considered when no direct observation exists anywhere in the search.
+    candidates = observed_candidates or interpolated_candidates
+    candidate_source = (
+        "direct_observation"
+        if observed_candidates
+        else "two_sided_interpolation"
+        if interpolated_candidates
+        else None
+    )
     matching_segments = sorted({candidate.segment_index for candidate in candidates})
     match_diagnostics = {
         **base,
         "isolated_target_reading_count": isolated_target_reading_count,
+        "exact_second_candidate_source": candidate_source,
+        "direct_observation_candidate_count": len(observed_candidates),
+        "two_sided_interpolation_candidate_count": len(interpolated_candidates),
     }
     if len(matching_segments) > 1:
         raise WorkerError(
@@ -1396,7 +1549,29 @@ def _locate_goal_second(
                 ],
             },
         )
-    if not candidates:
+    estimates: list[_ClockSecondEstimate] = []
+    if not candidates and isolated_target_reading_count == 0:
+        estimates = _one_sided_clock_estimates(
+            segments,
+            event_second=event_second,
+        )
+        if len(estimates) > 1:
+            raise WorkerError(
+                "ocr_ambiguous",
+                f"the target match clock {target_clock} had multiple one-sided estimates",
+                diagnostics={
+                    **match_diagnostics,
+                    "exact_second_failure_reason": "multiple_disjoint_estimates",
+                    "matching_occurrence_count": len(estimates),
+                    "estimated_frame_seconds": [
+                        round(estimate.frame_seconds, 3) for estimate in estimates
+                    ],
+                    "estimate_error_bound_seconds": (
+                        NEAR_NEIGHBOR_MAX_CLOCK_DISTANCE_SECONDS
+                    ),
+                },
+            )
+    if not candidates and not estimates:
         readable_clocks = [
             reading.clock_seconds
             for segment in segments
@@ -1417,6 +1592,92 @@ def _locate_goal_second(
             },
         )
 
+    if estimates:
+        selected_estimate = min(
+            estimates,
+            key=lambda estimate: estimate.frame_seconds,
+        )
+        anchor = candidate_start_seconds + selected_estimate.frame_seconds
+        evidence = selected_estimate.evidence
+        nearest = selected_estimate.nearest
+        estimate_reason = {
+            "kind": "near_neighbor_clock_estimate",
+            "message": (
+                "target clock was estimated from a consecutive direct OCR run "
+                "within two clock seconds"
+            ),
+            "error_bound_seconds": NEAR_NEIGHBOR_MAX_CLOCK_DISTANCE_SECONDS,
+        }
+        diagnostics.update(
+            {
+                "target_clock": target_clock,
+                "target_clock_seconds": event_second,
+                "trusted_clock_frame_count": trusted_count,
+                "clock_continuity_segment_count": len(segments),
+                "isolated_target_reading_count": isolated_target_reading_count,
+                "matching_occurrence_count": 1,
+                "exact_second_candidate_source": "one_sided_estimate",
+                "direct_observation_candidate_count": len(observed_candidates),
+                "two_sided_interpolation_candidate_count": len(
+                    interpolated_candidates
+                ),
+                "exact_second_method": "paddleocr_near_neighbor_estimate",
+                "exact_second_precision": "estimated_second",
+                "target_frame_seconds": round(
+                    selected_estimate.frame_seconds, 3
+                ),
+                "estimate_direction": selected_estimate.direction,
+                "estimate_error_bound_seconds": (
+                    NEAR_NEIGHBOR_MAX_CLOCK_DISTANCE_SECONDS
+                ),
+                "estimate_error_bound_label": "+/-2s",
+                "estimate_nearest_clock": _clock_text(nearest.clock_seconds),
+                "estimate_nearest_frame_seconds": round(
+                    nearest.frame_seconds, 3
+                ),
+                "estimate_clock_distance_seconds": (
+                    selected_estimate.clock_distance_seconds
+                ),
+                "estimate_direct_reading_count": len(evidence),
+                "estimate_evidence_frame_indices": [
+                    reading.frame_index for reading in evidence
+                ],
+                "estimate_evidence_frame_bounds": [
+                    round(evidence[0].frame_seconds, 3),
+                    round(evidence[-1].frame_seconds, 3),
+                ],
+                "estimate_evidence_clock_bounds": [
+                    _clock_text(evidence[0].clock_seconds),
+                    _clock_text(evidence[-1].clock_seconds),
+                ],
+                "estimate_clock_video_slope": round(
+                    selected_estimate.clock_video_slope, 6
+                ),
+                "estimate_used_repaired_reading": False,
+                "estimate_used_resynchronized_reading": False,
+                "interpolation_clock_bounds": None,
+                "interpolation_frame_bounds": None,
+            }
+        )
+        return {
+            "anchor_seconds": round(anchor, 3),
+            "method": "paddleocr_near_neighbor_estimate",
+            "precision": "estimated_second",
+            "location_kind": "match_clock_second",
+            "localization_quality": "estimated",
+            "degraded": True,
+            "degradation_mode": "near_neighbor_clock_estimate",
+            "degradation_reason": estimate_reason,
+            "estimated_error_bound_seconds": (
+                NEAR_NEIGHBOR_MAX_CLOCK_DISTANCE_SECONDS
+            ),
+            "estimated_error_bound_label": "+/-2s",
+            "target_clock": target_clock,
+            "target_clock_seconds": event_second,
+            "requires_tdeed": False,
+            "diagnostics": diagnostics,
+        }
+
     selected = min(candidates, key=lambda candidate: candidate.frame_seconds)
     anchor = candidate_start_seconds + selected.frame_seconds
     diagnostics.update(
@@ -1427,6 +1688,11 @@ def _locate_goal_second(
             "clock_continuity_segment_count": len(segments),
             "isolated_target_reading_count": isolated_target_reading_count,
             "matching_occurrence_count": 1,
+            "exact_second_candidate_source": candidate_source,
+            "direct_observation_candidate_count": len(observed_candidates),
+            "two_sided_interpolation_candidate_count": len(
+                interpolated_candidates
+            ),
             "exact_second_method": selected.method,
             "exact_second_precision": selected.precision,
             "target_frame_seconds": round(selected.frame_seconds, 3),
@@ -1500,9 +1766,18 @@ def _locate_minute_boundary(
                 "minute_boundary_failure": exc.as_dict(),
             },
         ) from exc
+    estimated_boundary = located.get("precision") == "estimated_second"
     located.update({
-        "method": "paddleocr_minute_boundary",
-        "precision": "minute_boundary",
+        "method": (
+            "paddleocr_estimated_minute_boundary"
+            if estimated_boundary
+            else "paddleocr_minute_boundary"
+        ),
+        "precision": (
+            "estimated_minute_boundary"
+            if estimated_boundary
+            else "minute_boundary"
+        ),
         "location_kind": "match_clock_minute_boundary",
         "api_event_minute": event_minute,
         "minute_window_start_clock": _clock_text(max(0, target_second - 60)),
@@ -2768,6 +3043,9 @@ def probe_video_dimensions(
     *,
     ffmpeg: str,
     timeout_seconds: float | None = None,
+    input_format: str | None = None,
+    input_seek_seconds: float = 0.0,
+    input_duration_seconds: float | None = None,
 ) -> tuple[int, int]:
     command = [
         _ffprobe_for_ffmpeg(ffmpeg),
@@ -2779,8 +3057,13 @@ def probe_video_dimensions(
         "stream=width,height",
         "-of",
         "json",
-        str(candidate_path),
     ]
+    # The direct TS path is represented by a generated, trusted ffconcat
+    # manifest.  Keep protocol handling explicit and never infer it from a
+    # filename, so ordinary MP4 requests retain the legacy command exactly.
+    if input_format == "ffconcat":
+        command.extend(["-f", "concat", "-safe", "0"])
+    command.append(str(candidate_path))
     try:
         completed = subprocess.run(
             command,
@@ -2837,6 +3120,46 @@ def _resolve_worker_profile(value: Any) -> ScoreboardProfile:
         ) from exc
 
 
+def _validate_ffconcat_manifest(path: Path) -> None:
+    """Fail closed on direct-input manifests before passing them to FFmpeg."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise WorkerError(
+            "ocr_invalid_request",
+            f"cannot read ffconcat candidate manifest: {path}",
+        ) from exc
+    if not lines or lines[0].strip() != "ffconcat version 1.0":
+        raise WorkerError("ocr_invalid_request", "invalid ffconcat candidate manifest header")
+    entries = 0
+    for raw in lines[1:]:
+        line = raw.strip()
+        if not line:
+            continue
+        if not (line.startswith("file '") and line.endswith("'")):
+            raise WorkerError("ocr_invalid_request", "ffconcat manifest contains unsupported directives")
+        encoded = line[6:-1]
+        # The producer escapes embedded single quotes using ffconcat's
+        # standard '\'' form. No other protocol or directive is accepted.
+        value = encoded.replace("'\\''", "'")
+        if not value or "://" in value or value.startswith(("pipe:", "subfile:")):
+            raise WorkerError("ocr_invalid_request", "ffconcat manifest contains an unsafe media path")
+        media = Path(value)
+        try:
+            available = media.is_file() and media.stat().st_size > 0
+        except OSError:
+            available = False
+        if not available:
+            raise WorkerError(
+                "ocr_frame_extraction_failed",
+                f"ffconcat media segment is unavailable: {media}",
+                diagnostics={"stage": "ffconcat_validation", "path": str(media)},
+            )
+        entries += 1
+    if not entries:
+        raise WorkerError("ocr_invalid_request", "ffconcat candidate manifest has no media entries")
+
+
 def extract_profile_clock_frames(
     candidate_path: Path,
     output_dir: Path,
@@ -2846,6 +3169,9 @@ def extract_profile_clock_frames(
     profile: ScoreboardProfile,
     maximum_frames: int = 300,
     deadline_monotonic: float | None = None,
+    input_format: str | None = None,
+    input_seek_seconds: float = 0.0,
+    input_duration_seconds: float | None = None,
 ) -> tuple[list[Path], dict[str, Any]]:
     """Extract only the clock ROI for an explicit clock-only request."""
     frame_width, frame_height = probe_video_dimensions(
@@ -2855,6 +3181,9 @@ def extract_profile_clock_frames(
             deadline_monotonic,
             stage="ffprobe",
         ),
+        input_format=input_format,
+        input_seek_seconds=input_seek_seconds,
+        input_duration_seconds=input_duration_seconds,
     )
     try:
         clock_x1, clock_y1, clock_x2, clock_y2 = profile.scaled_rois(
@@ -2874,8 +3203,18 @@ def extract_profile_clock_frames(
         "-hide_banner",
         "-loglevel",
         "error",
+    ]
+    if input_format == "ffconcat":
+        command.extend(["-f", "concat", "-safe", "0"])
+    command.extend([
         "-i",
         str(candidate_path),
+    ])
+    if input_seek_seconds > 0:
+        command.extend(["-ss", f"{input_seek_seconds:.6f}"])
+    if input_duration_seconds is not None:
+        command.extend(["-t", f"{input_duration_seconds:.6f}"])
+    command.extend([
         "-an",
         "-vf",
         (
@@ -2886,7 +3225,7 @@ def extract_profile_clock_frames(
         "-frames:v",
         str(maximum_frames),
         str(clock_pattern),
-    ]
+    ])
     try:
         completed = subprocess.run(
             command,
@@ -4166,6 +4505,11 @@ def run_request(
     inference_batch_size = int(request.get("inference_batch_size", 8))
     profile_value = request.get("scoreboard_profile")
     clock_only = request.get("clock_only", False)
+    candidate_input_format = request.get("candidate_input_format")
+    candidate_seek_seconds = float(request.get("candidate_seek_seconds", 0.0))
+    candidate_duration_seconds = request.get("candidate_duration_seconds")
+    if candidate_duration_seconds is not None:
+        candidate_duration_seconds = float(candidate_duration_seconds)
     maximum_frames = int(
         request.get(
             "maximum_frames",
@@ -4185,6 +4529,19 @@ def run_request(
         raise WorkerError("ocr_invalid_request", "maximum_frames must be positive")
     if not isinstance(clock_only, bool):
         raise WorkerError("ocr_invalid_request", "clock_only must be a boolean")
+    if candidate_input_format not in {None, "ffconcat"}:
+        raise WorkerError("ocr_invalid_request", "candidate_input_format must be ffconcat or None")
+    if candidate_seek_seconds < 0 or (
+        candidate_duration_seconds is not None and candidate_duration_seconds <= 0
+    ):
+        raise WorkerError("ocr_invalid_request", "invalid ffconcat input bounds")
+    if candidate_input_format == "ffconcat":
+        if not clock_only or profile_value is None:
+            raise WorkerError(
+                "ocr_invalid_request",
+                "direct ffconcat OCR requires clock_only and a scoreboard profile",
+            )
+        _validate_ffconcat_manifest(candidate_path)
     raw_event_minute = request.get("event_minute")
     if clock_only and (
         raw_event_minute is None or not str(raw_event_minute).strip()
@@ -4224,6 +4581,9 @@ def run_request(
                     profile=profile,
                     maximum_frames=maximum_frames,
                     deadline_monotonic=deadline_monotonic,
+                    input_format=candidate_input_format,
+                    input_seek_seconds=candidate_seek_seconds,
+                    input_duration_seconds=candidate_duration_seconds,
                 )
                 crop_kinds = ["clock"] * len(frames)
             else:
@@ -4482,6 +4842,9 @@ def run_request(
         diagnostics.update(
             {
                 "candidate_path": str(candidate_path.resolve()),
+                "candidate_input_format": candidate_input_format or "file",
+                "candidate_seek_seconds": candidate_seek_seconds,
+                "candidate_duration_seconds": candidate_duration_seconds,
                 "minimum_confidence": minimum_confidence,
                 "inference_batch_size": inference_batch_size,
                 "extraction_seconds": round(extraction_seconds, 3),

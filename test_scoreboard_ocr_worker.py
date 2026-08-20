@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -539,6 +540,42 @@ class ProfileCropTests(unittest.TestCase):
         self.assertNotIn("-filter_complex", ffmpeg_command)
         self.assertNotIn("[score]", ffmpeg_command)
 
+    def test_clock_only_profile_ffconcat_applies_bounds_before_roi_filter(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory)
+            segment = output_dir / "segment.ts"
+            segment.write_bytes(b"video")
+            candidate = output_dir / "candidate.ffconcat"
+            candidate.write_text(
+                f"ffconcat version 1.0\nfile '{segment}'\n", encoding="utf-8"
+            )
+            commands = []
+
+            def runner(command, **_kwargs):
+                commands.append(command)
+                if command[0] == "ffprobe":
+                    return subprocess.CompletedProcess(
+                        command, 0,
+                        stdout=json.dumps({"streams": [{"width": 1280, "height": 720}]}),
+                        stderr="",
+                    )
+                (output_dir / "clock_only_000001.png").write_bytes(b"clock")
+                return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+            with patch("scoreboard_ocr_worker.subprocess.run", side_effect=runner):
+                extract_profile_clock_frames(
+                    candidate, output_dir, ffmpeg="ffmpeg",
+                    sample_interval_seconds=10, profile=self._profile(),
+                    input_format="ffconcat", input_seek_seconds=5.0,
+                    input_duration_seconds=15.0,
+                )
+
+        ffmpeg_command = commands[1]
+        self.assertEqual(ffmpeg_command[ffmpeg_command.index("-f") + 1], "concat")
+        self.assertEqual(ffmpeg_command[ffmpeg_command.index("-ss") + 1], "5.000000")
+        self.assertEqual(ffmpeg_command[ffmpeg_command.index("-t") + 1], "15.000000")
+        self.assertIn("crop=", ffmpeg_command[ffmpeg_command.index("-vf") + 1])
+
     def test_profile_aspect_mismatch_fails_closed_before_extraction(self):
         probe = subprocess.CompletedProcess(
             ["ffprobe"],
@@ -677,6 +714,207 @@ class ProfileCropTests(unittest.TestCase):
                 self.assertFalse(result["degraded"])
                 self.assertIsNone(result["degradation_mode"])
                 self.assertIsNone(result["degradation_reason"])
+
+    @staticmethod
+    def _direct_clock_run(
+        start_clock_seconds: int,
+        count: int,
+        *,
+        start_frame_index: int = 0,
+        start_video_seconds: float = 0.0,
+        video_step: float = 1.0,
+    ):
+        return [
+            frame_reading(
+                start_frame_index + index,
+                start_video_seconds + index * video_step,
+                [
+                    f"{(start_clock_seconds + index) // 60:02d}:"
+                    f"{(start_clock_seconds + index) % 60:02d}"
+                ],
+                [0.95],
+            )
+            for index in range(count)
+        ]
+
+    def test_goal_second_estimates_forward_from_three_direct_near_neighbors(self):
+        readings = self._direct_clock_run(69 * 60 + 33, 3)
+
+        result = locate_from_readings(
+            readings,
+            {
+                "event_code": "G",
+                "event_second": 69 * 60 + 37,
+                "candidate_start_seconds": 100.0,
+            },
+        )
+
+        self.assertEqual(result["anchor_seconds"], 104.0)
+        self.assertEqual(result["method"], "paddleocr_near_neighbor_estimate")
+        self.assertEqual(result["precision"], "estimated_second")
+        self.assertEqual(result["localization_quality"], "estimated")
+        self.assertTrue(result["degraded"])
+        self.assertEqual(result["estimated_error_bound_seconds"], 2)
+        diagnostics = result["diagnostics"]
+        self.assertEqual(
+            diagnostics["estimate_direction"],
+            "forward_from_preceding_reading",
+        )
+        self.assertEqual(diagnostics["estimate_nearest_clock"], "69:35")
+        self.assertEqual(diagnostics["estimate_clock_distance_seconds"], 2)
+        self.assertEqual(diagnostics["estimate_direct_reading_count"], 3)
+        self.assertEqual(diagnostics["estimate_evidence_frame_indices"], [0, 1, 2])
+        self.assertEqual(diagnostics["estimate_clock_video_slope"], 1.0)
+        self.assertFalse(diagnostics["estimate_used_repaired_reading"])
+        self.assertFalse(diagnostics["estimate_used_resynchronized_reading"])
+
+    def test_goal_second_estimates_backward_from_direct_following_readings(self):
+        readings = self._direct_clock_run(
+            69 * 60 + 39,
+            4,
+            start_frame_index=2,
+            start_video_seconds=2.0,
+        )
+
+        result = locate_from_readings(
+            readings,
+            {
+                "event_code": "OG",
+                "event_second": 69 * 60 + 37,
+                "candidate_start_seconds": 100.0,
+            },
+        )
+
+        self.assertEqual(result["anchor_seconds"], 100.0)
+        self.assertEqual(
+            result["diagnostics"]["estimate_direction"],
+            "backward_from_following_reading",
+        )
+        self.assertEqual(result["diagnostics"]["estimate_nearest_clock"], "69:39")
+        self.assertEqual(result["diagnostics"]["estimate_direct_reading_count"], 4)
+
+    def test_card_minute_boundary_keeps_estimated_method_and_precision(self):
+        readings = self._direct_clock_run(29 * 60 + 56, 3)
+
+        result = locate_from_readings(
+            readings,
+            {
+                "event_code": "YC",
+                "event_minute": 30,
+                "candidate_start_seconds": 100.0,
+                "clock_only": True,
+            },
+        )
+
+        self.assertEqual(result["anchor_seconds"], 104.0)
+        self.assertEqual(result["method"], "paddleocr_estimated_minute_boundary")
+        self.assertEqual(result["precision"], "estimated_minute_boundary")
+        self.assertEqual(result["localization_quality"], "estimated")
+        self.assertEqual(result["estimated_error_bound_seconds"], 2)
+
+    def test_goal_second_direct_observation_remains_ahead_of_estimate(self):
+        readings = self._direct_clock_run(69 * 60 + 35, 4)
+
+        result = locate_from_readings(
+            readings,
+            {"event_code": "G", "event_second": 69 * 60 + 37},
+        )
+
+        self.assertEqual(result["method"], "paddleocr_exact_clock")
+        self.assertEqual(result["precision"], "observed_second")
+        self.assertEqual(result["localization_quality"], "exact")
+
+    def test_goal_second_direct_observation_precedes_disjoint_interpolation(self):
+        readings = [
+            frame_reading(0, 0.0, ["69:37"], [0.95]),
+            frame_reading(1, 1.0, ["69:38"], [0.95]),
+            frame_reading(100, 100.0, ["69:36"], [0.95]),
+            frame_reading(102, 102.0, ["69:38"], [0.95]),
+        ]
+
+        result = locate_from_readings(
+            readings,
+            {"event_code": "G", "event_second": 69 * 60 + 37},
+        )
+
+        self.assertEqual(result["anchor_seconds"], 0.0)
+        self.assertEqual(result["method"], "paddleocr_exact_clock")
+        self.assertEqual(
+            result["diagnostics"]["exact_second_candidate_source"],
+            "direct_observation",
+        )
+        self.assertEqual(
+            result["diagnostics"]["two_sided_interpolation_candidate_count"],
+            1,
+        )
+
+    def test_goal_second_two_sided_interpolation_remains_ahead_of_estimate(self):
+        readings = [
+            frame_reading(0, 0.0, ["69:34"], [0.95]),
+            frame_reading(1, 1.0, ["69:35"], [0.95]),
+            frame_reading(4, 4.0, ["69:38"], [0.95]),
+        ]
+
+        result = locate_from_readings(
+            readings,
+            {"event_code": "PG", "event_second": 69 * 60 + 37},
+        )
+
+        self.assertEqual(result["method"], "paddleocr_interpolated_clock")
+        self.assertEqual(result["precision"], "interpolated_second")
+        self.assertEqual(result["localization_quality"], "exact")
+
+    def test_goal_second_strict_estimate_rejects_weak_evidence(self):
+        valid = self._direct_clock_run(69 * 60 + 33, 3)
+        cases = {
+            "nearest_more_than_two_seconds": self._direct_clock_run(
+                69 * 60 + 31, 3
+            ),
+            "fewer_than_three_direct_readings": self._direct_clock_run(
+                69 * 60 + 34, 2
+            ),
+            "clock_video_slope_not_near_one": self._direct_clock_run(
+                69 * 60 + 33, 3, video_step=2.0
+            ),
+            "frame_index_gap": [valid[0], valid[1], replace(valid[2], frame_index=3)],
+            "resynchronized_evidence": [
+                replace(reading, continuity_status="resynchronized")
+                for reading in valid
+            ],
+            "resync_before_otherwise_valid_run": [
+                replace(
+                    frame_reading(0, 0.0, ["69:32"], [0.95]),
+                    continuity_status="resynchronized",
+                ),
+                *[
+                    replace(
+                        reading,
+                        frame_index=reading.frame_index + 1,
+                        frame_seconds=reading.frame_seconds + 1.0,
+                    )
+                    for reading in valid
+                ],
+            ],
+            "repaired_evidence_only": [
+                replace(reading, continuity_status="repaired")
+                for reading in valid
+            ],
+        }
+
+        for name, readings in cases.items():
+            with self.subTest(name=name):
+                with self.assertRaises(WorkerError) as raised:
+                    locate_from_readings(
+                        readings,
+                        {
+                            "event_code": "G",
+                            "event_second": 69 * 60 + 37,
+                        },
+                    )
+                self.assertIn(
+                    raised.exception.kind,
+                    {"ocr_clock_unreadable", "ocr_exact_second_not_found"},
+                )
 
     def test_clock_only_goal_falls_back_from_missing_second_to_minute_boundary(self):
         result = locate_from_readings(

@@ -187,7 +187,8 @@ python3 event_driven_pipeline.py \
 
 `--event-to-video-offset` configures the measured relationship between the
 event's first appearance and the corresponding action in the received video.
-It remains `0` until a same-match API/RTMP live test establishes that offset.
+The Dashboard and direct Worker default is `-10` seconds; override it after a
+same-match API/RTMP live test establishes a better measured offset.
 `--match-start-play` accepts the match-detail API's Beijing time. It supplies a
 coarse match-clock reference for the visual search window; the API observation
 time remains the default GIF anchor. OCR and T-DEED run as separate optional
@@ -343,9 +344,11 @@ python3 -m venv tmp/ocr_venv
 tmp/ocr_venv/bin/python -m pip install -r ocr_requirements.txt
 ```
 
-Enable `AI 精剪` before starting a match Worker. Each new event then has three
-independent artifacts: the unchanged default GIF, an OCR-located 60-second GIF,
-and a T-DEED-refined 20-second GIF. The Worker polls shotmap independently every
+Enable `OCR 第二链路` before starting a match Worker. Each new event then has
+two active artifacts by default: the unchanged default GIF and an OCR-located
+60-second GIF. The optional T-DEED-refined 20-second artifact remains available
+behind `--tdeed-enabled`, but the Dashboard keeps that third chain paused until
+it is explicitly enabled. The Worker polls shotmap independently every
 five seconds and only treats newly added `outcome=goal` rows as goal events. Its
 first valid JSON response is a durable SQLite baseline, so goals that existed
 before the Worker started are not replayed after startup or restart. A new goal
@@ -355,11 +358,16 @@ offset (zero by default); OCR locates the exact `MM:SS` and uses `-30/+30`, then
 T-DEED refines only that OCR window. If shotmap has no shot rows, overview goals
 remain available as the compatibility fallback. Red and yellow cards continue
 to use overview and the minute-boundary OCR rule. OCR reads only the clock area;
-the score is not required. The rolling buffer retains 360 seconds and OCR
-searches the latest 120 seconds at one sample per second through one persistent
-local worker shared by active matches. Dashboard deployments can override the
-window with `GIF_VISION_SEARCH_BEFORE_SECONDS`; direct Workers use
-`--vision-search-before`.
+the score is not required. The rolling buffer retains 360 seconds. OCR uses a
+two-stage scan: a coarse 10-second sample to find the neighborhood, followed by
+a 1-second local scan around that candidate. A persistent local worker is shared
+by active matches; queue wait is tracked separately from the OCR execution
+deadline. With a known scoreboard profile and continuous TS coverage, the
+clock-only path reads the leased TS files directly and extracts only the clock
+ROI. It falls back to the legacy MP4 materialization path when the direct path is
+unavailable, while preserving the same remaining timeout. Dashboard deployments
+can override the search window with `GIF_VISION_SEARCH_BEFORE_SECONDS`; direct
+Workers use `--vision-search-before`.
 
 The shotmap cursor stores the last valid response and a fingerprint made from
 player, team, minute, cumulative second, situation, and normalized coordinates.

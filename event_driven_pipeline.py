@@ -3,8 +3,8 @@
 
 The default path continuously keeps a rolling MPEG-TS buffer and never depends
 on visual inference. New G/OG, YC, and RC records create a fast default GIF;
-an optional second path can inspect the scoreboard and then fall back to
-T-DEED without changing the default artifact.
+an optional second path uses scoreboard OCR, while T-DEED refinement is a
+separately controlled third artifact.
 """
 
 from __future__ import annotations
@@ -324,6 +324,89 @@ def vision_artifact_ready_for_submission(
     ):
         return False
     return True
+
+
+def enabled_vision_artifact_kinds(*, tdeed_enabled: bool) -> tuple[str, ...]:
+    """Return the visual artifacts this worker is allowed to submit."""
+    return (
+        VISION_ARTIFACT_KINDS
+        if tdeed_enabled
+        else ("ocr_window",)
+    )
+
+
+def vision_artifact_task_priority(artifact_kind: str) -> int:
+    """Keep OCR ahead of optional refinement in the in-process queue."""
+    if artifact_kind == "ocr_window":
+        return 1
+    if artifact_kind == "tdeed_refined":
+        return 2
+    raise ValueError(f"unsupported vision artifact kind: {artifact_kind!r}")
+
+
+def vision_artifact_slot_kind(artifact_kind: str) -> str:
+    """Return the matching cross-process coordinator priority class."""
+    if artifact_kind == "ocr_window":
+        return "vision_ocr"
+    if artifact_kind == "tdeed_refined":
+        return "vision_tdeed"
+    raise ValueError(f"unsupported vision artifact kind: {artifact_kind!r}")
+
+
+def vision_queue_phase_callback(
+    runtime: PipelineRuntime,
+    *,
+    event_key: str,
+    artifact_kind: str,
+    queued_at_unix: float,
+) -> Callable[[str, float], None]:
+    """Persist slot acquisition and the actual execution start separately."""
+    def record(phase: str, timestamp: float) -> None:
+        runtime.record_vision_queue_phase(
+            event_key,
+            phase,
+            artifact_kind=artifact_kind,
+            queued_at_unix=queued_at_unix,
+            now=timestamp,
+        )
+
+    return record
+
+
+def disable_incomplete_tdeed_tasks(
+    runtime: PipelineRuntime,
+    match_id: str,
+) -> int:
+    """Make old unfinished T-DEED work terminal while refinement is paused."""
+    disabled_count = 0
+    for task in runtime.store.list_incomplete_vision_tasks(
+        match_id,
+        artifact_kind="tdeed_refined",
+    ):
+        message = "T-DEED refinement is disabled for this worker"
+        runtime.transition_vision_task(
+            task.event_key,
+            "failed",
+            artifact_kind="tdeed_refined",
+            result={
+                "artifact_kind": "tdeed_refined",
+                "disabled": True,
+                "stage": "feature_disabled",
+                "failure_reason": {
+                    "kind": "tdeed_disabled",
+                    "stage": "feature_disabled",
+                    "message": message,
+                },
+                "default_gif_preserved": True,
+                "ocr_artifact_preserved": True,
+            },
+            error=message,
+            error_kind="tdeed_disabled",
+            failure_stage="feature_disabled",
+            failure_reason=message,
+        )
+        disabled_count += 1
+    return disabled_count
 
 
 def fail_unhandled_vision_worker_error(
@@ -3023,7 +3106,7 @@ def main() -> None:
     parser.add_argument(
         "--event-to-video-offset",
         type=float,
-        default=-30.0,
+        default=-10.0,
         help="video event time minus the event's first-observed stream time",
     )
     parser.add_argument(
@@ -3090,6 +3173,11 @@ def main() -> None:
         help="maximum simultaneous GIF encodes (default: 2)",
     )
     parser.add_argument("--vision-enabled", action="store_true")
+    parser.add_argument(
+        "--tdeed-enabled",
+        action="store_true",
+        help="enable the optional third T-DEED refined GIF artifact",
+    )
     parser.add_argument("--vision-search-before", type=float, default=120.0)
     parser.add_argument("--vision-search-after", type=float, default=0.0)
     parser.add_argument("--vision-before", type=float, default=8.0)
@@ -3533,7 +3621,34 @@ def main() -> None:
     event_report_contexts: dict[str, dict[str, Any]] = {}
     vision_jobs: dict[str, VisionJob] = {}
     if args.vision_enabled:
-        for task in runtime.recover_incomplete_vision(args.match_id):
+        recovery_seeds = {
+            task.event_key: task
+            for task in runtime.store.list_incomplete_vision_tasks(args.match_id)
+        }
+        if not args.tdeed_enabled:
+            disabled_tdeed_count = disable_incomplete_tdeed_tasks(
+                runtime,
+                args.match_id,
+            )
+            if disabled_tdeed_count:
+                runtime.logger.log(
+                    "tdeed_tasks_disabled",
+                    match_id=args.match_id,
+                    disabled_count=disabled_tdeed_count,
+                )
+        recovered_vision_tasks = []
+        for artifact_kind in enabled_vision_artifact_kinds(
+            tdeed_enabled=args.tdeed_enabled
+        ):
+            recovered_vision_tasks.extend(
+                runtime.recover_incomplete_vision(
+                    args.match_id,
+                    artifact_kind=artifact_kind,
+                )
+            )
+        for task in recovered_vision_tasks:
+            recovery_seeds[task.event_key] = task
+        for task in recovery_seeds.values():
             default_task = runtime.store.get(task.event_key)
             event_data = default_task.event_data if default_task is not None else {}
             if runtime.store.get_vision_task(
@@ -3609,7 +3724,11 @@ def main() -> None:
     stop_reason = "ingest_exit"
     state_lock = threading.Lock()
     task_pool = BoundedTaskPool(args.gif_workers)
-    vision_pool = BoundedTaskPool(args.vision_workers) if args.vision_enabled else None
+    vision_pool = (
+        BoundedTaskPool(args.vision_workers, prioritized=True)
+        if args.vision_enabled
+        else None
+    )
     segment_generations: list[SegmentGeneration] = []
     for generation in manifest.generations:
         segment_generations.append(
@@ -4245,19 +4364,20 @@ def main() -> None:
                                 effective_vision_deadline_at
                             ),
                         )
-                        runtime.enqueue_vision_task(
-                            match_event.event_key,
-                            artifact_kind="tdeed_refined",
-                            search_start_stream_time=vision_search_start,
-                            search_end_stream_time=vision_search_end,
-                            clip_before_seconds=args.vision_before,
-                            clip_after_seconds=args.vision_after,
-                            model_name="T-DEED",
-                            model_version="ocr-window-v1",
-                            deadline_at_unix=(
-                                effective_vision_deadline_at
-                            ),
-                        )
+                        if args.tdeed_enabled:
+                            runtime.enqueue_vision_task(
+                                match_event.event_key,
+                                artifact_kind="tdeed_refined",
+                                search_start_stream_time=vision_search_start,
+                                search_end_stream_time=vision_search_end,
+                                clip_before_seconds=args.vision_before,
+                                clip_after_seconds=args.vision_after,
+                                model_name="T-DEED",
+                                model_version="ocr-window-v1",
+                                deadline_at_unix=(
+                                    effective_vision_deadline_at
+                                ),
+                            )
                         vision_jobs[match_event.event_key] = VisionJob(
                             event_key=match_event.event_key,
                             match_id=args.match_id,
@@ -4281,9 +4401,8 @@ def main() -> None:
                                 runtime,
                                 [
                                     task
-                                    for artifact_kind in (
-                                        "ocr_window",
-                                        "tdeed_refined",
+                                    for artifact_kind in enabled_vision_artifact_kinds(
+                                        tdeed_enabled=args.tdeed_enabled
                                     )
                                     if (
                                         task := runtime.store.get_vision_task(
@@ -4423,19 +4542,24 @@ def main() -> None:
                     sync_completed_default_job(job, runtime, event_key, completed)
 
                 if vision_pool is not None:
-                    for event_key, vision_job in vision_jobs.items():
-                        default_task = runtime.store.get(event_key)
-                        if default_task is None:
-                            continue
-                        # Event revisions can arrive after the visual task was
-                        # created. Refresh the OCR request immediately before
-                        # submission so a corrected API minute/score is used.
-                        refresh_vision_job_event_data(vision_job, default_task)
-                        ocr_task = runtime.store.get_vision_task(
-                            event_key,
-                            artifact_kind="ocr_window",
-                        )
-                        for artifact_kind in VISION_ARTIFACT_KINDS:
+                    for artifact_kind in enabled_vision_artifact_kinds(
+                        tdeed_enabled=args.tdeed_enabled
+                    ):
+                        for event_key, vision_job in vision_jobs.items():
+                            default_task = runtime.store.get(event_key)
+                            if default_task is None:
+                                continue
+                            # Refresh event revisions before either artifact is
+                            # submitted. The artifact-first loops ensure every
+                            # ready OCR job enters the queue ahead of T-DEED.
+                            refresh_vision_job_event_data(
+                                vision_job,
+                                default_task,
+                            )
+                            ocr_task = runtime.store.get_vision_task(
+                                event_key,
+                                artifact_kind="ocr_window",
+                            )
                             vision_task = runtime.store.get_vision_task(
                                 event_key,
                                 artifact_kind=artifact_kind,
@@ -4459,11 +4583,20 @@ def main() -> None:
                                 event_key,
                                 artifact_kind,
                             )
+                            if pool_key in vision_pool.futures:
+                                continue
+                            queued_at_unix = time.time()
+                            runtime.record_vision_queue_phase(
+                                event_key,
+                                "queued",
+                                artifact_kind=artifact_kind,
+                                now=queued_at_unix,
+                            )
                             if vision_pool.submit(
                                 pool_key,
                                 run_with_task_slot,
                                 heavy_task_coordinator,
-                                "vision",
+                                vision_artifact_slot_kind(artifact_kind),
                                 args.match_id,
                                 event_key,
                                 process_vision_artifact,
@@ -4474,6 +4607,15 @@ def main() -> None:
                                 ffprobe,
                                 args.output_dir,
                                 cancel_event=graceful_stop_cancel_encodes,
+                                on_state_change=vision_queue_phase_callback(
+                                    runtime,
+                                    event_key=event_key,
+                                    artifact_kind=artifact_kind,
+                                    queued_at_unix=queued_at_unix,
+                                ),
+                                task_priority=vision_artifact_task_priority(
+                                    artifact_kind
+                                ),
                                 function_kwargs={
                                     "artifact_kind": artifact_kind,
                                     "search_before": args.vision_search_before,
@@ -4970,6 +5112,7 @@ def main() -> None:
             "gif_workers": args.gif_workers,
             "ingest_restart_count": supervisor.restart_count,
             "vision_enabled": args.vision_enabled,
+            "tdeed_enabled": args.vision_enabled and args.tdeed_enabled,
             "vision_workers": args.vision_workers if args.vision_enabled else 0,
             "ocr_python": str(args.ocr_python) if args.vision_enabled else None,
             "ocr_timeout_seconds": (

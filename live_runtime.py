@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import heapq
+import itertools
 import subprocess
+import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -126,34 +129,102 @@ class IngestSupervisor:
 
 
 class BoundedTaskPool:
-    """Run at most ``workers`` jobs without submitting the same key twice."""
+    """Run bounded keyed jobs, starting the lowest-priority value first."""
 
-    def __init__(self, workers: int) -> None:
+    def __init__(self, workers: int, *, prioritized: bool = False) -> None:
         if workers < 1:
             raise ValueError("workers must be at least 1")
         self.executor = ThreadPoolExecutor(
             max_workers=workers, thread_name_prefix="gif-encoder"
         )
+        self.workers = workers
+        self.prioritized = prioritized
         self.futures: dict[str, Future[Any]] = {}
+        self._pending: list[
+            tuple[int, int, str, Callable[..., Any], tuple[Any, ...], dict[str, Any]]
+        ] = []
+        self._sequence = itertools.count()
+        self._active_count = 0
+        self._accepting = True
+        self._condition = threading.Condition()
 
     def submit(
         self,
         key: str,
         function: Callable[..., Any],
         *args: Any,
+        task_priority: int = 0,
         **kwargs: Any,
     ) -> bool:
-        if key in self.futures:
-            return False
-        self.futures[key] = self.executor.submit(function, *args, **kwargs)
-        return True
+        if not self.prioritized:
+            if key in self.futures:
+                return False
+            self.futures[key] = self.executor.submit(function, *args, **kwargs)
+            return True
+        with self._condition:
+            if not self._accepting:
+                raise RuntimeError("task pool is shutting down")
+            if key in self.futures:
+                return False
+            self.futures[key] = Future()
+            heapq.heappush(
+                self._pending,
+                (
+                    int(task_priority),
+                    next(self._sequence),
+                    key,
+                    function,
+                    args,
+                    kwargs,
+                ),
+            )
+            self._start_pending_locked()
+            return True
+
+    def _start_pending_locked(self) -> None:
+        while self._pending and self._active_count < self.workers:
+            _priority, _sequence, key, function, args, kwargs = heapq.heappop(
+                self._pending
+            )
+            public_future = self.futures[key]
+            if not public_future.set_running_or_notify_cancel():
+                continue
+            self._active_count += 1
+            try:
+                worker_future = self.executor.submit(function, *args, **kwargs)
+            except BaseException as exc:
+                self._active_count -= 1
+                public_future.set_exception(exc)
+                continue
+            worker_future.add_done_callback(
+                lambda completed, task_key=key: self._worker_done(
+                    task_key, completed
+                )
+            )
+
+    def _worker_done(self, key: str, worker_future: Future[Any]) -> None:
+        with self._condition:
+            public_future = self.futures.get(key)
+            if public_future is not None:
+                try:
+                    public_future.set_result(worker_future.result())
+                except BaseException as exc:
+                    public_future.set_exception(exc)
+            self._active_count -= 1
+            self._start_pending_locked()
+            self._condition.notify_all()
 
     def collect_done(self) -> list[tuple[str, Any, BaseException | None]]:
         completed: list[tuple[str, Any, BaseException | None]] = []
-        for key, future in list(self.futures.items()):
-            if not future.done():
-                continue
-            del self.futures[key]
+        with self._condition:
+            done = [
+                (key, future)
+                for key, future in self.futures.items()
+                if future.done()
+            ]
+            for key, _future in done:
+                del self.futures[key]
+        for key, future in done:
             try:
                 completed.append((key, future.result(), None))
             except BaseException as exc:
@@ -161,4 +232,17 @@ class BoundedTaskPool:
         return completed
 
     def shutdown(self, *, wait: bool = True) -> None:
+        if not self.prioritized:
+            self.executor.shutdown(wait=wait)
+            return
+        with self._condition:
+            self._accepting = False
+            if wait:
+                while self._pending or self._active_count:
+                    self._condition.wait()
+            else:
+                for pending in self._pending:
+                    key = pending[2]
+                    self.futures[key].cancel()
+                self._pending.clear()
         self.executor.shutdown(wait=wait)

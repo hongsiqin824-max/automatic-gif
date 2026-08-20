@@ -1,4 +1,6 @@
 import io
+import threading
+import time
 import unittest
 from unittest.mock import Mock
 
@@ -19,6 +21,55 @@ class FakeProcess:
 
 
 class LiveRuntimeTests(unittest.TestCase):
+    def test_pool_starts_higher_priority_job_before_queued_lower_priority_job(self):
+        pool = BoundedTaskPool(1, prioritized=True)
+        release = threading.Event()
+        started = threading.Event()
+        order = []
+
+        def hold():
+            started.set()
+            release.wait(2.0)
+            order.append("holder")
+            return "holder"
+
+        def run(name):
+            order.append(name)
+            return name
+
+        try:
+            self.assertTrue(pool.submit("holder", hold, task_priority=0))
+            self.assertTrue(started.wait(2.0))
+            self.assertTrue(pool.submit("tdeed", run, "tdeed", task_priority=2))
+            self.assertTrue(pool.submit("ocr", run, "ocr", task_priority=1))
+            release.set()
+            deadline = time.time() + 2.0
+            while len(order) < 3:
+                self.assertLess(time.time(), deadline)
+                time.sleep(0.01)
+            self.assertEqual(order, ["holder", "ocr", "tdeed"])
+        finally:
+            release.set()
+            pool.shutdown(wait=True)
+
+    def test_non_waiting_shutdown_cancels_jobs_that_have_not_started(self):
+        pool = BoundedTaskPool(1, prioritized=True)
+        release = threading.Event()
+        started = threading.Event()
+
+        def hold():
+            started.set()
+            release.wait(2.0)
+
+        self.assertTrue(pool.submit("holder", hold))
+        self.assertTrue(started.wait(2.0))
+        self.assertTrue(pool.submit("pending", lambda: None))
+        pool.shutdown(wait=False)
+        try:
+            self.assertTrue(pool.futures["pending"].cancelled())
+        finally:
+            release.set()
+
     def test_supervisor_restarts_with_two_three_five_backoff(self):
         processes = [FakeProcess(1), FakeProcess(1), FakeProcess(1), FakeProcess(1)]
         popen = Mock(side_effect=processes)

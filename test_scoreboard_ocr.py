@@ -953,6 +953,199 @@ class ScoreboardClientTests(unittest.TestCase):
                     clock_only=True,
                 ).to_payload()
 
+    def test_clock_only_uses_coarse_scan_then_authoritative_local_fine_scan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            candidate = Path(directory) / "candidate.mp4"
+            candidate.write_bytes(b"video")
+            coarse = {
+                "anchor_seconds": 150.0,
+                "method": "paddleocr_minute_boundary",
+                "precision": "minute_boundary",
+                "location_kind": "match_clock_minute_boundary",
+                "diagnostics": {"sampled_frame_count": 12},
+            }
+            fine = {
+                "anchor_seconds": 149.0,
+                "method": "paddleocr_minute_boundary",
+                "precision": "minute_boundary",
+                "location_kind": "match_clock_minute_boundary",
+                "diagnostics": {"sampled_frame_count": 30},
+            }
+            with (
+                patch(
+                    "scoreboard_ocr.run_scoreboard_ocr",
+                    side_effect=[coarse, fine],
+                ) as run,
+                patch("scoreboard_ocr._materialize_fine_scan_clip") as materialize,
+            ):
+                result = locate_scoreboard_event(
+                    candidate,
+                    event_code="YC",
+                    event_minute=30,
+                    candidate_start_seconds=100.0,
+                    clock_only=True,
+                )
+
+        requests = [call.args[0] for call in run.call_args_list]
+        self.assertEqual(
+            [request.sample_interval_seconds for request in requests],
+            [10.0, 1.0],
+        )
+        self.assertEqual(requests[1].candidate_start_seconds, 135.0)
+        self.assertEqual(result["anchor_seconds"], 149.0)
+        strategy = result["diagnostics"]["sampling_strategy"]
+        self.assertEqual(strategy["mode"], "coarse_then_local_fine")
+        self.assertEqual(strategy["final_anchor_source"], "fine_scan")
+        self.assertEqual(strategy["coarse_scan"]["anchor_seconds"], 150.0)
+        self.assertEqual(materialize.call_args.kwargs["start_seconds"], 35.0)
+
+    def test_goal_second_projects_coarse_minute_boundary_before_fine_scan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            candidate = Path(directory) / "candidate.mp4"
+            candidate.write_bytes(b"video")
+            coarse = {
+                "anchor_seconds": 150.0,
+                "method": "paddleocr_minute_boundary",
+                "location_kind": "match_clock_minute_boundary",
+                "diagnostics": {},
+            }
+            fine = {
+                "anchor_seconds": 125.0,
+                "method": "paddleocr_exact_clock",
+                "location_kind": "match_clock_second",
+                "diagnostics": {},
+            }
+            with (
+                patch(
+                    "scoreboard_ocr.run_scoreboard_ocr",
+                    side_effect=[coarse, fine],
+                ) as run,
+                patch("scoreboard_ocr._materialize_fine_scan_clip") as materialize,
+            ):
+                result = locate_scoreboard_event(
+                    candidate,
+                    event_code="G",
+                    event_minute=8,
+                    event_second=455,
+                    candidate_start_seconds=100.0,
+                    clock_only=True,
+                )
+
+        fine_request = run.call_args_list[1].args[0]
+        self.assertEqual(fine_request.candidate_start_seconds, 110.0)
+        self.assertEqual(materialize.call_args.kwargs["start_seconds"], 10.0)
+        self.assertEqual(result["anchor_seconds"], 125.0)
+
+    def test_ffconcat_local_fine_scan_reuses_manifest_without_mp4(self):
+        with tempfile.TemporaryDirectory() as directory:
+            candidate = Path(directory) / "candidate.ffconcat"
+            candidate.write_text("ffconcat version 1.0\n", encoding="utf-8")
+            coarse = {
+                "anchor_seconds": 150.0,
+                "location_kind": "match_clock_minute_boundary",
+                "diagnostics": {},
+            }
+            fine = {
+                "anchor_seconds": 149.0,
+                "location_kind": "match_clock_minute_boundary",
+                "diagnostics": {},
+            }
+            with (
+                patch("scoreboard_ocr.run_scoreboard_ocr", side_effect=[coarse, fine]) as run,
+                patch(
+                    "scoreboard_ocr._materialize_fine_scan_clip",
+                    side_effect=AssertionError("direct ffconcat fine scan must not make MP4"),
+                ),
+            ):
+                result = locate_scoreboard_event(
+                    candidate, event_code="YC", event_minute=30,
+                    candidate_start_seconds=100.0, clock_only=True,
+                    candidate_input_format="ffconcat",
+                    candidate_seek_seconds=5.0,
+                    candidate_duration_seconds=80.0,
+                )
+
+        fine_request = run.call_args_list[1].args[0]
+        self.assertEqual(fine_request.candidate_path, candidate)
+        self.assertEqual(fine_request.candidate_start_seconds, 135.0)
+        self.assertEqual(fine_request.candidate_seek_seconds, 40.0)
+        self.assertEqual(fine_request.candidate_duration_seconds, 30.0)
+        self.assertEqual(result["anchor_seconds"], 149.0)
+
+    def test_coarse_miss_falls_back_to_full_one_second_scan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            candidate = Path(directory) / "candidate.mp4"
+            candidate.write_bytes(b"video")
+            coarse_error = ScoreboardOcrError(
+                "ocr_clock_unreadable", "coarse clock was unreadable"
+            )
+            fine = {
+                "anchor_seconds": 150.0,
+                "location_kind": "match_clock_minute_boundary",
+                "diagnostics": {},
+            }
+            with patch(
+                "scoreboard_ocr.run_scoreboard_ocr",
+                side_effect=[coarse_error, fine],
+            ) as run:
+                result = locate_scoreboard_event(
+                    candidate,
+                    event_code="YC",
+                    event_minute=30,
+                    clock_only=True,
+                )
+
+        requests = [call.args[0] for call in run.call_args_list]
+        self.assertEqual(
+            [request.sample_interval_seconds for request in requests],
+            [10.0, 1.0],
+        )
+        self.assertEqual(requests[1].candidate_path, candidate)
+        strategy = result["diagnostics"]["sampling_strategy"]
+        self.assertEqual(strategy["mode"], "full_fine_fallback")
+        self.assertEqual(strategy["coarse_error"]["kind"], "ocr_clock_unreadable")
+
+    def test_local_fine_miss_falls_back_without_using_coarse_anchor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            candidate = Path(directory) / "candidate.mp4"
+            candidate.write_bytes(b"video")
+            coarse = {
+                "anchor_seconds": 150.0,
+                "location_kind": "match_clock_minute_boundary",
+                "diagnostics": {},
+            }
+            local_error = ScoreboardOcrError(
+                "ocr_minute_boundary_not_found", "local fine scan missed"
+            )
+            full_fine = {
+                "anchor_seconds": 152.0,
+                "location_kind": "match_clock_minute_boundary",
+                "diagnostics": {},
+            }
+            with (
+                patch(
+                    "scoreboard_ocr.run_scoreboard_ocr",
+                    side_effect=[coarse, local_error, full_fine],
+                ) as run,
+                patch("scoreboard_ocr._materialize_fine_scan_clip"),
+            ):
+                result = locate_scoreboard_event(
+                    candidate,
+                    event_code="RC",
+                    event_minute=30,
+                    candidate_start_seconds=100.0,
+                    clock_only=True,
+                )
+
+        self.assertEqual(result["anchor_seconds"], 152.0)
+        self.assertEqual(run.call_args_list[2].args[0].candidate_path, candidate)
+        strategy = result["diagnostics"]["sampling_strategy"]
+        self.assertEqual(strategy["final_anchor_source"], "fine_scan")
+        self.assertEqual(
+            strategy["local_fine_error"]["kind"],
+            "ocr_minute_boundary_not_found",
+        )
+
     def test_client_module_has_no_model_framework_imports(self):
         source = Path(__file__).with_name("scoreboard_ocr.py").read_text(
             encoding="utf-8"
