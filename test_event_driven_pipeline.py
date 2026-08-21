@@ -23,6 +23,7 @@ from event_driven_pipeline import (
     encode_event_job,
     event_timing_diagnostics,
     evict_terminal_runtime_jobs,
+    protect_incomplete_vision_event_segments,
     maintain_segment_generations,
     merge_cross_source_goal,
     merge_observed_event_revision,
@@ -38,6 +39,7 @@ from event_driven_pipeline import (
     select_cross_source_goal_incident,
     shotmap_goal_match_event,
     refresh_vision_job_event_data,
+    reset_vision_artifact_for_target_upgrade,
     split_vision_pool_task_key,
     sync_completed_default_job,
     vision_artifact_ready_for_submission,
@@ -61,6 +63,93 @@ class FakeHttpResponse:
 
     def read(self):
         return self.body
+
+
+class EventVisualLeaseTests(unittest.TestCase):
+    def test_progressive_scan_and_output_windows_extend_event_lease(self):
+        from pipeline_runtime import PipelineRuntime
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = PipelineRuntime(root / "state.sqlite3", root / "events.jsonl")
+            event_key = "match-1:G:lease-window"
+            runtime.discover_task(
+                match_id="match-1",
+                event_data={
+                    "event_key": event_key,
+                    "code": "G",
+                    "event_type": "goal",
+                    "minute": "2",
+                    "minute_extra": "0",
+                    "team": "teamA",
+                    "person": "A",
+                    "person_id": "1",
+                    "score": "1-0",
+                    "reason": "",
+                    "metadata": {},
+                },
+                observed_stream_time=200.0,
+                observed_source_time=None,
+                clip_anchor_stream_time=200.0,
+                clip_anchor_source_time=None,
+                output_due_stream_time=230.0,
+                detected_at_unix=1000.0,
+            )
+            runtime.enqueue_vision_task(
+                event_key,
+                artifact_kind="ocr_window",
+                search_start_stream_time=100.0,
+                search_end_stream_time=200.0,
+                clip_before_seconds=30.0,
+                clip_after_seconds=30.0,
+                deadline_at_unix=1400.0,
+            )
+            runtime.record_vision_readiness_wait(
+                event_key,
+                "waiting for progressive media",
+                artifact_kind="ocr_window",
+                error_kind="waiting_for_clock_target",
+                window_metadata={
+                    "progressive_scan": {
+                        "last_scan_start_stream_time": 180.0,
+                        "scan_cursor_stream_time": 260.0,
+                        "target_rescan_window": {
+                            "start_stream_time": 130.0,
+                            "end_stream_time": 160.0,
+                        },
+                        "requested_output_start_stream_time": 120.0,
+                        "requested_output_end_stream_time": 280.0,
+                    }
+                },
+                now=1001.0,
+            )
+            early_path = root / "early.ts"
+            late_path = root / "late.ts"
+            early_path.write_bytes(b"video")
+            late_path.write_bytes(b"video")
+            task = runtime.store.get_vision_task(event_key, "ocr_window")
+
+            result = protect_incomplete_vision_event_segments(
+                runtime,
+                [task],
+                [
+                    Segment(early_path, 40.0, 70.0),
+                    Segment(late_path, 250.0, 280.0),
+                ],
+                ocr_timeout_seconds=180.0,
+                vision_timeout_seconds=90.0,
+                graceful_stop_timeout_seconds=30.0,
+                now_unix=1002.0,
+            )[0]
+
+            self.assertEqual(result["retention_start_stream_time"], 40.0)
+            self.assertEqual(result["retention_end_stream_time"], 290.0)
+            self.assertEqual(result["segment_count"], 2)
+            self.assertEqual(
+                runtime.store.protected_segment_paths(now=1002.0),
+                {str(early_path.resolve()), str(late_path.resolve())},
+            )
+            runtime.close()
 
 
 class ShotmapSecondEnrichmentTests(unittest.TestCase):
@@ -1154,6 +1243,250 @@ class OptionalVisionSchedulingTests(unittest.TestCase):
         self.assertEqual(vision_job.event_second, 2473)
         self.assertEqual(vision_job.target_score, "5-0")
         self.assertEqual(vision_job.observed_anchor_stream_time, 120.0)
+
+    def test_late_shotmap_second_increments_target_revision_once(self):
+        vision_job = VisionJob(
+            event_key="match-1:G:late",
+            match_id="match-1",
+            code="G",
+            event_type="goal",
+            default_anchor_stream_time=100.0,
+            default_anchor_source_time=None,
+            detected_at_unix=1.0,
+            event_minute="90",
+            event_second=None,
+        )
+        overview_task = SimpleNamespace(
+            event_data={
+                "code": "G",
+                "event_type": "goal",
+                "minute": "90",
+                "minute_extra": "0",
+                "second": None,
+                "metadata": {"event_source": {"primary": "overview"}},
+            },
+            observed_stream_time=100.0,
+            observed_source_time=None,
+        )
+        self.assertIsNone(refresh_vision_job_event_data(vision_job, overview_task))
+
+        shotmap_task = SimpleNamespace(
+            event_data={
+                **overview_task.event_data,
+                "second": 5353,
+                "metadata": {"event_source": {"primary": "shotmap"}},
+            },
+            observed_stream_time=108.0,
+            observed_source_time=None,
+        )
+        upgrade = refresh_vision_job_event_data(vision_job, shotmap_task)
+        self.assertEqual(upgrade["target_revision"], 1)
+        self.assertEqual(upgrade["target_clock_seconds"], 5353)
+        self.assertEqual(vision_job.target_source, "shotmap")
+        self.assertIsNone(refresh_vision_job_event_data(vision_job, shotmap_task))
+        self.assertEqual(vision_job.target_revision, 1)
+
+        changed_shotmap_task = SimpleNamespace(
+            event_data={
+                **shotmap_task.event_data,
+                "second": 5354,
+            },
+            observed_stream_time=109.0,
+            observed_source_time=None,
+        )
+        changed = refresh_vision_job_event_data(
+            vision_job, changed_shotmap_task
+        )
+        self.assertEqual(changed["target_revision"], 2)
+        self.assertEqual(changed["target_clock_seconds"], 5354)
+
+    def test_direct_shotmap_target_does_not_count_as_late_upgrade(self):
+        vision_job = VisionJob(
+            event_key="match-1:G:direct",
+            match_id="match-1",
+            code="G",
+            event_type="goal",
+            default_anchor_stream_time=100.0,
+            default_anchor_source_time=None,
+            detected_at_unix=1.0,
+            event_minute="90",
+            event_second=5353,
+            target_kind="exact_second",
+            target_source="shotmap",
+        )
+        task = SimpleNamespace(
+            event_data={
+                "code": "G",
+                "event_type": "goal",
+                "minute": "90",
+                "minute_extra": "0",
+                "second": 5353,
+                "metadata": {"event_source": {"primary": "shotmap"}},
+            },
+            observed_stream_time=100.0,
+            observed_source_time=None,
+        )
+        self.assertIsNone(refresh_vision_job_event_data(vision_job, task))
+        self.assertEqual(vision_job.target_revision, 0)
+
+    def test_target_upgrade_resets_pending_artifact_and_persists_progress(self):
+        from pipeline_runtime import PipelineRuntime
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = PipelineRuntime(root / "state.sqlite3", root / "events.jsonl")
+            event_key = "match-1:G:reset"
+            runtime.discover_task(
+                match_id="match-1",
+                event_data={
+                    "event_key": event_key,
+                    "code": "G",
+                    "event_type": "goal",
+                    "minute": "90",
+                    "minute_extra": "0",
+                    "team": "team",
+                    "person": "player",
+                    "person_id": "1",
+                    "score": "1-0",
+                    "reason": "",
+                    "metadata": {"event_source": {"primary": "overview"}},
+                },
+                observed_stream_time=100.0,
+                observed_source_time=None,
+                clip_anchor_stream_time=90.0,
+                clip_anchor_source_time=None,
+                output_due_stream_time=110.0,
+                detected_at_unix=1.0,
+            )
+            runtime.enqueue_vision_task(
+                event_key,
+                artifact_kind="ocr_window",
+                search_start_stream_time=0.0,
+                search_end_stream_time=220.0,
+                clip_before_seconds=30.0,
+                clip_after_seconds=30.0,
+            )
+            vision_job = VisionJob(
+                event_key=event_key,
+                match_id="match-1",
+                code="G",
+                event_type="goal",
+                default_anchor_stream_time=90.0,
+                default_anchor_source_time=None,
+                detected_at_unix=1.0,
+            )
+            self.assertTrue(
+                reset_vision_artifact_for_target_upgrade(
+                    runtime,
+                    vision_job,
+                    "ocr_window",
+                    {
+                        "target_revision": 1,
+                        "target_kind": "exact_second",
+                        "target_source": "shotmap",
+                        "target_clock_seconds": 5353,
+                        "reason": "shotmap_second_upgrade",
+                    },
+                )
+            )
+            task = runtime.store.get_vision_task(event_key, "ocr_window")
+            self.assertEqual(task.status, "pending")
+            self.assertEqual(
+                task.window_metadata["progressive_scan"]["target_revision"], 1
+            )
+            self.assertFalse(
+                reset_vision_artifact_for_target_upgrade(
+                    runtime,
+                    vision_job,
+                    "ocr_window",
+                    {
+                        "target_revision": 1,
+                        "target_kind": "exact_second",
+                        "target_source": "shotmap",
+                        "target_clock_seconds": 5353,
+                    },
+                )
+            )
+            runtime.close()
+
+    def test_target_upgrade_requeues_encoded_artifact_for_exact_second(self):
+        from pipeline_runtime import PipelineRuntime
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = PipelineRuntime(root / "state.sqlite3", root / "events.jsonl")
+            event_key = "match-1:G:encoded-reset"
+            runtime.discover_task(
+                match_id="match-1",
+                event_data={
+                    "event_key": event_key,
+                    "code": "G",
+                    "event_type": "goal",
+                    "minute": "90",
+                    "minute_extra": "0",
+                    "team": "team",
+                    "person": "player",
+                    "person_id": "1",
+                    "score": "1-0",
+                    "reason": "",
+                    "metadata": {"event_source": {"primary": "overview"}},
+                },
+                observed_stream_time=100.0,
+                observed_source_time=None,
+                clip_anchor_stream_time=90.0,
+                clip_anchor_source_time=None,
+                output_due_stream_time=110.0,
+                detected_at_unix=1.0,
+            )
+            runtime.enqueue_vision_task(
+                event_key,
+                artifact_kind="ocr_window",
+                search_start_stream_time=0.0,
+                search_end_stream_time=220.0,
+                clip_before_seconds=30.0,
+                clip_after_seconds=30.0,
+            )
+            runtime.transition_vision_task(event_key, "locating", artifact_kind="ocr_window")
+            runtime.transition_vision_task(
+                event_key,
+                "located",
+                artifact_kind="ocr_window",
+                result={"anchor_stream_time": 90.0},
+            )
+            runtime.transition_vision_task(event_key, "encoding", artifact_kind="ocr_window")
+            runtime.transition_vision_task(
+                event_key,
+                "encoded",
+                artifact_kind="ocr_window",
+                result={"output": "/tmp/minute.gif", "bytes": 10},
+            )
+            job = VisionJob(
+                event_key=event_key,
+                match_id="match-1",
+                code="G",
+                event_type="goal",
+                default_anchor_stream_time=90.0,
+                default_anchor_source_time=None,
+                detected_at_unix=1.0,
+            )
+            self.assertTrue(
+                reset_vision_artifact_for_target_upgrade(
+                    runtime,
+                    job,
+                    "ocr_window",
+                    {
+                        "target_revision": 1,
+                        "target_kind": "exact_second",
+                        "target_source": "shotmap",
+                        "target_clock_seconds": 5353,
+                        "reason": "shotmap_second_upgrade",
+                    },
+                )
+            )
+            task = runtime.store.get_vision_task(event_key, "ocr_window")
+            self.assertEqual(task.status, "pending")
+            self.assertEqual(task.result["superseded_output"], "/tmp/minute.gif")
+            runtime.close()
 
 
 class ReconnectingSupervisor:

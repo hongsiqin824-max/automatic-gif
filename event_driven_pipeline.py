@@ -79,8 +79,10 @@ from vision_runtime import (
     OCR_MINUTE_FALLBACK_FPS,
     OCR_MINUTE_FALLBACK_WIDTH,
     OCR_MINUTE_WINDOW_BEFORE_SECONDS,
+    OCR_PROGRESSIVE_INCREMENT_SECONDS,
     OCR_PYTHON,
     VisionJob,
+    ensure_ocr_target_revision,
     find_python,
     process_vision_artifact,
 )
@@ -219,6 +221,7 @@ def evict_terminal_runtime_jobs(
     after: float,
     active_default_keys: set[str] | None = None,
     active_vision_keys: set[str] | None = None,
+    retain_terminal_vision_jobs: bool = False,
 ) -> tuple[int, int]:
     """Drop terminal task objects after their authoritative state is durable."""
     default_busy = active_default_keys or set()
@@ -260,6 +263,8 @@ def evict_terminal_runtime_jobs(
             or not artifacts
             or any(task.status not in {"encoded", "failed"} for task in artifacts)
         ):
+            continue
+        if retain_terminal_vision_jobs:
             continue
         del vision_jobs[event_key]
         removed_vision_jobs += 1
@@ -477,6 +482,50 @@ def event_visual_window_lease_ttl(
     )
 
 
+def _event_visual_task_window_bounds(tasks: list[Any]) -> tuple[float, float]:
+    """Include durable progressive scan/output windows in lease coverage.
+
+    The persisted task search bounds describe the API observation window only.
+    Progressive OCR can advance beyond that bound while live media arrives, so
+    the lease refresher must follow its cursor and any historical target retry.
+    """
+    starts = [float(task.search_start_stream_time) for task in tasks]
+    ends = [float(task.search_end_stream_time) for task in tasks]
+    for task in tasks:
+        metadata = getattr(task, "window_metadata", {})
+        state = metadata.get("progressive_scan") if isinstance(metadata, dict) else None
+        if not isinstance(state, dict):
+            continue
+        for key in (
+            "last_scan_start_stream_time",
+            "requested_output_start_stream_time",
+        ):
+            value = state.get(key)
+            if isinstance(value, (int, float)):
+                starts.append(float(value))
+        for key in (
+            "last_scan_end_stream_time",
+            "requested_output_end_stream_time",
+        ):
+            value = state.get(key)
+            if isinstance(value, (int, float)):
+                ends.append(float(value))
+        cursor = state.get("scan_cursor_stream_time")
+        if isinstance(cursor, (int, float)):
+            ends.append(float(cursor) + OCR_PROGRESSIVE_INCREMENT_SECONDS)
+        for key in ("target_rescan_window", "final_scan_window"):
+            window = state.get(key)
+            if not isinstance(window, dict):
+                continue
+            start = window.get("start_stream_time")
+            end = window.get("end_stream_time")
+            if isinstance(start, (int, float)):
+                starts.append(float(start))
+            if isinstance(end, (int, float)):
+                ends.append(float(end))
+    return min(starts), max(ends)
+
+
 def ensure_event_visual_window_lease(
     runtime: PipelineRuntime,
     *,
@@ -584,18 +633,15 @@ def protect_incomplete_vision_event_segments(
             ),
             event_tasks[0],
         )
+        search_start, search_end = _event_visual_task_window_bounds(event_tasks)
         results.append(
             ensure_event_visual_window_lease(
                 runtime,
                 event_key=event_key,
                 artifact_kind=primary.artifact_kind,
                 segments=segments,
-                search_start_stream_time=min(
-                    task.search_start_stream_time for task in event_tasks
-                ),
-                search_end_stream_time=max(
-                    task.search_end_stream_time for task in event_tasks
-                ),
+                search_start_stream_time=search_start,
+                search_end_stream_time=search_end,
                 ttl_seconds=event_visual_window_lease_ttl(
                     deadline_at_unix=max(
                         task.deadline_at_unix for task in event_tasks
@@ -707,9 +753,68 @@ def sync_completed_default_job(
     return stored
 
 
-def refresh_vision_job_event_data(vision_job: VisionJob, default_task: StoredTask) -> None:
-    """Apply the latest API revision immediately before visual localization."""
+def _vision_event_second_source(event_data: dict[str, Any]) -> str:
+    """Return the feed that currently authorizes an event clock target."""
+    metadata = event_data.get("metadata")
+    if not isinstance(metadata, dict):
+        return "overview"
+    source = metadata.get("event_source")
+    if isinstance(source, dict) and source.get("primary"):
+        return str(source["primary"]).strip().lower()
+    if isinstance(source, str) and source.strip():
+        return source.strip().lower()
+    return str(metadata.get("second_source") or metadata.get("source") or "overview").strip().lower()
+
+
+def refresh_vision_job_event_data(
+    vision_job: VisionJob,
+    default_task: StoredTask,
+) -> dict[str, Any] | None:
+    """Apply the latest API revision and report one late exact-clock upgrade.
+
+    The event task is the durable source of truth.  ``VisionJob`` keeps the
+    in-process guard so repeated polling of the same shotmap row cannot reset
+    OCR repeatedly.  The returned payload is consumed by the visual scheduler
+    to persist the reset marker on the artifact task; the default GIF task is
+    deliberately untouched.
+    """
     event_data = dict(default_task.event_data or {})
+    previous_second = getattr(vision_job, "event_second", None)
+    previous_source = str(
+        getattr(vision_job, "target_source", "") or ""
+    ).strip().lower()
+    latest_second = parse_cumulative_match_second(event_data.get("second"))
+    latest_source = _vision_event_second_source(event_data)
+    if not previous_source:
+        # Direct shotmap discoveries already carry their exact second at job
+        # creation; do not count the first refresh as a late upgrade.
+        previous_source = (
+            latest_source
+            if previous_second is not None and latest_second == previous_second
+            else "overview"
+        )
+    target_revision = int(getattr(vision_job, "target_revision", 0) or 0)
+    target_kind = str(
+        getattr(vision_job, "target_kind", "minute") or "minute"
+    ).strip().lower()
+    upgraded = (
+        latest_second is not None
+        and latest_source == "shotmap"
+        and (
+            previous_second != latest_second
+            or (previous_second is None and previous_source != "shotmap")
+        )
+    )
+    if upgraded:
+        target_revision += 1
+        target_kind = "exact_second"
+    setattr(vision_job, "target_revision", target_revision)
+    setattr(vision_job, "target_kind", target_kind)
+    setattr(
+        vision_job,
+        "target_source",
+        "shotmap" if latest_source == "shotmap" and latest_second is not None else previous_source,
+    )
     latest_code = str(event_data.get("code") or vision_job.code).upper()
     vision_job.code = latest_code
     vision_job.event_type = str(
@@ -719,12 +824,122 @@ def refresh_vision_job_event_data(vision_job: VisionJob, default_task: StoredTas
     )
     vision_job.event_minute = str(event_data.get("minute") or "")
     vision_job.event_minute_extra = str(event_data.get("minute_extra") or "0")
-    vision_job.event_second = parse_cumulative_match_second(event_data.get("second"))
+    # ``merge_event_metadata`` does not erase a populated value.  Keep the
+    # same monotonic behavior here for older/recovered tasks as well.
+    if latest_second is not None:
+        vision_job.event_second = latest_second
     vision_job.target_score = str(event_data.get("score") or "")
     if default_task.observed_stream_time is not None:
         vision_job.observed_anchor_stream_time = default_task.observed_stream_time
     if default_task.observed_source_time is not None:
         vision_job.observed_anchor_source_time = default_task.observed_source_time
+    if not upgraded:
+        return None
+    return {
+        "target_revision": target_revision,
+        "target_kind": target_kind,
+        "target_source": "shotmap",
+        "target_clock_seconds": latest_second,
+        "previous_target_clock_seconds": previous_second,
+        "reason": "shotmap_second_upgrade",
+    }
+
+
+def reset_vision_artifact_for_target_upgrade(
+    runtime: PipelineRuntime,
+    vision_job: VisionJob,
+    artifact_kind: str,
+    upgrade: dict[str, Any],
+) -> bool:
+    """Persist a one-shot OCR/T-DEED rescan marker after shotmap enrichment.
+
+    A running visual worker is returned to ``pending``; its target revision is
+    carried in ``progressive_scan`` so the worker can discard stale writes and
+    restart from the original historical search window. An encoded artifact
+    may also be requeued when a later authoritative second supersedes it.
+    """
+    task = runtime.store.get_vision_task(
+        vision_job.event_key,
+        artifact_kind=artifact_kind,
+    )
+    if task is None:
+        return False
+    revision = int(upgrade["target_revision"])
+    progress = dict(task.window_metadata.get("progressive_scan") or {})
+    stored_revision = int(progress.get("target_revision") or 0)
+    if stored_revision >= revision:
+        return False
+    progress.update(
+        {
+            "target_revision": revision,
+            "target_kind": upgrade.get("target_kind"),
+            "target_source": upgrade.get("target_source"),
+            "target_clock_seconds": upgrade.get("target_clock_seconds"),
+            "target_clock": (
+                f"{int(upgrade['target_clock_seconds']) // 60:02d}:"
+                f"{int(upgrade['target_clock_seconds']) % 60:02d}"
+                if upgrade.get("target_clock_seconds") is not None
+                else None
+            ),
+            "state": "target_revision_reset",
+            "reset_reason": upgrade.get("reason", "shotmap_second_upgrade"),
+            "scan_cursor_stream_time": None,
+            "latest_trusted_clock_seconds": None,
+            "final_scan_completed": False,
+            "final_scan_completed_at_unix": None,
+            "final_scan_started_at_unix": None,
+            "final_scan_window": None,
+            "target_rescan_window": None,
+            "target_rescan_started_at_unix": None,
+            "target_rescan_completed_at_unix": None,
+            "anchor_stream_time": None,
+            "anchor_provenance": None,
+            "reset_at_unix": time.time(),
+        }
+    )
+    window_metadata = {"progressive_scan": progress}
+    result = {
+        "target_revision": revision,
+        "target_kind": upgrade.get("target_kind"),
+        "target_source": upgrade.get("target_source"),
+        "target_clock_seconds": upgrade.get("target_clock_seconds"),
+        "target_revision_reset": True,
+        "default_gif_preserved": True,
+    }
+    if task.status == "encoded":
+        previous_output = task.result.get("output") or task.output_path
+        if previous_output:
+            result["superseded_output"] = previous_output
+        result["superseded_at_target_revision"] = revision
+    if task.status != "pending":
+        runtime.transition_vision_task(
+            vision_job.event_key,
+            "pending",
+            artifact_kind=artifact_kind,
+            result=result,
+            window_metadata=window_metadata,
+            reason="shotmap_second_upgrade",
+        )
+    else:
+        # The existing readiness API performs an atomic merge of both JSON
+        # blobs while keeping the task pending and restartable.
+        runtime.record_vision_readiness_wait(
+            vision_job.event_key,
+            "shotmap exact second upgraded the visual target",
+            artifact_kind=artifact_kind,
+            error_kind="target_revision_reset",
+            result=result,
+            window_metadata=window_metadata,
+            next_attempt_at_unix=time.time(),
+        )
+    runtime.logger.log(
+        "vision_target_upgraded",
+        event_key=vision_job.event_key,
+        match_id=vision_job.match_id,
+        artifact_kind=artifact_kind,
+        **result,
+    )
+    return True
 
 
 def stream_rate_for_mode(*, simulate_live: bool, replay_speed: float) -> float:
@@ -3625,6 +3840,12 @@ def main() -> None:
             task.event_key: task
             for task in runtime.store.list_incomplete_vision_tasks(args.match_id)
         }
+        # Keep terminal visual rows addressable while the live feed is still
+        # running. A late shotmap second can supersede a minute-only result
+        # even when the process was restarted after the first encode.
+        for task in runtime.store.list_vision_tasks(args.match_id):
+            if task.artifact_kind == "ocr_window" or args.tdeed_enabled:
+                recovery_seeds.setdefault(task.event_key, task)
         if not args.tdeed_enabled:
             disabled_tdeed_count = disable_incomplete_tdeed_tasks(
                 runtime,
@@ -3651,6 +3872,15 @@ def main() -> None:
         for task in recovery_seeds.values():
             default_task = runtime.store.get(task.event_key)
             event_data = default_task.event_data if default_task is not None else {}
+            persisted_progress = task.window_metadata.get("progressive_scan")
+            if not isinstance(persisted_progress, dict):
+                persisted_progress = {}
+            try:
+                recovered_target_revision = max(
+                    0, int(persisted_progress.get("target_revision") or 0)
+                )
+            except (TypeError, ValueError):
+                recovered_target_revision = 0
             if runtime.store.get_vision_task(
                 task.event_key,
                 artifact_kind="ocr_window",
@@ -3689,6 +3919,11 @@ def main() -> None:
                 scoreboard_profile=scoreboard_profile,
                 require_scoreboard_profile=False,
                 clock_only=args.ocr_clock_only,
+                target_kind=(
+                    "exact_second" if parse_cumulative_match_second(event_data.get("second")) is not None else "minute"
+                ),
+                target_source=_event_source_name(event_data),
+                target_revision=recovered_target_revision,
             )
     recovered_jobs = len(jobs)
     run_id = (
@@ -4395,6 +4630,10 @@ def main() -> None:
                             scoreboard_profile=scoreboard_profile,
                             require_scoreboard_profile=False,
                             clock_only=args.ocr_clock_only,
+                            target_kind=(
+                                "exact_second" if match_event.second is not None else "minute"
+                            ),
+                            target_source=_event_source_name(match_event),
                         )
                         try:
                             lease_results = protect_incomplete_vision_event_segments(
@@ -4542,6 +4781,9 @@ def main() -> None:
                     sync_completed_default_job(job, runtime, event_key, completed)
 
                 if vision_pool is not None:
+                    # Refresh each event once per scheduler pass and retain
+                    # the upgrade payload for both OCR and optional T-DEED.
+                    vision_target_upgrades: dict[str, dict[str, Any]] = {}
                     for artifact_kind in enabled_vision_artifact_kinds(
                         tdeed_enabled=args.tdeed_enabled
                     ):
@@ -4552,10 +4794,23 @@ def main() -> None:
                             # Refresh event revisions before either artifact is
                             # submitted. The artifact-first loops ensure every
                             # ready OCR job enters the queue ahead of T-DEED.
-                            refresh_vision_job_event_data(
+                            target_upgrade = refresh_vision_job_event_data(
                                 vision_job,
                                 default_task,
                             )
+                            if target_upgrade is not None:
+                                vision_target_upgrades[event_key] = target_upgrade
+                            target_upgrade = vision_target_upgrades.get(event_key)
+                            if target_upgrade is not None:
+                                if artifact_kind == "ocr_window":
+                                    ensure_ocr_target_revision(runtime, vision_job)
+                                else:
+                                    reset_vision_artifact_for_target_upgrade(
+                                        runtime,
+                                        vision_job,
+                                        artifact_kind,
+                                        target_upgrade,
+                                    )
                             ocr_task = runtime.store.get_vision_task(
                                 event_key,
                                 artifact_kind="ocr_window",
@@ -4651,14 +4906,13 @@ def main() -> None:
                         event_key, artifact_kind = split_vision_pool_task_key(
                             pool_key
                         )
-                        if error is not None:
-                            if not isinstance(error, HeavyTaskCancelled):
-                                fail_unhandled_vision_worker_error(
-                                    runtime,
-                                    event_key=event_key,
-                                    artifact_kind=artifact_kind,
-                                    error=error,
-                                )
+                        if error is not None and not isinstance(error, HeavyTaskCancelled):
+                            fail_unhandled_vision_worker_error(
+                                runtime,
+                                event_key=event_key,
+                                artifact_kind=artifact_kind,
+                                error=error,
+                            )
                             print(
                                 f"[vision:worker:error] artifact={artifact_kind} "
                                 f"key={event_key} {error}"
@@ -4676,6 +4930,7 @@ def main() -> None:
                         active_vision_event_keys(set(vision_pool.futures))
                         if vision_pool is not None else set()
                     ),
+                    retain_terminal_vision_jobs=not graceful_stop_requested.is_set(),
                 )
 
                 if now_monotonic - last_heartbeat_monotonic >= 3.0:
@@ -4819,6 +5074,36 @@ def main() -> None:
                                 reason="all_visual_artifacts_terminal",
                             )
                     current_segments = segment_reader()
+                    if args.vision_enabled and current_segments:
+                        try:
+                            lease_results = protect_incomplete_vision_event_segments(
+                                runtime,
+                                runtime.store.list_incomplete_vision_tasks(
+                                    args.match_id
+                                ),
+                                current_segments,
+                                ocr_timeout_seconds=args.ocr_timeout_seconds,
+                                vision_timeout_seconds=args.vision_timeout_seconds,
+                                graceful_stop_timeout_seconds=(
+                                    args.graceful_stop_timeout_seconds
+                                ),
+                            )
+                            for lease_result in lease_results:
+                                if not lease_result.get("new_segment_count"):
+                                    continue
+                                runtime.logger.log(
+                                    "event_visual_window_leased",
+                                    match_id=args.match_id,
+                                    reason="progressive_scan_heartbeat",
+                                    **lease_result,
+                                )
+                        except Exception as exc:
+                            runtime.logger.log(
+                                "event_visual_window_lease_failed",
+                                match_id=args.match_id,
+                                reason="progressive_scan_heartbeat",
+                                error=str(exc),
+                            )
                     observe_segment_progress(
                         supervisor,
                         current_segments,
@@ -4920,13 +5205,14 @@ def main() -> None:
     if vision_pool is not None:
         for pool_key, _completed, error in vision_pool.collect_done():
             event_key, artifact_kind = split_vision_pool_task_key(pool_key)
-            if error is not None and not isinstance(error, HeavyTaskCancelled):
-                fail_unhandled_vision_worker_error(
-                    runtime,
-                    event_key=event_key,
-                    artifact_kind=artifact_kind,
-                    error=error,
-                )
+            if error is not None:
+                if not isinstance(error, HeavyTaskCancelled):
+                    fail_unhandled_vision_worker_error(
+                        runtime,
+                        event_key=event_key,
+                        artifact_kind=artifact_kind,
+                        error=error,
+                    )
             if error is not None:
                 print(
                     f"[vision:worker:error] artifact={artifact_kind} "

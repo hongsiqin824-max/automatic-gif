@@ -154,8 +154,11 @@ class _ClockSecondEstimate:
     clock_video_slope: float
 
 
-NEAR_NEIGHBOR_MAX_CLOCK_DISTANCE_SECONDS = 2
-NEAR_NEIGHBOR_MIN_DIRECT_READINGS = 3
+# A fixed scoreboard ROI can still provide a useful one-sided estimate when
+# only a short, clean run is readable.  Keep the estimate explicitly degraded
+# so it is never confused with a directly observed target second.
+NEAR_NEIGHBOR_MAX_CLOCK_DISTANCE_SECONDS = 4
+NEAR_NEIGHBOR_MIN_DIRECT_READINGS = 2
 NEAR_NEIGHBOR_MAX_DIRECT_READINGS = 5
 NEAR_NEIGHBOR_MIN_CLOCK_VIDEO_SLOPE = 0.8
 NEAR_NEIGHBOR_MAX_CLOCK_VIDEO_SLOPE = 1.2
@@ -1470,18 +1473,25 @@ def _locate_goal_second(
             diagnostics={
                 **base,
                 "exact_second_failure_reason": "no_trustworthy_clock_readings",
+                "exact_second_failure_cause": "unreadable",
             },
         )
 
     observed_candidates: list[_ClockSecondCandidate] = []
     interpolated_candidates: list[_ClockSecondCandidate] = []
     isolated_target_reading_count = 0
+    accepted_isolated_target_reading_count = 0
     for segment_index, segment in enumerate(segments):
         for reading in segment:
             if reading.clock_seconds == event_second:
                 if len(segment) < 2:
                     isolated_target_reading_count += 1
-                    continue
+                    # A fixed scoreboard clock ROI does not need a second
+                    # neighboring frame to identify an exact displayed
+                    # second.  Once the reading has passed the normal
+                    # trustworthiness checks, use the single frame as the
+                    # anchor and expose the weaker evidence in diagnostics.
+                    accepted_isolated_target_reading_count += 1
                 observed_candidates.append(
                     _ClockSecondCandidate(
                         reading.frame_seconds,
@@ -1532,6 +1542,9 @@ def _locate_goal_second(
     match_diagnostics = {
         **base,
         "isolated_target_reading_count": isolated_target_reading_count,
+        "accepted_isolated_target_reading_count": (
+            accepted_isolated_target_reading_count
+        ),
         "exact_second_candidate_source": candidate_source,
         "direct_observation_candidate_count": len(observed_candidates),
         "two_sided_interpolation_candidate_count": len(interpolated_candidates),
@@ -1584,6 +1597,13 @@ def _locate_goal_second(
             diagnostics={
                 **match_diagnostics,
                 "exact_second_failure_reason": "target_clock_not_found",
+                "exact_second_failure_cause": (
+                    "isolated"
+                    if isolated_target_reading_count
+                    else "continuity"
+                    if matching_segments == [] and len(readable_clocks) >= 2
+                    else "unreadable"
+                ),
                 "trusted_clock_range": [
                     _clock_text(min(readable_clocks)),
                     _clock_text(max(readable_clocks)),
@@ -1604,7 +1624,7 @@ def _locate_goal_second(
             "kind": "near_neighbor_clock_estimate",
             "message": (
                 "target clock was estimated from a consecutive direct OCR run "
-                "within two clock seconds"
+                "within four clock seconds"
             ),
             "error_bound_seconds": NEAR_NEIGHBOR_MAX_CLOCK_DISTANCE_SECONDS,
         }
@@ -1630,7 +1650,9 @@ def _locate_goal_second(
                 "estimate_error_bound_seconds": (
                     NEAR_NEIGHBOR_MAX_CLOCK_DISTANCE_SECONDS
                 ),
-                "estimate_error_bound_label": "+/-2s",
+                "estimate_error_bound_label": (
+                    f"+/-{NEAR_NEIGHBOR_MAX_CLOCK_DISTANCE_SECONDS}s"
+                ),
                 "estimate_nearest_clock": _clock_text(nearest.clock_seconds),
                 "estimate_nearest_frame_seconds": round(
                     nearest.frame_seconds, 3
@@ -1671,7 +1693,9 @@ def _locate_goal_second(
             "estimated_error_bound_seconds": (
                 NEAR_NEIGHBOR_MAX_CLOCK_DISTANCE_SECONDS
             ),
-            "estimated_error_bound_label": "+/-2s",
+            "estimated_error_bound_label": (
+                f"+/-{NEAR_NEIGHBOR_MAX_CLOCK_DISTANCE_SECONDS}s"
+            ),
             "target_clock": target_clock,
             "target_clock_seconds": event_second,
             "requires_tdeed": False,
@@ -1687,6 +1711,9 @@ def _locate_goal_second(
             "trusted_clock_frame_count": trusted_count,
             "clock_continuity_segment_count": len(segments),
             "isolated_target_reading_count": isolated_target_reading_count,
+            "accepted_isolated_target_reading_count": (
+                accepted_isolated_target_reading_count
+            ),
             "matching_occurrence_count": 1,
             "exact_second_candidate_source": candidate_source,
             "direct_observation_candidate_count": len(observed_candidates),

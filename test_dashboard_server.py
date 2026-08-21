@@ -799,9 +799,13 @@ class DashboardTests(unittest.TestCase):
                      "progressive_scan": {
                          "state": "waiting_for_clock_target",
                          "scan_cursor_stream_time": 88.5,
-                         "latest_trusted_clock": "07:35",
-                         "latest_trusted_clock_seconds": 455,
-                         "scan_attempt_count": 3,
+                        "latest_trusted_clock": "07:35",
+                        "latest_trusted_clock_seconds": 455,
+                        "target_failure_cause": "target_passed",
+                        "target_failure_explanation": "OCR 已经越过目标时间，但没有找到可验证的直接读数或连续插值锚点。",
+                        "target_passed_without_anchor": True,
+                        "target_failure_scan_stage": "ocr_progressive_scan",
+                        "scan_attempt_count": 3,
                          "last_scan_start_stream_time": 20.0,
                          "last_scan_end_stream_time": 100.0,
                      },
@@ -818,10 +822,106 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(ocr["scan_cursor"], 88.5)
         self.assertEqual(ocr["last_trusted_clock"], "07:35")
         self.assertEqual(ocr["last_trusted_clock_seconds"], 455)
+        self.assertEqual(ocr["target_failure_cause"], "target_passed")
+        self.assertTrue(ocr["target_passed_without_anchor"])
+        self.assertEqual(ocr["target_failure_scan_stage"], "ocr_progressive_scan")
         self.assertEqual(ocr["scan_attempt_count"], 3)
         self.assertEqual(ocr["next_attempt_at_unix"], 30.0)
         self.assertEqual(ocr["deadline_at_unix"], 120.0)
         self.assertEqual(ocr["scan_window"]["start_stream_time"], 20.0)
+
+    def test_database_marks_pending_target_rescan_as_recoverable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "pipeline_state.sqlite3"
+            runtime = dashboard_server.sqlite3.connect(database)
+            runtime.executescript(
+                """
+                CREATE TABLE event_tasks (
+                    event_key TEXT, code TEXT, event_type TEXT, event_json TEXT,
+                    status TEXT, discovered_at_unix REAL, updated_at_unix REAL,
+                    output_path TEXT, output_bytes INTEGER, result_json TEXT,
+                    error TEXT
+                );
+                CREATE TABLE vision_tasks (
+                    event_key TEXT, status TEXT, located_anchor_stream_time REAL,
+                    confidence REAL, inference_seconds REAL, model_name TEXT,
+                    model_version TEXT, output_path TEXT, output_bytes INTEGER,
+                    result_json TEXT, error TEXT, last_error_kind TEXT,
+                    failure_stage TEXT, failure_reason TEXT,
+                    location_json TEXT, window_json TEXT,
+                    next_attempt_at_unix REAL, deadline_at_unix REAL,
+                    artifact_kind TEXT, created_at_unix REAL
+                );
+                """
+            )
+            event = {"event_key": "m:G:rescan", "code": "G", "event_type": "goal"}
+            runtime.execute(
+                "INSERT INTO event_tasks VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                ("m:G:rescan", "G", "goal", json.dumps(event),
+                 "encoded", 1, 2, "/tmp/default.gif", 10, "{}", None),
+            )
+            runtime.execute(
+                "INSERT INTO vision_tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("m:G:rescan", "pending", None, None, None, "PaddleOCR", "1",
+                 None, None, json.dumps({"stage": "waiting_for_clock_target"}),
+                 "waiting", "waiting_for_clock_target", None, None, json.dumps({}),
+                 json.dumps({"progressive_scan": {
+                     "state": "waiting_for_clock_target",
+                     "target_rescan_window": {"start_stream_time": 90, "end_stream_time": 120},
+                     "target_passed_without_anchor": True,
+                 }}), 30.0, 120.0, "ocr_window", 1),
+            )
+            runtime.commit(); runtime.close()
+            tasks, _, _ = dashboard_server._tasks_from_database(database)
+        ocr = tasks[0]["ocr_window"]
+        self.assertEqual(ocr["ocr_pipeline_status"], "ocr_target_rescan")
+        self.assertTrue(ocr["target_rescan_pending"])
+        self.assertEqual(ocr["target_rescan_window"]["start_stream_time"], 90)
+
+    def test_database_downgrades_stale_failure_for_pending_ocr_row(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "pipeline_state.sqlite3"
+            runtime = dashboard_server.sqlite3.connect(database)
+            runtime.executescript(
+                """
+                CREATE TABLE event_tasks (
+                    event_key TEXT, code TEXT, event_type TEXT, event_json TEXT,
+                    status TEXT, discovered_at_unix REAL, updated_at_unix REAL,
+                    output_path TEXT, output_bytes INTEGER, result_json TEXT,
+                    error TEXT
+                );
+                CREATE TABLE vision_tasks (
+                    event_key TEXT, status TEXT, located_anchor_stream_time REAL,
+                    confidence REAL, inference_seconds REAL, model_name TEXT,
+                    model_version TEXT, output_path TEXT, output_bytes INTEGER,
+                    result_json TEXT, error TEXT, last_error_kind TEXT,
+                    failure_stage TEXT, failure_reason TEXT,
+                    location_json TEXT, window_json TEXT,
+                    next_attempt_at_unix REAL, deadline_at_unix REAL,
+                    artifact_kind TEXT, created_at_unix REAL
+                );
+                """
+            )
+            event = {"event_key": "m:G:stale", "code": "G", "event_type": "goal"}
+            runtime.execute(
+                "INSERT INTO event_tasks VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                ("m:G:stale", "G", "goal", json.dumps(event), "encoded", 1, 2,
+                 "/tmp/default.gif", 10, "{}", None),
+            )
+            runtime.execute(
+                "INSERT INTO vision_tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("m:G:stale", "pending", None, None, None, "PaddleOCR", "1",
+                 None, None, json.dumps({"error_kind": "ocr_clock_target_not_located"}),
+                 "stale", "ocr_clock_target_not_located", None, None, json.dumps({}),
+                 json.dumps({"progressive_scan": {"state": "waiting_for_clock_target"}}),
+                 30.0, 120.0, "ocr_window", 1),
+            )
+            runtime.commit(); runtime.close()
+            tasks, _, _ = dashboard_server._tasks_from_database(database)
+        self.assertEqual(
+            tasks[0]["ocr_window"]["ocr_pipeline_status"],
+            "waiting_for_clock_target",
+        )
 
     def test_database_normalizes_progressive_ocr_failure_kind(self):
         with tempfile.TemporaryDirectory() as directory:

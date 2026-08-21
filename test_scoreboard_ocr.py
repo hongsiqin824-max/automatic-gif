@@ -504,6 +504,29 @@ class ScoreboardLocationTests(unittest.TestCase):
             ["69:36", "69:38"],
         )
 
+    def test_goal_second_uses_two_readings_for_degraded_one_sided_estimate(self):
+        readings = [
+            self._reading(0, 0.0, "69:33"),
+            self._reading(1, 1.0, "69:34"),
+        ]
+
+        result = locate_from_readings(
+            readings,
+            {
+                "event_code": "G",
+                "event_second": 4177,
+            },
+        )
+
+        self.assertEqual(result["method"], "paddleocr_near_neighbor_estimate")
+        self.assertEqual(result["precision"], "estimated_second")
+        self.assertEqual(result["localization_quality"], "estimated")
+        self.assertTrue(result["degraded"])
+        self.assertEqual(result["anchor_seconds"], 4.0)
+        self.assertEqual(result["estimated_error_bound_seconds"], 4)
+        self.assertEqual(result["estimated_error_bound_label"], "+/-4s")
+        self.assertEqual(result["diagnostics"]["estimate_direct_reading_count"], 2)
+
     def test_goal_second_rejects_multiple_disjoint_clock_occurrences(self):
         readings = [
             self._reading(0, 0.0, "69:37"),
@@ -552,21 +575,27 @@ class ScoreboardLocationTests(unittest.TestCase):
         self.assertEqual(result["anchor_seconds"], 101.0)
         self.assertEqual(result["method"], "paddleocr_exact_clock")
 
-    def test_goal_second_does_not_trust_one_isolated_clock_reading(self):
+    def test_goal_second_uses_one_isolated_clock_reading(self):
         readings = [self._reading(0, 7.0, "69:37")]
 
-        with self.assertRaises(WorkerError) as raised:
-            locate_from_readings(
-                readings,
-                {
-                    "event_code": "G",
-                    "event_second": 4177,
-                },
-            )
+        result = locate_from_readings(
+            readings,
+            {
+                "event_code": "G",
+                "event_second": 4177,
+            },
+        )
 
-        self.assertEqual(raised.exception.kind, "ocr_exact_second_not_found")
+        self.assertEqual(result["anchor_seconds"], 7.0)
+        self.assertEqual(result["method"], "paddleocr_exact_clock")
+        self.assertEqual(result["precision"], "observed_second")
+        self.assertEqual(result["localization_quality"], "exact")
         self.assertEqual(
-            raised.exception.diagnostics["isolated_target_reading_count"], 1
+            result["diagnostics"]["isolated_target_reading_count"], 1
+        )
+        self.assertEqual(
+            result["diagnostics"]["accepted_isolated_target_reading_count"],
+            1,
         )
 
     def test_goal_second_failure_downgrades_to_score_transition(self):

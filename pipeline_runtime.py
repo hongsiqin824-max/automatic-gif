@@ -47,7 +47,10 @@ _ALLOWED_VISION_TRANSITIONS = {
     "locating": {"pending", "located", "failed"},
     "located": {"pending", "encoding", "failed"},
     "encoding": {"pending", "located", "encoded", "failed"},
-    "encoded": set(),
+    # A late authoritative shotmap second may supersede a minute-only visual
+    # artifact. The upgrade path records the prior result and requeues only
+    # the visual artifact; the default GIF task remains terminal/independent.
+    "encoded": {"pending"},
     "failed": {"pending"},
 }
 

@@ -53,14 +53,58 @@ OCR_PROGRESSIVE_INITIAL_LOOKBACK_SECONDS = 120.0
 OCR_PROGRESSIVE_OVERLAP_SECONDS = 5.0
 OCR_PROGRESSIVE_INCREMENT_SECONDS = 30.0
 OCR_PROGRESSIVE_TAIL_EPSILON_SECONDS = 0.25
+# A progressive miss may happen after the match clock has already crossed the
+# requested boundary.  Keep a wider, target-centred retry window so a transient
+# unreadable frame cannot permanently move the cursor past the event.  The
+# first target-local retry uses a +/-20s window; subsequent retries use the
+# expanded +/-30s window below.
+OCR_PROGRESSIVE_TARGET_RESCAN_MARGIN_SECONDS = 20.0
+# Target-local retries use the normal one-second OCR cadence.  The recovery
+# comes from revisiting a target-centred window, not from changing the default
+# GIF path or making every OCR pass more expensive.
+OCR_PROGRESSIVE_TARGET_RESCAN_SAMPLE_INTERVAL_SECONDS = 1.0
+OCR_PROGRESSIVE_TARGET_RESCAN_EXPANDED_MARGIN_SECONDS = 30.0
+OCR_PROGRESSIVE_TARGET_RESCAN_MAX_ATTEMPTS = 3
+# A validated clock-to-video mapping is already a strong anchor. Keep its
+# focused scan at the original +/-15s; the wider windows above are reserved
+# for recovery after an OCR miss.
+OCR_PROGRESSIVE_MAPPED_TARGET_MARGIN_SECONDS = 15.0
+# A clock-to-video mapping is only used after two trustworthy observations.
+# The ratio is normally close to 1.0, but a small tolerance covers broadcast
+# drift and timestamp jitter without accepting a paused/replayed stream.
+OCR_CLOCK_MAPPING_MIN_SAMPLES = 2
+OCR_CLOCK_MAPPING_MIN_RATE = 0.5
+OCR_CLOCK_MAPPING_MAX_RATE = 2.0
+OCR_CLOCK_MAPPING_MAX_SAMPLES = 32
+# Do not project a target arbitrarily far beyond the observed clock range.
+# Such a projection is useful for a short API/OCR lag, but unsafe after a
+# halftime break, stream seek, or a long missing segment.
+OCR_CLOCK_MAPPING_MAX_EXTRAPOLATION_SECONDS = 60.0
 OCR_TARGET_WAIT_INITIAL_SECONDS = 60.0
 OCR_TARGET_WAIT_MARGIN_SECONDS = 20.0
-OCR_EVENT_HARD_LIMIT_SECONDS = 180.0
+# The target wait may be extended while the live tail is still advancing, but
+# it must have a finite watchdog so a dead stream cannot occupy an OCR worker
+# forever.  Keep this separate from the per-inference timeout.
+OCR_EVENT_HARD_LIMIT_SECONDS = 300.0
+# A live tail or a trusted match clock that stops changing is useful evidence
+# that waiting will not produce a new target.  The timeout is deliberately
+# shorter than the event watchdog, while still allowing normal short pauses.
+OCR_MEDIA_STALL_TIMEOUT_SECONDS = 60.0
+OCR_CLOCK_PAUSE_TIMEOUT_SECONDS = 60.0
 OCR_POSTROLL_HARD_LIMIT_SECONDS = 60.0
+# When OCR has not produced an accepted clock yet, a growing live tail is
+# still useful evidence that the requested media may arrive.  Extend the
+# readiness deadline in short increments, bounded by the event hard limit,
+# instead of failing at the initial 60-second cap.
+OCR_MEDIA_PROGRESS_EXTENSION_SECONDS = 20.0
 OCR_FAR_TARGET_RETRY_MIN_SECONDS = 10.0
 OCR_FAR_TARGET_RETRY_MAX_SECONDS = 30.0
 OCR_PROGRESSIVE_SCAN_MISS_KINDS = frozenset({
     "buffer_gap",
+    # A slow OCR inference is a scan miss, not proof that the target clock is
+    # absent.  The next progressive pass must be allowed to inspect newer
+    # media that entered the rolling buffer while this pass was running.
+    "inference_timeout",
     "ocr_clock_unreadable",
     "ocr_exact_second_not_found",
     "ocr_minute_boundary_not_found",
@@ -172,6 +216,8 @@ def _vision_failure_result(
         "error_kind": error_kind,
         "fallback_used": False,
         "minute_fallback": False,
+        "localization_source": "failed",
+        "precision": "unverified",
         "precise_location": False,
         "default_gif_preserved": True,
         "fallback_generated": False,
@@ -275,6 +321,16 @@ def _ocr_minute_range_fallback(
         "anchor_stream_time": anchor,
         "location_kind": (
             "match_clock_minute_interval"
+            if ocr_location_kind == "clock_interval"
+            else "score_transition"
+        ),
+        "localization_source": (
+            "minute_boundary"
+            if ocr_location_kind == "clock_interval"
+            else "score_transition"
+        ),
+        "precision": (
+            "minute_boundary"
             if ocr_location_kind == "clock_interval"
             else "score_transition"
         ),
@@ -394,6 +450,7 @@ def locate_with_ocr_fallback(
         except (KeyError, TypeError, ValueError):
             exact_anchor = math.nan
         if math.isfinite(exact_anchor) and window_start <= exact_anchor <= window_end:
+            localization_source, precision = _ocr_localization_contract(ocr_result)
             return {
                 "anchor_stream_time": exact_anchor,
                 "confidence": None,
@@ -407,6 +464,8 @@ def locate_with_ocr_fallback(
                 "locator_method": ocr_result.get("method") or "paddleocr_exact_clock",
                 "location_kind": ocr_result.get("location_kind"),
                 "precision": ocr_result.get("precision") or "observed_second",
+                "localization_source": localization_source,
+                "localization_precision": precision,
                 "localization_quality": (
                     ocr_result.get("localization_quality") or "exact"
                 ),
@@ -420,7 +479,8 @@ def locate_with_ocr_fallback(
                 "fallback_used": False,
                 "minute_fallback": False,
                 "output_kind": "precise_refined",
-                "precise_location": True,
+                "precise_location": localization_source in {"exact", "interpolated"}
+                and (ocr_result.get("localization_quality") or "exact") == "exact",
             }
         ocr_error = {
             "kind": "ocr_invalid_result",
@@ -578,6 +638,8 @@ def locate_with_ocr_fallback(
                 "default_gif_preserved": True,
                 "fallback_generated": False,
                 "output_kind": "failed",
+                "localization_source": "failed",
+                "precision": "unverified",
             },
         )
 
@@ -997,6 +1059,11 @@ class VisionJob:
     scoreboard_profile: dict[str, Any] | str | None = None
     require_scoreboard_profile: bool = False
     clock_only: bool = False
+    # Monotonic target identity.  A late shotmap second increments this once;
+    # workers use it to reject writes produced for the prior minute target.
+    target_revision: int = 0
+    target_kind: str = "minute"
+    target_source: str = "overview"
 
     @property
     def api_observed_stream_time(self) -> float:
@@ -1717,6 +1784,156 @@ def _artifact_readiness_wait(
     )
 
 
+def ensure_ocr_target_revision(
+    runtime: Any,
+    job: VisionJob,
+    *,
+    now_unix: float | None = None,
+) -> Any:
+    """Make a late exact-second target restart OCR from the retained history.
+
+    The event loop may discover an overview event first and receive the
+    shotmap's cumulative ``second`` later.  OCR progress is durable, so merely
+    mutating ``VisionJob.event_second`` would leave its cursor past the target.
+    This helper records a monotonic revision, clears only the active scan
+    cursor/anchor state, and requeues the OCR artifact immediately.  Existing
+    default-GIF state and diagnostic history are untouched.
+
+    It is safe to call on every polling iteration; identical revisions are a
+    no-op.  The caller should increment ``job.target_revision`` exactly once
+    when the authoritative target changes.
+    """
+    timestamp = time.time() if now_unix is None else float(now_unix)
+    current = _artifact_task(runtime, job.event_key, "ocr_window")
+    if current is None:
+        return None
+    revision = _vision_target_revision(job)
+    source = _vision_target_source(job)
+    previous = _ocr_progressive_state(current)
+    recorded = previous.get("target_revision")
+    try:
+        recorded_revision = int(recorded) if recorded is not None else None
+    except (TypeError, ValueError):
+        recorded_revision = None
+    # Existing rows created before target revisions were introduced must keep
+    # their persisted located/encoding state on the first read.  Revision 0
+    # is the legacy baseline; only a positive revision denotes a late target
+    # that requires a rewind.
+    if recorded_revision is None and revision == 0:
+        return current
+    if recorded_revision == revision:
+        return current
+
+    history = list(previous.get("target_revision_history") or [])
+    history.append(
+        {
+            "from_revision": recorded_revision,
+            "to_revision": revision,
+            "target_source": source,
+            "target_clock_seconds": job.event_second,
+            "reset_at_unix": timestamp,
+        }
+    )
+    reset_progress = {
+        **previous,
+        "target_revision": revision,
+        "target_source": source,
+        "target_clock_seconds": job.event_second,
+        "target_clock": _clock_text_from_seconds(job.event_second),
+        "target_revision_reset_at_unix": timestamp,
+        "target_revision_reset_reason": "late_exact_second_target",
+        "target_revision_history": history[-8:],
+        # The old cursor and anchor belong to the old target.  Keep the scan
+        # diagnostics/history above, but force the next pass to use the full
+        # retained initial lookback window again.
+        "scan_cursor_stream_time": None,
+        "latest_trusted_clock_seconds": None,
+        "final_scan_completed_at_unix": None,
+        "final_scan_started_at_unix": None,
+        "final_scan_window": None,
+        "target_rescan_window": None,
+        "target_rescan_started_at_unix": None,
+        "target_rescan_completed_at_unix": None,
+        "target_passed_without_anchor": False,
+        "anchor_stream_time": None,
+        "anchor_provenance": None,
+        "state": "target_revision_reset",
+    }
+
+    # A worker may be in-flight while the API refreshes the event.  Moving it
+    # back to pending invalidates its old result; the worker-side revision
+    # check below prevents that stale result from being persisted afterward.
+    if current.status in {"locating", "located", "encoding", "encoded", "failed"}:
+        try:
+            reset_result = {
+                "stage": "target_revision_reset",
+                "target_revision": revision,
+                "target_source": source,
+                "default_gif_preserved": True,
+            }
+            if current.status == "encoded":
+                previous_output = current.result.get("output") or current.output_path
+                if previous_output:
+                    reset_result["superseded_output"] = previous_output
+                reset_result["superseded_at_target_revision"] = revision
+            _artifact_transition(
+                runtime,
+                job.event_key,
+                "ocr_window",
+                "pending",
+                result=reset_result,
+                window_metadata={"progressive_scan": reset_progress},
+            )
+        except ValueError:
+            # Keep compatibility with an older state store that still treats
+            # encoded visual rows as terminal; the upgrade remains visible in
+            # diagnostics instead of corrupting that row.
+            return current
+        current = _artifact_task(runtime, job.event_key, "ocr_window")
+        if current is None:
+            return None
+
+    if current.status == "pending":
+        return _artifact_readiness_wait(
+            runtime,
+            job.event_key,
+            "ocr_window",
+            "OCR target revised; rescanning the retained initial history window",
+            error_kind="ocr_target_revision_reset",
+            result={
+                "artifact_kind": "ocr_window",
+                "stage": "target_revision_reset",
+                "progressive_status": "target_revision_reset",
+                "target_revision": revision,
+                "target_source": source,
+                "target_clock_seconds": job.event_second,
+                "default_gif_preserved": True,
+            },
+            window_metadata={"progressive_scan": reset_progress},
+            next_attempt_at_unix=timestamp,
+            now=timestamp,
+        )
+    return current
+
+
+def _ocr_target_revision_is_stale(
+    runtime: Any,
+    event_key: str,
+    revision: int,
+) -> bool:
+    """Return whether a worker result belongs to an obsolete OCR target."""
+    current = _artifact_task(runtime, event_key, "ocr_window")
+    if current is None:
+        return True
+    state = _ocr_progressive_state(current)
+    raw = state.get("target_revision")
+    try:
+        current_revision = int(raw) if raw is not None else 0
+    except (TypeError, ValueError):
+        current_revision = 0
+    return current_revision != revision
+
+
 def _clock_text_from_seconds(value: int | float | None) -> str | None:
     if value is None:
         return None
@@ -1812,7 +2029,27 @@ def _latest_trusted_clock_seconds(value: Any) -> int | None:
 
 
 def _ocr_progressive_target_seconds(job: VisionJob) -> int | None:
-    """Return the last clock boundary that can yield an OCR-authorized anchor."""
+    """Return the primary match-clock target for progressive OCR.
+
+    An exact cumulative second is authoritative when available.  The previous
+    implementation used ``max(event_second, minute_boundary)`` which silently
+    moved a late shotmap target forward to the API minute and caused scans to
+    miss the actual event.  Minute-boundary fallback remains represented by
+    ``_ocr_minute_boundary_seconds`` and is no longer allowed to replace the
+    exact target.
+    """
+    if job.event_second is not None:
+        try:
+            value = int(job.event_second)
+        except (TypeError, ValueError):
+            value = -1
+        if value >= 0:
+            return value
+    return _ocr_minute_boundary_seconds(job)
+
+
+def _ocr_minute_boundary_seconds(job: VisionJob) -> int | None:
+    """Return the minute boundary used only for degraded fallback semantics."""
     minute_text = _event_minute(job).rstrip("'").strip()
     minute_target: int | None = None
     if minute_text:
@@ -1825,13 +2062,27 @@ def _ocr_progressive_target_seconds(job: VisionJob) -> int | None:
         else:
             if base >= 0 and extra >= 0:
                 minute_target = (base + extra) * 60
-    if job.event_second is None:
-        return minute_target
-    if minute_target is None:
-        return int(job.event_second)
-    # Before this boundary the minute fallback is not yet observable. Continue
-    # scanning even if an isolated OCR miss has already passed the exact second.
-    return max(int(job.event_second), minute_target)
+    return minute_target
+
+
+def _ocr_progressive_fallback_horizon_seconds(job: VisionJob) -> int | None:
+    """Return the minute boundary without overriding an exact target."""
+    return _ocr_minute_boundary_seconds(job)
+
+
+def _vision_target_revision(job: VisionJob) -> int:
+    """Read the monotonic API-target revision from old and new job objects."""
+    raw = getattr(job, "target_revision", 0)
+    try:
+        revision = int(raw)
+    except (TypeError, ValueError):
+        revision = 0
+    return max(0, revision)
+
+
+def _vision_target_source(job: VisionJob) -> str:
+    source = str(getattr(job, "target_source", "overview") or "overview").strip()
+    return source or "overview"
 
 
 def _ocr_progressive_state(task: Any) -> dict[str, Any]:
@@ -1842,12 +2093,486 @@ def _ocr_progressive_state(task: Any) -> dict[str, Any]:
     return dict(state) if isinstance(state, dict) else {}
 
 
+def _ocr_progressive_clock_readings(value: Any) -> list[tuple[float, int]]:
+    """Extract unique ``(video_seconds, match_clock_seconds)`` observations.
+
+    Worker failures preserve diagnostics at different nesting levels (for
+    example ``readings`` and ``clock_raw_observations``).  Keeping this parser
+    local to the progressive state avoids coupling the runtime to one worker
+    response shape while still allowing a safe target-window retry.
+    """
+    found: set[tuple[float, int]] = set()
+
+    def visit(item: Any, candidate_start: float = 0.0) -> None:
+        if isinstance(item, dict):
+            local_candidate_start = candidate_start
+            try:
+                parsed_candidate_start = float(item.get("candidate_start_seconds"))
+            except (TypeError, ValueError):
+                parsed_candidate_start = math.nan
+            if math.isfinite(parsed_candidate_start):
+                local_candidate_start = parsed_candidate_start
+            frame_raw = item.get("frame_seconds")
+            if frame_raw is None:
+                frame_raw = item.get("video_seconds")
+            clock_raw = None
+            for key in (
+                "effective_clock_seconds",
+                "clock_seconds",
+                "observed_clock_seconds",
+                "effective_clock",
+                "clock",
+                "observed_clock",
+            ):
+                if item.get(key) is not None:
+                    clock_raw = item.get(key)
+                    break
+            try:
+                frame = float(frame_raw)
+            except (TypeError, ValueError):
+                frame = math.nan
+            if (
+                isinstance(clock_raw, (int, float))
+                and not isinstance(clock_raw, bool)
+                and float(clock_raw).is_integer()
+            ):
+                clock = int(clock_raw)
+            else:
+                clock = _clock_seconds_from_text(clock_raw)
+            trusted = (
+                item.get("scoreboard_visible") is not False
+                and item.get("ambiguous_clock") is not True
+                and str(item.get("continuity_status") or "")
+                not in {"rejected", "repaired"}
+            )
+            if (
+                trusted
+                and math.isfinite(frame)
+                and clock is not None
+                and clock >= 0
+            ):
+                found.add(
+                    (round(local_candidate_start + frame, 3), int(clock))
+                )
+            for nested in item.values():
+                visit(nested, local_candidate_start)
+        elif isinstance(item, (list, tuple)):
+            for nested in item:
+                visit(nested, candidate_start)
+
+    visit(value)
+    return sorted(found)
+
+
+def _ocr_progressive_target_rescan_window(
+    diagnostics: dict[str, Any] | None,
+    *,
+    target_clock_seconds: int | None,
+    margin_seconds: float | None = None,
+    rescan_attempt: int = 1,
+) -> dict[str, Any] | None:
+    """Estimate a stream-time window around a clock that was already crossed."""
+    if target_clock_seconds is None or not isinstance(diagnostics, dict):
+        return None
+    readings = _ocr_progressive_clock_readings(diagnostics)
+    if not readings:
+        return None
+    target = int(target_clock_seconds)
+    exact = [frame for frame, clock in readings if clock == target]
+    if exact:
+        estimate = min(exact)
+        method = "direct_clock_observation"
+    else:
+        before = [item for item in readings if item[1] < target]
+        after = [item for item in readings if item[1] > target]
+        estimate: float | None = None
+        method = "nearest_clock_observation"
+        if before and after:
+            left_frame, left_clock = max(before, key=lambda item: item[1])
+            right_frame, right_clock = min(after, key=lambda item: item[1])
+            clock_delta = right_clock - left_clock
+            video_delta = right_frame - left_frame
+            if (
+                clock_delta > 0
+                and video_delta >= 0
+                and 0.5 <= video_delta / clock_delta <= 1.5
+            ):
+                fraction = (target - left_clock) / (right_clock - left_clock)
+                estimate = left_frame + fraction * (right_frame - left_frame)
+                method = "two_sided_clock_interpolation"
+        if estimate is None:
+            nearest_frame, nearest_clock = min(
+                readings,
+                key=lambda item: (abs(item[1] - target), item[0]),
+            )
+            estimate = nearest_frame + (target - nearest_clock)
+            method = "one_sided_clock_projection"
+    try:
+        attempt = max(1, int(rescan_attempt))
+    except (TypeError, ValueError):
+        attempt = 1
+    margin = (
+        OCR_PROGRESSIVE_TARGET_RESCAN_MARGIN_SECONDS
+        if margin_seconds is None
+        else max(1.0, float(margin_seconds))
+    )
+    return {
+        "start_stream_time": round(max(0.0, float(estimate) - margin), 3),
+        "end_stream_time": round(float(estimate) + margin, 3),
+        "estimated_stream_time": round(float(estimate), 3),
+        "target_clock_seconds": target,
+        "method": method,
+        "margin_seconds": margin,
+        "rescan_attempt": attempt,
+        "sample_interval_seconds": OCR_PROGRESSIVE_TARGET_RESCAN_SAMPLE_INTERVAL_SECONDS,
+        "scan_mode": "target_centered_rescan",
+    }
+
+
+def _ocr_progressive_expand_target_rescan_window(
+    previous: Any,
+    *,
+    target_clock_seconds: int | None,
+    rescan_attempt: int,
+    margin_seconds: float | None = None,
+) -> dict[str, Any] | None:
+    """Expand a persisted target retry around its previous stream-time centre."""
+    if not isinstance(previous, dict):
+        return None
+    try:
+        estimate = float(previous.get("estimated_stream_time"))
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(estimate):
+        return None
+    margin = (
+        OCR_PROGRESSIVE_TARGET_RESCAN_EXPANDED_MARGIN_SECONDS
+        if margin_seconds is None
+        else max(1.0, float(margin_seconds))
+    )
+    return {
+        "start_stream_time": round(max(0.0, estimate - margin), 3),
+        "end_stream_time": round(estimate + margin, 3),
+        "estimated_stream_time": round(estimate, 3),
+        "target_clock_seconds": target_clock_seconds,
+        "method": "expanded_previous_target_rescan",
+        "margin_seconds": margin,
+        "rescan_attempt": max(1, int(rescan_attempt)),
+        "sample_interval_seconds": OCR_PROGRESSIVE_TARGET_RESCAN_SAMPLE_INTERVAL_SECONDS,
+        "scan_mode": "target_centered_rescan",
+    }
+
+
+def _ocr_localization_contract(located: dict[str, Any]) -> tuple[str, str]:
+    """Return the stable source/precision pair for a verified OCR result.
+
+    The worker's historical ``location_kind`` remains the authorization
+    boundary.  These additional values only make the evidence grade visible
+    to persistence and the dashboard: a directly observed target second,
+    two-sided interpolation, short one-sided estimate, or minute boundary.
+    """
+    location_kind = str(located.get("location_kind") or "")
+    if location_kind == "match_clock_second":
+        precision = str(located.get("precision") or "")
+        method = str(located.get("method") or "")
+        if precision == "observed_second" or method == "paddleocr_exact_clock":
+            return "exact", "observed_second"
+        if (
+            precision == "interpolated_second"
+            or method == "paddleocr_interpolated_clock"
+        ):
+            return "interpolated", "interpolated_second"
+        if precision == "estimated_second" or method == "paddleocr_near_neighbor_estimate":
+            return "estimated", "estimated_second"
+        # Keep third-party/custom OCR worker implementations compatible while
+        # remaining conservative about their claimed precision.
+        return "exact", precision or "observed_second"
+    if location_kind in {
+        "match_clock_minute_boundary",
+        "match_clock_minute_interval",
+    }:
+        precision = str(located.get("precision") or "minute_boundary")
+        return "minute_boundary", precision
+    if location_kind == "score_transition":
+        return "score_transition", str(located.get("precision") or "score_transition")
+    return "failed", "unverified"
+
+
+def _ocr_localization_is_second_precision(source: Any) -> bool:
+    """Whether a persisted source is authorized as a second-level anchor."""
+    return str(source or "") in {
+        # ``exact_second`` is retained for persisted rows created before the
+        # evidence-grade contract was introduced.
+        "exact_second",
+        "exact",
+        "interpolated",
+        "estimated",
+    }
+
+
+def _ocr_progressive_merge_clock_samples(
+    previous: Any,
+    diagnostics: Any,
+    *,
+    limit: int = OCR_CLOCK_MAPPING_MAX_SAMPLES,
+) -> list[dict[str, float | int]]:
+    """Merge trusted OCR clock readings into durable stream-time samples."""
+    merged: dict[tuple[float, int], dict[str, float | int]] = {}
+
+    def add(stream_time: Any, clock_seconds: Any) -> None:
+        try:
+            stream = float(stream_time)
+            clock = int(clock_seconds)
+        except (TypeError, ValueError):
+            return
+        if not math.isfinite(stream) or stream < 0 or clock < 0:
+            return
+        merged[(round(stream, 3), clock)] = {
+            "stream_time": round(stream, 3),
+            "match_clock_seconds": clock,
+        }
+
+    if isinstance(previous, list):
+        for item in previous:
+            if isinstance(item, dict):
+                add(item.get("stream_time"), item.get("match_clock_seconds"))
+    for stream, clock in _ocr_progressive_clock_readings(diagnostics):
+        add(stream, clock)
+    return sorted(
+        merged.values(),
+        key=lambda item: (float(item["stream_time"]), int(item["match_clock_seconds"])),
+    )[-max(1, min(int(limit), OCR_CLOCK_MAPPING_MAX_SAMPLES)) :]
+
+
+def _ocr_progressive_clock_mapping(samples: Any) -> dict[str, Any]:
+    """Build a validated linear mapping from match-clock to stream time.
+
+    At least two observations and one positive, sensible interval are
+    required.  A replay, pause, or discontinuity therefore cannot silently
+    become the localization anchor.
+    """
+    if not isinstance(samples, list):
+        return {
+            "status": "insufficient_samples",
+            "reason": "samples_missing",
+            "sample_count": 0,
+            "accepted_sample_count": 0,
+            "rejected_samples": [],
+            "updated_at_unix": time.time(),
+        }
+    parsed: list[tuple[float, int]] = []
+    for item in samples:
+        if not isinstance(item, dict):
+            continue
+        try:
+            stream = float(item.get("stream_time"))
+            clock = int(item.get("match_clock_seconds"))
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(stream) and stream >= 0 and clock >= 0:
+            parsed.append((stream, clock))
+    parsed = sorted(set(parsed))[-OCR_CLOCK_MAPPING_MAX_SAMPLES:]
+    # Keep this initialized before the short-input guard; a one-sample history
+    # should report insufficient data rather than raising an implementation
+    # error while inspecting pause diagnostics.
+    pause_runs: list[dict[str, Any]] = []
+    # OCR usually emits several adjacent frames for the same displayed second.
+    # Collapse those ordinary duplicate-clock readings before fitting.  Keep a
+    # long same-clock run as an explicit pause diagnostic instead of treating
+    # every duplicate frame as a discontinuity.
+    collapsed: list[tuple[float, int]] = []
+    index = 0
+    while index < len(parsed):
+        clock = parsed[index][1]
+        run = []
+        while index < len(parsed) and parsed[index][1] == clock:
+            run.append(parsed[index])
+            index += 1
+        first_stream = run[0][0]
+        last_stream = run[-1][0]
+        if last_stream - first_stream > 3.0:
+            pause_runs.append({
+                "match_clock_seconds": clock,
+                "stream_start": round(first_stream, 3),
+                "stream_end": round(last_stream, 3),
+                "reason": "match_clock_paused_or_video_continued",
+            })
+        # The midpoint reduces frame-boundary bias while retaining a stable
+        # one-to-one clock sample for the linear fit.
+        collapsed.append(((first_stream + last_stream) / 2.0, clock))
+    parsed = collapsed
+    if len(parsed) < OCR_CLOCK_MAPPING_MIN_SAMPLES:
+        if pause_runs:
+            return {
+                "status": "rejected_pause",
+                "reason": "match_clock_paused_or_video_continued",
+                "sample_count": len(parsed),
+                "accepted_sample_count": 0,
+                "rejected_samples": pause_runs[-8:],
+                "updated_at_unix": time.time(),
+            }
+        return {
+            "status": "insufficient_samples",
+            "reason": "at_least_two_distinct_clock_samples_required",
+            "sample_count": len(parsed),
+            "accepted_sample_count": len(parsed),
+            "rejected_samples": pause_runs[-8:],
+            "updated_at_unix": time.time(),
+        }
+    valid: list[tuple[float, int, float, int, float]] = []
+    rejected: list[dict[str, Any]] = []
+    for (left_stream, left_clock), (right_stream, right_clock) in zip(
+        parsed, parsed[1:]
+    ):
+        clock_delta = right_clock - left_clock
+        stream_delta = right_stream - left_stream
+        if clock_delta == 0 and stream_delta > 0:
+            rejected.append({
+                "from_stream_time": round(left_stream, 3),
+                "from_match_clock_seconds": left_clock,
+                "to_stream_time": round(right_stream, 3),
+                "to_match_clock_seconds": right_clock,
+                "reason": "match_clock_paused_or_video_continued",
+            })
+            continue
+        if clock_delta <= 0 or stream_delta <= 0:
+            rejected.append({
+                "from_stream_time": round(left_stream, 3),
+                "from_match_clock_seconds": left_clock,
+                "to_stream_time": round(right_stream, 3),
+                "to_match_clock_seconds": right_clock,
+                "reason": "clock_regressed_or_stream_rewound",
+            })
+            continue
+        rate = stream_delta / clock_delta
+        if OCR_CLOCK_MAPPING_MIN_RATE <= rate <= OCR_CLOCK_MAPPING_MAX_RATE:
+            valid.append((left_stream, left_clock, right_stream, right_clock, rate))
+        else:
+            rejected.append({
+                "from_stream_time": round(left_stream, 3),
+                "from_match_clock_seconds": left_clock,
+                "to_stream_time": round(right_stream, 3),
+                "to_match_clock_seconds": right_clock,
+                "reason": "clock_stream_rate_out_of_range",
+                "rate": round(rate, 6),
+            })
+    if pause_runs:
+        rejected.extend(pause_runs)
+    if rejected:
+        # A single pause or discontinuity makes one global linear mapping
+        # unsafe.  Keep the reason in durable diagnostics and let the existing
+        # progressive/target-rescan path handle localization.
+        reason = (
+            "match_clock_paused_or_video_continued"
+            if any(item.get("reason") == "match_clock_paused_or_video_continued" for item in rejected)
+            else "clock_stream_discontinuity"
+        )
+        return {
+            "status": "rejected_pause" if reason == "match_clock_paused_or_video_continued" else "rejected_jump",
+            "reason": reason,
+            "sample_count": len(parsed),
+            "accepted_sample_count": len(parsed) - len(rejected),
+            "rejected_samples": rejected[-8:],
+            "updated_at_unix": time.time(),
+        }
+    if not valid:
+        return {
+            "status": "rejected_jump",
+            "reason": "no_valid_positive_clock_stream_interval",
+            "sample_count": len(parsed),
+            "accepted_sample_count": 0,
+            "rejected_samples": [],
+            "updated_at_unix": time.time(),
+        }
+    # Fit all trusted monotonic samples (rather than only the last pair) so
+    # small frame timestamp jitter does not move the anchor unnecessarily.
+    clocks = [clock for _, clock in parsed]
+    streams = [stream for stream, _ in parsed]
+    mean_clock = sum(clocks) / len(clocks)
+    mean_stream = sum(streams) / len(streams)
+    denominator = sum((clock - mean_clock) ** 2 for clock in clocks)
+    slope = (
+        sum((clock - mean_clock) * (stream - mean_stream) for stream, clock in parsed)
+        / denominator
+        if denominator > 0
+        else valid[-1][4]
+    )
+    if not math.isfinite(slope) or not (
+        OCR_CLOCK_MAPPING_MIN_RATE <= slope <= OCR_CLOCK_MAPPING_MAX_RATE
+    ):
+        return {
+            "status": "rejected_jump",
+            "reason": "fitted_clock_stream_rate_out_of_range",
+            "sample_count": len(parsed),
+            "accepted_sample_count": len(parsed),
+            "rejected_samples": [],
+            "updated_at_unix": time.time(),
+        }
+    intercept = mean_stream - slope * mean_clock
+    left_stream, left_clock = parsed[0]
+    right_stream, right_clock = parsed[-1]
+    return {
+        "status": "ready",
+        "sample_count": len(parsed),
+        "accepted_sample_count": len(parsed),
+        "valid_interval_count": len(valid),
+        "stream_time_per_match_second": round(slope, 6),
+        "slope": round(slope, 6),
+        "intercept": round(intercept, 6),
+        "left_stream_time": round(left_stream, 3),
+        "left_match_clock_seconds": left_clock,
+        "right_stream_time": round(right_stream, 3),
+        "right_match_clock_seconds": right_clock,
+        "updated_at_unix": time.time(),
+    }
+
+
+def _ocr_progressive_mapped_target_window(
+    samples: Any,
+    *,
+    target_clock_seconds: int | None,
+    margin_seconds: float = OCR_PROGRESSIVE_MAPPED_TARGET_MARGIN_SECONDS,
+) -> dict[str, Any] | None:
+    """Estimate the retained-video window corresponding to a target clock."""
+    if target_clock_seconds is None:
+        return None
+    mapping = _ocr_progressive_clock_mapping(samples)
+    if mapping.get("status") != "ready":
+        return None
+    rate = float(mapping.get("slope") or mapping["stream_time_per_match_second"])
+    intercept = float(mapping["intercept"])
+    target = int(target_clock_seconds)
+    left_clock = int(mapping["left_match_clock_seconds"])
+    right_clock = int(mapping["right_match_clock_seconds"])
+    outside_distance = max(left_clock - target, target - right_clock, 0)
+    if outside_distance > OCR_CLOCK_MAPPING_MAX_EXTRAPOLATION_SECONDS:
+        return None
+    estimate = rate * target + intercept
+    if not math.isfinite(estimate):
+        return None
+    margin = max(1.0, float(margin_seconds))
+    return {
+        "start_stream_time": round(max(0.0, estimate - margin), 3),
+        "end_stream_time": round(estimate + margin, 3),
+        "estimated_stream_time": round(estimate, 3),
+        "target_clock_seconds": target,
+        "margin_seconds": margin,
+        "method": (
+            "persistent_clock_video_interpolation"
+            if left_clock <= target <= right_clock
+            else "persistent_clock_video_extrapolation"
+        ),
+        "mapping": mapping,
+    }
+
+
 def _ocr_deadline_policy(
     task: Any,
     *,
     now_unix: float,
     target_clock_seconds: int | None,
     latest_trusted_clock_seconds: int | None,
+    latest_media_end_stream_time: float | None = None,
 ) -> dict[str, Any]:
     """Return the persisted target-wait budget, excluding visual queue time."""
     state = _ocr_progressive_state(task)
@@ -1863,10 +2588,26 @@ def _ocr_deadline_policy(
     queue_extension = max(0.0, queue_wait - accounted_queue_wait)
 
     if "hard_deadline_at_unix" not in policy:
+        try:
+            first_execution_started = float(
+                queue_timing.get("execution_started_at_unix")
+            )
+        except (TypeError, ValueError):
+            first_execution_started = math.nan
+        pre_submission_wait = (
+            max(
+                0.0,
+                first_execution_started
+                - float(task.created_at_unix)
+                - queue_wait,
+            )
+            if math.isfinite(first_execution_started)
+            else 0.0
+        )
         initial_cap = float(task.created_at_unix) + OCR_TARGET_WAIT_INITIAL_SECONDS
         initial_deadline = min(float(task.deadline_at_unix), initial_cap)
         policy.update({
-            "policy_version": 1,
+            "policy_version": 2,
             "phase": "target_wait",
             "initial_target_wait_seconds": OCR_TARGET_WAIT_INITIAL_SECONDS,
             "target_wait_margin_seconds": OCR_TARGET_WAIT_MARGIN_SECONDS,
@@ -1876,7 +2617,44 @@ def _ocr_deadline_policy(
             "hard_deadline_at_unix": (
                 float(task.created_at_unix) + OCR_EVENT_HARD_LIMIT_SECONDS
             ),
+            "first_execution_started_at_unix": (
+                first_execution_started
+                if math.isfinite(first_execution_started)
+                else None
+            ),
+            "pre_submission_wait_accounted_seconds": pre_submission_wait,
         })
+        if pre_submission_wait > 0:
+            for field in (
+                "initial_target_deadline_at_unix",
+                "target_deadline_at_unix",
+                "hard_deadline_at_unix",
+            ):
+                policy[field] = float(policy[field]) + pre_submission_wait
+
+    # Policies are persisted in the task row.  Upgrade an in-flight task that
+    # was created with the old 180-second watchdog without resetting its
+    # already-accounted queue/OCR execution time.  If the old target deadline
+    # had reached that watchdog, carry it forward as well; otherwise a process
+    # restart would still fail at the old limit despite the new configuration.
+    stored_limit_raw = policy.get("event_hard_limit_seconds")
+    try:
+        stored_limit = float(stored_limit_raw)
+    except (TypeError, ValueError):
+        stored_limit = OCR_EVENT_HARD_LIMIT_SECONDS
+    if stored_limit < OCR_EVENT_HARD_LIMIT_SECONDS:
+        old_hard_deadline = float(policy["hard_deadline_at_unix"])
+        hard_extension = OCR_EVENT_HARD_LIMIT_SECONDS - stored_limit
+        policy["hard_deadline_at_unix"] = old_hard_deadline + hard_extension
+        target_deadline = policy.get("target_deadline_at_unix")
+        if target_deadline is not None and float(target_deadline) >= old_hard_deadline - 0.001:
+            policy["target_deadline_at_unix"] = float(target_deadline) + hard_extension
+        policy["event_hard_limit_seconds"] = OCR_EVENT_HARD_LIMIT_SECONDS
+    try:
+        policy_version = int(policy.get("policy_version") or 0)
+    except (TypeError, ValueError):
+        policy_version = 0
+    policy["policy_version"] = max(2, policy_version)
 
     if queue_extension > 0:
         for field in (
@@ -1891,6 +2669,124 @@ def _ocr_deadline_policy(
     policy["queue_wait_accounted_seconds"] = queue_wait
     policy["slot_acquired"] = slot_acquired
 
+    # A trusted OCR clock is not the only signal that live media is advancing.
+    # In particular, a missing/temporary scoreboard ROI can leave
+    # ``latest_trusted_clock_seconds`` unset while new TS segments continue to
+    # arrive.  Persist the media tail and grant one bounded extension whenever
+    # it advances since the previous readiness check.  The first observation
+    # establishes a baseline; subsequent growth is what earns extra time.
+    media_progress = False
+    previous_media_end_raw = state.get("latest_media_end_stream_time")
+    try:
+        previous_media_end = float(previous_media_end_raw)
+    except (TypeError, ValueError):
+        previous_media_end = math.nan
+    try:
+        current_media_end = (
+            float(latest_media_end_stream_time)
+            if latest_media_end_stream_time is not None
+            else math.nan
+        )
+    except (TypeError, ValueError):
+        current_media_end = math.nan
+    if math.isfinite(current_media_end):
+        media_progress = bool(
+            math.isfinite(previous_media_end)
+            and current_media_end
+            > previous_media_end + OCR_PROGRESSIVE_TAIL_EPSILON_SECONDS
+        )
+        policy["latest_media_end_stream_time"] = round(current_media_end, 3)
+    policy["media_progress_observed"] = bool(
+        policy.get("media_progress_observed") or media_progress
+    )
+    policy["media_progress_current"] = media_progress
+    if media_progress:
+        policy["last_media_progress_at_unix"] = float(now_unix)
+    elif math.isfinite(current_media_end):
+        # The first observation is a baseline.  Subsequent unchanged tails
+        # are measured from the last observed growth, not from task creation.
+        policy.setdefault("last_media_progress_at_unix", float(now_unix))
+    terminal_wait_reason = policy.get("target_wait_terminal_reason")
+    if media_progress and latest_trusted_clock_seconds is None and not terminal_wait_reason:
+        previous_deadline = float(policy["target_deadline_at_unix"])
+        proposed_deadline = float(now_unix) + OCR_MEDIA_PROGRESS_EXTENSION_SECONDS
+        hard_deadline = float(policy["hard_deadline_at_unix"])
+        policy["target_deadline_at_unix"] = min(
+            hard_deadline,
+            max(previous_deadline, proposed_deadline),
+        )
+        policy["media_progress_extension_seconds"] = round(
+            float(policy.get("media_progress_extension_seconds") or 0.0)
+            + max(0.0, policy["target_deadline_at_unix"] - previous_deadline),
+            3,
+        )
+        policy["last_media_progress_at_unix"] = float(now_unix)
+
+    # A target wait is wall-clock time spent waiting for new live media, not
+    # time spent materializing a scan window or running OCR.  A slow first
+    # scan used to consume the whole target deadline; when it returned a
+    # trustworthy 56:36 for a 57:00 target, the task failed immediately even
+    # though several minutes of newer media had entered the rolling buffer.
+    # Persist an incremental accounting cursor so each execution interval is
+    # excluded exactly once, including across process restarts.
+    execution_started_raw = state.get("execution_started_at_unix")
+    execution_completed_raw = state.get("last_execution_completed_at_unix")
+    try:
+        execution_started = float(execution_started_raw)
+    except (TypeError, ValueError):
+        execution_started = math.nan
+    try:
+        execution_completed = float(execution_completed_raw)
+    except (TypeError, ValueError):
+        execution_completed = math.nan
+    execution_extension = 0.0
+    if math.isfinite(execution_started):
+        execution_end = float(now_unix)
+        if (
+            math.isfinite(execution_completed)
+            and execution_completed >= execution_started
+        ):
+            execution_end = min(execution_end, execution_completed)
+        accounted_start_raw = policy.get("execution_accounted_start_at_unix")
+        accounted_until_raw = policy.get("execution_accounted_until_unix")
+        try:
+            accounted_start = float(accounted_start_raw)
+        except (TypeError, ValueError):
+            accounted_start = math.nan
+        try:
+            accounted_until = float(accounted_until_raw)
+        except (TypeError, ValueError):
+            accounted_until = math.nan
+        if (
+            not math.isfinite(accounted_start)
+            or abs(accounted_start - execution_started) > 0.001
+        ):
+            accounted_until = execution_started
+        execution_extension = max(
+            0.0,
+            execution_end - max(execution_started, accounted_until),
+        )
+        if execution_extension > 0:
+            for field in (
+                "initial_target_deadline_at_unix",
+                "target_deadline_at_unix",
+                "hard_deadline_at_unix",
+                "postroll_deadline_at_unix",
+                "postroll_hard_deadline_at_unix",
+            ):
+                if policy.get(field) is not None:
+                    policy[field] = float(policy[field]) + execution_extension
+        policy["execution_accounted_start_at_unix"] = execution_started
+        policy["execution_accounted_until_unix"] = max(
+            execution_started,
+            execution_end,
+        )
+    policy["ocr_execution_accounted_seconds"] = max(
+        0.0,
+        float(policy.get("ocr_execution_accounted_seconds") or 0.0)
+        + execution_extension,
+    )
+
     gap_seconds: int | None = None
     if (
         target_clock_seconds is not None
@@ -1900,12 +2796,89 @@ def _ocr_deadline_policy(
             0,
             int(target_clock_seconds) - int(latest_trusted_clock_seconds),
         )
-        proposed_deadline = (
-            float(now_unix) + gap_seconds + OCR_TARGET_WAIT_MARGIN_SECONDS
+        # A fresh OCR sample establishes how much live playback remains until
+        # the target. A scan that ran while new source-video arrived is not a
+        # true target-wait timeout: the source tail has advanced, but this
+        # worker has only inspected its earlier snapshot. Permit that one
+        # post-scan handoff to refresh the target wait. Stalled retries still
+        # take the explicit final-scan/failure path.
+        # Historical telemetry must not revive a later stalled retry.
+        media_progress = bool(policy.get("media_progress_current"))
+        if (
+            not terminal_wait_reason
+            and (
+                float(now_unix) < float(policy["target_deadline_at_unix"])
+                or media_progress
+            )
+        ):
+            proposed_deadline = (
+                float(now_unix) + gap_seconds + OCR_TARGET_WAIT_MARGIN_SECONDS
+            )
+            policy["target_deadline_at_unix"] = min(
+                float(policy["hard_deadline_at_unix"]),
+                max(float(policy["target_deadline_at_unix"]), proposed_deadline),
+            )
+
+    # Stop a readiness loop when its evidence has been stationary for long
+    # enough.  This is checked after OCR execution accounting and target-gap
+    # extensions so a slow scan cannot accidentally revive a stalled source.
+    media_stall_since = policy.get("last_media_progress_at_unix")
+    try:
+        media_stall_elapsed = (
+            max(0.0, float(now_unix) - float(media_stall_since))
+            if media_stall_since is not None
+            else 0.0
         )
+    except (TypeError, ValueError):
+        media_stall_elapsed = 0.0
+    target_still_future = bool(
+        target_clock_seconds is None
+        or latest_trusted_clock_seconds is None
+        or int(latest_trusted_clock_seconds) < int(target_clock_seconds)
+    )
+    media_stalled = bool(
+        target_still_future
+        and math.isfinite(current_media_end)
+        and media_stall_elapsed >= OCR_MEDIA_STALL_TIMEOUT_SECONDS
+    )
+    previous_clock = state.get("latest_trusted_clock_seconds")
+    clock_changed = bool(
+        isinstance(previous_clock, int)
+        and isinstance(latest_trusted_clock_seconds, int)
+        and latest_trusted_clock_seconds != previous_clock
+    )
+    if clock_changed:
+        policy["last_clock_progress_at_unix"] = float(now_unix)
+    elif isinstance(latest_trusted_clock_seconds, int):
+        policy.setdefault("last_clock_progress_at_unix", float(now_unix))
+    clock_progress_at = policy.get("last_clock_progress_at_unix")
+    try:
+        clock_pause_elapsed = (
+            max(0.0, float(now_unix) - float(clock_progress_at))
+            if clock_progress_at is not None
+            else 0.0
+        )
+    except (TypeError, ValueError):
+        clock_pause_elapsed = 0.0
+    clock_paused = bool(
+        target_clock_seconds is not None
+        and isinstance(latest_trusted_clock_seconds, int)
+        and latest_trusted_clock_seconds < int(target_clock_seconds)
+        and len(state.get("clock_samples") or []) >= 2
+        and clock_pause_elapsed >= OCR_CLOCK_PAUSE_TIMEOUT_SECONDS
+    )
+    policy["media_stall_elapsed_seconds"] = round(media_stall_elapsed, 3)
+    policy["clock_pause_elapsed_seconds"] = round(clock_pause_elapsed, 3)
+    policy["media_stalled"] = media_stalled
+    policy["clock_paused"] = clock_paused
+    if media_stalled or clock_paused:
+        terminal_wait_reason = (
+            "ocr_clock_paused_timeout" if clock_paused
+            else "ocr_target_media_stalled"
+        )
+        policy["target_wait_terminal_reason"] = terminal_wait_reason
         policy["target_deadline_at_unix"] = min(
-            float(policy["hard_deadline_at_unix"]),
-            max(float(policy["target_deadline_at_unix"]), proposed_deadline),
+            float(policy["target_deadline_at_unix"]), float(now_unix)
         )
     policy.update({
         "phase": "target_wait",
@@ -1915,6 +2888,408 @@ def _ocr_deadline_policy(
         "updated_at_unix": float(now_unix),
     })
     return policy
+
+
+def _ocr_target_wait_failure(
+    state: dict[str, Any],
+    *,
+    target_clock_seconds: int | None,
+    latest_trusted_clock_seconds: int,
+    latest_media_end_stream_time: float | None,
+    diagnostics: Any = None,
+) -> tuple[str, str, dict[str, Any]]:
+    """Explain why live media failed to reach a still-future clock target."""
+    gap_seconds = max(
+        0,
+        int(target_clock_seconds or 0) - int(latest_trusted_clock_seconds),
+    )
+    clock_samples = _ocr_progressive_merge_clock_samples(
+        state.get("clock_samples"), diagnostics
+    )
+    clock_mapping = _ocr_progressive_clock_mapping(clock_samples)
+    deadline_policy = state.get("deadline_policy")
+    if not isinstance(deadline_policy, dict):
+        deadline_policy = {}
+    previous_media_end_raw = state.get("latest_media_end_stream_time")
+    try:
+        previous_media_end = float(previous_media_end_raw)
+    except (TypeError, ValueError):
+        previous_media_end = math.nan
+    current_media_end = (
+        float(latest_media_end_stream_time)
+        if latest_media_end_stream_time is not None
+        else math.nan
+    )
+    media_stalled = bool(
+        deadline_policy.get("media_stalled")
+        or (
+        math.isfinite(previous_media_end)
+        and math.isfinite(current_media_end)
+        and current_media_end
+        <= previous_media_end + OCR_PROGRESSIVE_TAIL_EPSILON_SECONDS
+        )
+    )
+    clock_paused = bool(
+        deadline_policy.get("clock_paused")
+        or clock_mapping.get("status") == "rejected_pause"
+    )
+    details = {
+        "target_wait_outcome": (
+            "clock_paused"
+            if clock_paused
+            else "media_stalled"
+            if media_stalled
+            else "target_media_not_arrived"
+        ),
+        "target_clock_seconds": target_clock_seconds,
+        "target_clock": _clock_text_from_seconds(target_clock_seconds),
+        "latest_trusted_clock_seconds": latest_trusted_clock_seconds,
+        "latest_trusted_clock": _clock_text_from_seconds(
+            latest_trusted_clock_seconds
+        ),
+        "target_clock_gap_seconds": gap_seconds,
+        "latest_media_end_stream_time": latest_media_end_stream_time,
+        "previous_media_end_stream_time": (
+            previous_media_end if math.isfinite(previous_media_end) else None
+        ),
+        "clock_mapping": clock_mapping,
+    }
+    if clock_paused:
+        return (
+            "ocr_clock_paused_timeout",
+            (
+                "the scoreboard clock stopped advancing before the requested "
+                f"time (latest {_clock_text_from_seconds(latest_trusted_clock_seconds)}, "
+                f"target {_clock_text_from_seconds(target_clock_seconds)}, "
+                f"{gap_seconds} seconds remaining)"
+            ),
+            details,
+        )
+    if media_stalled:
+        return (
+            "ocr_target_media_stalled",
+            (
+                "the live video buffer stopped growing before the requested "
+                f"match clock arrived (latest {_clock_text_from_seconds(latest_trusted_clock_seconds)}, "
+                f"target {_clock_text_from_seconds(target_clock_seconds)}, "
+                f"{gap_seconds} seconds remaining)"
+            ),
+            details,
+        )
+    return (
+        "ocr_target_media_not_arrived",
+        (
+            "the requested match clock did not enter the retained live video "
+            f"before the wait budget ended (latest {_clock_text_from_seconds(latest_trusted_clock_seconds)}, "
+            f"target {_clock_text_from_seconds(target_clock_seconds)}, "
+            f"{gap_seconds} seconds remaining)"
+        ),
+        details,
+    )
+
+
+def _ocr_target_not_located_diagnostics(
+    diagnostics: Any,
+    *,
+    target_clock_seconds: int | None,
+    latest_trusted_clock_seconds: int | None,
+    coverage_diagnostics: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Classify a crossed/unverified OCR target without changing its error kind.
+
+    ``ocr_clock_target_not_located`` is intentionally kept as the stable
+    terminal error for callers that already depend on it.  The information
+    needed to explain that error is collected in several nested OCR payloads,
+    so normalize it here into a small, durable contract for the worker and UI.
+    """
+    source = diagnostics if isinstance(diagnostics, dict) else {}
+    coverage = (
+        coverage_diagnostics
+        if isinstance(coverage_diagnostics, dict)
+        else source.get("coverage_diagnostics")
+        if isinstance(source.get("coverage_diagnostics"), dict)
+        else {}
+    )
+
+    # Prefer explicit OCR failure metadata, then inspect the nested payload
+    # emitted by scoreboard_ocr_worker.
+    exact_reason = str(
+        source.get("exact_second_failure_cause")
+        or source.get("target_failure_cause")
+        or source.get("exact_second_failure_reason")
+        or ""
+    ).strip().lower()
+    nested = source.get("ocr")
+    if isinstance(nested, dict):
+        nested_diag = nested.get("diagnostics")
+        if isinstance(nested_diag, dict):
+            exact_reason = str(
+                nested_diag.get("exact_second_failure_cause")
+                or nested_diag.get("target_failure_cause")
+                or nested_diag.get("exact_second_failure_reason")
+                or exact_reason
+            ).strip().lower()
+
+    coverage_class = str(coverage.get("coverage_class") or "").strip().lower()
+    isolated_count = source.get("isolated_target_reading_count")
+    try:
+        isolated_count = int(isolated_count or 0)
+    except (TypeError, ValueError):
+        isolated_count = 0
+    target_passed = bool(
+        target_clock_seconds is not None
+        and latest_trusted_clock_seconds is not None
+        and int(latest_trusted_clock_seconds) >= int(target_clock_seconds)
+    )
+
+    if coverage_class in {"history_unavailable", "window_evicted"} or bool(
+        coverage.get("target_history_fully_missing")
+    ):
+        cause = "window_evicted"
+        explanation = "目标对应的视频窗口已经不在保留缓存中，无法再次扫描。"
+    elif coverage_class in {"media_stalled", "video_stalled"} or bool(
+        coverage.get("media_stalled")
+    ):
+        cause = "media_stalled"
+        explanation = "缓存尾部在扫描期间没有继续增长，暂时没有新的画面可定位。"
+    elif exact_reason in {
+        "isolated_target_reading",
+        "isolated_target",
+        "single_frame_target",
+    } or isolated_count > 0:
+        cause = "isolated"
+        explanation = "OCR 只在单帧读到了目标时间，缺少连续帧证据，因此没有把它当作可靠锚点。"
+    elif exact_reason in {
+        "continuity_rejected",
+        "discontinuous_clock",
+        "clock_mapping_unverified",
+        "paused_or_accelerated_clock",
+    } or coverage_class in {"video_gap", "clock_unreadable"}:
+        cause = "continuity"
+        explanation = "目标附近的时钟读数不连续或视频存在间断，无法安全插值到目标秒。"
+    elif not target_passed and (
+        coverage_class in {"clock_target_not_reached", "waiting_for_media"}
+        or latest_trusted_clock_seconds is None
+    ):
+        cause = "target_not_reached"
+        explanation = "最近一次可信时钟还没有达到 API 事件的目标时间。"
+    elif target_passed:
+        cause = "target_passed"
+        explanation = "OCR 已经越过目标时间，但没有找到可验证的直接读数或连续插值锚点。"
+    else:
+        cause = "unreadable"
+        explanation = "目标附近没有足够可读的时钟证据，无法确认目标秒。"
+
+    outcome = {
+        # Crossing the target is an observable fact independent of why the
+        # anchor was rejected (isolated frame, discontinuity, etc.).
+        "target_passed_without_anchor": target_passed,
+        "target_failure_cause": cause,
+        "target_failure_explanation": explanation,
+        "latest_trusted_clock_seconds": latest_trusted_clock_seconds,
+        "latest_trusted_clock": _clock_text_from_seconds(
+            latest_trusted_clock_seconds
+        ),
+        "target_clock_seconds": target_clock_seconds,
+        "target_clock": _clock_text_from_seconds(target_clock_seconds),
+        "target_wait_outcome": (
+            "clock_passed_without_anchor"
+            if target_passed
+            else "media_stalled"
+            if cause == "media_stalled"
+            else "target_media_not_arrived"
+            if cause == "target_not_reached"
+            else None
+        ),
+    }
+    if coverage:
+        outcome["target_failure_coverage_class"] = coverage_class or None
+        outcome["target_failure_scan_stage"] = (
+            source.get("scan_stage")
+            or source.get("stage")
+            or coverage.get("scan_stage")
+            or "ocr_progressive_scan"
+        )
+        outcome["target_history_fully_missing"] = bool(
+            coverage.get("target_history_fully_missing")
+        )
+        outcome["media_stalled"] = bool(coverage.get("media_stalled"))
+    else:
+        outcome["target_failure_scan_stage"] = (
+            source.get("scan_stage")
+            or source.get("stage")
+            or "ocr_progressive_scan"
+        )
+    if isolated_count:
+        outcome["isolated_target_reading_count"] = isolated_count
+    if exact_reason:
+        outcome["exact_second_failure_reason"] = exact_reason
+    return outcome
+
+
+def _ocr_progressive_coverage_diagnostics(
+    retained: Any,
+    *,
+    intended_initial_start: float,
+    requested_start: float,
+    requested_end: float,
+    scan_start: float,
+    scan_end: float,
+    target_clock_seconds: int | None,
+    latest_trusted_clock_seconds: int | None,
+    previous_media_end_stream_time: float | None = None,
+    target_window: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Classify the media/OCR coverage state before deciding to wait or fail.
+
+    Progressive OCR used to expose only a boolean ``history_evicted`` flag.
+    That flag is useful for retention diagnostics, but it cannot distinguish
+    missing history from a live tail that has not reached the requested target
+    or an input stream that stopped growing.  This helper deliberately avoids
+    OCR-specific assumptions and reports the observable media bounds, gaps,
+    and a conservative high-level classification for the caller/UI.
+    """
+    epsilon = OCR_PROGRESSIVE_TAIL_EPSILON_SECONDS
+    spans: list[tuple[float, float]] = []
+    for segment in retained or ():
+        try:
+            start = float(segment.start)
+            end = float(segment.end)
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if not math.isfinite(start) or not math.isfinite(end) or end <= start:
+            continue
+        spans.append((start, end))
+    spans.sort()
+    earliest = spans[0][0] if spans else None
+    latest = max((end for _, end in spans), default=None)
+    gaps: list[dict[str, float]] = []
+    if spans:
+        component_end = spans[0][1]
+        for start, end in spans[1:]:
+            if start - component_end > 0.5:
+                gap_start = max(component_end, float(requested_start))
+                gap_end = min(start, float(requested_end))
+                if gap_end > gap_start:
+                    gaps.append({
+                        "start_stream_time": round(gap_start, 3),
+                        "end_stream_time": round(gap_end, 3),
+                        "duration_seconds": round(gap_end - gap_start, 3),
+                    })
+            component_end = max(component_end, end)
+
+    history_missing_seconds = 0.0
+    if earliest is not None:
+        history_missing_seconds = max(
+            0.0,
+            earliest - float(intended_initial_start),
+        )
+    requested_history_missing = bool(
+        earliest is not None
+        and earliest > float(requested_start) + epsilon
+    )
+    target_window_start: float | None = None
+    target_window_end: float | None = None
+    if isinstance(target_window, dict):
+        try:
+            candidate_start = float(target_window.get("start_stream_time"))
+            candidate_end = float(target_window.get("end_stream_time"))
+        except (TypeError, ValueError):
+            candidate_start = candidate_end = math.nan
+        if (
+            math.isfinite(candidate_start)
+            and math.isfinite(candidate_end)
+            and candidate_end > candidate_start
+        ):
+            target_window_start = candidate_start
+            target_window_end = candidate_end
+    if target_window_start is None:
+        target_window_start = float(scan_start)
+        target_window_end = float(scan_end)
+
+    # If the whole target window ends before the retained head, the target has
+    # been evicted.  The previous overlap-only check missed the exact-boundary
+    # case (target_end == earliest) and misreported it as an unreadable clock.
+    target_history_missing = bool(
+        earliest is not None
+        and (
+            (
+                target_window_start < earliest - epsilon
+                and target_window_end > earliest + epsilon
+            )
+            or target_window_end <= earliest + epsilon
+        )
+    )
+    target_history_fully_missing = bool(
+        earliest is not None
+        and target_window_end <= earliest + epsilon
+    )
+    target_media_not_arrived = bool(
+        latest is None or latest <= target_window_start + epsilon
+    )
+    media_stalled = bool(
+        previous_media_end_stream_time is not None
+        and latest is not None
+        and latest <= float(previous_media_end_stream_time) + epsilon
+    )
+    gap_intersects_target = any(
+        item["end_stream_time"] > target_window_start + epsilon
+        and item["start_stream_time"] < target_window_end - epsilon
+        for item in gaps
+    )
+
+    if latest is None:
+        coverage_class = "waiting_for_media"
+    elif target_history_missing:
+        coverage_class = "history_unavailable"
+    elif gap_intersects_target:
+        coverage_class = "video_gap"
+    elif target_media_not_arrived:
+        coverage_class = "media_stalled" if media_stalled else "waiting_for_media"
+    elif target_clock_seconds is not None and latest_trusted_clock_seconds is None:
+        coverage_class = "clock_unreadable"
+    elif (
+        target_clock_seconds is not None
+        and latest_trusted_clock_seconds is not None
+        and int(latest_trusted_clock_seconds) < int(target_clock_seconds)
+    ):
+        coverage_class = "clock_target_not_reached"
+    elif (
+        target_clock_seconds is not None
+        and latest_trusted_clock_seconds is not None
+        and int(latest_trusted_clock_seconds) >= int(target_clock_seconds)
+    ):
+        coverage_class = "clock_passed_without_anchor"
+    else:
+        coverage_class = "covered"
+
+    return {
+        "coverage_class": coverage_class,
+        "earliest_media_start_stream_time": (
+            round(earliest, 3) if earliest is not None else None
+        ),
+        "latest_media_end_stream_time": (
+            round(latest, 3) if latest is not None else None
+        ),
+        "intended_initial_start_stream_time": round(
+            float(intended_initial_start), 3
+        ),
+        "requested_search_start_stream_time": round(float(requested_start), 3),
+        "requested_search_end_stream_time": round(float(requested_end), 3),
+        "scan_start_stream_time": round(float(scan_start), 3),
+        "scan_end_stream_time": round(float(scan_end), 3),
+        "target_window_start_stream_time": round(target_window_start, 3),
+        "target_window_end_stream_time": round(target_window_end, 3),
+        "history_missing_seconds": round(history_missing_seconds, 3),
+        "requested_history_missing": requested_history_missing,
+        "target_history_missing": target_history_missing,
+        "target_history_fully_missing": target_history_fully_missing,
+        "target_media_not_arrived": target_media_not_arrived,
+        "media_stalled": media_stalled,
+        "video_gaps": gaps,
+        "target_clock_seconds": target_clock_seconds,
+        "latest_trusted_clock_seconds": latest_trusted_clock_seconds,
+    }
 
 
 def _ocr_far_target_retry_at(
@@ -1988,12 +3363,26 @@ def _ocr_progressive_wait(
     scan_start: float,
     scan_end: float,
     latest_trusted_clock_seconds: int | None,
+    latest_media_end_stream_time: float | None,
     history_evicted: bool,
     diagnostics: dict[str, Any] | None = None,
+    target_rescan_attempted: bool = False,
+    suppress_target_rescan: bool = False,
+    next_scan_cursor_stream_time: float | None = None,
     now_unix: float | None = None,
 ) -> None:
     timestamp = time.time() if now_unix is None else float(now_unix)
     previous = _ocr_progressive_state(task)
+    try:
+        prior_rescan_attempt_count = max(
+            0, int(previous.get("target_rescan_attempt_count") or 0)
+        )
+    except (TypeError, ValueError):
+        prior_rescan_attempt_count = 0
+    clock_samples = _ocr_progressive_merge_clock_samples(
+        previous.get("clock_samples"), diagnostics
+    )
+    clock_mapping = _ocr_progressive_clock_mapping(clock_samples)
     previous_latest = previous.get("latest_trusted_clock_seconds")
     if isinstance(previous_latest, int):
         latest_trusted_clock_seconds = max(
@@ -2008,6 +3397,7 @@ def _ocr_progressive_wait(
         now_unix=timestamp,
         target_clock_seconds=target_clock_seconds,
         latest_trusted_clock_seconds=latest_trusted_clock_seconds,
+        latest_media_end_stream_time=latest_media_end_stream_time,
     )
     target_deadline = float(deadline_policy["target_deadline_at_unix"])
     next_attempt_at = _ocr_far_target_retry_at(
@@ -2019,14 +3409,26 @@ def _ocr_progressive_wait(
     progress = {
         **previous,
         "state": wait_kind,
+        "target_revision": _vision_target_revision(job),
+        "target_source": _vision_target_source(job),
         "scan_attempt_count": int(previous.get("scan_attempt_count") or 0) + 1,
         "last_scan_start_stream_time": round(scan_start, 3),
         "last_scan_end_stream_time": round(scan_end, 3),
-        "scan_cursor_stream_time": round(scan_end, 3),
+        "scan_cursor_stream_time": round(
+            scan_end
+            if next_scan_cursor_stream_time is None
+            else next_scan_cursor_stream_time,
+            3,
+        ),
         "overlap_seconds": OCR_PROGRESSIVE_OVERLAP_SECONDS,
         "latest_trusted_clock_seconds": latest_trusted_clock_seconds,
         "latest_trusted_clock": _clock_text_from_seconds(
             latest_trusted_clock_seconds
+        ),
+        "latest_media_end_stream_time": (
+            round(float(latest_media_end_stream_time), 3)
+            if latest_media_end_stream_time is not None
+            else None
         ),
         "target_clock_seconds": target_clock_seconds,
         "target_clock": _clock_text_from_seconds(
@@ -2034,11 +3436,98 @@ def _ocr_progressive_wait(
         ),
         "history_evicted": bool(history_evicted),
         "deadline_policy": deadline_policy,
+        "clock_samples": clock_samples,
+        "clock_mapping": clock_mapping,
+        "target_rescan_attempt_count": prior_rescan_attempt_count,
     }
     if diagnostics:
         progress["last_scan_diagnostics"] = diagnostics
         progress["last_execution_completed_at_unix"] = timestamp
         progress["last_execution_error_kind"] = diagnostics.get("kind")
+        coverage_diagnostics = diagnostics.get("coverage_diagnostics")
+        if isinstance(coverage_diagnostics, dict):
+            progress["coverage_diagnostics"] = dict(coverage_diagnostics)
+        if target_rescan_attempted:
+            completed_attempt_count = prior_rescan_attempt_count + 1
+            progress["target_rescan_attempt_count"] = completed_attempt_count
+            progress["target_rescan_last_completed_at_unix"] = timestamp
+            if (
+                completed_attempt_count >= OCR_PROGRESSIVE_TARGET_RESCAN_MAX_ATTEMPTS
+                or suppress_target_rescan
+            ):
+                # A small bounded retry budget is enough to recover transient
+                # OCR misses. Mark exhaustion durably so polling/restarts
+                # cannot keep rescanning the same historical window forever.
+                progress["target_rescan_completed_at_unix"] = timestamp
+                progress["target_rescan_exhausted"] = True
+            else:
+                next_attempt = completed_attempt_count + 1
+                target_window = _ocr_progressive_target_rescan_window(
+                    diagnostics,
+                    target_clock_seconds=target_clock_seconds,
+                    margin_seconds=OCR_PROGRESSIVE_TARGET_RESCAN_EXPANDED_MARGIN_SECONDS,
+                    rescan_attempt=next_attempt,
+                )
+                if target_window is None:
+                    target_window = _ocr_progressive_expand_target_rescan_window(
+                        previous.get("target_rescan_window"),
+                        target_clock_seconds=target_clock_seconds,
+                        rescan_attempt=next_attempt,
+                    )
+                if target_window is not None:
+                    progress["target_rescan_window"] = target_window
+                    progress["target_passed_without_anchor"] = True
+                    progress.pop("target_rescan_completed_at_unix", None)
+                    progress["target_rescan_exhausted"] = False
+        elif (
+            not suppress_target_rescan
+            and
+            prior_rescan_attempt_count < OCR_PROGRESSIVE_TARGET_RESCAN_MAX_ATTEMPTS
+            and not bool(previous.get("target_rescan_exhausted"))
+        ):
+            target_window = _ocr_progressive_target_rescan_window(
+                diagnostics,
+                target_clock_seconds=target_clock_seconds,
+                rescan_attempt=prior_rescan_attempt_count + 1,
+            )
+            if (
+                target_window is None
+                and target_clock_seconds is not None
+                and latest_trusted_clock_seconds is not None
+                and latest_trusted_clock_seconds >= int(target_clock_seconds)
+                and scan_end > scan_start
+            ):
+                # Some OCR backends report the accepted clock but omit the
+                # frame-relative timestamp.  Keep the recovery contract
+                # usable by centring the first retry on the scanned window;
+                # this is only a search window, never an accepted anchor.
+                target_window = _ocr_progressive_expand_target_rescan_window(
+                    {
+                        "estimated_stream_time": (
+                            float(scan_start) + float(scan_end)
+                        )
+                        / 2.0
+                    },
+                    target_clock_seconds=target_clock_seconds,
+                    rescan_attempt=prior_rescan_attempt_count + 1,
+                    margin_seconds=(
+                        OCR_PROGRESSIVE_TARGET_RESCAN_MARGIN_SECONDS
+                        if prior_rescan_attempt_count == 0
+                        else OCR_PROGRESSIVE_TARGET_RESCAN_EXPANDED_MARGIN_SECONDS
+                    ),
+                )
+            if target_window is not None and (
+                latest_trusted_clock_seconds is None
+                or latest_trusted_clock_seconds >= int(target_clock_seconds)
+            ):
+                # Keep this independently of the normal forward cursor.  The
+                # next worker attempt must revisit the crossed target before
+                # advancing through newer media, even when the miss was only
+                # temporary.
+                progress["target_rescan_window"] = target_window
+                progress["target_passed_without_anchor"] = True
+                progress.pop("target_rescan_completed_at_unix", None)
+                progress["target_rescan_exhausted"] = False
     current = _artifact_task(runtime, job.event_key, "ocr_window")
     if current is not None and current.status == "locating":
         _artifact_transition(
@@ -2080,6 +3569,9 @@ def _ocr_output_shape(
         return (
             OCR_EXACT_WINDOW_BEFORE_SECONDS,
             OCR_EXACT_WINDOW_AFTER_SECONDS,
+            # Keep the tuple's historical third value for callers that use it
+            # only to choose the 30/30-second window.  Persisted results use
+            # the evidence-grade source from ``_ocr_localization_contract``.
             "exact_second",
         )
     if location_kind in {
@@ -2135,6 +3627,9 @@ def _normalized_ocr_clip_window(
     if not shape_source.get("location_kind"):
         shape_source["location_kind"] = {
             "exact_second": "match_clock_second",
+            "exact": "match_clock_second",
+            "interpolated": "match_clock_second",
+            "estimated": "match_clock_second",
             "minute_boundary": "match_clock_minute_boundary",
             "score_transition": "score_transition",
         }.get(localization_source)
@@ -2248,6 +3743,7 @@ def _locate_ocr_window_across_components(
     ocr_python: Path,
     ocr_timeout_seconds: float,
     minimum_component_seconds: float,
+    sample_interval_seconds: float = 1.0,
 ) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
     if not Path(ocr_python).is_file():
         raise VisualLocationFailed(
@@ -2323,6 +3819,7 @@ def _locate_ocr_window_across_components(
                 python_executable=ocr_python,
                 scoreboard_profile=job.scoreboard_profile,
                 clock_only=job.clock_only,
+                sample_interval_seconds=sample_interval_seconds,
                 candidate_input_format=materialized.get("input_format"),
                 candidate_seek_seconds=float(materialized.get("input_seek_seconds", 0.0)),
                 candidate_duration_seconds=materialized.get("input_duration_seconds"),
@@ -2430,6 +3927,7 @@ def _locate_ocr_window_across_components(
                         python_executable=ocr_python,
                         scoreboard_profile=job.scoreboard_profile,
                         clock_only=job.clock_only,
+                        sample_interval_seconds=sample_interval_seconds,
                     )
                     located = dict(located)
                     direct_diagnostics = {
@@ -2513,7 +4011,8 @@ def _locate_ocr_window_across_components(
                             timeout_seconds=fallback_remaining,
                             python_executable=ocr_python,
                             scoreboard_profile=job.scoreboard_profile,
-                            clock_only=True,
+                            clock_only=job.clock_only,
+                            sample_interval_seconds=sample_interval_seconds,
                         )
                         located = dict(located)
                         anchor, interval = _ocr_anchor_or_interval(
@@ -2673,12 +4172,19 @@ def _process_ocr_window(
 ) -> bool:
     artifact_kind = "ocr_window"
     current = _artifact_task(runtime, job.event_key, artifact_kind)
+    if current is None:
+        return True
+    target_revision = _vision_target_revision(job)
+    current = ensure_ocr_target_revision(runtime, job)
     if current is None or current.status in {"encoded", "failed"}:
         return True
     if time.time() < current.next_attempt_at_unix:
         return False
     lease_id: str | None = None
     try:
+        # Capture the revision before any expensive materialization.  The
+        # event loop may advance the target while this worker is running.
+        worker_target_revision = target_revision
         scope_error = _v1_clock_scope_error(job)
         if scope_error is not None:
             kind, message = scope_error
@@ -2693,7 +4199,13 @@ def _process_ocr_window(
         if current.status == "located" and current.located_anchor_stream_time is not None:
             located = dict(current.result)
             anchor = float(current.located_anchor_stream_time)
-            allowed_sources = {"exact_second", "minute_boundary"}
+            allowed_sources = {
+                "exact_second",  # legacy persisted rows
+                "exact",
+                "interpolated",
+                "estimated",
+                "minute_boundary",
+            }
             if not job.clock_only:
                 allowed_sources.add("score_transition")
             if str(located.get("localization_source") or "") not in allowed_sources:
@@ -2773,16 +4285,108 @@ def _process_ocr_window(
             if not isinstance(latest_trusted, int):
                 latest_trusted = None
             target_clock_seconds = _ocr_progressive_target_seconds(job)
+            clock_samples = list(state.get("clock_samples") or [])
+            mapped_target_window = _ocr_progressive_mapped_target_window(
+                clock_samples,
+                target_clock_seconds=target_clock_seconds,
+            )
+            target_rescan_window = state.get("target_rescan_window")
+            try:
+                target_rescan_attempt_count = max(
+                    0, int(state.get("target_rescan_attempt_count") or 0)
+                )
+            except (TypeError, ValueError):
+                target_rescan_attempt_count = 0
+            target_rescan_pending = (
+                isinstance(target_rescan_window, dict)
+                and state.get("target_rescan_completed_at_unix") is None
+                and not bool(state.get("target_rescan_exhausted"))
+                and target_rescan_attempt_count < OCR_PROGRESSIVE_TARGET_RESCAN_MAX_ATTEMPTS
+            )
+            previous_media_end_raw = state.get("latest_media_end_stream_time")
+            try:
+                previous_media_end = float(previous_media_end_raw)
+            except (TypeError, ValueError):
+                previous_media_end = None
             deadline_policy = _ocr_deadline_policy(
                 current,
                 now_unix=now_unix,
                 target_clock_seconds=target_clock_seconds,
                 latest_trusted_clock_seconds=latest_trusted,
+                latest_media_end_stream_time=latest_end,
             )
             target_deadline = float(deadline_policy["target_deadline_at_unix"])
             deadline_reached = now_unix >= target_deadline
             final_scan_completed = bool(state.get("final_scan_completed_at_unix"))
             force_final_scan = False
+            mapped_target_ready = False
+            coverage_diagnostics = _ocr_progressive_coverage_diagnostics(
+                retained,
+                intended_initial_start=intended_initial_start,
+                requested_start=float(current.search_start_stream_time),
+                requested_end=float(current.search_end_stream_time),
+                scan_start=window_start,
+                scan_end=window_end,
+                target_clock_seconds=target_clock_seconds,
+                latest_trusted_clock_seconds=latest_trusted,
+                previous_media_end_stream_time=previous_media_end,
+                target_window=(
+                    target_rescan_window
+                    if target_rescan_pending
+                    else mapped_target_window
+                    if isinstance(mapped_target_window, dict)
+                    else target_rescan_window
+                ),
+            )
+
+            # Once two continuous OCR observations establish a clock/video
+            # mapping, avoid replaying the whole retained history.  A target
+            # that is still ahead of the media tail only records a readiness
+            # wait; the queue slot is released by the caller before retry.
+            if mapped_target_window is not None and not target_rescan_pending:
+                mapped_start = float(mapped_target_window["start_stream_time"])
+                mapped_end = float(mapped_target_window["end_stream_time"])
+                if latest_end is None or latest_end <= mapped_start + OCR_PROGRESSIVE_TAIL_EPSILON_SECONDS:
+                    _ocr_progressive_wait(
+                        runtime,
+                        job,
+                        current,
+                        wait_kind="waiting_for_target_media",
+                        message="trusted OCR clock mapping is ready; waiting for target media to enter the retained buffer",
+                        scan_start=mapped_start,
+                        scan_end=mapped_end,
+                        latest_trusted_clock_seconds=latest_trusted,
+                        latest_media_end_stream_time=latest_end,
+                        history_evicted=history_evicted,
+                        diagnostics={
+                            "stage": "ocr_target_window_mapping",
+                            "mapped_target_window": mapped_target_window,
+                            "clock_mapping": _ocr_progressive_clock_mapping(clock_samples),
+                            "coverage_diagnostics": _ocr_progressive_coverage_diagnostics(
+                                retained,
+                                intended_initial_start=intended_initial_start,
+                                requested_start=float(current.search_start_stream_time),
+                                requested_end=float(current.search_end_stream_time),
+                                scan_start=mapped_start,
+                                scan_end=mapped_end,
+                                target_clock_seconds=target_clock_seconds,
+                                latest_trusted_clock_seconds=latest_trusted,
+                                previous_media_end_stream_time=previous_media_end,
+                                target_window=mapped_target_window,
+                            ),
+                        },
+                        now_unix=now_unix,
+                    )
+                    return False
+                if latest_end > mapped_start + OCR_PROGRESSIVE_TAIL_EPSILON_SECONDS:
+                    focused_start = max(mapped_start, float(earliest_start or 0.0))
+                    focused_end = min(mapped_end, float(latest_end))
+                    if focused_end - focused_start >= 3.0:
+                        window_start = focused_start
+                        window_end = focused_end
+                        mapped_target_ready = True
+                        force_final_scan = True
+                        target_rescan_pending = False
 
             if latest_end is None:
                 if deadline_reached:
@@ -2793,6 +4397,7 @@ def _process_ocr_window(
                             "stage": "buffer_coverage",
                             "scan_start_stream_time": window_start,
                             "deadline_policy": deadline_policy,
+                            "coverage_diagnostics": coverage_diagnostics,
                         },
                     )
                 _ocr_progressive_wait(
@@ -2804,7 +4409,9 @@ def _process_ocr_window(
                     scan_start=window_start,
                     scan_end=window_end,
                     latest_trusted_clock_seconds=latest_trusted,
+                    latest_media_end_stream_time=latest_end,
                     history_evicted=history_evicted,
+                    diagnostics={"coverage_diagnostics": coverage_diagnostics},
                     now_unix=now_unix,
                 )
                 return False
@@ -2816,6 +4423,36 @@ def _process_ocr_window(
             no_scannable_window = bool(
                 latest_end <= window_start + OCR_PROGRESSIVE_TAIL_EPSILON_SECONDS
             )
+            if mapped_target_ready:
+                # The target window is intentionally historical when a late
+                # shotmap second arrives; do not let the normal tail cursor
+                # turn this focused rewind into a readiness wait.
+                no_new_media = False
+                no_scannable_window = False
+            if target_rescan_pending and latest_end is not None:
+                try:
+                    retry_start = float(target_rescan_window["start_stream_time"])
+                    retry_end = float(target_rescan_window["end_stream_time"])
+                except (KeyError, TypeError, ValueError):
+                    retry_start = retry_end = math.nan
+                if (
+                    math.isfinite(retry_start)
+                    and math.isfinite(retry_end)
+                    and retry_end > retry_start
+                    and latest_end > retry_start + OCR_PROGRESSIVE_TAIL_EPSILON_SECONDS
+                ):
+                    # A target-local retry is historical media by design; it
+                    # must run even when the normal cursor has reached the
+                    # current media tail.
+                    window_start = max(0.0, retry_start)
+                    window_end = min(float(latest_end), retry_end)
+                    if window_end - window_start >= 3.0:
+                        no_new_media = False
+                        no_scannable_window = False
+                        if deadline_reached and bool(
+                            deadline_policy.get("slot_acquired")
+                        ):
+                            force_final_scan = True
             if (
                 deadline_reached
                 and not final_scan_completed
@@ -2823,33 +4460,130 @@ def _process_ocr_window(
                 and retained
                 and (no_new_media or no_scannable_window)
             ):
-                final_scan_start = max(
-                    float(earliest_start or 0.0),
-                    float(latest_end) - max(3.0, OCR_PROGRESSIVE_OVERLAP_SECONDS),
-                )
-                if latest_end - final_scan_start >= 3.0:
+                final_scan_start = None
+                final_scan_end = float(latest_end)
+                if isinstance(target_rescan_window, dict):
+                    try:
+                        candidate_start = float(
+                            target_rescan_window["start_stream_time"]
+                        )
+                        candidate_end = float(
+                            target_rescan_window["end_stream_time"]
+                        )
+                    except (KeyError, TypeError, ValueError):
+                        candidate_start = candidate_end = math.nan
+                    if (
+                        math.isfinite(candidate_start)
+                        and math.isfinite(candidate_end)
+                        and candidate_end > candidate_start
+                    ):
+                        final_scan_start = max(
+                            float(earliest_start or 0.0), candidate_start
+                        )
+                        final_scan_end = min(float(latest_end), candidate_end)
+                if final_scan_start is None:
+                    final_scan_start = max(
+                        float(earliest_start or 0.0),
+                        float(latest_end)
+                        - max(3.0, OCR_PROGRESSIVE_OVERLAP_SECONDS),
+                    )
+                if final_scan_end - final_scan_start >= 3.0:
                     window_start = final_scan_start
-                    window_end = float(latest_end)
+                    window_end = final_scan_end
                     force_final_scan = True
                     no_new_media = False
                     no_scannable_window = False
             if no_new_media:
                 if deadline_reached:
-                    if latest_trusted is None:
+                    try:
+                        persisted_rescan_count = max(
+                            0, int(state.get("target_rescan_attempt_count") or 0)
+                        )
+                    except (TypeError, ValueError):
+                        persisted_rescan_count = 0
+                    legacy_rescan_completed = bool(
+                        state.get("target_rescan_completed_at_unix") is not None
+                        and persisted_rescan_count == 0
+                        and not bool(state.get("target_rescan_exhausted"))
+                    )
+                    can_retry_without_scan = bool(
+                        not coverage_diagnostics.get("target_history_fully_missing")
+                        and target_clock_seconds is not None
+                        and latest_trusted is not None
+                        and latest_trusted >= target_clock_seconds
+                        and persisted_rescan_count
+                        < OCR_PROGRESSIVE_TARGET_RESCAN_MAX_ATTEMPTS
+                        and not bool(state.get("target_rescan_exhausted"))
+                        and not legacy_rescan_completed
+                    )
+                    if can_retry_without_scan:
+                        _ocr_progressive_wait(
+                            runtime,
+                            job,
+                            current,
+                            wait_kind="waiting_for_target_rescan",
+                            message="目标时钟已经经过，正在重扫目标附近画面",
+                            scan_start=window_start,
+                            scan_end=window_end,
+                            latest_trusted_clock_seconds=latest_trusted,
+                            latest_media_end_stream_time=latest_end,
+                            history_evicted=history_evicted,
+                            diagnostics={
+                                "stage": "ocr_target_rescan_recovery",
+                                "coverage_diagnostics": coverage_diagnostics,
+                                **(
+                                    state.get("last_scan_diagnostics")
+                                    if isinstance(
+                                        state.get("last_scan_diagnostics"), dict
+                                    )
+                                    else {}
+                                ),
+                            },
+                            target_rescan_attempted=False,
+                            now_unix=now_unix,
+                        )
+                        return False
+                    failure_details: dict[str, Any] = {
+                        "coverage_diagnostics": coverage_diagnostics,
+                    }
+                    if coverage_diagnostics.get("target_history_fully_missing"):
+                        error_kind = "ocr_search_history_evicted"
+                        message = "required OCR search history was evicted before the target clock was located"
+                    elif latest_trusted is None:
                         error_kind = "ocr_no_trustworthy_clock_before_deadline"
                         message = "OCR never produced a trustworthy match-clock reading before the deadline"
-                    elif history_evicted:
+                    elif history_evicted and coverage_diagnostics.get("target_history_fully_missing"):
                         error_kind = "ocr_search_history_evicted"
                         message = "required OCR search history was evicted before the target clock was located"
                     elif (
                         target_clock_seconds is not None
                         and latest_trusted < target_clock_seconds
                     ):
-                        error_kind = "ocr_clock_target_timeout"
-                        message = "the retained video never reached the requested match clock before the deadline"
+                        error_kind, message, target_wait_details = (
+                            _ocr_target_wait_failure(
+                                {**state, "deadline_policy": deadline_policy},
+                                target_clock_seconds=target_clock_seconds,
+                                latest_trusted_clock_seconds=latest_trusted,
+                                latest_media_end_stream_time=latest_end,
+                            )
+                        )
+                        failure_details.update(target_wait_details)
                     else:
                         error_kind = "ocr_clock_target_not_located"
                         message = "OCR passed the requested clock but could not verify a usable anchor"
+                        target_failure_diagnostics = {}
+                        last_scan_diagnostics = state.get("last_scan_diagnostics")
+                        if isinstance(last_scan_diagnostics, dict):
+                            target_failure_diagnostics.update(last_scan_diagnostics)
+                        target_failure_diagnostics.update(failure_details)
+                        failure_details.update(
+                            _ocr_target_not_located_diagnostics(
+                                target_failure_diagnostics,
+                                target_clock_seconds=target_clock_seconds,
+                                latest_trusted_clock_seconds=latest_trusted,
+                                coverage_diagnostics=coverage_diagnostics,
+                            )
+                        )
                     raise VisualLocationFailed(
                         error_kind,
                         message,
@@ -2860,6 +4594,7 @@ def _process_ocr_window(
                             "history_evicted": history_evicted,
                             "deadline_policy": deadline_policy,
                             "final_scan_completed": final_scan_completed,
+                            **failure_details,
                         },
                     )
                 _ocr_progressive_wait(
@@ -2871,7 +4606,9 @@ def _process_ocr_window(
                     scan_start=window_start,
                     scan_end=window_end,
                     latest_trusted_clock_seconds=latest_trusted,
+                    latest_media_end_stream_time=latest_end,
                     history_evicted=history_evicted,
+                    diagnostics={"coverage_diagnostics": coverage_diagnostics},
                     now_unix=now_unix,
                 )
                 return False
@@ -2886,6 +4623,7 @@ def _process_ocr_window(
                             "latest_media_end": latest_end,
                             "deadline_policy": deadline_policy,
                             "final_scan_completed": final_scan_completed,
+                            "coverage_diagnostics": coverage_diagnostics,
                         },
                     )
                 _ocr_progressive_wait(
@@ -2897,7 +4635,9 @@ def _process_ocr_window(
                     scan_start=window_start,
                     scan_end=window_end,
                     latest_trusted_clock_seconds=latest_trusted,
+                    latest_media_end_stream_time=latest_end,
                     history_evicted=history_evicted,
+                    diagnostics={"coverage_diagnostics": coverage_diagnostics},
                     now_unix=now_unix,
                 )
                 return False
@@ -2915,6 +4655,7 @@ def _process_ocr_window(
                         "stage": "buffer_coverage",
                         "window_start_stream_time": window_start,
                         "window_end_stream_time": window_end,
+                        "coverage_diagnostics": coverage_diagnostics,
                     },
                 )
             lease_id = runtime.store.acquire_segment_lease(
@@ -2927,15 +4668,45 @@ def _process_ocr_window(
             scan_state = {
                 **state,
                 "state": "final_target_scan" if force_final_scan else "ocr_execution",
+                "target_revision": worker_target_revision,
+                "target_source": _vision_target_source(job),
                 "deadline_policy": deadline_policy,
+                # Keep the media-tail baseline with the in-flight scan.  The
+                # post-scan policy can then tell whether new TS arrived while
+                # OCR was running, even when no prior readiness-wait row exists.
+                "latest_media_end_stream_time": (
+                    round(float(latest_end), 3)
+                    if latest_end is not None
+                    else None
+                ),
                 "execution_started_at_unix": now_unix,
+                "sample_interval_seconds": (
+                    OCR_PROGRESSIVE_TARGET_RESCAN_SAMPLE_INTERVAL_SECONDS
+                    if target_rescan_pending
+                    or mapped_target_ready
+                    or force_final_scan
+                    else 1.0
+                ),
+                "scan_mode": (
+                    "target_centered_dense_rescan"
+                    if target_rescan_pending or mapped_target_ready or force_final_scan
+                    else "progressive_forward_scan"
+                ),
+                "target_rescan_attempt_count": target_rescan_attempt_count,
             }
+            if target_rescan_pending:
+                scan_state["target_rescan_started_at_unix"] = now_unix
+                scan_state["target_rescan_window"] = dict(target_rescan_window)
             if force_final_scan:
                 scan_state["final_scan_started_at_unix"] = now_unix
                 scan_state["final_scan_window"] = {
                     "start_stream_time": round(window_start, 3),
                     "end_stream_time": round(window_end, 3),
                 }
+            if _ocr_target_revision_is_stale(
+                runtime, job.event_key, worker_target_revision
+            ):
+                return False
             _artifact_transition(
                 runtime,
                 job.event_key,
@@ -2959,8 +4730,19 @@ def _process_ocr_window(
                     ocr_python=ocr_python,
                     ocr_timeout_seconds=ocr_timeout_seconds,
                     minimum_component_seconds=max(3.0, min_degraded_seconds),
+                    sample_interval_seconds=(
+                        OCR_PROGRESSIVE_TARGET_RESCAN_SAMPLE_INTERVAL_SECONDS
+                        if target_rescan_pending
+                        or mapped_target_ready
+                        or force_final_scan
+                        else 1.0
+                    ),
                 )
             except VisualLocationFailed as exc:
+                if _ocr_target_revision_is_stale(
+                    runtime, job.event_key, worker_target_revision
+                ):
+                    return False
                 if (
                     not progressive_scan
                     or exc.kind not in OCR_PROGRESSIVE_SCAN_MISS_KINDS
@@ -2982,17 +4764,76 @@ def _process_ocr_window(
                     )
                 )
                 after_scan_unix = time.time()
+                media_tail_before_scan = latest_end
+                refreshed_segments = segment_reader()
+                refreshed_retained = [
+                    segment
+                    for segment in refreshed_segments
+                    if Path(segment.path).is_file()
+                ]
+                refreshed_latest_end = max(
+                    (float(segment.end) for segment in refreshed_retained),
+                    default=latest_end,
+                )
+                if refreshed_latest_end is not None:
+                    latest_end = refreshed_latest_end
+                media_tail_grew_during_scan = bool(
+                    latest_end is not None
+                    and (
+                        media_tail_before_scan is None
+                        or latest_end
+                        > float(media_tail_before_scan)
+                        + OCR_PROGRESSIVE_TAIL_EPSILON_SECONDS
+                    )
+                )
+                # Re-read the transition persisted immediately before OCR.
+                # It contains the execution start timestamp needed to exclude
+                # this expensive scan from the live-media wait budget.
+                refreshed = _artifact_task(runtime, job.event_key, artifact_kind)
+                if refreshed is not None:
+                    current = refreshed
+                    state = _ocr_progressive_state(current)
                 updated_deadline_policy = _ocr_deadline_policy(
                     current,
                     now_unix=after_scan_unix,
                     target_clock_seconds=target_clock_seconds,
                     latest_trusted_clock_seconds=scanned_trusted,
+                    latest_media_end_stream_time=latest_end,
                 )
                 effective_deadline_reached = (
                     after_scan_unix
                     >= float(updated_deadline_policy["target_deadline_at_unix"])
                 )
-                if history_evicted and not target_not_reached:
+                post_scan_clock_samples = _ocr_progressive_merge_clock_samples(
+                    state.get("clock_samples"), exc.diagnostics
+                )
+                post_scan_target_window = _ocr_progressive_mapped_target_window(
+                    post_scan_clock_samples,
+                    target_clock_seconds=target_clock_seconds,
+                )
+                predicted_target_media_ready = bool(
+                    media_tail_grew_during_scan
+                    and latest_end is not None
+                    and isinstance(post_scan_target_window, dict)
+                    and float(latest_end)
+                    >= float(post_scan_target_window["estimated_stream_time"])
+                )
+                post_scan_coverage = _ocr_progressive_coverage_diagnostics(
+                    refreshed_retained,
+                    intended_initial_start=intended_initial_start,
+                    requested_start=float(current.search_start_stream_time),
+                    requested_end=float(current.search_end_stream_time),
+                    scan_start=window_start,
+                    scan_end=window_end,
+                    target_clock_seconds=target_clock_seconds,
+                    latest_trusted_clock_seconds=scanned_trusted,
+                    previous_media_end_stream_time=media_tail_before_scan,
+                    target_window=post_scan_target_window,
+                )
+                if (
+                    history_evicted
+                    and post_scan_coverage.get("target_history_fully_missing")
+                ):
                     raise VisualLocationFailed(
                         "ocr_search_history_evicted",
                         "required OCR search history was evicted before the target clock was located",
@@ -3003,18 +4844,103 @@ def _process_ocr_window(
                             "latest_trusted_clock_seconds": scanned_trusted,
                             "target_clock_seconds": target_clock_seconds,
                             "history_evicted": True,
+                            "coverage_diagnostics": post_scan_coverage,
                         },
                     ) from exc
-                if effective_deadline_reached:
-                    if scanned_trusted is None:
+                # A deadline reached immediately after a crossed-target scan
+                # is not enough evidence to fail.  Give the bounded target
+                # rescan policy its remaining attempt(s), including the first
+                # target-centered pass when the forward scan was the one that
+                # first observed the clock crossing.
+                try:
+                    persisted_rescan_count = max(
+                        0, int(state.get("target_rescan_attempt_count") or 0)
+                    )
+                except (TypeError, ValueError):
+                    persisted_rescan_count = 0
+                # Rows written before the retry counter was introduced used
+                # ``target_rescan_completed_at_unix`` as a terminal marker.
+                # Treat those legacy rows as exhausted instead of silently
+                # reopening an old final-scan decision after an upgrade.
+                legacy_rescan_completed = bool(
+                    state.get("target_rescan_completed_at_unix") is not None
+                    and persisted_rescan_count == 0
+                    and not bool(state.get("target_rescan_exhausted"))
+                )
+                can_retry_crossed_target = bool(
+                    effective_deadline_reached
+                    and not predicted_target_media_ready
+                    and not post_scan_coverage.get("target_history_fully_missing")
+                    and target_clock_seconds is not None
+                    and scanned_trusted is not None
+                    and scanned_trusted >= target_clock_seconds
+                    and persisted_rescan_count
+                    < OCR_PROGRESSIVE_TARGET_RESCAN_MAX_ATTEMPTS
+                    and not bool(state.get("target_rescan_exhausted"))
+                    and not legacy_rescan_completed
+                )
+                if can_retry_crossed_target:
+                    _ocr_progressive_wait(
+                        runtime,
+                        job,
+                        current,
+                        wait_kind="waiting_for_target_rescan",
+                        message="目标时钟已经经过，正在重扫目标附近画面",
+                        scan_start=window_start,
+                        scan_end=window_end,
+                        latest_trusted_clock_seconds=scanned_trusted,
+                        latest_media_end_stream_time=latest_end,
+                        history_evicted=history_evicted,
+                        diagnostics={
+                            "kind": exc.kind,
+                            "message": str(exc),
+                            "post_scan_target_window": post_scan_target_window,
+                            "coverage_diagnostics": post_scan_coverage,
+                            **exc.diagnostics,
+                        },
+                        target_rescan_attempted=target_rescan_pending,
+                        next_scan_cursor_stream_time=(
+                            float(cursor)
+                            if target_rescan_pending
+                            and isinstance(cursor, (int, float))
+                            else None
+                        ),
+                        now_unix=after_scan_unix,
+                    )
+                    return False
+                if effective_deadline_reached and not predicted_target_media_ready:
+                    failure_details: dict[str, Any] = {}
+                    if post_scan_coverage.get("target_history_fully_missing"):
+                        error_kind = "ocr_search_history_evicted"
+                        message = "required OCR search history was evicted before the target clock was located"
+                    elif scanned_trusted is None:
                         error_kind = "ocr_no_trustworthy_clock_before_deadline"
                         message = "OCR never produced a trustworthy match-clock reading before the deadline"
                     elif target_not_reached:
-                        error_kind = "ocr_clock_target_timeout"
-                        message = "the retained video never reached the requested match clock before the deadline"
+                        error_kind, message, target_wait_details = (
+                            _ocr_target_wait_failure(
+                                {
+                                    **state,
+                                    "deadline_policy": updated_deadline_policy,
+                                },
+                                target_clock_seconds=target_clock_seconds,
+                                latest_trusted_clock_seconds=scanned_trusted,
+                                latest_media_end_stream_time=latest_end,
+                                diagnostics=exc.diagnostics,
+                            )
+                        )
+                        failure_details.update(target_wait_details)
                     else:
                         error_kind = "ocr_clock_target_not_located"
                         message = "OCR passed the requested clock but could not verify a usable anchor"
+                        failure_details.update(
+                            _ocr_target_not_located_diagnostics(
+                                exc.diagnostics,
+                                target_clock_seconds=target_clock_seconds,
+                                latest_trusted_clock_seconds=scanned_trusted,
+                                coverage_diagnostics=post_scan_coverage,
+                            )
+                        )
                     raise VisualLocationFailed(
                         error_kind,
                         message,
@@ -3028,6 +4954,8 @@ def _process_ocr_window(
                             "deadline_policy": updated_deadline_policy,
                             "final_scan_completed_at_unix": after_scan_unix,
                             "final_scan_was_forced": force_final_scan,
+                            "coverage_diagnostics": post_scan_coverage,
+                            **failure_details,
                         },
                     ) from exc
                 _ocr_progressive_wait(
@@ -3043,17 +4971,44 @@ def _process_ocr_window(
                     scan_start=window_start,
                     scan_end=window_end,
                     latest_trusted_clock_seconds=scanned_trusted,
+                    latest_media_end_stream_time=latest_end,
                     history_evicted=history_evicted,
                     diagnostics={
                         "kind": exc.kind,
                         "message": str(exc),
+                        "media_tail_before_scan": media_tail_before_scan,
+                        "media_tail_after_scan": latest_end,
+                        "media_tail_grew_during_scan": media_tail_grew_during_scan,
+                        "predicted_target_media_ready": predicted_target_media_ready,
+                        "post_scan_target_window": post_scan_target_window,
+                        "coverage_diagnostics": post_scan_coverage,
                         **exc.diagnostics,
                     },
+                    target_rescan_attempted=target_rescan_pending,
+                    suppress_target_rescan=effective_deadline_reached,
+                    next_scan_cursor_stream_time=(
+                        float(cursor)
+                        if target_rescan_pending
+                        and isinstance(cursor, (int, float))
+                        else None
+                    ),
                     now_unix=after_scan_unix,
                 )
                 return False
+            if _ocr_target_revision_is_stale(
+                runtime, job.event_key, worker_target_revision
+            ):
+                return False
+            execution_completed_at = time.time()
+            refreshed = _artifact_task(runtime, job.event_key, artifact_kind)
+            if refreshed is not None:
+                current = refreshed
+                state = _ocr_progressive_state(current)
             anchor = float(located["anchor_stream_time"])
-            before, after, localization_source = _ocr_output_shape(job, located)
+            before, after, _legacy_localization_source = _ocr_output_shape(job, located)
+            localization_source, localization_precision = _ocr_localization_contract(
+                located
+            )
             anchor_source = (
                 job.api_observed_source_time
                 + (anchor - job.api_observed_stream_time)
@@ -3069,6 +5024,7 @@ def _process_ocr_window(
                 "localization_source": localization_source,
                 "location_kind": located.get("location_kind"),
                 "precision": located.get("precision"),
+                "localization_precision": localization_precision,
                 "target_clock": located.get("target_clock"),
                 "target_clock_seconds": located.get("target_clock_seconds"),
                 "exact_second_error": located.get("exact_second_error"),
@@ -3094,6 +5050,22 @@ def _process_ocr_window(
             locate_result["clip_before_seconds"] = before
             locate_result["clip_after_seconds"] = after
             located_trusted = _latest_trusted_clock_seconds(located)
+            effective_latest_trusted = (
+                max(latest_trusted, located_trusted)
+                if latest_trusted is not None and located_trusted is not None
+                else latest_trusted
+                if latest_trusted is not None
+                else located_trusted
+            )
+            deadline_policy = _ocr_deadline_policy(
+                current,
+                now_unix=execution_completed_at,
+                target_clock_seconds=target_clock_seconds,
+                latest_trusted_clock_seconds=effective_latest_trusted,
+            )
+            merged_clock_samples = _ocr_progressive_merge_clock_samples(
+                state.get("clock_samples"), located.get("diagnostics") or located
+            )
             progress = {
                 **state,
                 "state": "target_located",
@@ -3102,14 +5074,10 @@ def _process_ocr_window(
                 "last_scan_end_stream_time": round(window_end, 3),
                 "scan_cursor_stream_time": round(window_end, 3),
                 "overlap_seconds": OCR_PROGRESSIVE_OVERLAP_SECONDS,
-                "latest_trusted_clock_seconds": (
-                    max(latest_trusted, located_trusted)
-                    if latest_trusted is not None and located_trusted is not None
-                    else latest_trusted
-                    if latest_trusted is not None
-                    else located_trusted
-                ),
+                "latest_trusted_clock_seconds": effective_latest_trusted,
                 "target_clock_seconds": target_clock_seconds,
+                "target_revision": worker_target_revision,
+                "target_source": _vision_target_source(job),
                 "anchor_stream_time": round(anchor, 3),
                 "anchor_provenance": "ocr_verified_match_clock",
                 "location_kind": located.get("location_kind"),
@@ -3117,14 +5085,20 @@ def _process_ocr_window(
                 "deadline_policy": {
                     **deadline_policy,
                     "phase": "target_located",
-                    "target_located_at_unix": time.time(),
+                    "target_located_at_unix": execution_completed_at,
                 },
-                "last_execution_completed_at_unix": time.time(),
+                "last_execution_completed_at_unix": execution_completed_at,
                 "last_execution_result": "target_located",
+                "clock_samples": merged_clock_samples,
+                "clock_mapping": _ocr_progressive_clock_mapping(merged_clock_samples),
             }
             if force_final_scan:
                 progress["final_scan_completed_at_unix"] = time.time()
                 progress["final_scan_result"] = "target_located"
+            if _ocr_target_revision_is_stale(
+                runtime, job.event_key, worker_target_revision
+            ):
+                return False
             _artifact_transition(
                 runtime,
                 job.event_key,
@@ -3138,6 +5112,10 @@ def _process_ocr_window(
                 runtime.store.release_segment_lease(lease_id)
                 lease_id = None
 
+        if _ocr_target_revision_is_stale(
+            runtime, job.event_key, worker_target_revision
+        ):
+            return False
         before, after = _normalized_ocr_clip_window(
             job,
             located,
@@ -3180,7 +5158,12 @@ def _process_ocr_window(
         if coverage.status == CoverageStatus.WAITING:
             wait_kind = (
                 "waiting_for_postroll"
-                if located.get("localization_source") == "exact_second"
+                if (
+                    _ocr_localization_is_second_precision(
+                        located.get("localization_source")
+                    )
+                    or located.get("location_kind") == "match_clock_second"
+                )
                 and after > 0
                 else "waiting_for_ocr_output_window"
             )
@@ -3265,6 +5248,10 @@ def _process_ocr_window(
             output_due_stream_time=requested_end,
             output_id=job.event_key.rsplit(":", 1)[-1][:8],
         )
+        if _ocr_target_revision_is_stale(
+            runtime, job.event_key, worker_target_revision
+        ):
+            return False
         _artifact_transition(
             runtime,
             job.event_key,
@@ -3272,6 +5259,10 @@ def _process_ocr_window(
             "encoding",
             result=located,
         )
+        if _ocr_target_revision_is_stale(
+            runtime, job.event_key, worker_target_revision
+        ):
+            return False
         encoded = encode_gif(
             ffmpeg,
             ffprobe,
@@ -3292,6 +5283,12 @@ def _process_ocr_window(
                 variant="ocr",
             ),
         )
+        if _ocr_target_revision_is_stale(
+            runtime, job.event_key, worker_target_revision
+        ):
+            # The encoded file is intentionally left to the normal lifecycle
+            # cleanup; a newer revision owns the durable artifact row.
+            return False
         encoded.update({
             **located,
             "artifact_kind": artifact_kind,
@@ -3305,7 +5302,8 @@ def _process_ocr_window(
             "minute_fallback": located.get("localization_source") == "minute_boundary",
             "fallback_generated": located.get("localization_source") == "minute_boundary",
             "precise_location": (
-                located.get("localization_source") == "exact_second"
+                located.get("localization_source")
+                in {"exact_second", "exact", "interpolated"}
                 and located.get("localization_quality") == "exact"
             ),
             "output_width": width,
@@ -3334,6 +5332,13 @@ def _process_ocr_window(
             },
             "default_gif_preserved": True,
         })
+        if _ocr_target_revision_is_stale(
+            runtime, job.event_key, worker_target_revision
+        ):
+            # A late target revision may have reset the durable row while the
+            # old encode was running. Do not let the stale artifact transition
+            # back to encoded; the next worker will encode the new target.
+            return False
         _artifact_transition(
             runtime,
             job.event_key,
@@ -3701,6 +5706,7 @@ def _process_tdeed_refined(
             refined_anchor = float(current.located_anchor_stream_time)
             located = dict(current.result)
         else:
+            target_window_used = None
             if ocr_task.status == "encoded":
                 ocr_anchor = float(ocr_task.located_anchor_stream_time)
                 ocr_before, ocr_after = _normalized_ocr_clip_window(
@@ -3720,15 +5726,49 @@ def _process_tdeed_refined(
                 window_start = max(0.0, ocr_anchor - candidate_before)
                 window_end = ocr_anchor + candidate_after
             else:
-                window_start = max(0.0, float(current.search_start_stream_time))
-                window_end = float(current.search_end_stream_time)
-                if window_end <= window_start:
-                    window_start = max(0.0, job.api_observed_stream_time - search_before)
-                    window_end = job.api_observed_stream_time
-                ocr_anchor = min(
-                    window_end,
-                    max(window_start, job.api_observed_stream_time),
-                )
+                # When OCR exhausted its target-local retries, preserve the
+                # last focused retry window for T-DEED.  The old behavior
+                # always fell back to the broad API interval, which could
+                # make T-DEED search the wrong part of a rolling buffer even
+                # though OCR had already narrowed the target location.
+                progressive_state = _ocr_progressive_state(ocr_task)
+                target_window = progressive_state.get("target_rescan_window")
+                target_window_used = None
+                if isinstance(target_window, dict):
+                    try:
+                        candidate_start = float(target_window["start_stream_time"])
+                        candidate_end = float(target_window["end_stream_time"])
+                        candidate_anchor = float(
+                            target_window.get(
+                                "estimated_stream_time",
+                                (candidate_start + candidate_end) / 2.0,
+                            )
+                        )
+                    except (KeyError, TypeError, ValueError):
+                        candidate_start = candidate_end = candidate_anchor = math.nan
+                    if (
+                        math.isfinite(candidate_start)
+                        and math.isfinite(candidate_end)
+                        and math.isfinite(candidate_anchor)
+                        and candidate_end > candidate_start
+                    ):
+                        window_start = max(0.0, candidate_start)
+                        window_end = candidate_end
+                        ocr_anchor = min(
+                            window_end,
+                            max(window_start, candidate_anchor),
+                        )
+                        target_window_used = dict(target_window)
+                if target_window_used is None:
+                    window_start = max(0.0, float(current.search_start_stream_time))
+                    window_end = float(current.search_end_stream_time)
+                    if window_end <= window_start:
+                        window_start = max(0.0, job.api_observed_stream_time - search_before)
+                        window_end = job.api_observed_stream_time
+                    ocr_anchor = min(
+                        window_end,
+                        max(window_start, job.api_observed_stream_time),
+                    )
                 minute_based = False
             segments = segment_reader()
             coverage = _vision_coverage(
@@ -3851,6 +5891,7 @@ def _process_tdeed_refined(
                     ),
                     "window_start_stream_time": actual_start,
                     "window_end_stream_time": actual_end,
+                    "target_rescan_window": target_window_used,
                 },
                 "analysis_window": materialized,
                 "upstream_ocr_failure": upstream_ocr_failure,

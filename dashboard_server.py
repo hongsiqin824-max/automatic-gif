@@ -937,12 +937,17 @@ def _tasks_from_database(
             )
         ocr_pipeline_statuses = {
             "waiting_for_clock_target",
+            "ocr_target_rescan",
             "waiting_for_postroll",
             "ocr_second_exact",
+            "ocr_second_interpolated",
             "ocr_second_estimated",
             "ocr_minute_fallback",
             "ocr_no_clock_detected",
             "ocr_target_timeout",
+            "ocr_target_media_not_arrived",
+            "ocr_target_media_stalled",
+            "ocr_clock_paused_timeout",
             "ocr_window_evicted",
             "ocr_discontinuous_clock",
             "ocr_encode_failed",
@@ -982,6 +987,47 @@ def _tasks_from_database(
             ),
             "",
         )
+        # A crossed target is retried from a short historical window.  The
+        # durable row remains pending while that rewind is waiting for a
+        # worker slot, so expose it as a distinct recoverable state instead of
+        # presenting the old terminal timeout label.
+        target_rescan_window = progressive_scan.get("target_rescan_window")
+        target_rescan_pending = bool(
+            str(row["status"] or "").strip().lower() != "failed"
+            and isinstance(target_rescan_window, dict)
+            and progressive_scan.get("target_rescan_completed_at_unix") is None
+        )
+        if target_rescan_pending and ocr_pipeline_status not in {
+            "ocr_second_exact",
+            "ocr_second_interpolated",
+            "ocr_second_estimated",
+            "ocr_minute_fallback",
+        }:
+            ocr_pipeline_status = "ocr_target_rescan"
+        # A previous attempt's terminal error can remain in result_json while
+        # the durable row is requeued. Never expose that stale error as a
+        # failed badge for a recoverable row.
+        recoverable_statuses = {
+            "ocr_clock_target_not_located",
+            "ocr_no_clock_detected",
+            "ocr_target_timeout",
+            "ocr_target_media_not_arrived",
+            "ocr_target_media_stalled",
+            "ocr_clock_paused_timeout",
+            "ocr_window_evicted",
+            "ocr_discontinuous_clock",
+            "ocr_encode_failed",
+            "ocr_dependency_unavailable",
+        }
+        if (
+            str(row["status"] or "").strip().lower() != "failed"
+            and ocr_pipeline_status in recoverable_statuses
+        ):
+            ocr_pipeline_status = (
+                "ocr_target_rescan"
+                if target_rescan_pending
+                else "waiting_for_clock_target"
+            )
         if ocr_pipeline_status not in ocr_pipeline_statuses:
             structured_failure = vision_result.get("failure_reason")
             failure_kind = str(
@@ -1001,6 +1047,9 @@ def _tasks_from_database(
                 "ocr_clock_unreadable": "ocr_no_clock_detected",
                 "scoreboard_missing": "ocr_no_clock_detected",
                 "ocr_clock_target_timeout": "ocr_target_timeout",
+                "ocr_target_media_not_arrived": "ocr_target_media_not_arrived",
+                "ocr_target_media_stalled": "ocr_target_media_stalled",
+                "ocr_clock_paused_timeout": "ocr_clock_paused_timeout",
                 "ocr_clock_target_not_located": "ocr_target_timeout",
                 "ocr_postroll_timeout": "ocr_target_timeout",
                 "ocr_output_window_timeout": "ocr_target_timeout",
@@ -1020,11 +1069,31 @@ def _tasks_from_database(
                 ocr_pipeline_status = failure_kind
             elif normalized_failure_status is not None:
                 ocr_pipeline_status = normalized_failure_status
-            elif vision_result.get("localization_source") == "exact_second":
+            elif vision_result.get("localization_source") in {
+                "exact_second",
+                "exact",
+                "interpolated",
+                "estimated",
+            }:
+                localization_source = str(
+                    vision_result.get("localization_source") or ""
+                )
+                precision = str(vision_result.get("precision") or "")
+                is_estimated = (
+                    localization_source == "estimated"
+                    or precision == "estimated_second"
+                    or vision_result.get("localization_quality") == "estimated"
+                    or vision_result.get("degraded") is True
+                )
+                is_interpolated = (
+                    localization_source == "interpolated"
+                    or precision == "interpolated_second"
+                )
                 ocr_pipeline_status = (
                     "ocr_second_estimated"
-                    if vision_result.get("localization_quality") == "estimated"
-                    or vision_result.get("degraded") is True
+                    if is_estimated
+                    else "ocr_second_interpolated"
+                    if is_interpolated
                     else "ocr_second_exact"
                 )
             elif (
@@ -1034,6 +1103,15 @@ def _tasks_from_database(
                 ocr_pipeline_status = "ocr_minute_fallback"
             else:
                 ocr_pipeline_status = ""
+        if (
+            str(row["status"] or "").strip().lower() != "failed"
+            and ocr_pipeline_status in recoverable_statuses
+        ):
+            ocr_pipeline_status = (
+                "ocr_target_rescan"
+                if target_rescan_pending
+                else "waiting_for_clock_target"
+            )
         scan_window = first_ocr_value("scan_window", "scanning_window")
         if not isinstance(scan_window, dict):
             scan_window = window_metadata.get("search_window")
@@ -1114,6 +1192,54 @@ def _tasks_from_database(
         artifact_kind = (
             "tdeed_refined" if raw_artifact_kind == "refined" else raw_artifact_kind
         )
+        target_wait_outcome = first_ocr_value("target_wait_outcome")
+        target_failure_cause = first_ocr_value(
+            "target_failure_cause", "ocr_target_failure_cause"
+        )
+        target_passed_without_anchor = first_ocr_value(
+            "target_passed_without_anchor"
+        )
+        target_failure_coverage_class = first_ocr_value(
+            "target_failure_coverage_class", "coverage_class"
+        )
+        target_failure_scan_stage = first_ocr_value(
+            "target_failure_scan_stage", "scan_stage"
+        )
+        target_clock_gap_seconds = first_ocr_value("target_clock_gap_seconds")
+        latest_media_end_stream_time = first_ocr_value(
+            "latest_media_end_stream_time"
+        )
+        previous_media_end_stream_time = first_ocr_value(
+            "previous_media_end_stream_time"
+        )
+        wait_explanations = {
+            "target_media_not_arrived": (
+                "目标比赛时钟对应的画面还没有进入当前缓存，OCR 目前只读到了较早时间。"
+            ),
+            "media_stalled": (
+                "缓存尾部在等待期间没有继续增长，暂时没有新画面可供 OCR 扫描。"
+            ),
+            "clock_paused": (
+                "比分牌时钟在画面继续播放时没有推进，可能是比赛暂停或转播回放。"
+            ),
+        }
+        failure_explanation = first_ocr_value(
+            "failure_explanation",
+            "target_failure_explanation",
+            "target_wait_explanation",
+        )
+        if not failure_explanation and target_wait_outcome:
+            failure_explanation = wait_explanations.get(target_wait_outcome)
+        next_actions = {
+            "target_media_not_arrived": "继续等待缓存进入目标时间；若直播已停止，再保留默认 GIF。",
+            "media_stalled": "检查直播源或缓存录制是否断流；恢复增长后会继续目标附近精扫。",
+            "clock_paused": "等待比赛时钟恢复推进；不要把暂停期间的画面当作目标时间。",
+        }
+        failure_next_action = first_ocr_value(
+            "failure_next_action", "target_wait_next_action"
+        )
+        if not failure_next_action and target_wait_outcome:
+            failure_next_action = next_actions.get(target_wait_outcome)
         artifact = {
             "artifact_kind": artifact_kind,
             "status": str(row["status"]),
@@ -1130,6 +1256,19 @@ def _tasks_from_database(
             "experimental": bool(vision_result.get("experimental")),
             "disabled": bool(vision_result.get("disabled")),
             "ocr_pipeline_status": ocr_pipeline_status or None,
+            "target_rescan_pending": target_rescan_pending,
+            "target_rescan_window": target_rescan_window
+            if isinstance(target_rescan_window, dict)
+            else None,
+            "target_rescan_attempt_count": first_ocr_value(
+                "target_rescan_attempt_count"
+            ),
+            "target_rescan_exhausted": bool(
+                progressive_scan.get("target_rescan_exhausted")
+            ),
+            "target_rescan_sample_interval_seconds": first_ocr_value(
+                "sample_interval_seconds"
+            ),
             "scan_window": scan_window,
             "scan_cursor": first_ocr_value(
                 "scan_cursor",
@@ -1149,6 +1288,19 @@ def _tasks_from_database(
                 "latest_trusted_clock_seconds",
             ),
             "target_clock_seconds": first_ocr_value("target_clock_seconds"),
+            "target_wait_outcome": target_wait_outcome,
+            "target_failure_cause": target_failure_cause,
+            "target_failure_coverage_class": target_failure_coverage_class,
+            "target_failure_scan_stage": target_failure_scan_stage,
+            "target_passed_without_anchor": bool(target_passed_without_anchor),
+            "target_failure_explanation": first_ocr_value(
+                "target_failure_explanation"
+            ),
+            "target_clock_gap_seconds": target_clock_gap_seconds,
+            "latest_media_end_stream_time": latest_media_end_stream_time,
+            "previous_media_end_stream_time": previous_media_end_stream_time,
+            "failure_explanation": failure_explanation,
+            "failure_next_action": failure_next_action,
             "scan_attempt_count": first_ocr_value("scan_attempt_count"),
             "next_attempt_at_unix": (
                 first_ocr_value("next_attempt_at_unix")
@@ -1195,6 +1347,10 @@ def _tasks_from_database(
                 )
             ),
             "localization_source": vision_result.get("localization_source"),
+            "localization_precision": vision_result.get(
+                "localization_precision"
+            ),
+            "precision": vision_result.get("precision"),
             "localization_quality": vision_result.get("localization_quality"),
             "degraded": bool(vision_result.get("degraded")),
             "degradation_mode": vision_result.get("degradation_mode"),
