@@ -981,6 +981,7 @@ class DashboardTests(unittest.TestCase):
             "ocr_inference_failed": "ocr_dependency_unavailable",
             "ocr_processing_failed": "ocr_dependency_unavailable",
             "ocr_window_encoding_failed": "ocr_encode_failed",
+            "vision_shutdown_timeout": "ocr_incomplete",
         }
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "pipeline_state.sqlite3"
@@ -1490,7 +1491,7 @@ class DashboardTests(unittest.TestCase):
         )
         self.assertEqual(
             command[command.index("--buffer-seconds") + 1],
-            "360.0",
+            "900.0",
         )
         self.assertEqual(command[command.index("--gif-width") + 1], "768")
         self.assertEqual(command[command.index("--gif-fps") + 1], "16.0")
@@ -1509,11 +1510,16 @@ class DashboardTests(unittest.TestCase):
             command[command.index("--vision-search-after") + 1],
             "0.0",
         )
+        self.assertEqual(
+            command[command.index("--vision-workers") + 1],
+            str(dashboard_server.VISION_WORKERS),
+        )
         payload = response.get_json()
         self.assertTrue(payload["vision"]["enabled"])
         self.assertTrue(payload["vision"]["worker_enabled"])
         self.assertFalse(payload["vision"]["tdeed_enabled"])
         self.assertFalse(payload["vision"]["worker_tdeed_enabled"])
+        self.assertEqual(payload["vision"]["workers"], dashboard_server.VISION_WORKERS)
 
     def test_live_start_passes_match_start_play_to_worker(self):
         manager = dashboard_server.Dashboard(background_monitors=False)
@@ -1585,8 +1591,12 @@ class DashboardTests(unittest.TestCase):
             "0.0",
         )
         self.assertEqual(
+            command[command.index("--vision-workers") + 1],
+            str(dashboard_server.VISION_WORKERS),
+        )
+        self.assertEqual(
             command[command.index("--buffer-seconds") + 1],
-            "360.0",
+            "900.0",
         )
         self.assertEqual(command[command.index("--gif-width") + 1], "768")
         self.assertEqual(command[command.index("--gif-fps") + 1], "16.0")
@@ -2349,7 +2359,10 @@ class DashboardTests(unittest.TestCase):
         self.assertFalse(session.desired_running)
         self.assertIsNone(session.worker_restart_due_at)
         self.assertFalse(session.source_changed)
-        self.assertEqual(session.finishing_deadline, 246.0)
+        self.assertEqual(
+            session.finishing_deadline,
+            111.0 + dashboard_server.FINISHING_TIMEOUT_SECONDS,
+        )
         kill.assert_called_once_with(301, dashboard_server.signal.SIGUSR1)
 
     def test_played_confirmation_resets_when_status_returns_to_playing(self):

@@ -144,8 +144,11 @@ WORKER_KILL_GRACE_SECONDS = float(
 WORKER_CLEANUP_POLL_SECONDS = 0.1
 PLAYED_CONFIRMATIONS_REQUIRED = 2
 WORKER_FINISH_GRACE_SECONDS = 90.0
-WORKER_FINISH_TIMEOUT_SECONDS = 120.0
-DASHBOARD_BUFFER_SECONDS = 360.0
+WORKER_FINISH_TIMEOUT_SECONDS = _positive_environment_float(
+    "GIF_WORKER_FINISH_TIMEOUT_SECONDS", 600.0
+)
+DASHBOARD_BUFFER_SECONDS = 900.0
+VISION_WORKERS = _positive_environment_integer("GIF_VISION_WORKERS", 4)
 VISION_SEARCH_BEFORE_SECONDS = _positive_environment_float(
     "GIF_VISION_SEARCH_BEFORE_SECONDS", 120.0
 )
@@ -937,6 +940,7 @@ def _tasks_from_database(
             )
         ocr_pipeline_statuses = {
             "waiting_for_clock_target",
+            "waiting_for_latest_tail_rescan",
             "ocr_target_rescan",
             "waiting_for_postroll",
             "ocr_second_exact",
@@ -952,6 +956,7 @@ def _tasks_from_database(
             "ocr_discontinuous_clock",
             "ocr_encode_failed",
             "ocr_dependency_unavailable",
+            "ocr_incomplete",
         }
 
         def first_ocr_value(*keys: str) -> Any:
@@ -1008,6 +1013,7 @@ def _tasks_from_database(
         # the durable row is requeued. Never expose that stale error as a
         # failed badge for a recoverable row.
         recoverable_statuses = {
+            "waiting_for_latest_tail_rescan",
             "ocr_clock_target_not_located",
             "ocr_no_clock_detected",
             "ocr_target_timeout",
@@ -1064,6 +1070,7 @@ def _tasks_from_database(
                 "ocr_model_unavailable": "ocr_dependency_unavailable",
                 "ocr_inference_failed": "ocr_dependency_unavailable",
                 "ocr_processing_failed": "ocr_dependency_unavailable",
+                "vision_shutdown_timeout": "ocr_incomplete",
             }.get(failure_kind)
             if failure_kind in ocr_pipeline_statuses:
                 ocr_pipeline_status = failure_kind
@@ -1902,7 +1909,7 @@ def _session_json(session: MatchSession) -> dict[str, Any]:
             "search_after_seconds": VISION_SEARCH_AFTER_SECONDS,
             "scoreboard_profile_path": session.scoreboard_profile_path or None,
             "model": "PaddleOCR",
-            "workers": 1,
+            "workers": VISION_WORKERS,
             "fallback_gif": {
                 "duration_seconds": 60.0,
                 "exact_second_before_seconds": 30.0,
@@ -3163,7 +3170,7 @@ class Dashboard:
                     "--vision-search-after", str(VISION_SEARCH_AFTER_SECONDS),
                     "--vision-before", str(session.vision_before_seconds),
                     "--vision-after", str(session.vision_after_seconds),
-                    "--vision-workers", "1",
+                    "--vision-workers", str(VISION_WORKERS),
                     "--fallback-gif-width", str(FALLBACK_GIF_WIDTH),
                     "--fallback-gif-fps", str(FALLBACK_GIF_FPS),
                     "--fallback-gif-colors", str(FALLBACK_GIF_COLORS),

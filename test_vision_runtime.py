@@ -199,8 +199,8 @@ class VisionRuntimeTests(unittest.TestCase):
             target_clock_seconds=120,
         )
         self.assertEqual(window["method"], "one_sided_clock_projection")
-        self.assertEqual(window["start_stream_time"], 105.0)
-        self.assertEqual(window["end_stream_time"], 135.0)
+        self.assertEqual(window["start_stream_time"], 100.0)
+        self.assertEqual(window["end_stream_time"], 140.0)
         self.assertEqual(window["sample_interval_seconds"], 1.0)
         self.assertEqual(window["scan_mode"], "target_centered_rescan")
 
@@ -1669,6 +1669,99 @@ class VisionRuntimeTests(unittest.TestCase):
             self.assertEqual(
                 second["hard_deadline_at_unix"],
                 first["hard_deadline_at_unix"],
+            )
+            runtime.close()
+
+    def test_deadline_policy_accounts_pre_submission_wait_after_readiness_policy(self):
+        """A policy created before queue submission is extended once at execution."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime, job = self._create_progressive_ocr_job(
+                root, "pre-submission-after-readiness"
+            )
+            task = runtime.store.get_vision_task(job.event_key, "ocr_window")
+            created = task.created_at_unix
+
+            # The scheduler may persist a readiness policy before the visual
+            # worker is submitted.  This used to permanently lose the later
+            # pre-submission interval because the policy already had a hard
+            # deadline by the time OCR acquired a slot.
+            initial = _ocr_deadline_policy(
+                task,
+                now_unix=created + 1.0,
+                target_clock_seconds=3420,
+                latest_trusted_clock_seconds=None,
+            )
+            runtime.record_vision_readiness_wait(
+                job.event_key,
+                "waiting for visual queue",
+                artifact_kind="ocr_window",
+                error_kind="waiting_for_clock_target",
+                window_metadata={
+                    "progressive_scan": {
+                        "deadline_policy": initial,
+                    }
+                },
+                now=created + 1.0,
+            )
+            runtime.record_vision_queue_phase(
+                job.event_key,
+                "queued",
+                artifact_kind="ocr_window",
+                now=created + 230.0,
+            )
+            runtime.record_vision_queue_phase(
+                job.event_key,
+                "acquired",
+                artifact_kind="ocr_window",
+                queued_at_unix=created + 230.0,
+                now=created + 270.0,
+            )
+            runtime.record_vision_queue_phase(
+                job.event_key,
+                "executing",
+                artifact_kind="ocr_window",
+                queued_at_unix=created + 230.0,
+                now=created + 271.0,
+            )
+
+            executing = runtime.store.get_vision_task(job.event_key, "ocr_window")
+            updated = _ocr_deadline_policy(
+                executing,
+                now_unix=created + 271.0,
+                target_clock_seconds=3420,
+                latest_trusted_clock_seconds=3409,
+            )
+            self.assertAlmostEqual(
+                updated["pre_submission_wait_accounted_seconds"],
+                231.0,
+                places=3,
+            )
+            # 300s base + 231s pre-submission + 40s actual queue wait.
+            self.assertAlmostEqual(
+                updated["hard_deadline_at_unix"],
+                created + 571.0,
+                places=3,
+            )
+
+            runtime.record_vision_readiness_wait(
+                job.event_key,
+                "persist compensated policy",
+                artifact_kind="ocr_window",
+                error_kind="waiting_for_clock_target",
+                window_metadata={"progressive_scan": {"deadline_policy": updated}},
+                now=created + 271.0,
+            )
+            persisted = runtime.store.get_vision_task(job.event_key, "ocr_window")
+            retried = _ocr_deadline_policy(
+                persisted,
+                now_unix=created + 272.0,
+                target_clock_seconds=3420,
+                latest_trusted_clock_seconds=3410,
+            )
+            self.assertEqual(
+                retried["hard_deadline_at_unix"],
+                updated["hard_deadline_at_unix"],
             )
             runtime.close()
 

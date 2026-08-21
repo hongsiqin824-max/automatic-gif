@@ -14,8 +14,11 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-DEFAULT_MAX_CONCURRENT_HEAVY_TASKS = 2
-DEFAULT_MAX_CONCURRENT_VISION_TASKS = 1
+# Keep one shared heavy slot available for the default GIF path while allowing
+# four OCR jobs to run concurrently on the deployment machine.  Both limits
+# remain overridable through GIF_MAX_CONCURRENT_* for smaller servers.
+DEFAULT_MAX_CONCURRENT_HEAVY_TASKS = 5
+DEFAULT_MAX_CONCURRENT_VISION_TASKS = 4
 DEFAULT_RESERVED_GIF_SLOTS = 1
 DEFAULT_LEASE_SECONDS = 15.0
 DEFAULT_POLL_SECONDS = 0.1

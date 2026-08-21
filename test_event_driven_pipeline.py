@@ -29,6 +29,7 @@ from event_driven_pipeline import (
     merge_observed_event_revision,
     main,
     load_scoreboard_profile,
+    mark_incomplete_vision_tasks_on_shutdown,
     observe_segment_progress,
     observed_stream_time_from_wall,
     parse_match_start_play,
@@ -66,6 +67,58 @@ class FakeHttpResponse:
 
 
 class EventVisualLeaseTests(unittest.TestCase):
+    def test_shutdown_marks_ocr_incomplete_without_touching_default_gif(self):
+        from pipeline_runtime import PipelineRuntime
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = PipelineRuntime(root / "state.sqlite3", root / "events.jsonl")
+            event_key = "match-1:G:shutdown-ocr"
+            runtime.discover_task(
+                match_id="match-1",
+                event_data={
+                    "event_key": event_key,
+                    "code": "G",
+                    "event_type": "goal",
+                    "minute": "2",
+                    "minute_extra": "0",
+                    "team": "teamA",
+                    "person": "A",
+                    "person_id": "1",
+                    "score": "1-0",
+                    "reason": "",
+                    "metadata": {},
+                },
+                observed_stream_time=200.0,
+                observed_source_time=None,
+                clip_anchor_stream_time=200.0,
+                clip_anchor_source_time=None,
+                output_due_stream_time=230.0,
+                detected_at_unix=1000.0,
+            )
+            runtime.enqueue_vision_task(
+                event_key,
+                artifact_kind="ocr_window",
+                search_start_stream_time=100.0,
+                search_end_stream_time=200.0,
+                clip_before_seconds=30.0,
+                clip_after_seconds=30.0,
+                deadline_at_unix=1400.0,
+            )
+
+            marked = mark_incomplete_vision_tasks_on_shutdown(
+                runtime, "match-1", reason="graceful_stop_timeout"
+            )
+
+            self.assertEqual(marked, 1)
+            ocr_task = runtime.store.get_vision_task(event_key, "ocr_window")
+            default_task = runtime.store.get(event_key)
+            self.assertEqual(ocr_task.status, "failed")
+            self.assertEqual(ocr_task.last_error_kind, "vision_shutdown_timeout")
+            self.assertEqual(ocr_task.result["completion_state"], "incomplete")
+            self.assertEqual(default_task.status, "pending")
+            runtime.close()
+
     def test_progressive_scan_and_output_windows_extend_event_lease(self):
         from pipeline_runtime import PipelineRuntime
 

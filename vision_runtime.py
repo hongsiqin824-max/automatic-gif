@@ -65,6 +65,10 @@ OCR_PROGRESSIVE_TARGET_RESCAN_MARGIN_SECONDS = 20.0
 OCR_PROGRESSIVE_TARGET_RESCAN_SAMPLE_INTERVAL_SECONDS = 1.0
 OCR_PROGRESSIVE_TARGET_RESCAN_EXPANDED_MARGIN_SECONDS = 30.0
 OCR_PROGRESSIVE_TARGET_RESCAN_MAX_ATTEMPTS = 3
+# When one OCR pass takes long enough for the live buffer to grow, the next
+# progressive pass is explicitly recorded as a refresh of the newly appended
+# tail instead of treating the old scan snapshot as final evidence.
+OCR_LONG_SCAN_TAIL_RESCAN_SECONDS = 5.0
 # A validated clock-to-video mapping is already a strong anchor. Keep its
 # focused scan at the original +/-15s; the wider windows above are reserved
 # for recovery after an OCR miss.
@@ -2650,6 +2654,67 @@ def _ocr_deadline_policy(
         if target_deadline is not None and float(target_deadline) >= old_hard_deadline - 0.001:
             policy["target_deadline_at_unix"] = float(target_deadline) + hard_extension
         policy["event_hard_limit_seconds"] = OCR_EVENT_HARD_LIMIT_SECONDS
+
+    # A readiness check can create and persist the deadline policy before the
+    # visual worker is submitted.  In that case the initial policy branch
+    # above has no execution timestamp and cannot account for the time between
+    # task creation and the first queue submission.  Apply that compensation
+    # once as soon as the first execution timestamp becomes available.  Keep a
+    # separate timestamp marker so later retries do not count the same wait a
+    # second time.
+    first_execution_started_raw = policy.get("first_execution_started_at_unix")
+    try:
+        first_execution_started = float(first_execution_started_raw)
+    except (TypeError, ValueError):
+        first_execution_started = math.nan
+    queue_execution_started_raw = queue_timing.get("execution_started_at_unix")
+    try:
+        queue_execution_started = float(queue_execution_started_raw)
+    except (TypeError, ValueError):
+        queue_execution_started = math.nan
+    if (
+        math.isfinite(first_execution_started)
+        and policy.get("pre_submission_wait_accounted_seconds") is None
+    ):
+        pre_submission_wait = max(
+            0.0,
+            first_execution_started
+            - float(task.created_at_unix)
+            - queue_wait,
+        )
+        policy["pre_submission_wait_accounted_seconds"] = pre_submission_wait
+        if pre_submission_wait > 0:
+            for field in (
+                "initial_target_deadline_at_unix",
+                "target_deadline_at_unix",
+                "hard_deadline_at_unix",
+            ):
+                if policy.get(field) is not None:
+                    policy[field] = float(policy[field]) + pre_submission_wait
+    elif (
+        not math.isfinite(first_execution_started)
+        and math.isfinite(queue_execution_started)
+    ):
+        # Policies persisted before the first worker execution have no marker
+        # at all.  This branch intentionally handles both missing legacy
+        # fields and the explicit ``None`` marker from the initial policy.
+        first_execution_started = queue_execution_started
+        pre_submission_wait = max(
+            0.0,
+            first_execution_started
+            - float(task.created_at_unix)
+            - queue_wait,
+        )
+        policy["first_execution_started_at_unix"] = first_execution_started
+        policy["pre_submission_wait_accounted_seconds"] = pre_submission_wait
+        if pre_submission_wait > 0:
+            for field in (
+                "initial_target_deadline_at_unix",
+                "target_deadline_at_unix",
+                "hard_deadline_at_unix",
+            ):
+                if policy.get(field) is not None:
+                    policy[field] = float(policy[field]) + pre_submission_wait
     try:
         policy_version = int(policy.get("policy_version") or 0)
     except (TypeError, ValueError):
@@ -4786,6 +4851,11 @@ def _process_ocr_window(
                         + OCR_PROGRESSIVE_TAIL_EPSILON_SECONDS
                     )
                 )
+                long_scan_tail_rescan = bool(
+                    media_tail_grew_during_scan
+                    and after_scan_unix - now_unix
+                    >= OCR_LONG_SCAN_TAIL_RESCAN_SECONDS
+                )
                 # Re-read the transition persisted immediately before OCR.
                 # It contains the execution start timestamp needed to exclude
                 # this expensive scan from the live-media wait budget.
@@ -4909,6 +4979,39 @@ def _process_ocr_window(
                     )
                     return False
                 if effective_deadline_reached and not predicted_target_media_ready:
+                    if long_scan_tail_rescan:
+                        _ocr_progressive_wait(
+                            runtime,
+                            job,
+                            current,
+                            wait_kind="waiting_for_latest_tail_rescan",
+                            message="上一轮 OCR 用时较长，正在重新扫描新增视频尾部",
+                            scan_start=window_start,
+                            scan_end=window_end,
+                            latest_trusted_clock_seconds=scanned_trusted,
+                            latest_media_end_stream_time=latest_end,
+                            history_evicted=history_evicted,
+                            diagnostics={
+                                "kind": exc.kind,
+                                "message": str(exc),
+                                "media_tail_before_scan": media_tail_before_scan,
+                                "media_tail_after_scan": latest_end,
+                                "media_tail_grew_during_scan": True,
+                                "long_scan_tail_rescan": True,
+                                "post_scan_target_window": post_scan_target_window,
+                                "coverage_diagnostics": post_scan_coverage,
+                                **exc.diagnostics,
+                            },
+                            target_rescan_attempted=target_rescan_pending,
+                            next_scan_cursor_stream_time=(
+                                float(cursor)
+                                if target_rescan_pending
+                                and isinstance(cursor, (int, float))
+                                else None
+                            ),
+                            now_unix=after_scan_unix,
+                        )
+                        return False
                     failure_details: dict[str, Any] = {}
                     if post_scan_coverage.get("target_history_fully_missing"):
                         error_kind = "ocr_search_history_evicted"
@@ -4962,9 +5065,15 @@ def _process_ocr_window(
                     runtime,
                     job,
                     current,
-                    wait_kind="waiting_for_clock_target",
+                    wait_kind=(
+                        "waiting_for_latest_tail_rescan"
+                        if long_scan_tail_rescan
+                        else "waiting_for_clock_target"
+                    ),
                     message=(
-                        "latest trustworthy OCR clock has not reached the target"
+                        "上一轮 OCR 用时较长，正在重新扫描新增视频尾部"
+                        if long_scan_tail_rescan
+                        else "latest trustworthy OCR clock has not reached the target"
                         if target_not_reached
                         else "target clock has not yet yielded a verified OCR anchor"
                     ),
@@ -4979,6 +5088,7 @@ def _process_ocr_window(
                         "media_tail_before_scan": media_tail_before_scan,
                         "media_tail_after_scan": latest_end,
                         "media_tail_grew_during_scan": media_tail_grew_during_scan,
+                        "long_scan_tail_rescan": long_scan_tail_rescan,
                         "predicted_target_media_ready": predicted_target_media_ready,
                         "post_scan_target_window": post_scan_target_window,
                         "coverage_diagnostics": post_scan_coverage,

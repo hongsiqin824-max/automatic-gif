@@ -342,6 +342,7 @@ function visionPresentation(vision, enabled = true) {
       : '已越过目标，正在重新扫描';
     const pipelinePresentation = ({
       waiting_for_clock_target:{label:'正在查找比赛时间',cls:'encoding'},
+      waiting_for_latest_tail_rescan:{label:'正在扫描新增视频尾部',cls:'encoding'},
       ocr_target_rescan:{label:rescanLabel,cls:'encoding'},
       waiting_for_postroll:{label:'已找到画面 · 等待后续画面',cls:'pending'},
       ocr_second_exact:{label:'已精确到秒',cls:vision.status === 'encoded' ? 'encoded' : 'encoding'},
@@ -356,7 +357,8 @@ function visionPresentation(vision, enabled = true) {
       ocr_window_evicted:{label:'需要的历史画面已被删除',cls:'failed'},
       ocr_discontinuous_clock:{label:'画面时间前后对不上',cls:'failed'},
       ocr_encode_failed:{label:'画面 GIF 生成失败',cls:'failed'},
-      ocr_dependency_unavailable:{label:'画面识别服务不可用',cls:'failed'}
+      ocr_dependency_unavailable:{label:'画面识别服务不可用',cls:'failed'},
+      ocr_incomplete:{label:'比赛已结束 · OCR 未完成',cls:'failed'}
     })[pipelineStatus];
     if (pipelinePresentation) return pipelinePresentation;
     const degraded = vision.degraded === true || vision.localization_quality === 'degraded';
@@ -398,14 +400,14 @@ function visionFailureDetail(vision) {
     event_second_localization:'查找事件秒数', event_localization:'查找事件画面',
     fragmented_search:'检查连续视频片段', buffer_coverage:'检查视频覆盖范围',
     ocr_clock_discovery:'读取画面比赛时间', ocr_target_localization:'查找接口对应时间',
-    ocr_window_encoding:'生成 60 秒 GIF', waiting_for_clock_target:'等待比赛时间出现',
+    ocr_window_encoding:'生成 60 秒 GIF', waiting_for_clock_target:'等待比赛时间出现', waiting_for_latest_tail_rescan:'扫描新增视频尾部',
     waiting_for_postroll:'等待目标后的画面', ocr_second_exact:'精确到秒', ocr_second_interpolated:'根据前后画面推算秒数', ocr_second_estimated:'估算附近几秒',
     ocr_minute_fallback:'查找分钟附近画面', ocr_no_clock_detected:'读取比赛时间',
     ocr_target_timeout:'查找接口对应时间', ocr_window_evicted:'查找历史画面',
     ocr_target_media_not_arrived:'等待目标画面', ocr_target_media_stalled:'等待新画面',
     ocr_clock_paused_timeout:'等待比赛时间继续',
     ocr_discontinuous_clock:'核对画面时间', ocr_encode_failed:'生成画面 GIF',
-    ocr_dependency_unavailable:'检查画面识别服务', ocr_progressive_scan:'读取比赛时间并等待',
+    ocr_dependency_unavailable:'检查画面识别服务', ocr_incomplete:'比赛结束收尾', ocr_progressive_scan:'读取比赛时间并等待',
     tdeed_model_unavailable:'加载动作识别服务', tdeed_inference:'识别精彩动作',
     tdeed_candidate_selection:'选择精彩动作片段', tdeed_output_encoding:'生成动作 GIF'
   })[stage] || '处理过程';
@@ -438,7 +440,7 @@ function visionFailureDetail(vision) {
     ocr_postroll_timeout:'目标时间后面的画面还没有准备好', ocr_output_window_timeout:'GIF 所需画面还没有准备好',
     ocr_search_history_evicted:'视频保存时间不够，目标画面已经删除', ocr_output_history_evicted:'生成 GIF 所需的历史画面已经删除',
     ocr_buffer_never_available:'一直没有可用的视频画面', ocr_output_video_gap:'生成 GIF 的视频片段不完整',
-    ocr_window_encoding_failed:'画面 GIF 生成阶段失败'
+    ocr_window_encoding_failed:'画面 GIF 生成阶段失败', vision_shutdown_timeout:'比赛已结束，OCR 在收尾时间内未完成',
   })[kind] || friendlyErrorMessage(kind, '暂时无法判断具体原因');
   if (kind === 'ocr_clock_target_not_located') {
     reasonLabel = ({
@@ -517,7 +519,7 @@ function ocrPipelineDiagnosticsText(vision) {
       waiting_for_clock_target:'等待目标时钟', waiting_for_postroll:'等待后置画面',
       ocr_no_clock_detected:'时钟检测', ocr_target_timeout:'目标定位',
       ocr_window_evicted:'缓存窗口', ocr_discontinuous_clock:'时钟连续性',
-      ocr_encode_failed:'GIF 编码', ocr_dependency_unavailable:'依赖检查'
+      ocr_encode_failed:'GIF 编码', ocr_dependency_unavailable:'依赖检查', ocr_incomplete:'比赛结束收尾', waiting_for_latest_tail_rescan:'扫描新增视频尾部'
     })[stage] || stage;
     parts.push(`失败阶段 ${stageText}`);
   }

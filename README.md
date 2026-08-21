@@ -83,19 +83,26 @@ it remains usable without network access or a live match.
 
 One console can manage several matches. Active matches appear as tabs, and
 switching tabs only changes the visible match; it does not stop the other
-Workers. The defaults allow eight active matches while globally limiting heavy
-work to two concurrent tasks, including at most one vision task:
+Workers. The defaults allow eight active matches while reserving one shared
+slot for the default GIF and four shared slots for OCR:
 
 ```bash
 GIF_MAX_CONCURRENT_MATCHES=8
-GIF_MAX_CONCURRENT_HEAVY_TASKS=2
-GIF_MAX_CONCURRENT_VISION_TASKS=1
+GIF_MAX_CONCURRENT_HEAVY_TASKS=5
+GIF_MAX_CONCURRENT_VISION_TASKS=4
+GIF_VISION_WORKERS=4
+GIF_WORKER_FINISH_TIMEOUT_SECONDS=600
 ```
 
 The limits apply across all match Worker processes. A ninth match receives an
 HTTP 409 response until one active match has completely stopped. GIF encoding
 has queue priority over optional vision refinement, and the activity panel
 shows current heavy-task occupancy and queue depth.
+
+When the API reports that a match has ended, the worker stops ingesting only
+after pending OCR work drains. It waits up to `GIF_WORKER_FINISH_TIMEOUT_SECONDS`;
+anything still running at that point is recorded as “OCR incomplete” while the
+default GIF task remains independent.
 
 The default event anchor is the API first-observed stream time minus 30
 seconds. With the normal 30-second pre-roll and 20-second post-roll, the
@@ -127,7 +134,7 @@ retaining SQLite event deduplication state.
 
 ## Event API-driven pipeline
 
-`event_driven_pipeline.py` keeps the latest 360 seconds of video and polls a
+`event_driven_pipeline.py` keeps the latest 900 seconds of video and polls a
 match event source. A newly observed `G`, `OG`, `YC`, or `RC` event creates one
 GIF job. The first API response seeds the already-known event set by default, so
 starting the process during a match does not regenerate every earlier event.
@@ -358,7 +365,7 @@ offset (zero by default); OCR locates the exact `MM:SS` and uses `-30/+30`, then
 T-DEED refines only that OCR window. If shotmap has no shot rows, overview goals
 remain available as the compatibility fallback. Red and yellow cards continue
 to use overview and the minute-boundary OCR rule. OCR reads only the clock area;
-the score is not required. The rolling buffer retains 360 seconds. OCR uses a
+the score is not required. The rolling buffer retains 900 seconds. OCR uses a
 two-stage scan: a coarse 10-second sample to find the neighborhood, followed by
 a 1-second local scan around that candidate. A persistent local worker is shared
 by active matches; queue wait is tracked separately from the OCR execution

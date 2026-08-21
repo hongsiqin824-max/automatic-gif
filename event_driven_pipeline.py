@@ -450,6 +450,51 @@ def fail_unhandled_vision_worker_error(
     )
 
 
+def mark_incomplete_vision_tasks_on_shutdown(
+    runtime: PipelineRuntime,
+    match_id: str,
+    *,
+    reason: str,
+) -> int:
+    """Close visual work left at the finite match-end deadline.
+
+    A cancelled queued worker is not an OCR recognition failure. It still must
+    become terminal so the next dashboard poll does not report it as running.
+    The default GIF task is intentionally left untouched.
+    """
+    message = "比赛已结束，OCR 在收尾等待时间内仍未完成；默认 GIF 不受影响"
+    marked = 0
+    for task in runtime.store.list_incomplete_vision_tasks(match_id):
+        if task.status in {"encoded", "failed"}:
+            continue
+        result = {
+            "artifact_kind": task.artifact_kind,
+            "stage": "shutdown",
+            "output_kind": "incomplete",
+            "completion_state": "incomplete",
+            "default_gif_preserved": True,
+            "failure_reason": {
+                "kind": "vision_shutdown_timeout",
+                "stage": "shutdown",
+                "message": message,
+            },
+            "shutdown_reason": reason,
+        }
+        runtime.transition_vision_task(
+            task.event_key,
+            "failed",
+            artifact_kind=task.artifact_kind,
+            result=result,
+            error=message,
+            error_kind="vision_shutdown_timeout",
+            failure_stage="shutdown",
+            failure_reason=message,
+            reason="match_end_ocr_timeout",
+        )
+        marked += 1
+    return marked
+
+
 BEIJING = ZoneInfo("Asia/Shanghai")
 MATCH_START_NAIVE_TIMEZONES = {
     "beijing": BEIJING,
@@ -3360,7 +3405,7 @@ def main() -> None:
     parser.add_argument("--start", type=float, default=0.0)
     parser.add_argument("--duration", type=float)
     parser.add_argument("--segment-seconds", type=float, default=2.0)
-    parser.add_argument("--buffer-seconds", type=float, default=360.0)
+    parser.add_argument("--buffer-seconds", type=float, default=900.0)
     parser.add_argument("--before", type=float, default=10.0)
     parser.add_argument("--after", type=float, default=20.0)
     parser.add_argument("--segment-slack", type=float, default=7.0)
@@ -3397,7 +3442,12 @@ def main() -> None:
     parser.add_argument("--vision-search-after", type=float, default=0.0)
     parser.add_argument("--vision-before", type=float, default=8.0)
     parser.add_argument("--vision-after", type=float, default=12.0)
-    parser.add_argument("--vision-workers", type=int, default=1)
+    parser.add_argument(
+        "--vision-workers",
+        type=int,
+        default=4,
+        help="simultaneous OCR/vision worker threads (default: 4)",
+    )
     parser.add_argument("--vision-timeout-seconds", type=float, default=90.0)
     parser.add_argument("--ocr-python", type=Path, default=OCR_PYTHON)
     parser.add_argument("--ocr-timeout-seconds", type=float, default=180.0)
@@ -3448,8 +3498,8 @@ def main() -> None:
     parser.add_argument(
         "--graceful-stop-timeout-seconds",
         type=float,
-        default=120.0,
-        help="hard limit for SIGUSR1 shutdown (default: 120 seconds)",
+        default=600.0,
+        help="hard limit for SIGUSR1 shutdown (default: 600 seconds)",
     )
     parser.add_argument(
         "--lifecycle-keep-ingest-logs",
@@ -5297,6 +5347,29 @@ def main() -> None:
 
     if stop_reason == "ingest_exit":
         stop_reason = "ingest_completed" if return_code == 0 else "ingest_error"
+    if args.vision_enabled and stop_reason in {
+        "ingest_completed",
+        "match_played_stream_incomplete",
+    }:
+        # A source can end before the dashboard has delivered the normal
+        # match-played signal. Close any remaining visual rows explicitly so
+        # recovery/reporting distinguishes unfinished OCR from a live worker.
+        marked_vision_tasks = mark_incomplete_vision_tasks_on_shutdown(
+            runtime,
+            args.match_id,
+            reason=stop_reason,
+        )
+        if marked_vision_tasks:
+            runtime.logger.log(
+                "vision_tasks_marked_incomplete",
+                match_id=args.match_id,
+                count=marked_vision_tasks,
+                reason=stop_reason,
+            )
+            print(
+                f"[vision] {marked_vision_tasks} 个 OCR 任务在收尾期限内未完成，已标记为未完成",
+                flush=True,
+            )
     stored_default_tasks = {
         task.event_key: task for task in runtime.store.list_for_match(args.match_id)
     }
