@@ -1017,7 +1017,9 @@ def _tasks_from_database(
             "ocr_second_exact",
             "ocr_second_interpolated",
             "ocr_second_estimated",
+            "ocr_second_projected",
             "ocr_minute_fallback",
+            "ocr_range_fallback",
             "ocr_no_clock_detected",
             "ocr_target_timeout",
             "ocr_target_media_not_arrived",
@@ -1078,7 +1080,9 @@ def _tasks_from_database(
             "ocr_second_exact",
             "ocr_second_interpolated",
             "ocr_second_estimated",
+            "ocr_second_projected",
             "ocr_minute_fallback",
+            "ocr_range_fallback",
         }:
             ocr_pipeline_status = "ocr_target_rescan"
         # A previous attempt's terminal error can remain in result_json while
@@ -1106,6 +1110,58 @@ def _tasks_from_database(
                 if target_rescan_pending
                 else "waiting_for_clock_target"
             )
+        # Successful retries merge into the durable result JSON. Older failure
+        # details may remain for diagnostics, but they must not override a real
+        # encoded output and make the dashboard report a timeout after success.
+        encoded_source = str(vision_result.get("localization_source") or "")
+        encoded_precision = str(vision_result.get("precision") or "")
+        encoded_has_location = bool(
+            encoded_source
+            in {"exact_second", "exact", "interpolated", "estimated", "projected"}
+            or encoded_source == "minute_boundary"
+            or encoded_precision
+            in {
+                "observed_second",
+                "interpolated_second",
+                "estimated_second",
+                "projected_second",
+                "minute_boundary",
+                "estimated_minute_boundary",
+                "projected_minute_boundary",
+            }
+        )
+        if (
+            str(row["status"] or "").strip().lower() == "encoded"
+            and bool(row["output_path"] or vision_result.get("output"))
+            and (
+                encoded_has_location
+                or vision_result.get("output_kind") == "api_time_range_fallback"
+            )
+        ):
+            if vision_result.get("output_kind") == "api_time_range_fallback":
+                ocr_pipeline_status = "ocr_range_fallback"
+            elif (
+                encoded_source == "projected"
+                or encoded_precision == "projected_second"
+                or vision_result.get("degradation_mode")
+                == "mapped_clock_projection"
+            ):
+                ocr_pipeline_status = "ocr_second_projected"
+            elif encoded_source == "minute_boundary":
+                ocr_pipeline_status = "ocr_minute_fallback"
+            elif (
+                encoded_source == "estimated"
+                or encoded_precision == "estimated_second"
+                or vision_result.get("localization_quality") == "estimated"
+            ):
+                ocr_pipeline_status = "ocr_second_estimated"
+            elif (
+                encoded_source == "interpolated"
+                or encoded_precision == "interpolated_second"
+            ):
+                ocr_pipeline_status = "ocr_second_interpolated"
+            else:
+                ocr_pipeline_status = "ocr_second_exact"
         if ocr_pipeline_status not in ocr_pipeline_statuses:
             structured_failure = vision_result.get("failure_reason")
             failure_kind = str(
@@ -1155,6 +1211,7 @@ def _tasks_from_database(
                 "exact",
                 "interpolated",
                 "estimated",
+                "projected",
             }:
                 localization_source = str(
                     vision_result.get("localization_source") or ""
@@ -1166,12 +1223,20 @@ def _tasks_from_database(
                     or vision_result.get("localization_quality") == "estimated"
                     or vision_result.get("degraded") is True
                 )
+                is_projected = (
+                    localization_source == "projected"
+                    or precision == "projected_second"
+                    or vision_result.get("degradation_mode")
+                    == "mapped_clock_projection"
+                )
                 is_interpolated = (
                     localization_source == "interpolated"
                     or precision == "interpolated_second"
                 )
                 ocr_pipeline_status = (
-                    "ocr_second_estimated"
+                    "ocr_second_projected"
+                    if is_projected
+                    else "ocr_second_estimated"
                     if is_estimated
                     else "ocr_second_interpolated"
                     if is_interpolated
@@ -1259,7 +1324,7 @@ def _tasks_from_database(
             except (TypeError, ValueError):
                 fallback_available_seconds = None
         fallback_complete = vision_result.get("fallback_complete")
-        if minute_fallback:
+        if minute_fallback or vision_result.get("fallback_generated") is True:
             if fallback_complete is None:
                 fallback_complete = bool(
                     fallback_available_seconds is not None
@@ -1426,6 +1491,8 @@ def _tasks_from_database(
             "fallback_complete": fallback_complete,
             "fallback_label": vision_result.get("fallback_label"),
             "fragmented_fallback": bool(vision_result.get("fragmented_fallback")),
+            "fallback_explanation": vision_result.get("fallback_explanation"),
+            "ocr_verified": vision_result.get("ocr_verified"),
             "available_fallback_seconds": fallback_available_seconds,
             "requested_fallback_seconds": fallback_requested_seconds,
             "default_gif_preserved": vision_result.get("default_gif_preserved"),
@@ -1456,6 +1523,13 @@ def _tasks_from_database(
             "coverage_degraded": vision_result.get("coverage_degraded"),
             "degradation_mode": vision_result.get("degradation_mode"),
             "degradation_reason": vision_result.get("degradation_reason"),
+            "estimated_error_bound_seconds": first_ocr_value(
+                "estimated_error_bound_seconds"
+            ),
+            "target_clock_directly_observed": first_ocr_value(
+                "target_clock_directly_observed"
+            ),
+            "clock_video_mapping": first_ocr_value("clock_video_mapping"),
             "requested_media_window": vision_result.get("requested_media_window"),
             "actual_media_window": vision_result.get("actual_media_window"),
             "source_ocr_artifact": vision_result.get("source_ocr_artifact"),

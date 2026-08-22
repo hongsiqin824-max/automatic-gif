@@ -770,41 +770,41 @@ class ProfileCropTests(unittest.TestCase):
             for index in range(count)
         ]
 
-    def test_goal_second_estimates_forward_from_three_direct_near_neighbors(self):
-        readings = self._direct_clock_run(69 * 60 + 33, 3)
+    def test_goal_second_uses_closest_real_preceding_frame(self):
+        readings = self._direct_clock_run(51 * 60 + 58, 2)
 
         result = locate_from_readings(
             readings,
             {
                 "event_code": "G",
-                "event_second": 69 * 60 + 37,
+                "event_second": 52 * 60,
                 "candidate_start_seconds": 100.0,
             },
         )
 
-        self.assertEqual(result["anchor_seconds"], 104.0)
-        self.assertEqual(result["method"], "paddleocr_near_neighbor_estimate")
+        self.assertEqual(result["anchor_seconds"], 101.0)
+        self.assertEqual(result["method"], "paddleocr_nearby_clock_observation")
         self.assertEqual(result["precision"], "estimated_second")
         self.assertEqual(result["localization_quality"], "estimated")
         self.assertTrue(result["degraded"])
-        self.assertEqual(result["estimated_error_bound_seconds"], 2)
+        self.assertEqual(result["observed_clock"], "51:59")
+        self.assertEqual(result["observed_clock_delta_seconds"], -1)
+        self.assertEqual(result["observed_clock_distance_seconds"], 1)
+        self.assertEqual(result["accepted_clock_tolerance_seconds"], 5)
         diagnostics = result["diagnostics"]
         self.assertEqual(
-            diagnostics["estimate_direction"],
-            "forward_from_preceding_reading",
+            diagnostics["exact_second_candidate_source"],
+            "nearby_direct_observation",
         )
-        self.assertEqual(diagnostics["estimate_nearest_clock"], "69:35")
-        self.assertEqual(diagnostics["estimate_clock_distance_seconds"], 2)
-        self.assertEqual(diagnostics["estimate_direct_reading_count"], 3)
-        self.assertEqual(diagnostics["estimate_evidence_frame_indices"], [0, 1, 2])
-        self.assertEqual(diagnostics["estimate_clock_video_slope"], 1.0)
-        self.assertFalse(diagnostics["estimate_used_repaired_reading"])
-        self.assertFalse(diagnostics["estimate_used_resynchronized_reading"])
+        self.assertEqual(diagnostics["nearby_observed_clock"], "51:59")
+        self.assertEqual(diagnostics["nearby_observed_direct_reading_count"], 2)
+        self.assertEqual(diagnostics["nearby_observed_evidence_frame_indices"], [0, 1])
+        self.assertEqual(diagnostics["nearby_observed_clock_video_slope"], 1.0)
 
-    def test_goal_second_estimates_backward_from_direct_following_readings(self):
+    def test_goal_second_accepts_real_following_frame_at_five_second_limit(self):
         readings = self._direct_clock_run(
-            69 * 60 + 39,
-            4,
+            52 * 60 + 5,
+            7,
             start_frame_index=2,
             start_video_seconds=2.0,
         )
@@ -813,18 +813,49 @@ class ProfileCropTests(unittest.TestCase):
             readings,
             {
                 "event_code": "OG",
-                "event_second": 69 * 60 + 37,
+                "event_second": 52 * 60,
                 "candidate_start_seconds": 100.0,
             },
         )
 
-        self.assertEqual(result["anchor_seconds"], 100.0)
+        self.assertEqual(result["anchor_seconds"], 102.0)
+        self.assertEqual(result["observed_clock"], "52:05")
+        self.assertEqual(result["observed_clock_distance_seconds"], 5)
         self.assertEqual(
-            result["diagnostics"]["estimate_direction"],
-            "backward_from_following_reading",
+            result["diagnostics"]["nearby_observed_clock_delta_seconds"],
+            5,
         )
-        self.assertEqual(result["diagnostics"]["estimate_nearest_clock"], "69:39")
-        self.assertEqual(result["diagnostics"]["estimate_direct_reading_count"], 4)
+        self.assertEqual(
+            result["diagnostics"]["nearby_observed_evidence_frame_indices"],
+            [2, 3, 4, 5, 6],
+        )
+
+    def test_goal_second_rejects_equally_near_real_frames_at_different_positions(self):
+        readings = [
+            *self._direct_clock_run(51 * 60 + 58, 2),
+            *self._direct_clock_run(
+                52 * 60 + 1,
+                2,
+                start_frame_index=20,
+                start_video_seconds=20.0,
+            ),
+        ]
+
+        with self.assertRaises(WorkerError) as raised:
+            locate_from_readings(
+                readings,
+                {"event_code": "G", "event_second": 52 * 60},
+            )
+
+        self.assertEqual(raised.exception.kind, "ocr_ambiguous")
+        self.assertEqual(
+            raised.exception.diagnostics["exact_second_failure_reason"],
+            "multiple_equally_near_observed_clocks",
+        )
+        self.assertEqual(
+            raised.exception.diagnostics["nearby_observed_clock_distance_seconds"],
+            1,
+        )
 
     def test_card_minute_boundary_keeps_estimated_method_and_precision(self):
         readings = self._direct_clock_run(29 * 60 + 56, 3)
@@ -839,11 +870,32 @@ class ProfileCropTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(result["anchor_seconds"], 104.0)
+        self.assertEqual(result["anchor_seconds"], 102.0)
         self.assertEqual(result["method"], "paddleocr_estimated_minute_boundary")
         self.assertEqual(result["precision"], "estimated_minute_boundary")
         self.assertEqual(result["localization_quality"], "estimated")
         self.assertEqual(result["estimated_error_bound_seconds"], 2)
+
+    def test_minute_boundary_uses_real_5159_frame_when_5200_is_missing(self):
+        readings = self._direct_clock_run(51 * 60 + 58, 2)
+
+        result = locate_from_readings(
+            readings,
+            {
+                "event_code": "YC",
+                "event_minute": 52,
+                "candidate_start_seconds": 100.0,
+                "clock_only": True,
+            },
+        )
+
+        self.assertEqual(result["anchor_seconds"], 101.0)
+        self.assertEqual(result["method"], "paddleocr_estimated_minute_boundary")
+        self.assertEqual(result["precision"], "estimated_minute_boundary")
+        self.assertEqual(result["location_kind"], "match_clock_minute_boundary")
+        self.assertEqual(result["observed_clock"], "51:59")
+        self.assertEqual(result["observed_clock_distance_seconds"], 1)
+        self.assertTrue(result["degraded"])
 
     def test_goal_second_direct_observation_remains_ahead_of_estimate(self):
         readings = self._direct_clock_run(69 * 60 + 35, 4)
@@ -930,19 +982,166 @@ class ProfileCropTests(unittest.TestCase):
         self.assertEqual(result["precision"], "interpolated_second")
         self.assertEqual(result["localization_quality"], "exact")
 
-    def test_goal_second_strict_estimate_rejects_weak_evidence(self):
+    def test_goal_second_projects_from_stable_mapping_across_clock_occlusion(self):
+        readings = [
+            frame_reading(0, 0.0, ["84:45"], [0.95]),
+            frame_reading(1, 1.0, ["84:46"], [0.95]),
+            *[
+                frame_reading(index, float(index), [], [])
+                for index in range(2, 22)
+            ],
+            frame_reading(22, 22.0, ["85:07"], [0.95]),
+            frame_reading(23, 23.0, ["85:08"], [0.95]),
+        ]
+
+        result = locate_from_readings(
+            readings,
+            {
+                "event_code": "G",
+                "event_second": 85 * 60,
+                "candidate_start_seconds": 100.0,
+                "sample_interval_seconds": 1.0,
+            },
+        )
+
+        self.assertEqual(result["anchor_seconds"], 115.0)
+        self.assertEqual(result["method"], "paddleocr_stable_clock_mapping")
+        self.assertEqual(result["precision"], "projected_second")
+        self.assertEqual(result["localization_quality"], "projected")
+        self.assertTrue(result["degraded"])
+        self.assertEqual(result["degradation_mode"], "mapped_clock_projection")
+        self.assertFalse(result["target_clock_directly_observed"])
+        self.assertEqual(result["projection_status"], "estimated")
+        self.assertEqual(result["estimated_error_bound_seconds"], 0.5)
+        self.assertIn("目标时钟所在画面被遮挡", result["degradation_reason"]["message"])
+        mapping = result["clock_video_mapping"]
+        self.assertEqual(mapping["status"], "stable")
+        self.assertEqual(mapping["mapping_kind"], "interpolation")
+        self.assertEqual(mapping["sample_count"], 4)
+        self.assertEqual(mapping["frame_span_seconds"], 23.0)
+        self.assertEqual(mapping["clock_span_seconds"], 23)
+        self.assertEqual(mapping["slope"], 1.0)
+        self.assertEqual(mapping["maximum_residual_seconds"], 0.0)
+        self.assertTrue(mapping["video_gap_checked"])
+        self.assertTrue(mapping["clock_regression_checked"])
+        self.assertTrue(mapping["resynchronization_checked"])
+
+    def test_goal_second_projects_short_forward_distance_after_stable_run(self):
+        readings = [
+            *self._direct_clock_run(70 * 60 + 48, 4),
+            *[
+                frame_reading(index, float(index), [], [])
+                for index in range(4, 13)
+            ],
+        ]
+
+        result = locate_from_readings(
+            readings,
+            {
+                "event_code": "OG",
+                "event_second": 71 * 60,
+                "candidate_start_seconds": 100.0,
+                "sample_interval_seconds": 1.0,
+            },
+        )
+
+        self.assertEqual(result["anchor_seconds"], 112.0)
+        self.assertEqual(result["precision"], "projected_second")
+        self.assertEqual(
+            result["clock_video_mapping"]["mapping_kind"],
+            "forward_extrapolation",
+        )
+        self.assertEqual(
+            result["clock_video_mapping"]["projection_distance_seconds"],
+            9,
+        )
+        self.assertEqual(result["estimated_error_bound_seconds"], 0.9)
+
+    def test_minute_boundary_preserves_projected_mapping_status(self):
+        readings = [
+            *self._direct_clock_run(70 * 60 + 48, 4),
+            *[
+                frame_reading(index, float(index), [], [])
+                for index in range(4, 13)
+            ],
+        ]
+
+        result = locate_from_readings(
+            readings,
+            {
+                "event_code": "YC",
+                "event_minute": 71,
+                "candidate_start_seconds": 100.0,
+                "sample_interval_seconds": 1.0,
+                "clock_only": True,
+            },
+        )
+
+        self.assertEqual(result["anchor_seconds"], 112.0)
+        self.assertEqual(result["method"], "paddleocr_projected_minute_boundary")
+        self.assertEqual(result["precision"], "projected_minute_boundary")
+        self.assertEqual(result["location_kind"], "match_clock_minute_boundary")
+        self.assertEqual(result["localization_quality"], "projected")
+        self.assertEqual(result["degradation_mode"], "mapped_clock_projection")
+        self.assertFalse(result["target_clock_directly_observed"])
+
+    def test_goal_second_mapping_rejects_video_gap_resync_and_weak_evidence(self):
+        stable = [
+            *self._direct_clock_run(70 * 60 + 48, 4),
+            *[
+                frame_reading(index, float(index), [], [])
+                for index in range(4, 13)
+            ],
+        ]
+        cases = {
+            "video_gap": [reading for reading in stable if reading.frame_index != 8],
+            "resynchronized": [
+                replace(
+                    reading,
+                    continuity_status=(
+                        "resynchronized"
+                        if reading.frame_index == 8
+                        else reading.continuity_status
+                    ),
+                )
+                for reading in stable
+            ],
+            "only_three_direct_readings": stable[1:],
+        }
+
+        for name, readings in cases.items():
+            with self.subTest(name=name):
+                with self.assertRaises(WorkerError) as raised:
+                    locate_from_readings(
+                        readings,
+                        {
+                            "event_code": "G",
+                            "event_second": 71 * 60,
+                            "sample_interval_seconds": 1.0,
+                        },
+                    )
+                self.assertEqual(
+                    raised.exception.kind,
+                    "ocr_exact_second_not_found",
+                )
+
+    def test_goal_second_nearby_observation_rejects_weak_evidence(self):
         valid = self._direct_clock_run(69 * 60 + 33, 3)
         cases = {
-            "nearest_more_than_two_seconds": self._direct_clock_run(
-                69 * 60 + 31, 3
+            "nearest_more_than_five_seconds": self._direct_clock_run(
+                69 * 60 + 29, 3
             ),
-            "fewer_than_three_direct_readings": self._direct_clock_run(
-                69 * 60 + 34, 2
+            "fewer_than_two_direct_readings": self._direct_clock_run(
+                69 * 60 + 36, 1
             ),
             "clock_video_slope_not_near_one": self._direct_clock_run(
                 69 * 60 + 33, 3, video_step=2.0
             ),
-            "frame_index_gap": [valid[0], valid[1], replace(valid[2], frame_index=3)],
+            "frame_index_gap": [
+                valid[0],
+                replace(valid[1], frame_index=2),
+                replace(valid[2], frame_index=4),
+            ],
             "resynchronized_evidence": [
                 replace(reading, continuity_status="resynchronized")
                 for reading in valid
@@ -1244,8 +1443,33 @@ class ProfileCropTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.kind, "clock_profile_mismatch")
         self.assertEqual(raised.exception.diagnostics["trusted_clock_frame_count"], 1)
-        self.assertEqual(raised.exception.diagnostics["minimum_trusted_clock_frames"], 3)
+        self.assertEqual(raised.exception.diagnostics["minimum_trusted_clock_frames"], 2)
         self.assertEqual(raised.exception.diagnostics["minimum_trusted_clock_rate"], 0.2)
+
+    def test_profile_content_allows_two_progressing_clock_readings_at_low_rate(self):
+        tracker = ClockContinuityStateMachine(self._profile())
+        readings = [
+            split_frame_reading(
+                index,
+                index,
+                [f"59:{10 + index:02d}"] if index < 2 else [],
+                [],
+                tracker=tracker,
+                period=2,
+            )
+            for index in range(20)
+        ]
+
+        diagnostics = _validate_profile_content_quality(readings)
+
+        self.assertEqual(diagnostics["trusted_clock_frame_count"], 2)
+        self.assertEqual(diagnostics["minimum_trusted_clock_frames"], 2)
+        self.assertEqual(diagnostics["trusted_clock_rate"], 0.1)
+        self.assertLess(
+            diagnostics["trusted_clock_rate"],
+            diagnostics["minimum_trusted_clock_rate"],
+        )
+        self.assertEqual(diagnostics["clock_progression_seconds"], 1)
 
     def test_profile_content_rejects_repeated_static_clock_like_text(self):
         tracker = ClockContinuityStateMachine(self._profile())

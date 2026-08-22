@@ -23,7 +23,11 @@ from live_goal_pipeline import (
     analyze_video_coverage,
     encode_gif,
 )
-from scoreboard_ocr import ScoreboardOcrError, locate_scoreboard_event
+from scoreboard_ocr import (
+    DEFAULT_COARSE_SAMPLE_INTERVAL_SECONDS,
+    ScoreboardOcrError,
+    locate_scoreboard_event,
+)
 from vision_locator import (
     VisionBufferNotReady,
     VisionBufferUnavailable,
@@ -49,6 +53,8 @@ OCR_EXACT_WINDOW_BEFORE_SECONDS = 30.0
 OCR_EXACT_WINDOW_AFTER_SECONDS = 30.0
 OCR_MINUTE_WINDOW_BEFORE_SECONDS = 60.0
 OCR_MINUTE_WINDOW_AFTER_SECONDS = 0.0
+OCR_API_RANGE_FALLBACK_SECONDS = 120.0
+OCR_API_RANGE_FALLBACK_COMPLETE_RATIO = 0.90
 OCR_PROGRESSIVE_INITIAL_LOOKBACK_SECONDS = 120.0
 OCR_PROGRESSIVE_OVERLAP_SECONDS = 5.0
 OCR_PROGRESSIVE_INCREMENT_SECONDS = 30.0
@@ -2758,6 +2764,11 @@ def _ocr_localization_contract(located: dict[str, Any]) -> tuple[str, str]:
             return "interpolated", "interpolated_second"
         if precision == "estimated_second" or method == "paddleocr_near_neighbor_estimate":
             return "estimated", "estimated_second"
+        if (
+            precision == "projected_second"
+            or method == "paddleocr_stable_clock_mapping"
+        ):
+            return "projected", "projected_second"
         # Keep third-party/custom OCR worker implementations compatible while
         # remaining conservative about their claimed precision.
         return "exact", precision or "observed_second"
@@ -2789,6 +2800,7 @@ def _ocr_localization_is_second_precision(source: Any) -> bool:
         "exact",
         "interpolated",
         "estimated",
+        "projected",
     }
 
 
@@ -4369,6 +4381,9 @@ def _locate_ocr_window_across_components(
     ocr_timeout_seconds: float,
     minimum_component_seconds: float,
     sample_interval_seconds: float = 1.0,
+    coarse_sample_interval_seconds: float | None = (
+        DEFAULT_COARSE_SAMPLE_INTERVAL_SECONDS
+    ),
     cancel_event: Any = None,
 ) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
     if not Path(ocr_python).is_file():
@@ -4449,6 +4464,7 @@ def _locate_ocr_window_across_components(
                 scoreboard_profile=job.scoreboard_profile,
                 clock_only=job.clock_only,
                 sample_interval_seconds=sample_interval_seconds,
+                coarse_sample_interval_seconds=coarse_sample_interval_seconds,
                 candidate_input_format=materialized.get("input_format"),
                 candidate_seek_seconds=float(materialized.get("input_seek_seconds", 0.0)),
                 candidate_duration_seconds=materialized.get("input_duration_seconds"),
@@ -4591,6 +4607,9 @@ def _locate_ocr_window_across_components(
                         scoreboard_profile=job.scoreboard_profile,
                         clock_only=job.clock_only,
                         sample_interval_seconds=sample_interval_seconds,
+                        coarse_sample_interval_seconds=(
+                            coarse_sample_interval_seconds
+                        ),
                         cancel_event=cancel_event,
                     )
                     located = dict(located)
@@ -4679,6 +4698,9 @@ def _locate_ocr_window_across_components(
                             scoreboard_profile=job.scoreboard_profile,
                             clock_only=job.clock_only,
                             sample_interval_seconds=sample_interval_seconds,
+                            coarse_sample_interval_seconds=(
+                                coarse_sample_interval_seconds
+                            ),
                             cancel_event=cancel_event,
                         )
                         located = dict(located)
@@ -4749,6 +4771,33 @@ def _locate_ocr_window_across_components(
         if _ocr_result_locks_exact_target(item[0])
     ]
     selected_pool = exact or matches
+    if not exact:
+        nearby_observed: list[tuple[tuple[dict[str, Any], dict[str, Any]], int]] = []
+        for item in matches:
+            located_result = item[0]
+            if (
+                located_result.get("degradation_mode")
+                != "nearby_observed_clock"
+                or located_result.get("precision")
+                not in {"estimated_second", "estimated_minute_boundary"}
+            ):
+                continue
+            distance = located_result.get("observed_clock_distance_seconds")
+            if isinstance(distance, bool):
+                continue
+            try:
+                parsed_distance = int(distance)
+            except (TypeError, ValueError):
+                continue
+            if parsed_distance >= 0:
+                nearby_observed.append((item, parsed_distance))
+        if nearby_observed:
+            minimum_distance = min(distance for _item, distance in nearby_observed)
+            selected_pool = [
+                item
+                for item, distance in nearby_observed
+                if distance == minimum_distance
+            ]
     if len(selected_pool) > 1:
         target_clock = _clock_text_from_seconds(job.event_second)
         raise VisualLocationFailed(
@@ -4823,6 +4872,285 @@ def _fail_artifact(
     )
 
 
+def _encode_ocr_api_range_fallback(
+    job: VisionJob,
+    runtime: Any,
+    segment_reader: Callable[[], list[Segment]],
+    ffmpeg: str,
+    ffprobe: str,
+    output_dir: Path,
+    *,
+    failure: VisualLocationFailed,
+    width: int,
+    fps: float,
+    colors: int,
+    size_reference_bytes: int,
+    timeout_seconds: float,
+    min_degraded_seconds: float,
+    cancel_event: Any,
+) -> bool:
+    """Encode the closest retained API-time range after OCR localization fails."""
+    failure_stage = str(
+        failure.diagnostics.get("stage") or "ocr_target_localization"
+    )
+    if failure_stage in {
+        "ocr_anchor_validation",
+        "ocr_output_coverage",
+        "ocr_window_encoding",
+    }:
+        return False
+    if _ocr_target_revision_is_stale(
+        runtime, job.event_key, _vision_target_revision(job)
+    ):
+        return False
+
+    retained = sorted(
+        (
+            segment
+            for segment in segment_reader()
+            if Path(segment.path).is_file()
+            and float(segment.end) > float(segment.start)
+        ),
+        key=lambda segment: (float(segment.start), float(segment.end)),
+    )
+    if not retained:
+        return False
+    earliest = min(float(segment.start) for segment in retained)
+    latest = max(float(segment.end) for segment in retained)
+    if latest - earliest < max(2.0, min(float(min_degraded_seconds), 10.0)):
+        return False
+
+    api_anchor = float(job.api_observed_stream_time)
+    api_anchor_history_missing = api_anchor < earliest
+    if api_anchor_history_missing:
+        fallback_end = min(latest, earliest + OCR_API_RANGE_FALLBACK_SECONDS)
+    else:
+        fallback_end = min(api_anchor, latest)
+    fallback_start = max(earliest, fallback_end - OCR_API_RANGE_FALLBACK_SECONDS)
+    requested_seconds = OCR_API_RANGE_FALLBACK_SECONDS
+    if fallback_end - fallback_start < max(2.0, min(float(min_degraded_seconds), 10.0)):
+        return False
+
+    coverage = analyze_video_coverage(
+        retained,
+        window_start=fallback_start,
+        window_end=fallback_end,
+        anchor=fallback_end,
+        allow_degraded=True,
+        force_degraded=True,
+        min_degraded_seconds=max(2.0, min(float(min_degraded_seconds), 10.0)),
+        stitch_across_gaps=True,
+        allow_anchor_adjustment=True,
+        max_anchor_gap_seconds=OCR_OUTPUT_MAX_ANCHOR_GAP_SECONDS,
+        max_anchor_shift_seconds=OCR_API_RANGE_FALLBACK_SECONDS,
+    )
+    if coverage.status not in {CoverageStatus.READY_FULL, CoverageStatus.READY_DEGRADED}:
+        return False
+    if coverage.effective_start is None or coverage.effective_end is None:
+        return False
+    fallback_span_seconds = max(
+        0.0, float(coverage.effective_end) - float(coverage.effective_start)
+    )
+    # A stitched GIF compresses gaps out of its output timeline. Report the
+    # actual amount of playable video instead of the wall-clock span.
+    available_seconds = max(
+        0.0, fallback_span_seconds - float(coverage.skipped_gap_seconds)
+    )
+    if available_seconds < max(2.0, min(float(min_degraded_seconds), 10.0)):
+        return False
+    fallback_complete = bool(
+        not api_anchor_history_missing
+        and available_seconds
+        >= requested_seconds * OCR_API_RANGE_FALLBACK_COMPLETE_RATIO
+    )
+    failure_reason = {
+        "kind": failure.kind,
+        "stage": failure_stage,
+        "message": str(failure),
+        "ocr_verified": False,
+        "default_gif_preserved": True,
+    }
+    if api_anchor_history_missing:
+        explanation = (
+            "接口事件到达时对应的历史视频已被清理；"
+            f"已生成当前缓存中最接近的约 {available_seconds:.1f} 秒低清片段，"
+            "可能不包含事件。"
+        )
+    elif fallback_complete:
+        explanation = (
+            "没有通过画面比赛时间完成二次定位；"
+            "已保留接口到达前约 120 秒的低清范围片段。"
+        )
+    else:
+        explanation = (
+            "没有通过画面比赛时间完成二次定位；现有可播放视频不足 120 秒，"
+            f"已保留约 {available_seconds:.1f} 秒残缺片段，可能不包含事件。"
+        )
+    if coverage.skipped_gap_seconds > 0:
+        explanation += (
+            f" 直播源中断部分已跳过，共约 {coverage.skipped_gap_seconds:.1f} 秒。"
+        )
+    anchor_source = (
+        job.api_observed_source_time
+        + (fallback_end - job.api_observed_stream_time)
+        if job.api_observed_source_time is not None
+        else None
+    )
+    located = {
+        "artifact_kind": "ocr_window",
+        "stage": "ocr_api_range_fallback_ready",
+        "anchor_stream_time": fallback_end,
+        "anchor_source_time": anchor_source,
+        "anchor_provenance": "api_observation_range_unverified",
+        "locator_method": "api_time_range_fallback",
+        "location_kind": "api_observation_range",
+        "localization_source": "api_time_range",
+        "precision": "unverified_range",
+        "localization_precision": "unverified_range",
+        "localization_quality": "fallback",
+        "precise_location": False,
+        "ocr_verified": False,
+        "target_clock": _clock_text_from_seconds(
+            _ocr_progressive_target_seconds(job)
+        ),
+        "target_clock_seconds": _ocr_progressive_target_seconds(job),
+        "degraded": True,
+        "localization_degraded": True,
+        "degradation_mode": "api_time_range_fallback",
+        "degradation_reason": failure_reason,
+        "failure_reason": failure_reason,
+        "fallback_explanation": explanation,
+        "fallback_used": True,
+        "fallback_generated": True,
+        "fallback_time_range_aligned": not api_anchor_history_missing,
+        "fallback_anchor_history_missing": api_anchor_history_missing,
+        "minute_fallback": False,
+        "fragmented_fallback": not fallback_complete,
+        "fallback_complete": fallback_complete,
+        "fallback_label": (
+            "120_second_fallback"
+            if fallback_complete
+            else "history_missing_nearest_clip"
+            if api_anchor_history_missing
+            else "fragmented_clip"
+        ),
+        "requested_fallback_seconds": requested_seconds,
+        "available_fallback_seconds": available_seconds,
+        "clip_before_seconds": fallback_end - fallback_start,
+        "clip_after_seconds": 0.0,
+        "requested_media_window": {
+            "start_stream_time": fallback_start,
+            "end_stream_time": fallback_end,
+        },
+        "actual_media_window": {
+            "start_stream_time": coverage.effective_start,
+            "end_stream_time": coverage.effective_end,
+            **_ocr_coverage_contract(coverage),
+        },
+        "default_gif_preserved": True,
+    }
+
+    current = _artifact_task(runtime, job.event_key, "ocr_window")
+    if current is None or current.status in {"encoded", "failed", "encoding"}:
+        return False
+    if current.status == "pending":
+        _artifact_transition(
+            runtime,
+            job.event_key,
+            "ocr_window",
+            "locating",
+            reason="api_time_range_fallback",
+        )
+        current = _artifact_task(runtime, job.event_key, "ocr_window")
+    if current is None or current.status != "locating":
+        return False
+    _artifact_transition(
+        runtime,
+        job.event_key,
+        "ocr_window",
+        "located",
+        result=located,
+        reason="api_time_range_fallback_ready",
+    )
+
+    lease_id = runtime.store.acquire_segment_lease(
+        job.event_key,
+        [str(segment.path.resolve()) for segment in coverage.segments],
+        artifact_kind="ocr_window",
+        owner="ocr-api-range-fallback-encoder",
+        ttl_seconds=max(timeout_seconds + 60.0, 180.0),
+    )
+    try:
+        latest_task = runtime.store.get(job.event_key)
+        if latest_task is None:
+            return False
+        pending = PendingEvent(
+            event_type=f"{job.event_type}_ocr_range_fallback",
+            stream_time=fallback_end,
+            source_time=anchor_source,
+            detected_wall_time=job.detected_at_unix,
+            change_fraction=0.0,
+            stability_fraction=0.0,
+            output_due_stream_time=fallback_end,
+            output_id=job.event_key.rsplit(":", 1)[-1][:8],
+        )
+        _artifact_transition(
+            runtime,
+            job.event_key,
+            "ocr_window",
+            "encoding",
+            result=located,
+            reason="api_time_range_fallback_encoding",
+        )
+        encoded = encode_gif(
+            ffmpeg,
+            ffprobe,
+            retained,
+            pending,
+            output_dir,
+            before=fallback_end - fallback_start,
+            after=0.0,
+            width=width,
+            fps=fps,
+            colors=colors,
+            size_reference_bytes=size_reference_bytes,
+            cancel_event=cancel_event,
+            coverage=coverage,
+            output_filename=build_gif_filename(
+                match_id=latest_task.match_id,
+                event_data=latest_task.event_data,
+                variant="ocr-fallback",
+            ),
+            timeout_seconds=max(OCR_FFMPEG_WATCHDOG_SECONDS, timeout_seconds),
+        )
+        encoded.update(
+            {
+                **located,
+                "stage": "ocr_api_range_fallback_encoded",
+                "progressive_status": "ocr_range_fallback",
+                "output_kind": "api_time_range_fallback",
+                "output_width": width,
+                "output_fps": fps,
+                "output_colors": colors,
+                **_ocr_coverage_contract(coverage),
+                "coverage_degraded": coverage.degraded,
+                "localization_degraded": True,
+                "degraded": True,
+            }
+        )
+        _artifact_transition(
+            runtime,
+            job.event_key,
+            "ocr_window",
+            "encoded",
+            result=encoded,
+            reason="api_time_range_fallback_encoded",
+        )
+        return True
+    finally:
+        runtime.store.release_segment_lease(lease_id)
+
+
 def _process_ocr_window(
     job: VisionJob,
     runtime: Any,
@@ -4892,6 +5220,7 @@ def _process_ocr_window(
                 "exact",
                 "interpolated",
                 "estimated",
+                "projected",
                 "minute_boundary",
             }
             if not job.clock_only:
@@ -5433,6 +5762,17 @@ def _process_ocr_window(
                         or force_final_scan
                         else 1.0
                     ),
+                    # Target-centred scans are already bounded to the small
+                    # predicted/retry window. Scan them densely from the
+                    # first pass so a short retained component does not yield
+                    # only one 10-second coarse sample.
+                    coarse_sample_interval_seconds=(
+                        None
+                        if target_rescan_pending
+                        or mapped_target_ready
+                        or force_final_scan
+                        else DEFAULT_COARSE_SAMPLE_INTERVAL_SECONDS
+                    ),
                     cancel_event=cancel_event,
                 )
             except VisualLocationFailed as exc:
@@ -5784,6 +6124,12 @@ def _process_ocr_window(
             localization_source, localization_precision = _ocr_localization_contract(
                 located
             )
+            anchor_provenance = (
+                "trusted_clock_mapping_projection"
+                if located.get("degradation_mode") == "mapped_clock_projection"
+                or localization_source == "projected"
+                else "ocr_verified_match_clock"
+            )
             anchor_source = (
                 job.api_observed_source_time
                 + (anchor - job.api_observed_stream_time)
@@ -5807,13 +6153,20 @@ def _process_ocr_window(
                 "degraded": bool(located.get("degraded")),
                 "degradation_mode": located.get("degradation_mode"),
                 "degradation_reason": located.get("degradation_reason"),
+                "estimated_error_bound_seconds": located.get(
+                    "estimated_error_bound_seconds"
+                ),
+                "target_clock_directly_observed": located.get(
+                    "target_clock_directly_observed"
+                ),
+                "clock_video_mapping": located.get("clock_video_mapping"),
                 "clip_before_seconds": before,
                 "clip_after_seconds": after,
                 "ocr_clock_only": job.clock_only,
                 "ocr": located,
                 "search_window": materialized,
                 "fragment_attempts": located.get("fragment_attempts", []),
-                "anchor_provenance": "ocr_verified_match_clock",
+                "anchor_provenance": anchor_provenance,
                 "progressive_status": "target_located",
                 "default_gif_preserved": True,
                 "scoreboard_roi_cache": scoreboard_roi_cache,
@@ -5851,7 +6204,7 @@ def _process_ocr_window(
                 "target_revision": worker_target_revision,
                 "target_source": _vision_target_source(job),
                 "anchor_stream_time": round(anchor, 3),
-                "anchor_provenance": "ocr_verified_match_clock",
+                "anchor_provenance": anchor_provenance,
                 "location_kind": located.get("location_kind"),
                 "history_evicted": history_evicted,
                 "deadline_policy": {
@@ -5990,7 +6343,9 @@ def _process_ocr_window(
                 **_ocr_progressive_state(current),
                 "state": wait_kind,
                 "anchor_stream_time": round(anchor, 3),
-                "anchor_provenance": "ocr_verified_match_clock",
+                "anchor_provenance": located.get(
+                    "anchor_provenance", "ocr_verified_match_clock"
+                ),
                 "requested_output_start_stream_time": round(requested_start, 3),
                 "requested_output_end_stream_time": round(requested_end, 3),
                 "deadline_policy": postroll_policy,
@@ -6212,6 +6567,26 @@ def _process_ocr_window(
         )
         return True
     except VisualLocationFailed as exc:
+        try:
+            if _encode_ocr_api_range_fallback(
+                job,
+                runtime,
+                segment_reader,
+                ffmpeg,
+                ffprobe,
+                output_dir,
+                failure=exc,
+                width=width,
+                fps=fps,
+                colors=colors,
+                size_reference_bytes=size_reference_bytes,
+                timeout_seconds=max(ocr_timeout_seconds * 3.0, 180.0),
+                min_degraded_seconds=min_degraded_seconds,
+                cancel_event=cancel_event,
+            ):
+                return True
+        except Exception as fallback_exc:
+            exc.diagnostics["api_range_fallback_error"] = str(fallback_exc)
         _fail_artifact(
             runtime,
             job,
@@ -6548,25 +6923,31 @@ def _process_tdeed_refined(
     if ocr_task.status not in {"encoded", "failed"}:
         return False
 
+    ocr_location_verified = bool(
+        ocr_task.status == "encoded"
+        and ocr_task.result.get("ocr_verified") is not False
+        and ocr_task.result.get("output_kind") != "api_time_range_fallback"
+        and ocr_task.result.get("localization_source") != "api_time_range"
+    )
     upstream_ocr_failure = (
         dict(ocr_task.result.get("failure_reason") or {})
-        if ocr_task.status == "failed"
+        if ocr_task.status == "failed" or not ocr_location_verified
         else None
     )
-    if ocr_task.status == "failed" and not upstream_ocr_failure:
+    if not ocr_location_verified and not upstream_ocr_failure:
         upstream_ocr_failure = {
             "kind": ocr_task.last_error_kind or "ocr_processing_failed",
             "message": ocr_task.error or "OCR artifact failed",
             "stage": ocr_task.failure_stage or "ocr_processing",
         }
-    if ocr_task.status == "failed":
+    if not ocr_location_verified:
         # OCR failure is a recoverable upstream signal. T-DEED gets one
         # independent attempt over the original persisted search interval.
         # Only a subsequent T-DEED failure makes the refined artifact terminal.
         pass
 
     ocr_result: dict[str, Any] = (
-        dict(ocr_task.result) if ocr_task.status == "encoded" else {}
+        dict(ocr_task.result) if ocr_location_verified else {}
     )
     lease_id: str | None = None
     try:
@@ -6575,7 +6956,7 @@ def _process_tdeed_refined(
             located = dict(current.result)
         else:
             target_window_used = None
-            if ocr_task.status == "encoded":
+            if ocr_location_verified:
                 ocr_anchor = float(ocr_task.located_anchor_stream_time)
                 ocr_before, ocr_after = _normalized_ocr_clip_window(
                     job,
@@ -6735,7 +7116,7 @@ def _process_tdeed_refined(
                 "model_label": tdeed.get("label"),
                 "locator_method": (
                     "tdeed_within_ocr_window"
-                    if ocr_task.status == "encoded"
+                    if ocr_location_verified
                     else "tdeed_after_ocr_failure"
                 ),
                 "clip_before_seconds": refined_before,

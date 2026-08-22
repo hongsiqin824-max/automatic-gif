@@ -538,7 +538,7 @@ class ScoreboardLocationTests(unittest.TestCase):
             ["69:36", "69:38"],
         )
 
-    def test_goal_second_uses_three_readings_for_degraded_one_sided_estimate(self):
+    def test_goal_second_uses_nearest_real_frame_within_five_seconds(self):
         readings = [
             self._reading(0, 0.0, "69:33"),
             self._reading(1, 1.0, "69:34"),
@@ -553,14 +553,18 @@ class ScoreboardLocationTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(result["method"], "paddleocr_near_neighbor_estimate")
+        self.assertEqual(result["method"], "paddleocr_nearby_clock_observation")
         self.assertEqual(result["precision"], "estimated_second")
         self.assertEqual(result["localization_quality"], "estimated")
         self.assertTrue(result["degraded"])
-        self.assertEqual(result["anchor_seconds"], 4.0)
+        self.assertEqual(result["anchor_seconds"], 2.0)
         self.assertEqual(result["estimated_error_bound_seconds"], 2)
         self.assertEqual(result["estimated_error_bound_label"], "+/-2s")
-        self.assertEqual(result["diagnostics"]["estimate_direct_reading_count"], 3)
+        self.assertEqual(result["observed_clock"], "69:35")
+        self.assertEqual(result["observed_clock_delta_seconds"], -2)
+        self.assertEqual(
+            result["diagnostics"]["nearby_observed_direct_reading_count"], 3
+        )
 
     def test_goal_second_rejects_multiple_disjoint_clock_occurrences(self):
         readings = [

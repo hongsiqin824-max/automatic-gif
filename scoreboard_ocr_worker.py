@@ -49,7 +49,7 @@ SUPPORTED_EVENT_CODES = GOAL_LIKE_EVENT_CODES | frozenset({"YC", "RC"})
 MAX_REASONABLE_MATCH_MINUTE = 150
 MAX_REASONABLE_SCORE = 20
 OCR_CROP_KINDS = frozenset({"clock", "score"})
-MIN_PROFILE_TRUSTED_CLOCK_FRAMES = 3
+MIN_PROFILE_TRUSTED_CLOCK_FRAMES = 2
 MIN_PROFILE_TRUSTED_CLOCK_RATE = 0.20
 MIN_PROFILE_CLOCK_PROGRESSION_SECONDS = 1
 AUTO_SEARCH_WIDTH_RATIO = 0.40
@@ -158,14 +158,35 @@ class _ClockSecondEstimate:
     clock_video_slope: float
 
 
-# A fixed scoreboard ROI can still provide a useful one-sided estimate when
-# only a short, clean run is readable.  Keep the estimate explicitly degraded
-# so it is never confused with a directly observed target second.
-NEAR_NEIGHBOR_MAX_CLOCK_DISTANCE_SECONDS = 2
-NEAR_NEIGHBOR_MIN_DIRECT_READINGS = 3
+@dataclass(frozen=True)
+class _ClockMappingProjection:
+    frame_seconds: float
+    evidence: tuple[FrameReading, ...]
+    left: FrameReading
+    right: FrameReading
+    slope: float
+    intercept: float
+    maximum_residual_seconds: float
+    error_bound_seconds: float
+    mapping_kind: str
+    projection_distance_seconds: int
+
+
+# Keep nearby-frame evidence bounded while retaining enough consecutive OCR
+# observations to verify normal clock progression.
 NEAR_NEIGHBOR_MAX_DIRECT_READINGS = 5
 NEAR_NEIGHBOR_MIN_CLOCK_VIDEO_SLOPE = 0.8
 NEAR_NEIGHBOR_MAX_CLOCK_VIDEO_SLOPE = 1.2
+# When the exact displayed second is unavailable, prefer a nearby frame that
+# OCR actually read before projecting through a longer scoreboard occlusion.
+# This applies to explicit goal seconds and to the requested minute boundary,
+# with each result retaining its precision label.
+NEARBY_OBSERVED_MAX_CLOCK_DISTANCE_SECONDS = 5
+NEARBY_OBSERVED_MIN_DIRECT_READINGS = 2
+CLOCK_MAPPING_MIN_DIRECT_READINGS = 4
+CLOCK_MAPPING_MAX_OCCLUSION_SECONDS = 60.0
+CLOCK_MAPPING_MAX_EXTRAPOLATION_SECONDS = 15
+CLOCK_MAPPING_MAX_RESIDUAL_SECONDS = 1.5
 
 
 @dataclass(frozen=True)
@@ -1268,7 +1289,6 @@ def _validate_profile_content_quality(
     }
     if (
         trusted_count < MIN_PROFILE_TRUSTED_CLOCK_FRAMES
-        or trusted_rate < MIN_PROFILE_TRUSTED_CLOCK_RATE
         or clock_progression < MIN_PROFILE_CLOCK_PROGRESSION_SECONDS
     ):
         raise WorkerError(
@@ -1380,12 +1400,13 @@ def _direct_estimate_runs(
     return runs
 
 
-def _one_sided_clock_estimates(
+def _nearby_observed_clock_candidates(
     segments: Sequence[Sequence[FrameReading]],
     *,
     event_second: int,
 ) -> list[_ClockSecondEstimate]:
-    estimates: list[_ClockSecondEstimate] = []
+    """Return the closest real OCR frames from continuity-verified runs."""
+    candidates: list[_ClockSecondEstimate] = []
     for segment_index, segment in enumerate(segments):
         if any(
             reading.continuity_status == "resynchronized"
@@ -1398,57 +1419,307 @@ def _one_sided_clock_estimates(
         ):
             continue
         for run in _direct_estimate_runs(segment):
-            if len(run) < NEAR_NEIGHBOR_MIN_DIRECT_READINGS:
+            if len(run) < NEARBY_OBSERVED_MIN_DIRECT_READINGS:
                 continue
-            assert run[0].clock_seconds is not None
-            assert run[-1].clock_seconds is not None
-            if run[-1].clock_seconds < event_second:
-                evidence = tuple(run[-NEAR_NEIGHBOR_MAX_DIRECT_READINGS:])
-                nearest = evidence[-1]
-                direction = "forward_from_preceding_reading"
-            elif run[0].clock_seconds > event_second:
-                evidence = tuple(run[:NEAR_NEIGHBOR_MAX_DIRECT_READINGS])
-                nearest = evidence[0]
-                direction = "backward_from_following_reading"
-            else:
-                # Target is inside the observed run. Only direct observation or
-                # two-sided interpolation may locate it in that case.
+            eligible = [
+                reading
+                for reading in run
+                if reading.clock_seconds is not None
+                and 1
+                <= abs(reading.clock_seconds - event_second)
+                <= NEARBY_OBSERVED_MAX_CLOCK_DISTANCE_SECONDS
+            ]
+            if not eligible:
                 continue
-            assert nearest.clock_seconds is not None
-            signed_clock_delta = event_second - nearest.clock_seconds
-            clock_distance = abs(signed_clock_delta)
-            if not 1 <= clock_distance <= NEAR_NEIGHBOR_MAX_CLOCK_DISTANCE_SECONDS:
-                continue
-            first = evidence[0]
-            last = evidence[-1]
-            assert first.clock_seconds is not None
-            assert last.clock_seconds is not None
-            video_span = last.frame_seconds - first.frame_seconds
-            clock_span = last.clock_seconds - first.clock_seconds
-            if video_span <= 0:
-                continue
-            slope = clock_span / video_span
-            if not (
-                NEAR_NEIGHBOR_MIN_CLOCK_VIDEO_SLOPE
-                <= slope
-                <= NEAR_NEIGHBOR_MAX_CLOCK_VIDEO_SLOPE
-            ):
-                continue
-            projected_frame_seconds = nearest.frame_seconds + signed_clock_delta
-            if projected_frame_seconds < 0:
-                continue
-            estimates.append(
-                _ClockSecondEstimate(
-                    frame_seconds=projected_frame_seconds,
-                    segment_index=segment_index,
-                    nearest=nearest,
-                    evidence=evidence,
-                    direction=direction,
-                    clock_distance_seconds=clock_distance,
-                    clock_video_slope=slope,
-                )
+            minimum_distance = min(
+                abs(int(reading.clock_seconds) - event_second)
+                for reading in eligible
+                if reading.clock_seconds is not None
             )
-    return estimates
+            nearest_readings = [
+                reading
+                for reading in eligible
+                if reading.clock_seconds is not None
+                and abs(reading.clock_seconds - event_second) == minimum_distance
+            ]
+            for nearest in nearest_readings:
+                assert nearest.clock_seconds is not None
+                nearest_index = run.index(nearest)
+                evidence_start = max(
+                    0,
+                    min(
+                        nearest_index - NEAR_NEIGHBOR_MAX_DIRECT_READINGS // 2,
+                        len(run) - NEAR_NEIGHBOR_MAX_DIRECT_READINGS,
+                    ),
+                )
+                evidence = tuple(
+                    run[
+                        evidence_start:
+                        evidence_start + NEAR_NEIGHBOR_MAX_DIRECT_READINGS
+                    ]
+                )
+                first = evidence[0]
+                last = evidence[-1]
+                assert first.clock_seconds is not None
+                assert last.clock_seconds is not None
+                video_span = last.frame_seconds - first.frame_seconds
+                clock_span = last.clock_seconds - first.clock_seconds
+                if video_span <= 0:
+                    continue
+                slope = clock_span / video_span
+                if not (
+                    NEAR_NEIGHBOR_MIN_CLOCK_VIDEO_SLOPE
+                    <= slope
+                    <= NEAR_NEIGHBOR_MAX_CLOCK_VIDEO_SLOPE
+                ):
+                    continue
+                candidates.append(
+                    _ClockSecondEstimate(
+                        # Keep the real observed frame. Do not project into a
+                        # missing target second between retained fragments.
+                        frame_seconds=nearest.frame_seconds,
+                        segment_index=segment_index,
+                        nearest=nearest,
+                        evidence=evidence,
+                        direction=(
+                            "preceding_observed_reading"
+                            if nearest.clock_seconds < event_second
+                            else "following_observed_reading"
+                        ),
+                        clock_distance_seconds=minimum_distance,
+                        clock_video_slope=slope,
+                    )
+                )
+    return candidates
+
+
+def _stable_clock_mapping_projections(
+    readings: Sequence[FrameReading],
+    *,
+    event_second: int,
+    sample_interval_seconds: float,
+) -> list[_ClockMappingProjection]:
+    """Project an obscured target from bounded, stable direct OCR runs."""
+    ordered = sorted(readings, key=lambda reading: reading.frame_index)
+    direct = [
+        reading for reading in ordered if _direct_estimate_clock_reading(reading)
+    ]
+    if len(direct) < CLOCK_MAPPING_MIN_DIRECT_READINGS:
+        return []
+
+    projections: list[_ClockMappingProjection] = []
+    for index, (left, right) in enumerate(zip(direct, direct[1:])):
+        assert left.clock_seconds is not None
+        assert right.clock_seconds is not None
+        if not left.clock_seconds < event_second < right.clock_seconds:
+            continue
+        if index < 1 or index + 2 >= len(direct):
+            continue
+        left_support = direct[index - 1]
+        right_support = direct[index + 2]
+        if not (
+            _near_one_to_one_pair(left_support, left)
+            and _near_one_to_one_pair(right, right_support)
+        ):
+            continue
+        video_gap = right.frame_seconds - left.frame_seconds
+        clock_gap = right.clock_seconds - left.clock_seconds
+        if (
+            video_gap <= 0
+            or video_gap > CLOCK_MAPPING_MAX_OCCLUSION_SECONDS
+            or clock_gap <= 0
+        ):
+            continue
+        gap_slope = video_gap / clock_gap
+        if not (
+            NEAR_NEIGHBOR_MIN_CLOCK_VIDEO_SLOPE
+            <= gap_slope
+            <= NEAR_NEIGHBOR_MAX_CLOCK_VIDEO_SLOPE
+        ):
+            continue
+
+        covered = [
+            reading
+            for reading in ordered
+            if left.frame_index <= reading.frame_index <= right.frame_index
+        ]
+        expected_indices = list(range(left.frame_index, right.frame_index + 1))
+        if [reading.frame_index for reading in covered] != expected_indices:
+            continue
+        maximum_frame_step = max(
+            1.5,
+            float(sample_interval_seconds) * 1.5,
+        )
+        if any(
+            current.frame_seconds <= previous.frame_seconds
+            or current.frame_seconds - previous.frame_seconds > maximum_frame_step
+            for previous, current in zip(covered, covered[1:])
+        ):
+            continue
+        if any(
+            reading.continuity_status == "resynchronized"
+            or reading.continuity_reason
+            in {
+                "clock_discontinuity",
+                "continuous_observations_resynchronized",
+                "period_boundary_resynchronized",
+            }
+            for reading in covered
+        ):
+            continue
+
+        evidence = (left_support, left, right, right_support)
+        clocks = [float(reading.clock_seconds) for reading in evidence]
+        frames = [reading.frame_seconds for reading in evidence]
+        mean_clock = sum(clocks) / len(clocks)
+        mean_frame = sum(frames) / len(frames)
+        denominator = sum((clock - mean_clock) ** 2 for clock in clocks)
+        if denominator <= 0:
+            continue
+        slope = sum(
+            (clock - mean_clock) * (frame - mean_frame)
+            for clock, frame in zip(clocks, frames)
+        ) / denominator
+        if not (
+            NEAR_NEIGHBOR_MIN_CLOCK_VIDEO_SLOPE
+            <= slope
+            <= NEAR_NEIGHBOR_MAX_CLOCK_VIDEO_SLOPE
+        ):
+            continue
+        intercept = mean_frame - slope * mean_clock
+        residuals = [
+            abs(frame - (slope * clock + intercept))
+            for clock, frame in zip(clocks, frames)
+        ]
+        maximum_residual = max(residuals)
+        if maximum_residual > CLOCK_MAPPING_MAX_RESIDUAL_SECONDS:
+            continue
+        projected_frame = slope * event_second + intercept
+        if not left.frame_seconds <= projected_frame <= right.frame_seconds:
+            continue
+        projections.append(
+            _ClockMappingProjection(
+                frame_seconds=projected_frame,
+                evidence=evidence,
+                left=left,
+                right=right,
+                slope=slope,
+                intercept=intercept,
+                maximum_residual_seconds=maximum_residual,
+                error_bound_seconds=max(
+                    float(sample_interval_seconds) / 2.0,
+                    maximum_residual,
+                ),
+                mapping_kind="interpolation",
+                projection_distance_seconds=0,
+            )
+        )
+    if projections:
+        return projections
+
+    # If the clock becomes hidden immediately after a stable direct run, allow
+    # a short one-sided projection only while sampled video itself remains
+    # continuous through the projected target frame.
+    for run in _direct_estimate_runs(ordered):
+        if len(run) < CLOCK_MAPPING_MIN_DIRECT_READINGS:
+            continue
+        assert run[0].clock_seconds is not None
+        assert run[-1].clock_seconds is not None
+        if run[-1].clock_seconds < event_second:
+            evidence = tuple(run[-CLOCK_MAPPING_MIN_DIRECT_READINGS:])
+            nearest = evidence[-1]
+            direction = "forward_extrapolation"
+        elif run[0].clock_seconds > event_second:
+            evidence = tuple(run[:CLOCK_MAPPING_MIN_DIRECT_READINGS])
+            nearest = evidence[0]
+            direction = "backward_extrapolation"
+        else:
+            continue
+        assert nearest.clock_seconds is not None
+        projection_distance = abs(event_second - nearest.clock_seconds)
+        if not 1 <= projection_distance <= CLOCK_MAPPING_MAX_EXTRAPOLATION_SECONDS:
+            continue
+
+        clocks = [float(reading.clock_seconds) for reading in evidence]
+        frames = [reading.frame_seconds for reading in evidence]
+        mean_clock = sum(clocks) / len(clocks)
+        mean_frame = sum(frames) / len(frames)
+        denominator = sum((clock - mean_clock) ** 2 for clock in clocks)
+        if denominator <= 0:
+            continue
+        slope = sum(
+            (clock - mean_clock) * (frame - mean_frame)
+            for clock, frame in zip(clocks, frames)
+        ) / denominator
+        if not (
+            NEAR_NEIGHBOR_MIN_CLOCK_VIDEO_SLOPE
+            <= slope
+            <= NEAR_NEIGHBOR_MAX_CLOCK_VIDEO_SLOPE
+        ):
+            continue
+        intercept = mean_frame - slope * mean_clock
+        residuals = [
+            abs(frame - (slope * clock + intercept))
+            for clock, frame in zip(clocks, frames)
+        ]
+        maximum_residual = max(residuals)
+        if maximum_residual > CLOCK_MAPPING_MAX_RESIDUAL_SECONDS:
+            continue
+        projected_frame = slope * event_second + intercept
+        span_start = min(nearest.frame_seconds, projected_frame)
+        span_end = max(nearest.frame_seconds, projected_frame)
+        covered = [
+            reading
+            for reading in ordered
+            if span_start - 1e-6 <= reading.frame_seconds <= span_end + 1e-6
+        ]
+        if (
+            not covered
+            or covered[0].frame_seconds > span_start + 1e-6
+            or covered[-1].frame_seconds < span_end - 1e-6
+        ):
+            continue
+        expected_indices = list(
+            range(covered[0].frame_index, covered[-1].frame_index + 1)
+        )
+        if [reading.frame_index for reading in covered] != expected_indices:
+            continue
+        maximum_frame_step = max(1.5, float(sample_interval_seconds) * 1.5)
+        if any(
+            current.frame_seconds <= previous.frame_seconds
+            or current.frame_seconds - previous.frame_seconds > maximum_frame_step
+            for previous, current in zip(covered, covered[1:])
+        ):
+            continue
+        if any(
+            reading.continuity_status == "resynchronized"
+            or reading.continuity_reason
+            in {
+                "clock_discontinuity",
+                "continuous_observations_resynchronized",
+                "period_boundary_resynchronized",
+            }
+            for reading in covered
+        ):
+            continue
+        projections.append(
+            _ClockMappingProjection(
+                frame_seconds=projected_frame,
+                evidence=evidence,
+                left=evidence[0],
+                right=evidence[-1],
+                slope=slope,
+                intercept=intercept,
+                maximum_residual_seconds=maximum_residual,
+                error_bound_seconds=max(
+                    float(sample_interval_seconds) / 2.0,
+                    maximum_residual + projection_distance * 0.1,
+                ),
+                mapping_kind=direction,
+                projection_distance_seconds=projection_distance,
+            )
+        )
+    return projections
 
 
 def _locate_goal_second(
@@ -1458,6 +1729,7 @@ def _locate_goal_second(
     candidate_start_seconds: float,
     sample_interval_seconds: float,
     diagnostics: dict[str, Any],
+    allow_nearby_observed_clock: bool = False,
 ) -> dict[str, Any]:
     target_clock = _clock_text(event_second)
     segments = _clock_segments(
@@ -1512,8 +1784,6 @@ def _locate_goal_second(
                 continue
             video_delta = right.frame_seconds - left.frame_seconds
             clock_delta = right.clock_seconds - left.clock_seconds
-            # Paused or accelerated displays do not provide a defensible linear
-            # second mapping. Keep those cases on the existing fallback path.
             interpolation_tolerance = max(1.5, sample_interval_seconds * 0.75)
             if (
                 video_delta <= 0
@@ -1531,9 +1801,8 @@ def _locate_goal_second(
                     right,
                 )
             )
-
-    # A direct trusted OCR observation is authoritative. Interpolation is only
-    # considered when no direct observation exists anywhere in the search.
+    # Preserve the established exact contract: a direct observation wins, then
+    # a local two-sided interpolation. Wider nearby/mapping recovery comes later.
     candidates = observed_candidates or interpolated_candidates
     candidate_source = (
         "direct_observation"
@@ -1566,29 +1835,260 @@ def _locate_goal_second(
                 ],
             },
         )
-    estimates: list[_ClockSecondEstimate] = []
-    if not candidates and isolated_target_reading_count == 0:
-        estimates = _one_sided_clock_estimates(
+    nearby_observations: list[_ClockSecondEstimate] = []
+    if (
+        not candidates
+        and isolated_target_reading_count == 0
+        and allow_nearby_observed_clock
+    ):
+        nearby_observations = _nearby_observed_clock_candidates(
             segments,
             event_second=event_second,
         )
-        if len(estimates) > 1:
+        if nearby_observations:
+            minimum_distance = min(
+                candidate.clock_distance_seconds
+                for candidate in nearby_observations
+            )
+            nearby_observations = [
+                candidate
+                for candidate in nearby_observations
+                if candidate.clock_distance_seconds == minimum_distance
+            ]
+            if len(nearby_observations) > 1:
+                raise WorkerError(
+                    "ocr_ambiguous",
+                    f"the closest readable clock to {target_clock} appeared at multiple video positions",
+                    diagnostics={
+                        **match_diagnostics,
+                        "exact_second_failure_reason": (
+                            "multiple_equally_near_observed_clocks"
+                        ),
+                        "matching_occurrence_count": len(nearby_observations),
+                        "nearby_observed_clock_distance_seconds": minimum_distance,
+                        "nearby_observed_frame_seconds": [
+                            round(candidate.frame_seconds, 3)
+                            for candidate in nearby_observations
+                        ],
+                    },
+                )
+    if nearby_observations:
+        selected_observation = nearby_observations[0]
+        nearest = selected_observation.nearest
+        assert nearest.clock_seconds is not None
+        evidence = selected_observation.evidence
+        anchor = candidate_start_seconds + nearest.frame_seconds
+        signed_delta = nearest.clock_seconds - event_second
+        distance = selected_observation.clock_distance_seconds
+        degradation_reason = {
+            "kind": "nearby_observed_clock",
+            "message": (
+                f"the exact target frame was unavailable; used the real OCR frame "
+                f"at {_clock_text(nearest.clock_seconds)} ({signed_delta:+d}s from target)"
+            ),
+            "clock_difference_seconds": signed_delta,
+            "accepted_tolerance_seconds": (
+                NEARBY_OBSERVED_MAX_CLOCK_DISTANCE_SECONDS
+            ),
+        }
+        diagnostics.update(
+            {
+                "target_clock": target_clock,
+                "target_clock_seconds": event_second,
+                "trusted_clock_frame_count": trusted_count,
+                "clock_continuity_segment_count": len(segments),
+                "isolated_target_reading_count": isolated_target_reading_count,
+                "matching_occurrence_count": 1,
+                "exact_second_candidate_source": "nearby_direct_observation",
+                "direct_observation_candidate_count": len(observed_candidates),
+                "two_sided_interpolation_candidate_count": len(
+                    interpolated_candidates
+                ),
+                "exact_second_method": "paddleocr_nearby_clock_observation",
+                "exact_second_precision": "estimated_second",
+                "target_frame_seconds": round(nearest.frame_seconds, 3),
+                "nearby_observed_clock": _clock_text(nearest.clock_seconds),
+                "nearby_observed_clock_seconds": nearest.clock_seconds,
+                "nearby_observed_frame_seconds": round(nearest.frame_seconds, 3),
+                "nearby_observed_clock_delta_seconds": signed_delta,
+                "nearby_observed_clock_distance_seconds": distance,
+                "nearby_observed_direction": selected_observation.direction,
+                "estimate_nearest_clock": _clock_text(nearest.clock_seconds),
+                "estimate_clock_distance_seconds": distance,
+                "nearby_observed_tolerance_seconds": (
+                    NEARBY_OBSERVED_MAX_CLOCK_DISTANCE_SECONDS
+                ),
+                "nearby_observed_direct_reading_count": len(evidence),
+                "nearby_observed_evidence_frame_indices": [
+                    reading.frame_index for reading in evidence
+                ],
+                "nearby_observed_evidence_clock_bounds": [
+                    _clock_text(evidence[0].clock_seconds),
+                    _clock_text(evidence[-1].clock_seconds),
+                ],
+                "nearby_observed_clock_video_slope": round(
+                    selected_observation.clock_video_slope, 6
+                ),
+                "interpolation_clock_bounds": None,
+                "interpolation_frame_bounds": None,
+            }
+        )
+        return {
+            "anchor_seconds": round(anchor, 3),
+            "method": "paddleocr_nearby_clock_observation",
+            "precision": "estimated_second",
+            "location_kind": "match_clock_second",
+            "localization_quality": "estimated",
+            "degraded": True,
+            "degradation_mode": "nearby_observed_clock",
+            "degradation_reason": degradation_reason,
+            "estimated_error_bound_seconds": distance,
+            "estimated_error_bound_label": f"+/-{distance}s",
+            "target_clock": target_clock,
+            "target_clock_seconds": event_second,
+            "observed_clock": _clock_text(nearest.clock_seconds),
+            "observed_clock_seconds": nearest.clock_seconds,
+            "observed_clock_delta_seconds": signed_delta,
+            "observed_clock_distance_seconds": distance,
+            "estimate_clock_distance_seconds": distance,
+            "accepted_clock_tolerance_seconds": (
+                NEARBY_OBSERVED_MAX_CLOCK_DISTANCE_SECONDS
+            ),
+            "requires_tdeed": False,
+            "diagnostics": diagnostics,
+        }
+
+    mapping_projections: list[_ClockMappingProjection] = []
+    if not candidates and not nearby_observations and isolated_target_reading_count == 0:
+        mapping_projections = _stable_clock_mapping_projections(
+            readings,
+            event_second=event_second,
+            sample_interval_seconds=sample_interval_seconds,
+        )
+        if len(mapping_projections) > 1:
             raise WorkerError(
                 "ocr_ambiguous",
-                f"the target match clock {target_clock} had multiple one-sided estimates",
+                f"multiple stable clock mappings projected {target_clock} to different video positions",
                 diagnostics={
                     **match_diagnostics,
-                    "exact_second_failure_reason": "multiple_disjoint_estimates",
-                    "matching_occurrence_count": len(estimates),
-                    "estimated_frame_seconds": [
-                        round(estimate.frame_seconds, 3) for estimate in estimates
-                    ],
-                    "estimate_error_bound_seconds": (
-                        NEAR_NEIGHBOR_MAX_CLOCK_DISTANCE_SECONDS
+                    "exact_second_failure_reason": (
+                        "multiple_stable_mapping_projections"
                     ),
+                    "matching_occurrence_count": len(mapping_projections),
+                    "projected_frame_seconds": [
+                        round(projection.frame_seconds, 3)
+                        for projection in mapping_projections
+                    ],
                 },
             )
-    if not candidates and not estimates:
+
+    if mapping_projections:
+        projection = mapping_projections[0]
+        anchor = candidate_start_seconds + projection.frame_seconds
+        error_bound = round(projection.error_bound_seconds, 3)
+        mapping_diagnostics = {
+            "status": "stable",
+            "sample_count": len(projection.evidence),
+            "frame_span_seconds": round(
+                projection.evidence[-1].frame_seconds
+                - projection.evidence[0].frame_seconds,
+                3,
+            ),
+            "clock_span_seconds": (
+                int(projection.evidence[-1].clock_seconds)
+                - int(projection.evidence[0].clock_seconds)
+            ),
+            "slope": round(projection.slope, 6),
+            "intercept": round(projection.intercept, 6),
+            "maximum_residual_seconds": round(
+                projection.maximum_residual_seconds, 3
+            ),
+            "mapping_kind": projection.mapping_kind,
+            "projection_distance_seconds": (
+                projection.projection_distance_seconds
+            ),
+            "left_clock": _clock_text(projection.left.clock_seconds),
+            "right_clock": _clock_text(projection.right.clock_seconds),
+            "left_frame_seconds": round(projection.left.frame_seconds, 3),
+            "right_frame_seconds": round(projection.right.frame_seconds, 3),
+            "video_gap_checked": True,
+            "clock_regression_checked": True,
+            "resynchronization_checked": True,
+        }
+        mapping_basis = {
+            "interpolation": "遮挡前后连续可读的比赛时钟",
+            "forward_extrapolation": "遮挡前连续可读的比赛时钟",
+            "backward_extrapolation": "遮挡后连续可读的比赛时钟",
+        }.get(projection.mapping_kind, "连续可读的比赛时钟")
+        degradation_reason = {
+            "kind": "mapped_clock_projection",
+            "message": (
+                f"目标时钟所在画面被遮挡，已根据{mapping_basis}"
+                f"估算画面位置，预计误差不超过 {error_bound:g} 秒"
+            ),
+            "estimated_error_bound_seconds": error_bound,
+            "target_clock_directly_observed": False,
+        }
+        diagnostics.update(
+            {
+                "target_clock": target_clock,
+                "target_clock_seconds": event_second,
+                "trusted_clock_frame_count": trusted_count,
+                "clock_continuity_segment_count": len(segments),
+                "isolated_target_reading_count": isolated_target_reading_count,
+                "matching_occurrence_count": 1,
+                "exact_second_candidate_source": "stable_clock_video_mapping",
+                "direct_observation_candidate_count": len(observed_candidates),
+                "two_sided_interpolation_candidate_count": 0,
+                "stable_mapping_projection_candidate_count": 1,
+                "exact_second_method": "paddleocr_stable_clock_mapping",
+                "exact_second_precision": "projected_second",
+                "target_frame_seconds": round(projection.frame_seconds, 3),
+                "target_clock_directly_observed": False,
+                "estimated_error_bound_seconds": error_bound,
+                "clock_video_mapping": mapping_diagnostics,
+                "mapping_evidence_frame_indices": [
+                    reading.frame_index for reading in projection.evidence
+                ],
+                "mapping_evidence_clocks": [
+                    _clock_text(reading.clock_seconds)
+                    for reading in projection.evidence
+                ],
+                "mapping_evidence_frame_seconds": [
+                    round(reading.frame_seconds, 3)
+                    for reading in projection.evidence
+                ],
+                "interpolation_clock_bounds": [
+                    _clock_text(projection.left.clock_seconds),
+                    _clock_text(projection.right.clock_seconds),
+                ],
+                "interpolation_frame_bounds": [
+                    round(projection.left.frame_seconds, 3),
+                    round(projection.right.frame_seconds, 3),
+                ],
+            }
+        )
+        return {
+            "anchor_seconds": round(anchor, 3),
+            "method": "paddleocr_stable_clock_mapping",
+            "precision": "projected_second",
+            "location_kind": "match_clock_second",
+            "localization_quality": "projected",
+            "degraded": True,
+            "degradation_mode": "mapped_clock_projection",
+            "degradation_reason": degradation_reason,
+            "projection_status": "estimated",
+            "target_clock_directly_observed": False,
+            "estimated_error_bound_seconds": error_bound,
+            "estimated_error_bound_label": f"+/-{error_bound:g}s",
+            "target_clock": target_clock,
+            "target_clock_seconds": event_second,
+            "clock_video_mapping": mapping_diagnostics,
+            "requires_tdeed": False,
+            "diagnostics": diagnostics,
+        }
+
+    if not candidates and not nearby_observations:
         readable_clocks = [
             reading.clock_seconds
             for segment in segments
@@ -1597,7 +2097,7 @@ def _locate_goal_second(
         ]
         raise WorkerError(
             "ocr_exact_second_not_found",
-            f"the target match clock {target_clock} was not observed or safely interpolated",
+            f"the target match clock {target_clock} was not directly observed and no safe fallback was available",
             diagnostics={
                 **match_diagnostics,
                 "exact_second_failure_reason": "target_clock_not_found",
@@ -1613,98 +2113,9 @@ def _locate_goal_second(
                     _clock_text(max(readable_clocks)),
                 ],
                 "matching_occurrence_count": 0,
+                "stable_mapping_projection_candidate_count": 0,
             },
         )
-
-    if estimates:
-        selected_estimate = min(
-            estimates,
-            key=lambda estimate: estimate.frame_seconds,
-        )
-        anchor = candidate_start_seconds + selected_estimate.frame_seconds
-        evidence = selected_estimate.evidence
-        nearest = selected_estimate.nearest
-        estimate_reason = {
-            "kind": "near_neighbor_clock_estimate",
-            "message": (
-                "target clock was estimated from a consecutive direct OCR run "
-                "within two clock seconds"
-            ),
-            "error_bound_seconds": NEAR_NEIGHBOR_MAX_CLOCK_DISTANCE_SECONDS,
-        }
-        diagnostics.update(
-            {
-                "target_clock": target_clock,
-                "target_clock_seconds": event_second,
-                "trusted_clock_frame_count": trusted_count,
-                "clock_continuity_segment_count": len(segments),
-                "isolated_target_reading_count": isolated_target_reading_count,
-                "matching_occurrence_count": 1,
-                "exact_second_candidate_source": "one_sided_estimate",
-                "direct_observation_candidate_count": len(observed_candidates),
-                "two_sided_interpolation_candidate_count": len(
-                    interpolated_candidates
-                ),
-                "exact_second_method": "paddleocr_near_neighbor_estimate",
-                "exact_second_precision": "estimated_second",
-                "target_frame_seconds": round(
-                    selected_estimate.frame_seconds, 3
-                ),
-                "estimate_direction": selected_estimate.direction,
-                "estimate_error_bound_seconds": (
-                    NEAR_NEIGHBOR_MAX_CLOCK_DISTANCE_SECONDS
-                ),
-                "estimate_error_bound_label": (
-                    f"+/-{NEAR_NEIGHBOR_MAX_CLOCK_DISTANCE_SECONDS}s"
-                ),
-                "estimate_nearest_clock": _clock_text(nearest.clock_seconds),
-                "estimate_nearest_frame_seconds": round(
-                    nearest.frame_seconds, 3
-                ),
-                "estimate_clock_distance_seconds": (
-                    selected_estimate.clock_distance_seconds
-                ),
-                "estimate_direct_reading_count": len(evidence),
-                "estimate_evidence_frame_indices": [
-                    reading.frame_index for reading in evidence
-                ],
-                "estimate_evidence_frame_bounds": [
-                    round(evidence[0].frame_seconds, 3),
-                    round(evidence[-1].frame_seconds, 3),
-                ],
-                "estimate_evidence_clock_bounds": [
-                    _clock_text(evidence[0].clock_seconds),
-                    _clock_text(evidence[-1].clock_seconds),
-                ],
-                "estimate_clock_video_slope": round(
-                    selected_estimate.clock_video_slope, 6
-                ),
-                "estimate_used_repaired_reading": False,
-                "estimate_used_resynchronized_reading": False,
-                "interpolation_clock_bounds": None,
-                "interpolation_frame_bounds": None,
-            }
-        )
-        return {
-            "anchor_seconds": round(anchor, 3),
-            "method": "paddleocr_near_neighbor_estimate",
-            "precision": "estimated_second",
-            "location_kind": "match_clock_second",
-            "localization_quality": "estimated",
-            "degraded": True,
-            "degradation_mode": "near_neighbor_clock_estimate",
-            "degradation_reason": estimate_reason,
-            "estimated_error_bound_seconds": (
-                NEAR_NEIGHBOR_MAX_CLOCK_DISTANCE_SECONDS
-            ),
-            "estimated_error_bound_label": (
-                f"+/-{NEAR_NEIGHBOR_MAX_CLOCK_DISTANCE_SECONDS}s"
-            ),
-            "target_clock": target_clock,
-            "target_clock_seconds": event_second,
-            "requires_tdeed": False,
-            "diagnostics": diagnostics,
-        }
 
     selected = min(candidates, key=lambda candidate: candidate.frame_seconds)
     anchor = candidate_start_seconds + selected.frame_seconds
@@ -1782,6 +2193,7 @@ def _locate_minute_boundary(
             candidate_start_seconds=candidate_start_seconds,
             sample_interval_seconds=sample_interval_seconds,
             diagnostics=diagnostics,
+            allow_nearby_observed_clock=True,
         )
     except WorkerError as exc:
         if exc.kind == "ocr_invalid_request":
@@ -1798,13 +2210,20 @@ def _locate_minute_boundary(
             },
         ) from exc
     estimated_boundary = located.get("precision") == "estimated_second"
+    projected_boundary = located.get("precision") == "projected_second"
     located.update({
         "method": (
+            "paddleocr_projected_minute_boundary"
+            if projected_boundary
+            else
             "paddleocr_estimated_minute_boundary"
             if estimated_boundary
             else "paddleocr_minute_boundary"
         ),
         "precision": (
+            "projected_minute_boundary"
+            if projected_boundary
+            else
             "estimated_minute_boundary"
             if estimated_boundary
             else "minute_boundary"
@@ -2264,6 +2683,7 @@ def locate_from_readings(
                 candidate_start_seconds=candidate_start,
                 sample_interval_seconds=sample_interval,
                 diagnostics=dict(diagnostics),
+                allow_nearby_observed_clock=True,
             )
             if clock_only:
                 exact["clock_only"] = True

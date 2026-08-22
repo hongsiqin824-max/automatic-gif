@@ -17,6 +17,7 @@ from vision_runtime import (
     VisionJob,
     VisualLocationFailed,
     _continuous_search_components,
+    _encode_ocr_api_range_fallback,
     _locate_across_search_components,
     _locate_ocr_window_across_components,
     _normalized_ocr_clip_window,
@@ -354,6 +355,16 @@ class VisionRuntimeTests(unittest.TestCase):
         self.assertEqual(
             _ocr_localization_contract(
                 {
+                    "location_kind": "match_clock_second",
+                    "method": "paddleocr_stable_clock_mapping",
+                    "precision": "projected_second",
+                }
+            ),
+            ("projected", "projected_second"),
+        )
+        self.assertEqual(
+            _ocr_localization_contract(
+                {
                     "location_kind": "match_clock_minute_boundary",
                     "precision": "minute_boundary",
                 }
@@ -589,6 +600,9 @@ class VisionRuntimeTests(unittest.TestCase):
             self.assertEqual(locate.call_count, 1)
             self.assertEqual(locate.call_args.kwargs["window_start"], 115.0)
             self.assertEqual(locate.call_args.kwargs["window_end"], 145.0)
+            self.assertIsNone(
+                locate.call_args.kwargs["coarse_sample_interval_seconds"]
+            )
             runtime.close()
 
     def test_late_second_target_reuses_persisted_mapping_without_touching_default_gif(self):
@@ -821,6 +835,236 @@ class VisionRuntimeTests(unittest.TestCase):
             ocr_timeout_seconds=3.0,
         )
 
+    def test_ocr_failure_generates_complete_unverified_120_second_range(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime, job = self._create_progressive_ocr_job(root, "range-fallback")
+            segment_path = root / "segment.ts"
+            segment_path.write_bytes(b"video")
+            failure = VisualLocationFailed(
+                "ocr_clock_target_not_located",
+                "target clock was hidden",
+                {"stage": "ocr_progressive_scan"},
+            )
+
+            with patch(
+                "vision_runtime.encode_gif",
+                return_value={
+                    "output": str(root / "range.gif"),
+                    "bytes": 123,
+                    "duration_sec": 120.0,
+                },
+            ) as encode:
+                generated = _encode_ocr_api_range_fallback(
+                    job,
+                    runtime,
+                    lambda: [Segment(segment_path, 80.0, 200.0)],
+                    "ffmpeg",
+                    "ffprobe",
+                    root,
+                    failure=failure,
+                    width=384,
+                    fps=6.0,
+                    colors=160,
+                    size_reference_bytes=10_000_000,
+                    timeout_seconds=300.0,
+                    min_degraded_seconds=2.0,
+                    cancel_event=None,
+                )
+
+            self.assertTrue(generated)
+            encoded = runtime.store.get_vision_task(job.event_key, "ocr_window")
+            self.assertEqual(encoded.status, "encoded")
+            self.assertEqual(encoded.result["output_kind"], "api_time_range_fallback")
+            self.assertFalse(encoded.result["ocr_verified"])
+            self.assertTrue(encoded.result["degraded"])
+            self.assertTrue(encoded.result["fallback_complete"])
+            self.assertEqual(encoded.result["fallback_label"], "120_second_fallback")
+            self.assertEqual(encoded.result["requested_fallback_seconds"], 120.0)
+            self.assertEqual(encoded.result["available_fallback_seconds"], 120.0)
+            self.assertEqual(encode.call_args.kwargs["before"], 120.0)
+            self.assertEqual(encode.call_args.kwargs["after"], 0.0)
+            runtime.close()
+
+    def test_ocr_failure_labels_short_range_as_fragmented_and_unverified(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime, job = self._create_progressive_ocr_job(
+                root, "short-range-fallback"
+            )
+            segment_path = root / "segment.ts"
+            segment_path.write_bytes(b"video")
+            failure = VisualLocationFailed(
+                "ocr_no_trustworthy_clock_before_deadline",
+                "clock was unreadable",
+                {"stage": "ocr_progressive_scan"},
+            )
+
+            with patch(
+                "vision_runtime.encode_gif",
+                return_value={
+                    "output": str(root / "short-range.gif"),
+                    "bytes": 45,
+                    "duration_sec": 7.0,
+                },
+            ):
+                generated = _encode_ocr_api_range_fallback(
+                    job,
+                    runtime,
+                    lambda: [Segment(segment_path, 193.0, 200.0)],
+                    "ffmpeg",
+                    "ffprobe",
+                    root,
+                    failure=failure,
+                    width=384,
+                    fps=6.0,
+                    colors=160,
+                    size_reference_bytes=10_000_000,
+                    timeout_seconds=300.0,
+                    min_degraded_seconds=2.0,
+                    cancel_event=None,
+                )
+
+            self.assertTrue(generated)
+            encoded = runtime.store.get_vision_task(job.event_key, "ocr_window")
+            self.assertEqual(encoded.status, "encoded")
+            self.assertFalse(encoded.result["fallback_complete"])
+            self.assertTrue(encoded.result["fragmented_fallback"])
+            self.assertEqual(encoded.result["fallback_label"], "fragmented_clip")
+            self.assertEqual(encoded.result["available_fallback_seconds"], 7.0)
+            self.assertIn("可能不包含事件", encoded.result["fallback_explanation"])
+            runtime.close()
+
+    def test_ocr_failure_counts_only_playable_seconds_across_video_gaps(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime, job = self._create_progressive_ocr_job(
+                root, "gapped-range-fallback"
+            )
+            first = root / "first.ts"
+            second = root / "second.ts"
+            first.write_bytes(b"video")
+            second.write_bytes(b"video")
+            failure = VisualLocationFailed(
+                "ocr_clock_unreadable",
+                "clock was unreadable",
+                {"stage": "ocr_progressive_scan"},
+            )
+
+            with patch(
+                "vision_runtime.encode_gif",
+                return_value={
+                    "output": str(root / "gapped-range.gif"),
+                    "bytes": 45,
+                    "duration_sec": 80.0,
+                },
+            ):
+                generated = _encode_ocr_api_range_fallback(
+                    job,
+                    runtime,
+                    lambda: [
+                        Segment(first, 80.0, 120.0),
+                        Segment(second, 160.0, 200.0),
+                    ],
+                    "ffmpeg",
+                    "ffprobe",
+                    root,
+                    failure=failure,
+                    width=384,
+                    fps=6.0,
+                    colors=160,
+                    size_reference_bytes=10_000_000,
+                    timeout_seconds=300.0,
+                    min_degraded_seconds=2.0,
+                    cancel_event=None,
+                )
+
+            self.assertTrue(generated)
+            encoded = runtime.store.get_vision_task(job.event_key, "ocr_window")
+            self.assertFalse(encoded.result["fallback_complete"])
+            self.assertEqual(encoded.result["available_fallback_seconds"], 80.0)
+            self.assertEqual(encoded.result["skipped_gap_seconds"], 40.0)
+            self.assertIn("直播源中断部分已跳过", encoded.result["fallback_explanation"])
+            runtime.close()
+
+    def test_ocr_failure_does_not_call_nearest_video_a_complete_range(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime, job = self._create_progressive_ocr_job(
+                root, "history-missing-range-fallback"
+            )
+            segment_path = root / "late-segment.ts"
+            segment_path.write_bytes(b"video")
+            failure = VisualLocationFailed(
+                "ocr_target_history_evicted",
+                "event history was removed",
+                {"stage": "ocr_progressive_scan"},
+            )
+
+            with patch(
+                "vision_runtime.encode_gif",
+                return_value={
+                    "output": str(root / "nearest-range.gif"),
+                    "bytes": 45,
+                    "duration_sec": 120.0,
+                },
+            ):
+                generated = _encode_ocr_api_range_fallback(
+                    job,
+                    runtime,
+                    lambda: [Segment(segment_path, 220.0, 340.0)],
+                    "ffmpeg",
+                    "ffprobe",
+                    root,
+                    failure=failure,
+                    width=384,
+                    fps=6.0,
+                    colors=160,
+                    size_reference_bytes=10_000_000,
+                    timeout_seconds=300.0,
+                    min_degraded_seconds=2.0,
+                    cancel_event=None,
+                )
+
+            self.assertTrue(generated)
+            encoded = runtime.store.get_vision_task(job.event_key, "ocr_window")
+            self.assertFalse(encoded.result["fallback_complete"])
+            self.assertTrue(encoded.result["fallback_anchor_history_missing"])
+            self.assertEqual(
+                encoded.result["fallback_label"], "history_missing_nearest_clip"
+            )
+            self.assertIn("历史视频已被清理", encoded.result["fallback_explanation"])
+            runtime.close()
+
+    def test_terminal_ocr_localization_failure_invokes_api_range_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime, job = self._create_progressive_ocr_job(
+                root,
+                "fallback-integration",
+                event_minute="91",
+                event_second=None,
+            )
+
+            with patch(
+                "vision_runtime._encode_ocr_api_range_fallback",
+                return_value=True,
+            ) as fallback:
+                completed = self._run_progressive_ocr(
+                    job,
+                    runtime,
+                    lambda: [],
+                    root,
+                )
+
+            self.assertTrue(completed)
+            fallback.assert_called_once()
+            self.assertEqual(
+                fallback.call_args.kwargs["failure"].kind,
+                "unsupported_extra_time_or_penalties_v1",
+            )
+            runtime.close()
+
     def test_process_vision_artifact_advances_only_requested_artifact(self):
         with (
             patch("vision_runtime._process_ocr_window", return_value=True) as ocr,
@@ -984,9 +1228,22 @@ class VisionRuntimeTests(unittest.TestCase):
                     )
 
             self.assertEqual(locate.call_count, 4)
+            self.assertEqual(
+                locate.call_args_list[0].kwargs["coarse_sample_interval_seconds"],
+                10.0,
+            )
             self.assertEqual(locate.call_args_list[1].kwargs["sample_interval_seconds"], 1.0)
             self.assertEqual(locate.call_args_list[2].kwargs["sample_interval_seconds"], 1.0)
             self.assertEqual(locate.call_args_list[3].kwargs["sample_interval_seconds"], 1.0)
+            self.assertIsNone(
+                locate.call_args_list[1].kwargs["coarse_sample_interval_seconds"]
+            )
+            self.assertIsNone(
+                locate.call_args_list[2].kwargs["coarse_sample_interval_seconds"]
+            )
+            self.assertIsNone(
+                locate.call_args_list[3].kwargs["coarse_sample_interval_seconds"]
+            )
             self.assertEqual(locate.call_args_list[1].kwargs["window_start"], 105.0)
             self.assertEqual(locate.call_args_list[1].kwargs["window_end"], 135.0)
             self.assertEqual(locate.call_args_list[2].kwargs["window_start"], 90.0)
@@ -2790,9 +3047,13 @@ class VisionRuntimeTests(unittest.TestCase):
                     ocr_timeout_seconds=5.0,
                     minimum_component_seconds=3.0,
                     sample_interval_seconds=1.0,
+                    coarse_sample_interval_seconds=None,
                 )
 
             self.assertEqual(locate.call_args.kwargs["sample_interval_seconds"], 1.0)
+            self.assertIsNone(
+                locate.call_args.kwargs["coarse_sample_interval_seconds"]
+            )
 
     def test_slow_video_preparation_uses_independent_watchdog_and_clear_error(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -3391,6 +3652,87 @@ class VisionRuntimeTests(unittest.TestCase):
             self.assertEqual(located["unscanned_component_count"], 1)
             self.assertEqual(len(located["fragment_attempts"]), 2)
 
+    def test_nearby_observations_across_fragments_choose_smallest_clock_distance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = [root / f"part-{index}.ts" for index in range(2)]
+            for path in paths:
+                path.write_bytes(b"video")
+            ocr_python = root / "ocr-python"
+            ocr_python.write_bytes(b"python")
+            segments = [
+                Segment(paths[0], 0.0, 20.0),
+                Segment(paths[1], 40.0, 60.0),
+            ]
+            job = VisionJob(
+                "match:G:nearest-across-fragments",
+                "match",
+                "G",
+                "goal",
+                55.0,
+                None,
+                1000.0,
+                event_minute="52",
+                event_second=None,
+                clock_only=True,
+            )
+
+            def materialize(_ffmpeg, _segments, output, **kwargs):
+                return {
+                    "path": str(output),
+                    "window_start_stream_time": kwargs["window_start"],
+                    "window_end_stream_time": kwargs["window_end"],
+                }
+
+            def nearby(anchor, observed_clock, distance):
+                return {
+                    "anchor_seconds": anchor,
+                    "location_kind": "match_clock_minute_boundary",
+                    "method": "paddleocr_estimated_minute_boundary",
+                    "precision": "estimated_minute_boundary",
+                    "localization_quality": "estimated",
+                    "degraded": True,
+                    "degradation_mode": "nearby_observed_clock",
+                    "target_clock": "52:00",
+                    "target_clock_seconds": 52 * 60,
+                    "observed_clock": observed_clock,
+                    "observed_clock_distance_seconds": distance,
+                }
+
+            with (
+                patch(
+                    "vision_runtime.materialize_analysis_clip",
+                    side_effect=materialize,
+                ),
+                patch(
+                    "vision_runtime.locate_scoreboard_event",
+                    side_effect=[
+                        nearby(19.0, "51:59", 1),
+                        nearby(45.0, "52:05", 5),
+                    ],
+                ) as locate,
+            ):
+                located, _materialized, _leased = (
+                    _locate_ocr_window_across_components(
+                        job,
+                        segments,
+                        window_start=0.0,
+                        window_end=60.0,
+                        analysis_path=root / "candidate.mp4",
+                        ffmpeg="ffmpeg",
+                        ocr_python=ocr_python,
+                        ocr_timeout_seconds=10.0,
+                        minimum_component_seconds=3.0,
+                    )
+                )
+
+            self.assertEqual(locate.call_count, 2)
+            self.assertEqual(located["anchor_stream_time"], 19.0)
+            self.assertEqual(located["observed_clock"], "51:59")
+            self.assertEqual(located["observed_clock_distance_seconds"], 1)
+            self.assertFalse(located["exact_target_locked"])
+            self.assertEqual(len(located["fragment_attempts"]), 2)
+
     def test_minute_ocr_gif_survives_tdeed_failure_with_ai_fallback(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -3551,7 +3893,13 @@ class VisionRuntimeTests(unittest.TestCase):
                     "vision_runtime.locate_candidate_video",
                     side_effect=VisionCandidateNotFound("no standalone candidate"),
                 ) as tdeed,
-                patch("vision_runtime.encode_gif") as encode,
+                patch(
+                    "vision_runtime.encode_gif",
+                    return_value={
+                        "output": str(root / "ocr-range.gif"),
+                        "bytes": 1234,
+                    },
+                ) as encode,
             ):
                 self.assertTrue(refine_event_job(
                     job, runtime, lambda: [Segment(segment_path, 0.0, 200.0)],
@@ -3563,14 +3911,16 @@ class VisionRuntimeTests(unittest.TestCase):
                     python=Path("python"), timeout_seconds=3.0,
                 ))
 
-            encode.assert_not_called()
+            encode.assert_called_once()
             ocr_task = runtime.store.get_vision_task(event_key, "ocr_window")
             refined_task = runtime.store.get_vision_task(
                 event_key, "tdeed_refined"
             )
-            self.assertEqual(ocr_task.status, "failed")
-            self.assertEqual(ocr_task.last_error_kind, "ocr_clock_unreadable")
-            self.assertEqual(ocr_task.result["output_kind"], "failed")
+            self.assertEqual(ocr_task.status, "encoded")
+            self.assertEqual(
+                ocr_task.result["output_kind"], "api_time_range_fallback"
+            )
+            self.assertFalse(ocr_task.result["ocr_verified"])
             self.assertEqual(refined_task.status, "failed")
             self.assertEqual(refined_task.last_error_kind, "tdeed_no_candidate")
             self.assertEqual(
@@ -3632,7 +3982,10 @@ class VisionRuntimeTests(unittest.TestCase):
 
             self.assertEqual(tdeed.call_args.kwargs["candidate_window_start_seconds"], 60.0)
             self.assertEqual(tdeed.call_args.kwargs["candidate_window_end_seconds"], 180.0)
-            encode.assert_called_once()
+            self.assertEqual(encode.call_count, 2)
+            self.assertIn(
+                "ocr-fallback", encode.call_args_list[0].kwargs["output_filename"]
+            )
             refined = runtime.store.get_vision_task(event_key, "tdeed_refined")
             self.assertEqual(refined.status, "encoded")
             self.assertEqual(refined.result["locator_method"], "tdeed_after_ocr_failure")

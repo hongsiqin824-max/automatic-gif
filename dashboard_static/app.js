@@ -371,7 +371,9 @@ function visionPresentation(vision, enabled = true) {
       ocr_second_exact:{label:'已精确到秒',cls:vision.status === 'encoded' ? 'encoded' : 'encoding'},
       ocr_second_interpolated:{label:'已根据前后画面推算到秒',cls:vision.status === 'encoded' ? 'encoded' : 'encoding'},
       ocr_second_estimated:{label:'已估算到附近几秒',cls:vision.status === 'encoded' ? 'encoded' : 'encoding'},
+      ocr_second_projected:{label:'时钟被遮挡 · 已按前后时间推算',cls:vision.status === 'encoded' ? 'encoded' : 'encoding'},
       ocr_minute_fallback:{label:'已找到该分钟附近画面',cls:vision.status === 'encoded' ? 'encoded' : 'encoding'},
+      ocr_range_fallback:{label:vision.fallback_complete === true ? '未精确定位 · 120 秒范围 GIF 已生成' : '未精确定位 · 残缺范围 GIF 已生成',cls:'warning'},
       ocr_no_clock_detected:{label:'没有读到画面上的比赛时间',cls:'failed'},
       ocr_target_timeout:{label:'查找比赛时间超时',cls:'failed'},
       ocr_target_media_not_arrived:{label:'视频还没播放到这个时间',cls:'failed'},
@@ -429,7 +431,8 @@ function visionFailureDetail(vision) {
     ocr_clock_discovery:'读取画面比赛时间', ocr_target_localization:'查找接口对应时间',
     ocr_window_encoding:'生成 60 秒 GIF', waiting_for_clock_target:'等待比赛时间出现', waiting_for_latest_tail_rescan:'扫描新增视频尾部',
     waiting_for_postroll:'等待目标后的画面', ocr_second_exact:'精确到秒', ocr_second_interpolated:'根据前后画面推算秒数', ocr_second_estimated:'估算附近几秒',
-    ocr_minute_fallback:'查找分钟附近画面', ocr_no_clock_detected:'读取比赛时间',
+    ocr_second_projected:'时钟被遮挡后按前后时间推算',
+    ocr_minute_fallback:'查找分钟附近画面', ocr_range_fallback:'生成接口时间范围兜底', ocr_no_clock_detected:'读取比赛时间',
     ocr_target_timeout:'查找接口对应时间', ocr_window_evicted:'查找历史画面',
     ocr_target_media_not_arrived:'等待目标画面', ocr_target_media_stalled:'等待新画面',
     ocr_clock_paused_timeout:'等待比赛时间继续',
@@ -708,6 +711,18 @@ function ocrUserDetailText(vision) {
   const parts = [];
   const target = ocrClockValue(vision.target_clock, vision.target_clock_seconds);
   if (target && target !== '--') parts.push(`接口时间 ${target}`);
+  if (vision.degradation_mode === 'mapped_clock_projection') {
+    const error = finiteNumber(vision.estimated_error_bound_seconds);
+    const mappingKind = String(vision.clock_video_mapping && vision.clock_video_mapping.mapping_kind || '');
+    const basis = mappingKind === 'forward_extrapolation' ? '遮挡前' : mappingKind === 'backward_extrapolation' ? '遮挡后' : '遮挡前后';
+    parts.push(`目标时间画面被遮挡，已根据${basis}连续可读的比赛时间推算${error != null ? `，预计误差不超过 ${Number(error.toFixed(1))} 秒` : ''}`);
+  }
+  if (vision.output_kind === 'api_time_range_fallback') {
+    const available = finiteNumber(vision.available_fallback_seconds);
+    parts.push(vision.fallback_explanation || (vision.fallback_complete === true
+      ? 'OCR 没有完成二次定位，已生成接口时间附近约 120 秒的低清范围片段'
+      : `OCR 没有完成二次定位，已生成${available != null ? `约 ${Number(available.toFixed(1))} 秒` : ''}残缺片段，可能不包含事件`));
+  }
   if (vision.failure_explanation) parts.push(friendlyText(vision.failure_explanation));
   if (!parts.length && vision.status === 'failed') return '系统会保留默认 GIF，并继续记录失败原因。';
   return parts.join(' · ');
@@ -938,7 +953,9 @@ function render(data) {
       if (!ocrWindow) return '';
       const source = String(ocrWindow.localization_source || '');
       const precision = String(ocrWindow.localization_precision || ocrWindow.precision || '');
-      if (source === 'estimated' || precision === 'estimated_second') return '估算附近几秒';
+      if (ocrWindow.output_kind === 'api_time_range_fallback') return '未通过 OCR 校准';
+      if (source === 'projected' || precision === 'projected_second' || ocrWindow.degradation_mode === 'mapped_clock_projection') return '根据前后比赛时间推算';
+      if (source === 'estimated' || precision === 'estimated_second') return '采用目标附近的真实画面';
       if (source === 'interpolated' || precision === 'interpolated_second') return '根据前后画面推算';
       if (source === 'exact_second' || source === 'exact' || precision === 'observed_second') return '已精确到秒';
       if (source === 'minute_boundary') return '分钟附近';
@@ -949,7 +966,8 @@ function render(data) {
     const visionDetail = [failureDetail].filter(Boolean).join(' · ');
     const technicalMarkup = technicalDetail ? `<details class="technical-details"><summary>查看完整处理记录</summary><small>${escapeHtml(friendlyText(technicalDetail))}</small></details>` : '';
     const gifLink = artifact => artifact && artifact.output ? `<a class="gif-link" href="/api/gif/${encodeURIComponent(data.match_id)}/${encodeURIComponent(artifact.output.split('/').pop())}" target="_blank">预览</a>` : '';
-    return `<div class="event-row ${escapeHtml(task.cls)}"><div class="event-type event-type-${escapeHtml(type.kind)}"><span class="event-symbol" aria-hidden="true"></span><span class="event-type-text"><b>${escapeHtml(type.label)}</b><small>${escapeHtml(type.code)}</small></span></div><div class="event-minute">${escapeHtml(e.minute || '--')}'${e.minute_extra && e.minute_extra !== '0' ? `+${escapeHtml(e.minute_extra)}` : ''}</div><div class="event-person">${escapeHtml(e.person || '未提供球员')}<small>${escapeHtml(e.team || '')}${e.score ? ` · ${escapeHtml(e.score)}` : ''}${e.reason ? ` · ${friendlyText(e.reason)}` : ''}</small></div><div class="artifact-list"><div class="artifact ${e.status === 'failed' ? 'failed' : ''}"><div class="artifact-copy"><span>默认 · ${escapeHtml(task.label)}${defaultCoverage ? ` · ${escapeHtml(defaultCoverage)}` : ''}</span>${defaultFailureMarkup}</div>${e.output ? `<a class="gif-link" href="/api/gif/${encodeURIComponent(data.match_id)}/${encodeURIComponent(e.output.split('/').pop())}" target="_blank">预览</a>` : ''}</div><div class="artifact ${escapeHtml(ocr.cls)}"><div class="artifact-copy"><span>画面时间 60秒 · ${escapeHtml(ocr.label)}${ocrCoverage ? ` · ${escapeHtml(ocrCoverage)}` : ''}${ocrUserDetail ? `<small>${escapeHtml(ocrUserDetail)}</small>` : ''}</span>${ocrFailureMarkup}${technicalMarkup}</div>${gifLink(ocrWindow)}</div><div class="artifact ${escapeHtml(vision.cls)}"><div class="artifact-copy"><span>动作精剪 20秒 · ${escapeHtml(vision.label)}${escapeHtml(confidence)}${escapeHtml(delta)}${visionCoverage ? ` · ${escapeHtml(visionCoverage)}` : ''}${tdeed && tdeed.experimental ? ' · 实验' : ''}${visionDetail ? `<small>${escapeHtml(visionDetail)}</small>` : ''}</span>${visionFailureMarkup}</div>${gifLink(tdeed)}</div></div></div>`;
+    const ocrArtifactLabel = ocrWindow && ocrWindow.output_kind === 'api_time_range_fallback' ? '接口时间范围兜底' : '画面时间 60秒';
+    return `<div class="event-row ${escapeHtml(task.cls)}"><div class="event-type event-type-${escapeHtml(type.kind)}"><span class="event-symbol" aria-hidden="true"></span><span class="event-type-text"><b>${escapeHtml(type.label)}</b><small>${escapeHtml(type.code)}</small></span></div><div class="event-minute">${escapeHtml(e.minute || '--')}'${e.minute_extra && e.minute_extra !== '0' ? `+${escapeHtml(e.minute_extra)}` : ''}</div><div class="event-person">${escapeHtml(e.person || '未提供球员')}<small>${escapeHtml(e.team || '')}${e.score ? ` · ${escapeHtml(e.score)}` : ''}${e.reason ? ` · ${friendlyText(e.reason)}` : ''}</small></div><div class="artifact-list"><div class="artifact ${e.status === 'failed' ? 'failed' : ''}"><div class="artifact-copy"><span>默认 · ${escapeHtml(task.label)}${defaultCoverage ? ` · ${escapeHtml(defaultCoverage)}` : ''}</span>${defaultFailureMarkup}</div>${e.output ? `<a class="gif-link" href="/api/gif/${encodeURIComponent(data.match_id)}/${encodeURIComponent(e.output.split('/').pop())}" target="_blank">预览</a>` : ''}</div><div class="artifact ${escapeHtml(ocr.cls)}"><div class="artifact-copy"><span>${escapeHtml(ocrArtifactLabel)} · ${escapeHtml(ocr.label)}${ocrCoverage ? ` · ${escapeHtml(ocrCoverage)}` : ''}${ocrUserDetail ? `<small>${escapeHtml(ocrUserDetail)}</small>` : ''}</span>${ocrFailureMarkup}${technicalMarkup}</div>${gifLink(ocrWindow)}</div><div class="artifact ${escapeHtml(vision.cls)}"><div class="artifact-copy"><span>动作精剪 20秒 · ${escapeHtml(vision.label)}${escapeHtml(confidence)}${escapeHtml(delta)}${visionCoverage ? ` · ${escapeHtml(visionCoverage)}` : ''}${tdeed && tdeed.experimental ? ' · 实验' : ''}${visionDetail ? `<small>${escapeHtml(visionDetail)}</small>` : ''}</span>${visionFailureMarkup}</div>${gifLink(tdeed)}</div></div></div>`;
   }).join('') : '<div class="empty">暂无已发现事件。启动处理后，进球、黄牌、红牌和乌龙球会在这里显示。</div>';
   const logs = $('logs'); const records = data.logs || []; let heartbeatSeen = false; const visibleRecords = records.filter(record => record.event !== 'runtime_heartbeat' || (!heartbeatSeen && (heartbeatSeen = true))); logs.innerHTML = visibleRecords.length ? visibleRecords.slice(0, 40).map(l => { const presentation = logPresentation(l); return `<div class="log-line log-${escapeHtml(l.event || '')}"><time>${escapeHtml((l.timestamp || '').replace('T',' ').replace('Z','').slice(0,19))}</time><b>${escapeHtml(presentation.name)}</b><span>${escapeHtml(presentation.detail)}</span></div>`; }).join('') : '<div class="empty">暂无日志</div>';
   $('last-refresh').textContent = `更新于 ${new Date().toLocaleTimeString('zh-CN', {hour12:false})}`;

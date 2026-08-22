@@ -1208,6 +1208,138 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(ocr["ocr_pipeline_status"], "ocr_second_estimated")
         self.assertFalse(ocr["precise_location"])
 
+    def test_database_marks_stable_clock_projection_separately_from_exact_ocr(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "pipeline_state.sqlite3"
+            runtime = dashboard_server.sqlite3.connect(database)
+            runtime.executescript(
+                """
+                CREATE TABLE event_tasks (
+                    event_key TEXT, code TEXT, event_type TEXT, event_json TEXT,
+                    status TEXT, discovered_at_unix REAL, updated_at_unix REAL,
+                    output_path TEXT, output_bytes INTEGER, result_json TEXT,
+                    error TEXT
+                );
+                CREATE TABLE vision_tasks (
+                    event_key TEXT, status TEXT, located_anchor_stream_time REAL,
+                    confidence REAL, inference_seconds REAL, model_name TEXT,
+                    model_version TEXT, output_path TEXT, output_bytes INTEGER,
+                    result_json TEXT, error TEXT, artifact_kind TEXT,
+                    created_at_unix REAL
+                );
+                """
+            )
+            event = {
+                "event_key": "m:G:projected-ocr",
+                "code": "G",
+                "event_type": "goal",
+            }
+            runtime.execute(
+                "INSERT INTO event_tasks VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    "m:G:projected-ocr", "G", "goal", json.dumps(event),
+                    "encoded", 1, 2, "/tmp/default.gif", 10, "{}", None,
+                ),
+            )
+            runtime.execute(
+                "INSERT INTO vision_tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    "m:G:projected-ocr", "encoded", 80.0, None, 1.0,
+                    "PaddleOCR", "1", "/tmp/ocr.gif", 8,
+                    json.dumps({
+                        "stage": "encoded",
+                        "localization_source": "projected",
+                        "precision": "projected_second",
+                        "localization_quality": "projected",
+                        "degraded": True,
+                        "degradation_mode": "mapped_clock_projection",
+                        "estimated_error_bound_seconds": 2.0,
+                        "target_clock_directly_observed": False,
+                        "clock_video_mapping": {"status": "stable", "slope": 1.0},
+                        "error_kind": "ocr_clock_target_not_located",
+                        "failure_reason": {
+                            "kind": "ocr_clock_target_not_located",
+                            "message": "older failed attempt",
+                        },
+                    }),
+                    None, "ocr_window", 1,
+                ),
+            )
+            runtime.commit()
+            runtime.close()
+            tasks, _, _ = dashboard_server._tasks_from_database(database)
+
+        ocr = tasks[0]["ocr_window"]
+        self.assertEqual(ocr["ocr_pipeline_status"], "ocr_second_projected")
+        self.assertEqual(ocr["estimated_error_bound_seconds"], 2.0)
+        self.assertFalse(ocr["target_clock_directly_observed"])
+        self.assertEqual(ocr["clock_video_mapping"]["status"], "stable")
+        self.assertFalse(ocr["precise_location"])
+
+    def test_database_exposes_unverified_api_range_fallback_as_generated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "pipeline_state.sqlite3"
+            runtime = dashboard_server.sqlite3.connect(database)
+            runtime.executescript(
+                """
+                CREATE TABLE event_tasks (
+                    event_key TEXT, code TEXT, event_type TEXT, event_json TEXT,
+                    status TEXT, discovered_at_unix REAL, updated_at_unix REAL,
+                    output_path TEXT, output_bytes INTEGER, result_json TEXT,
+                    error TEXT
+                );
+                CREATE TABLE vision_tasks (
+                    event_key TEXT, status TEXT, located_anchor_stream_time REAL,
+                    confidence REAL, inference_seconds REAL, model_name TEXT,
+                    model_version TEXT, output_path TEXT, output_bytes INTEGER,
+                    result_json TEXT, error TEXT, artifact_kind TEXT,
+                    created_at_unix REAL
+                );
+                """
+            )
+            event = {
+                "event_key": "m:G:range-fallback",
+                "code": "G",
+                "event_type": "goal",
+            }
+            runtime.execute(
+                "INSERT INTO event_tasks VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    "m:G:range-fallback", "G", "goal", json.dumps(event),
+                    "encoded", 1, 2, "/tmp/default.gif", 10, "{}", None,
+                ),
+            )
+            runtime.execute(
+                "INSERT INTO vision_tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    "m:G:range-fallback", "encoded", 200.0, None, None,
+                    "PaddleOCR", "1", "/tmp/range.gif", 8,
+                    json.dumps({
+                        "stage": "ocr_api_range_fallback_encoded",
+                        "output_kind": "api_time_range_fallback",
+                        "localization_source": "api_time_range",
+                        "precision": "unverified_range",
+                        "ocr_verified": False,
+                        "fallback_generated": True,
+                        "requested_fallback_seconds": 120.0,
+                        "available_fallback_seconds": 112.0,
+                        "fallback_explanation": "未精确定位，已生成范围片段。",
+                    }),
+                    None, "ocr_window", 1,
+                ),
+            )
+            runtime.commit()
+            runtime.close()
+            tasks, _, _ = dashboard_server._tasks_from_database(database)
+
+        ocr = tasks[0]["ocr_window"]
+        self.assertEqual(ocr["ocr_pipeline_status"], "ocr_range_fallback")
+        self.assertTrue(ocr["fallback_generated"])
+        self.assertTrue(ocr["fallback_complete"])
+        self.assertEqual(ocr["requested_fallback_seconds"], 120.0)
+        self.assertEqual(ocr["available_fallback_seconds"], 112.0)
+        self.assertFalse(ocr["ocr_verified"])
+
     def test_new_session_defaults_to_calibrated_candidate_window(self):
         manager = dashboard_server.Dashboard(background_monitors=False)
         session = manager.get("default-gif-only")
