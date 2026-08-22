@@ -87,6 +87,25 @@ class HeavyTaskCoordinatorTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(HeavyTaskCoordinatorError, "positive integer"):
                 configured_limits()
+        with patch.dict(
+            "os.environ",
+            {
+                "GIF_MAX_CONCURRENT_HEAVY_TASKS": "5",
+                "GIF_VISION_WORKERS": "4",
+            },
+            clear=True,
+        ):
+            self.assertEqual(configured_limits(), (5, 4))
+        with patch.dict(
+            "os.environ",
+            {
+                "GIF_MAX_CONCURRENT_HEAVY_TASKS": "5",
+                "GIF_VISION_WORKERS": "4",
+                "GIF_MAX_CONCURRENT_VISION_TASKS": "3",
+            },
+            clear=True,
+        ):
+            self.assertEqual(configured_limits(), (5, 3))
 
     def test_limits_apply_across_coordinator_instances(self):
         with tempfile.TemporaryDirectory() as directory:

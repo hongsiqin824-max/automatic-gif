@@ -157,10 +157,15 @@ class BoundedTaskPool:
         **kwargs: Any,
     ) -> bool:
         if not self.prioritized:
-            if key in self.futures:
-                return False
-            self.futures[key] = self.executor.submit(function, *args, **kwargs)
-            return True
+            with self._condition:
+                if not self._accepting:
+                    raise RuntimeError("task pool is shutting down")
+                if key in self.futures:
+                    return False
+                future = self.executor.submit(function, *args, **kwargs)
+                self.futures[key] = future
+                future.add_done_callback(self._non_prioritized_worker_done)
+                return True
         with self._condition:
             if not self._accepting:
                 raise RuntimeError("task pool is shutting down")
@@ -214,6 +219,51 @@ class BoundedTaskPool:
             self._start_pending_locked()
             self._condition.notify_all()
 
+    def _non_prioritized_worker_done(self, _future: Future[Any]) -> None:
+        with self._condition:
+            self._condition.notify_all()
+
+    def stop_accepting(self) -> None:
+        """Reject future submissions while allowing accepted work to drain."""
+        with self._condition:
+            self._accepting = False
+            self._condition.notify_all()
+
+    def cancel_pending(self) -> list[str]:
+        """Cancel prioritized jobs that have not acquired a worker yet."""
+        if not self.prioritized:
+            return []
+        cancelled: list[str] = []
+        with self._condition:
+            for pending in self._pending:
+                key = pending[2]
+                if self.futures[key].cancel():
+                    cancelled.append(key)
+            self._pending.clear()
+            self._condition.notify_all()
+        return cancelled
+
+    def wait_until_idle(self, timeout: float | None = None) -> bool:
+        """Wait at most ``timeout`` seconds for accepted work to finish."""
+        if timeout is not None and timeout < 0:
+            raise ValueError("timeout must be non-negative or None")
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._condition:
+            while True:
+                if self.prioritized:
+                    idle = not self._pending and self._active_count == 0
+                else:
+                    idle = all(future.done() for future in self.futures.values())
+                if idle:
+                    return True
+                if deadline is None:
+                    self._condition.wait()
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._condition.wait(remaining)
+
     def collect_done(self) -> list[tuple[str, Any, BaseException | None]]:
         completed: list[tuple[str, Any, BaseException | None]] = []
         with self._condition:
@@ -232,17 +282,12 @@ class BoundedTaskPool:
         return completed
 
     def shutdown(self, *, wait: bool = True) -> None:
+        self.stop_accepting()
         if not self.prioritized:
             self.executor.shutdown(wait=wait)
             return
-        with self._condition:
-            self._accepting = False
-            if wait:
-                while self._pending or self._active_count:
-                    self._condition.wait()
-            else:
-                for pending in self._pending:
-                    key = pending[2]
-                    self.futures[key].cancel()
-                self._pending.clear()
+        if wait:
+            self.wait_until_idle()
+        else:
+            self.cancel_pending()
         self.executor.shutdown(wait=wait)

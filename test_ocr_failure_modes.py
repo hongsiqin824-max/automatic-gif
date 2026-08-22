@@ -25,6 +25,11 @@ class OcrFailureModeTests(unittest.TestCase):
             {
                 "exact_second_failure_reason": "target_clock_not_found",
                 "isolated_target_reading_count": 0,
+                "candidate_start_seconds": 100.0,
+                "clock_raw_observations": [
+                    {"frame_seconds": 0.0, "clock_seconds": 450, "continuity_status": "accepted"},
+                    {"frame_seconds": 7.0, "clock_seconds": 457, "continuity_status": "accepted"},
+                ],
             },
             target_clock_seconds=455,
             latest_trusted_clock_seconds=457,
@@ -46,7 +51,7 @@ class OcrFailureModeTests(unittest.TestCase):
             latest_trusted_clock_seconds=455,
         )
         self.assertEqual(details["target_failure_cause"], "isolated")
-        self.assertTrue(details["target_passed_without_anchor"])
+        self.assertFalse(details["target_passed_without_anchor"])
         self.assertIn("单帧", details["target_failure_explanation"])
 
     def test_target_not_located_classifies_evicted_window(self):

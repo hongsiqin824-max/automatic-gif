@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import ast
 import json
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -332,33 +335,64 @@ class ClockContinuityTests(unittest.TestCase):
         self.assertEqual(results[2].status, "accepted")
         self.assertEqual(results[2].reason, "coarse_stoppage_advanced")
 
-    def test_resynchronizes_after_four_continuous_observations_follow_bad_first_frame(self):
+    def test_resynchronizes_after_three_continuous_observations_follow_bad_first_frame(self):
         tracker = ClockContinuityStateMachine()
         tracker.update(0.0, "8:55", period=2)
 
         candidates = [
             tracker.update(index, text, period=2)
             for index, text in enumerate(
-                ["68:56", "68:57", "68:58", "68:59"], start=1
+                ["68:56", "68:57", "68:58"], start=1
             )
         ]
-        following = tracker.update(5.0, "69:00", period=2)
+        following = tracker.update(4.0, "68:59", period=2)
 
-        self.assertEqual(candidates[-1].clock_seconds, 68 * 60 + 59)
+        self.assertEqual(candidates[-1].clock_seconds, 68 * 60 + 58)
         self.assertEqual(candidates[-1].status, "resynchronized")
         self.assertEqual(
             candidates[-1].reason, "continuous_observations_resynchronized"
         )
         self.assertEqual(following.status, "accepted")
-        self.assertEqual(following.clock_seconds, 69 * 60)
+        self.assertEqual(following.clock_seconds, 68 * 60 + 59)
 
-    def test_stops_repairing_a_long_unreadable_run(self):
+    def test_resynchronizes_after_stream_gap_while_short_repairs_are_active(self):
+        tracker = ClockContinuityStateMachine()
+        tracker.update(0.0, "42:52")
+
+        first = tracker.update(1.0, "44:37")
+        second = tracker.update(3.0, "44:39")
+        relocked = tracker.update(4.0, "44:40")
+        following = tracker.update(5.0, "44:41")
+
+        self.assertEqual(first.status, "repaired")
+        self.assertEqual(second.status, "repaired")
+        self.assertEqual(relocked.status, "resynchronized")
+        self.assertEqual(relocked.clock_seconds, 44 * 60 + 40)
+        self.assertEqual(
+            relocked.reason, "continuous_observations_resynchronized"
+        )
+        self.assertEqual(following.status, "accepted")
+        self.assertEqual(following.clock_seconds, 44 * 60 + 41)
+
+    def test_isolated_clock_jump_does_not_replace_the_existing_track(self):
+        tracker = ClockContinuityStateMachine()
+        tracker.update(0.0, "42:52")
+
+        outlier = tracker.update(1.0, "44:37")
+        recovered = tracker.update(2.0, "42:54")
+
+        self.assertEqual(outlier.status, "repaired")
+        self.assertEqual(outlier.clock_seconds, 42 * 60 + 53)
+        self.assertEqual(recovered.status, "accepted")
+        self.assertEqual(recovered.clock_seconds, 42 * 60 + 54)
+
+    def test_stops_repairing_an_incoherent_unreadable_run(self):
         tracker = ClockContinuityStateMachine(maximum_consecutive_repairs=2)
         tracker.update(0.0, "10:00")
         self.assertEqual(tracker.update(1.0, "20:00").status, "repaired")
-        self.assertEqual(tracker.update(2.0, "20:01").status, "repaired")
+        self.assertEqual(tracker.update(2.0, "20:05").status, "repaired")
         rejected = tracker.update(3.0, "20:02")
-        still_rejected = tracker.update(4.0, "20:03")
+        still_rejected = tracker.update(4.0, "20:20")
 
         self.assertEqual(rejected.status, "rejected")
         self.assertIsNone(rejected.clock_seconds)
@@ -504,10 +538,11 @@ class ScoreboardLocationTests(unittest.TestCase):
             ["69:36", "69:38"],
         )
 
-    def test_goal_second_uses_two_readings_for_degraded_one_sided_estimate(self):
+    def test_goal_second_uses_three_readings_for_degraded_one_sided_estimate(self):
         readings = [
             self._reading(0, 0.0, "69:33"),
             self._reading(1, 1.0, "69:34"),
+            self._reading(2, 2.0, "69:35"),
         ]
 
         result = locate_from_readings(
@@ -523,9 +558,9 @@ class ScoreboardLocationTests(unittest.TestCase):
         self.assertEqual(result["localization_quality"], "estimated")
         self.assertTrue(result["degraded"])
         self.assertEqual(result["anchor_seconds"], 4.0)
-        self.assertEqual(result["estimated_error_bound_seconds"], 4)
-        self.assertEqual(result["estimated_error_bound_label"], "+/-4s")
-        self.assertEqual(result["diagnostics"]["estimate_direct_reading_count"], 2)
+        self.assertEqual(result["estimated_error_bound_seconds"], 2)
+        self.assertEqual(result["estimated_error_bound_label"], "+/-2s")
+        self.assertEqual(result["diagnostics"]["estimate_direct_reading_count"], 3)
 
     def test_goal_second_rejects_multiple_disjoint_clock_occurrences(self):
         readings = [
@@ -575,27 +610,27 @@ class ScoreboardLocationTests(unittest.TestCase):
         self.assertEqual(result["anchor_seconds"], 101.0)
         self.assertEqual(result["method"], "paddleocr_exact_clock")
 
-    def test_goal_second_uses_one_isolated_clock_reading(self):
+    def test_goal_second_rejects_one_isolated_clock_reading(self):
         readings = [self._reading(0, 7.0, "69:37")]
 
-        result = locate_from_readings(
-            readings,
-            {
-                "event_code": "G",
-                "event_second": 4177,
-            },
-        )
+        with self.assertRaises(WorkerError) as raised:
+            locate_from_readings(
+                readings,
+                {
+                    "event_code": "G",
+                    "event_second": 4177,
+                },
+            )
 
-        self.assertEqual(result["anchor_seconds"], 7.0)
-        self.assertEqual(result["method"], "paddleocr_exact_clock")
-        self.assertEqual(result["precision"], "observed_second")
-        self.assertEqual(result["localization_quality"], "exact")
+        self.assertEqual(raised.exception.kind, "ocr_exact_second_not_found")
         self.assertEqual(
-            result["diagnostics"]["isolated_target_reading_count"], 1
+            raised.exception.diagnostics["isolated_target_reading_count"], 1
         )
         self.assertEqual(
-            result["diagnostics"]["accepted_isolated_target_reading_count"],
-            1,
+            raised.exception.diagnostics[
+                "accepted_isolated_target_reading_count"
+            ],
+            0,
         )
 
     def test_goal_second_failure_downgrades_to_score_transition(self):
@@ -1101,22 +1136,30 @@ class ScoreboardClientTests(unittest.TestCase):
         self.assertEqual(fine_request.candidate_duration_seconds, 30.0)
         self.assertEqual(result["anchor_seconds"], 149.0)
 
-    def test_coarse_miss_falls_back_to_full_one_second_scan(self):
+    def test_scoreboard_missing_uses_five_second_recovery_before_local_fine_scan(self):
         with tempfile.TemporaryDirectory() as directory:
             candidate = Path(directory) / "candidate.mp4"
             candidate.write_bytes(b"video")
             coarse_error = ScoreboardOcrError(
-                "ocr_clock_unreadable", "coarse clock was unreadable"
+                "scoreboard_missing", "coarse samples contained no scoreboard"
             )
-            fine = {
+            recovery = {
                 "anchor_seconds": 150.0,
                 "location_kind": "match_clock_minute_boundary",
                 "diagnostics": {},
             }
-            with patch(
-                "scoreboard_ocr.run_scoreboard_ocr",
-                side_effect=[coarse_error, fine],
-            ) as run:
+            fine = {
+                "anchor_seconds": 149.0,
+                "location_kind": "match_clock_minute_boundary",
+                "diagnostics": {},
+            }
+            with (
+                patch(
+                    "scoreboard_ocr.run_scoreboard_ocr",
+                    side_effect=[coarse_error, recovery, fine],
+                ) as run,
+                patch("scoreboard_ocr._materialize_fine_scan_clip") as materialize,
+            ):
                 result = locate_scoreboard_event(
                     candidate,
                     event_code="YC",
@@ -1127,14 +1170,60 @@ class ScoreboardClientTests(unittest.TestCase):
         requests = [call.args[0] for call in run.call_args_list]
         self.assertEqual(
             [request.sample_interval_seconds for request in requests],
-            [10.0, 1.0],
+            [10.0, 5.0, 1.0],
         )
         self.assertEqual(requests[1].candidate_path, candidate)
+        self.assertNotEqual(requests[2].candidate_path, candidate)
+        self.assertEqual(materialize.call_args.kwargs["start_seconds"], 135.0)
         strategy = result["diagnostics"]["sampling_strategy"]
-        self.assertEqual(strategy["mode"], "full_fine_fallback")
-        self.assertEqual(strategy["coarse_error"]["kind"], "ocr_clock_unreadable")
+        self.assertEqual(strategy["mode"], "coarse_recovery_then_local_fine")
+        self.assertEqual(strategy["coarse_error"]["kind"], "scoreboard_missing")
+        self.assertEqual(strategy["recovery_sample_interval_seconds"], 5.0)
+        self.assertEqual(strategy["recovery_scan"]["anchor_seconds"], 150.0)
+        self.assertTrue(strategy["full_fine_scan_skipped"])
 
-    def test_local_fine_miss_falls_back_without_using_coarse_anchor(self):
+    def test_coarse_recovery_failure_never_runs_full_one_second_scan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            candidate = Path(directory) / "candidate.mp4"
+            candidate.write_bytes(b"video")
+            coarse_error = ScoreboardOcrError(
+                "scoreboard_missing",
+                "coarse samples did not contain scoreboard text",
+            )
+            recovery_error = ScoreboardOcrError(
+                "scoreboard_missing",
+                "recovery samples did not contain scoreboard text",
+            )
+            with (
+                patch(
+                    "scoreboard_ocr.run_scoreboard_ocr",
+                    side_effect=[coarse_error, recovery_error],
+                ) as run,
+                patch("scoreboard_ocr._materialize_fine_scan_clip") as materialize,
+            ):
+                with self.assertRaises(ScoreboardOcrError) as raised:
+                    locate_scoreboard_event(
+                        candidate,
+                        event_code="YC",
+                        event_minute=30,
+                        clock_only=True,
+                    )
+
+        requests = [call.args[0] for call in run.call_args_list]
+        self.assertEqual(
+            [request.sample_interval_seconds for request in requests],
+            [10.0, 5.0],
+        )
+        materialize.assert_not_called()
+        self.assertEqual(raised.exception.kind, "scoreboard_missing")
+        strategy = raised.exception.diagnostics["sampling_strategy"]
+        self.assertEqual(strategy["mode"], "coarse_recovery_failed")
+        self.assertEqual(strategy["coarse_error"]["kind"], "scoreboard_missing")
+        self.assertEqual(strategy["recovery_error"]["kind"], "scoreboard_missing")
+        self.assertTrue(strategy["full_fine_scan_skipped"])
+        self.assertIsNone(strategy["final_anchor_source"])
+
+    def test_local_fine_miss_is_reported_without_full_one_second_scan(self):
         with tempfile.TemporaryDirectory() as directory:
             candidate = Path(directory) / "candidate.mp4"
             candidate.write_bytes(b"video")
@@ -1146,30 +1235,32 @@ class ScoreboardClientTests(unittest.TestCase):
             local_error = ScoreboardOcrError(
                 "ocr_minute_boundary_not_found", "local fine scan missed"
             )
-            full_fine = {
-                "anchor_seconds": 152.0,
-                "location_kind": "match_clock_minute_boundary",
-                "diagnostics": {},
-            }
             with (
                 patch(
                     "scoreboard_ocr.run_scoreboard_ocr",
-                    side_effect=[coarse, local_error, full_fine],
+                    side_effect=[coarse, local_error],
                 ) as run,
                 patch("scoreboard_ocr._materialize_fine_scan_clip"),
             ):
-                result = locate_scoreboard_event(
-                    candidate,
-                    event_code="RC",
-                    event_minute=30,
-                    candidate_start_seconds=100.0,
-                    clock_only=True,
-                )
+                with self.assertRaises(ScoreboardOcrError) as raised:
+                    locate_scoreboard_event(
+                        candidate,
+                        event_code="RC",
+                        event_minute=30,
+                        candidate_start_seconds=100.0,
+                        clock_only=True,
+                    )
 
-        self.assertEqual(result["anchor_seconds"], 152.0)
-        self.assertEqual(run.call_args_list[2].args[0].candidate_path, candidate)
-        strategy = result["diagnostics"]["sampling_strategy"]
-        self.assertEqual(strategy["final_anchor_source"], "fine_scan")
+        self.assertEqual(len(run.call_args_list), 2)
+        self.assertEqual(
+            [call.args[0].sample_interval_seconds for call in run.call_args_list],
+            [10.0, 1.0],
+        )
+        self.assertEqual(raised.exception.kind, "ocr_minute_boundary_not_found")
+        strategy = raised.exception.diagnostics["sampling_strategy"]
+        self.assertEqual(strategy["mode"], "local_fine_failed")
+        self.assertTrue(strategy["full_fine_scan_skipped"])
+        self.assertIsNone(strategy["final_anchor_source"])
         self.assertEqual(
             strategy["local_fine_error"]["kind"],
             "ocr_minute_boundary_not_found",
@@ -1331,6 +1422,49 @@ class ScoreboardClientTests(unittest.TestCase):
         request = json.loads(recovered.stream.writes[0])
         self.assertGreater(request["_request_timeout_seconds"], 0)
         self.assertLessEqual(request["_request_timeout_seconds"], 2.0)
+
+    def test_persistent_client_interrupts_socket_wait_on_shutdown(self):
+        class WaitingConnection:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def sendall(self, _value: bytes) -> None:
+                pass
+
+            def settimeout(self, _value: float) -> None:
+                pass
+
+            def recv(self, _size: int) -> bytes:
+                time.sleep(0.01)
+                raise socket.timeout()
+
+        cancel_event = threading.Event()
+        with tempfile.TemporaryDirectory() as directory:
+            worker = Path(directory) / "worker.py"
+            worker.write_text("# worker", encoding="utf-8")
+            timer = threading.Timer(0.03, cancel_event.set)
+            timer.start()
+            try:
+                with patch("scoreboard_ocr._ensure_persistent_worker"), patch(
+                    "scoreboard_ocr._connect_worker",
+                    return_value=WaitingConnection(),
+                ):
+                    with self.assertRaises(ScoreboardOcrError) as raised:
+                        _run_persistent_worker(
+                            {"candidate_path": "candidate.mp4"},
+                            worker=worker,
+                            python="ocr-python",
+                            timeout_seconds=2.0,
+                            cancel_event=cancel_event,
+                        )
+            finally:
+                timer.cancel()
+
+        self.assertEqual(raised.exception.kind, "ocr_request_cancelled")
+        self.assertEqual(raised.exception.diagnostics["stage"], "shutdown")
 
     def test_client_accepts_json_after_worker_dependency_logs(self):
         with tempfile.TemporaryDirectory() as directory:

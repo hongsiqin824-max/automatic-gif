@@ -70,6 +70,53 @@ class LiveRuntimeTests(unittest.TestCase):
         finally:
             release.set()
 
+    def test_pool_can_stop_submissions_and_wait_with_a_deadline(self):
+        pool = BoundedTaskPool(1, prioritized=True)
+        release = threading.Event()
+        started = threading.Event()
+
+        def hold():
+            started.set()
+            release.wait(2.0)
+
+        try:
+            self.assertTrue(pool.submit("holder", hold))
+            self.assertTrue(started.wait(2.0))
+            pool.stop_accepting()
+            with self.assertRaisesRegex(RuntimeError, "shutting down"):
+                pool.submit("late", lambda: None)
+            self.assertFalse(pool.wait_until_idle(0.01))
+            release.set()
+            self.assertTrue(pool.wait_until_idle(2.0))
+        finally:
+            release.set()
+            pool.shutdown(wait=True)
+
+    def test_cancel_pending_does_not_cancel_running_prioritized_job(self):
+        pool = BoundedTaskPool(1, prioritized=True)
+        release = threading.Event()
+        started = threading.Event()
+
+        def hold():
+            started.set()
+            release.wait(2.0)
+
+        try:
+            self.assertTrue(pool.submit("running", hold))
+            self.assertTrue(started.wait(2.0))
+            self.assertTrue(pool.submit("queued", lambda: None))
+
+            cancelled = pool.cancel_pending()
+
+            self.assertEqual(cancelled, ["queued"])
+            self.assertFalse(pool.futures["running"].cancelled())
+            self.assertTrue(pool.futures["queued"].cancelled())
+            release.set()
+            self.assertTrue(pool.wait_until_idle(2.0))
+        finally:
+            release.set()
+            pool.shutdown(wait=True)
+
     def test_supervisor_restarts_with_two_three_five_backoff(self):
         processes = [FakeProcess(1), FakeProcess(1), FakeProcess(1), FakeProcess(1)]
         popen = Mock(side_effect=processes)

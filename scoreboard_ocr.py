@@ -25,6 +25,7 @@ from typing import Any, Callable, Mapping, Sequence
 ROOT = Path(__file__).resolve().parent
 DEFAULT_WORKER = ROOT / "scoreboard_ocr_worker.py"
 DEFAULT_COARSE_SAMPLE_INTERVAL_SECONDS = 10.0
+DEFAULT_RECOVERY_SAMPLE_INTERVAL_SECONDS = 5.0
 DEFAULT_FINE_SCAN_RADIUS_SECONDS = 15.0
 GOAL_LIKE_EVENT_CODES = frozenset({"G", "OG", "PG"})
 SUPPORTED_EVENT_CODES = GOAL_LIKE_EVENT_CODES | frozenset({"YC", "RC"})
@@ -508,7 +509,7 @@ class ClockContinuityStateMachine:
         *,
         maximum_repair_gap_seconds: float = 5.0,
         maximum_consecutive_repairs: int = 3,
-        resync_observations: int = 4,
+        resync_observations: int = 3,
         second_half_clock_mode: str | None = None,
     ) -> None:
         if maximum_repair_gap_seconds <= 0:
@@ -611,6 +612,7 @@ class ClockContinuityStateMachine:
         period: str | None,
         period_number: int | None,
         parsed_clock: ParsedMatchClock | None = None,
+        preserve_resync: bool = False,
     ) -> ClockContinuityResult:
         self._last_video_seconds = video_seconds
         self._last_clock_seconds = clock_seconds
@@ -622,7 +624,8 @@ class ClockContinuityStateMachine:
             self._last_clock_format = parsed_clock.clock_format
             self._last_stoppage_base = parsed_clock.base_minute
             self._last_added_minutes = parsed_clock.added_minutes
-        self._clear_resync()
+        if not preserve_resync:
+            self._clear_resync()
         return ClockContinuityResult(
             video_seconds=video_seconds,
             clock_seconds=clock_seconds,
@@ -648,8 +651,12 @@ class ClockContinuityStateMachine:
         ):
             elapsed_video = video_seconds - self._resync_video_seconds
             clock_advance = observed_clock_seconds - self._resync_clock_seconds
-            maximum_advance = max(3, round(elapsed_video * 1.8) + 2)
-            continuous = elapsed_video > 0 and 0 <= clock_advance <= maximum_advance
+            allowed_deviation = max(1, round(elapsed_video * 0.35))
+            continuous = bool(
+                elapsed_video > 0
+                and clock_advance > 0
+                and abs(clock_advance - round(elapsed_video)) <= allowed_deviation
+            )
         else:
             continuous = False
         if continuous:
@@ -848,6 +855,18 @@ class ClockContinuityStateMachine:
         )
         if repaired_from_text is not None:
             expected = repaired_from_text
+        # Keep testing a coherent post-gap clock track while bounded repairs
+        # protect callers from the first one or two isolated OCR outliers.
+        if observed is not None:
+            resynchronized = self._consider_resync(
+                video_seconds=video_time,
+                observed_clock_seconds=observed,
+                parsed_clock=parsed,
+                period=period_text,
+                period_number=period_number,
+            )
+            if resynchronized is not None:
+                return resynchronized
         if can_repair:
             return self._accept(
                 video_seconds=video_time,
@@ -862,18 +881,9 @@ class ClockContinuityStateMachine:
                 display_text=parsed.display_text or raw_text or None,
                 period=period_text,
                 period_number=period_number,
+                preserve_resync=observed is not None,
             )
-        if observed is not None:
-            resynchronized = self._consider_resync(
-                video_seconds=video_time,
-                observed_clock_seconds=observed,
-                parsed_clock=parsed,
-                period=period_text,
-                period_number=period_number,
-            )
-            if resynchronized is not None:
-                return resynchronized
-        else:
+        if observed is None:
             self._clear_resync()
         self._consecutive_repairs = self.maximum_consecutive_repairs
         return ClockContinuityResult(
@@ -1153,12 +1163,19 @@ def _run_persistent_worker(
     worker: Path,
     python: str,
     timeout_seconds: float,
+    cancel_event: Any = None,
 ) -> subprocess.CompletedProcess[str]:
     socket_path = _persistent_socket_path(worker, python)
     deadline = time.monotonic() + timeout_seconds
     response = b""
     last_communication_error: OSError | None = None
     for attempt in range(2):
+        if cancel_event is not None and cancel_event.is_set():
+            raise ScoreboardOcrError(
+                "ocr_request_cancelled",
+                "scoreboard OCR request was cancelled during shutdown",
+                diagnostics={"worker_mode": "persistent", "stage": "shutdown"},
+            )
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
@@ -1173,17 +1190,50 @@ def _run_persistent_worker(
         try:
             connection = _connect_worker(socket_path, remaining)
             with connection:
-                with connection.makefile("rwb") as stream:
-                    stream.write(
-                        json.dumps(
-                            wire_payload,
-                            ensure_ascii=False,
-                            separators=(",", ":"),
-                        ).encode("utf-8")
-                        + b"\n"
-                    )
-                    stream.flush()
-                    response = stream.readline(10_000_001)
+                request_bytes = (
+                    json.dumps(
+                        wire_payload,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                    + b"\n"
+                )
+                if cancel_event is None:
+                    with connection.makefile("rwb") as stream:
+                        stream.write(request_bytes)
+                        stream.flush()
+                        response = stream.readline(10_000_001)
+                else:
+                    connection.sendall(request_bytes)
+                    chunks: list[bytes] = []
+                    response_size = 0
+                    while True:
+                        if cancel_event.is_set():
+                            raise ScoreboardOcrError(
+                                "ocr_request_cancelled",
+                                "scoreboard OCR request was cancelled during shutdown",
+                                diagnostics={
+                                    "worker_mode": "persistent",
+                                    "stage": "shutdown",
+                                },
+                            )
+                        read_remaining = deadline - time.monotonic()
+                        if read_remaining <= 0:
+                            raise socket.timeout("persistent OCR response timed out")
+                        connection.settimeout(min(0.25, read_remaining))
+                        try:
+                            chunk = connection.recv(
+                                min(65_536, 10_000_001 - response_size)
+                            )
+                        except socket.timeout:
+                            continue
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                        response_size += len(chunk)
+                        if b"\n" in chunk or response_size >= 10_000_001:
+                            break
+                    response = b"".join(chunks)
             if response:
                 break
             last_communication_error = OSError(
@@ -1247,11 +1297,18 @@ def run_scoreboard_ocr(
     timeout_seconds: float = 180.0,
     runner: Runner = subprocess.run,
     persistent: bool | None = None,
+    cancel_event: Any = None,
 ) -> dict[str, Any]:
     """Run PaddleOCR in a child Python and return its structured result."""
     if timeout_seconds <= 0:
         raise ValueError("timeout_seconds must be positive")
     payload = request.to_payload()
+    if cancel_event is not None and cancel_event.is_set():
+        raise ScoreboardOcrError(
+            "ocr_request_cancelled",
+            "scoreboard OCR request was cancelled during shutdown",
+            diagnostics={"stage": "shutdown"},
+        )
     worker = Path(worker_path)
     if not worker.is_file():
         raise ScoreboardOcrError(
@@ -1268,6 +1325,7 @@ def run_scoreboard_ocr(
             worker=worker,
             python=python,
             timeout_seconds=timeout_seconds,
+            cancel_event=cancel_event,
         )
     else:
         try:
@@ -1355,7 +1413,7 @@ def _remaining_timeout(deadline: float) -> float:
 
 
 def _coarse_timeout_budget(timeout_seconds: float) -> float:
-    # Keep most of the caller's deadline for the authoritative one-second pass.
+    # Preserve time for one bounded recovery pass and the local one-second scan.
     return min(timeout_seconds, 60.0, max(5.0, timeout_seconds * 0.4))
 
 
@@ -1417,8 +1475,12 @@ def _attach_sampling_strategy(
     fine_window_radius: float,
     coarse_result: Mapping[str, Any] | None = None,
     coarse_error: ScoreboardOcrError | None = None,
+    recovery_interval: float | None = None,
+    recovery_result: Mapping[str, Any] | None = None,
+    recovery_error: ScoreboardOcrError | None = None,
     local_fine_error: ScoreboardOcrError | None = None,
     fine_clip_start_seconds: float | None = None,
+    final_anchor_source: str = "fine_scan",
 ) -> dict[str, Any]:
     diagnostics = result.get("diagnostics")
     if not isinstance(diagnostics, dict):
@@ -1435,11 +1497,23 @@ def _attach_sampling_strategy(
             if coarse_result is not None
             else None
         ),
-        "coarse_error": coarse_error.as_dict() if coarse_error is not None else None,
+        "coarse_error": (
+            coarse_error.as_dict() if coarse_error is not None else None
+        ),
+        "recovery_sample_interval_seconds": recovery_interval,
+        "recovery_scan": (
+            _sampling_result_summary(recovery_result)
+            if recovery_result is not None
+            else None
+        ),
+        "recovery_error": (
+            recovery_error.as_dict() if recovery_error is not None else None
+        ),
         "local_fine_error": (
             local_fine_error.as_dict() if local_fine_error is not None else None
         ),
-        "final_anchor_source": "fine_scan",
+        "full_fine_scan_skipped": True,
+        "final_anchor_source": final_anchor_source,
     }
     return result
 
@@ -1518,60 +1592,50 @@ def _materialize_fine_scan_clip(
         )
 
 
-def _run_full_fine_scan(
-    request: ScoreboardOcrRequest,
+def _sampling_strategy_error(
+    error: ScoreboardOcrError,
     *,
-    python_executable: str | Path | None,
-    worker_path: str | Path,
-    timeout_seconds: float,
-    runner: Runner,
+    mode: str,
     coarse_interval: float,
+    fine_interval: float,
     fine_window_radius: float,
     coarse_result: Mapping[str, Any] | None = None,
     coarse_error: ScoreboardOcrError | None = None,
+    recovery_interval: float | None = None,
+    recovery_result: Mapping[str, Any] | None = None,
+    recovery_error: ScoreboardOcrError | None = None,
     local_fine_error: ScoreboardOcrError | None = None,
-) -> dict[str, Any]:
-    try:
-        result = run_scoreboard_ocr(
-            request,
-            python_executable=python_executable,
-            worker_path=worker_path,
-            timeout_seconds=timeout_seconds,
-            runner=runner,
-        )
-    except ScoreboardOcrError as exc:
-        strategy = {
-            "mode": "full_fine_fallback",
-            "coarse_sample_interval_seconds": coarse_interval,
-            "fine_sample_interval_seconds": request.sample_interval_seconds,
-            "fine_window_radius_seconds": fine_window_radius,
-            "coarse_scan": (
-                _sampling_result_summary(coarse_result)
-                if coarse_result is not None
-                else None
-            ),
-            "coarse_error": (
-                coarse_error.as_dict() if coarse_error is not None else None
-            ),
-            "local_fine_error": (
-                local_fine_error.as_dict() if local_fine_error is not None else None
-            ),
-            "final_anchor_source": "fine_scan",
-        }
-        raise ScoreboardOcrError(
-            exc.kind,
-            exc.message,
-            diagnostics={**exc.diagnostics, "sampling_strategy": strategy},
-        ) from exc
-    return _attach_sampling_strategy(
-        result,
-        mode="full_fine_fallback",
-        coarse_interval=coarse_interval,
-        fine_interval=request.sample_interval_seconds,
-        fine_window_radius=fine_window_radius,
-        coarse_result=coarse_result,
-        coarse_error=coarse_error,
-        local_fine_error=local_fine_error,
+) -> ScoreboardOcrError:
+    strategy = {
+        "mode": mode,
+        "coarse_sample_interval_seconds": coarse_interval,
+        "fine_sample_interval_seconds": fine_interval,
+        "fine_window_radius_seconds": fine_window_radius,
+        "coarse_scan": (
+            _sampling_result_summary(coarse_result)
+            if coarse_result is not None
+            else None
+        ),
+        "coarse_error": coarse_error.as_dict() if coarse_error is not None else None,
+        "recovery_sample_interval_seconds": recovery_interval,
+        "recovery_scan": (
+            _sampling_result_summary(recovery_result)
+            if recovery_result is not None
+            else None
+        ),
+        "recovery_error": (
+            recovery_error.as_dict() if recovery_error is not None else None
+        ),
+        "local_fine_error": (
+            local_fine_error.as_dict() if local_fine_error is not None else None
+        ),
+        "full_fine_scan_skipped": True,
+        "final_anchor_source": None,
+    }
+    return ScoreboardOcrError(
+        error.kind,
+        error.message,
+        diagnostics={**error.diagnostics, "sampling_strategy": strategy},
     )
 
 
@@ -1597,6 +1661,7 @@ def locate_scoreboard_event(
     candidate_input_format: str | None = None,
     candidate_seek_seconds: float = 0.0,
     candidate_duration_seconds: float | None = None,
+    cancel_event: Any = None,
 ) -> dict[str, Any]:
     """Locate an event, using a sparse clock scan before authoritative fine OCR."""
     request = ScoreboardOcrRequest(
@@ -1632,14 +1697,23 @@ def locate_scoreboard_event(
             worker_path=worker_path,
             timeout_seconds=timeout_seconds,
             runner=runner,
+            cancel_event=cancel_event,
         )
 
     deadline = time.monotonic() + timeout_seconds
     coarse_interval = float(coarse_sample_interval_seconds)
+    recovery_interval = min(
+        DEFAULT_RECOVERY_SAMPLE_INTERVAL_SECONDS,
+        coarse_interval / 2.0,
+    )
     coarse_request = replace(
         request,
         sample_interval_seconds=coarse_interval,
     )
+    coarse_result: dict[str, Any] | None = None
+    coarse_error: ScoreboardOcrError | None = None
+    recovery_result: dict[str, Any] | None = None
+    recovery_error: ScoreboardOcrError | None = None
     try:
         coarse_result = run_scoreboard_ocr(
             coarse_request,
@@ -1647,39 +1721,90 @@ def locate_scoreboard_event(
             worker_path=worker_path,
             timeout_seconds=_coarse_timeout_budget(timeout_seconds),
             runner=runner,
+            cancel_event=cancel_event,
         )
     except ScoreboardOcrError as exc:
         if exc.kind not in _COARSE_SCAN_MISS_KINDS:
             raise
-        return _run_full_fine_scan(
-            request,
-            python_executable=python_executable,
-            worker_path=worker_path,
-            timeout_seconds=_remaining_timeout(deadline),
-            runner=runner,
-            coarse_interval=coarse_interval,
-            fine_window_radius=fine_scan_radius_seconds,
-            coarse_error=exc,
-        )
+        coarse_error = exc
 
-    fine_center = _fine_scan_center(coarse_result, request)
+    fine_center = (
+        _fine_scan_center(coarse_result, request)
+        if coarse_result is not None
+        else None
+    )
     if fine_center is None:
-        coarse_error = ScoreboardOcrError(
-            "ocr_no_target",
-            "the coarse OCR scan returned no usable clock anchor",
-            diagnostics={"coarse_result": _sampling_result_summary(coarse_result)},
-        )
-        return _run_full_fine_scan(
+        if coarse_error is None:
+            coarse_error = ScoreboardOcrError(
+                "ocr_no_target",
+                "the coarse OCR scan returned no usable clock anchor",
+                diagnostics={
+                    "coarse_result": _sampling_result_summary(coarse_result or {})
+                },
+            )
+        if recovery_interval <= request.sample_interval_seconds:
+            raise _sampling_strategy_error(
+                coarse_error,
+                mode="coarse_recovery_unavailable",
+                coarse_interval=coarse_interval,
+                fine_interval=request.sample_interval_seconds,
+                fine_window_radius=fine_scan_radius_seconds,
+                coarse_result=coarse_result,
+                coarse_error=coarse_error,
+            ) from coarse_error
+        recovery_request = replace(
             request,
-            python_executable=python_executable,
-            worker_path=worker_path,
-            timeout_seconds=_remaining_timeout(deadline),
-            runner=runner,
-            coarse_interval=coarse_interval,
-            fine_window_radius=fine_scan_radius_seconds,
-            coarse_error=coarse_error,
+            sample_interval_seconds=recovery_interval,
         )
+        try:
+            recovery_result = run_scoreboard_ocr(
+                recovery_request,
+                python_executable=python_executable,
+                worker_path=worker_path,
+                timeout_seconds=_coarse_timeout_budget(
+                    _remaining_timeout(deadline)
+                ),
+                runner=runner,
+                cancel_event=cancel_event,
+            )
+        except ScoreboardOcrError as exc:
+            if exc.kind not in _COARSE_SCAN_MISS_KINDS:
+                raise
+            recovery_error = exc
+            raise _sampling_strategy_error(
+                exc,
+                mode="coarse_recovery_failed",
+                coarse_interval=coarse_interval,
+                fine_interval=request.sample_interval_seconds,
+                fine_window_radius=fine_scan_radius_seconds,
+                coarse_result=coarse_result,
+                coarse_error=coarse_error,
+                recovery_interval=recovery_interval,
+                recovery_error=recovery_error,
+            ) from exc
+        fine_center = _fine_scan_center(recovery_result, request)
+        if fine_center is None:
+            recovery_error = ScoreboardOcrError(
+                "ocr_no_target",
+                "the bounded recovery OCR scan returned no usable clock anchor",
+                diagnostics={
+                    "recovery_result": _sampling_result_summary(recovery_result)
+                },
+            )
+            raise _sampling_strategy_error(
+                recovery_error,
+                mode="coarse_recovery_no_anchor",
+                coarse_interval=coarse_interval,
+                fine_interval=request.sample_interval_seconds,
+                fine_window_radius=fine_scan_radius_seconds,
+                coarse_result=coarse_result,
+                coarse_error=coarse_error,
+                recovery_interval=recovery_interval,
+                recovery_result=recovery_result,
+                recovery_error=recovery_error,
+            ) from recovery_error
 
+    assert fine_center is not None
     local_center = fine_center - request.candidate_start_seconds
     fine_start = max(0.0, local_center - fine_scan_radius_seconds)
     fine_duration = fine_scan_radius_seconds * 2.0
@@ -1705,6 +1830,7 @@ def locate_scoreboard_event(
                 worker_path=worker_path,
                 timeout_seconds=_remaining_timeout(deadline),
                 runner=runner,
+                cancel_event=cancel_event,
             )
         else:
             with tempfile.TemporaryDirectory(prefix="scoreboard_ocr_fine_") as directory:
@@ -1730,30 +1856,44 @@ def locate_scoreboard_event(
                     worker_path=worker_path,
                     timeout_seconds=_remaining_timeout(deadline),
                     runner=runner,
+                    cancel_event=cancel_event,
                 )
     except ScoreboardOcrError as exc:
         if exc.kind not in _COARSE_SCAN_MISS_KINDS | {
             "ocr_frame_extraction_failed"
         }:
             raise
-        return _run_full_fine_scan(
-            request,
-            python_executable=python_executable,
-            worker_path=worker_path,
-            timeout_seconds=_remaining_timeout(deadline),
-            runner=runner,
+        raise _sampling_strategy_error(
+            exc,
+            mode="local_fine_failed",
             coarse_interval=coarse_interval,
+            fine_interval=request.sample_interval_seconds,
             fine_window_radius=fine_scan_radius_seconds,
             coarse_result=coarse_result,
+            coarse_error=coarse_error,
+            recovery_interval=(
+                recovery_interval if recovery_result is not None else None
+            ),
+            recovery_result=recovery_result,
+            recovery_error=recovery_error,
             local_fine_error=exc,
-        )
+        ) from exc
     return _attach_sampling_strategy(
         fine_result,
-        mode="coarse_then_local_fine",
+        mode=(
+            "coarse_recovery_then_local_fine"
+            if recovery_result is not None
+            else "coarse_then_local_fine"
+        ),
         coarse_interval=coarse_interval,
         fine_interval=request.sample_interval_seconds,
         fine_window_radius=fine_scan_radius_seconds,
         coarse_result=coarse_result,
+        coarse_error=coarse_error,
+        recovery_interval=(
+            recovery_interval if recovery_result is not None else None
+        ),
+        recovery_result=recovery_result,
         fine_clip_start_seconds=round(
             request.candidate_start_seconds + fine_start, 3
         ),
@@ -1764,6 +1904,7 @@ __all__ = [
     "ClockContinuityResult",
     "ClockContinuityStateMachine",
     "DEFAULT_COARSE_SAMPLE_INTERVAL_SECONDS",
+    "DEFAULT_RECOVERY_SAMPLE_INTERVAL_SECONDS",
     "DEFAULT_FINE_SCAN_RADIUS_SECONDS",
     "DEFAULT_WORKER",
     "ParsedMatchClock",

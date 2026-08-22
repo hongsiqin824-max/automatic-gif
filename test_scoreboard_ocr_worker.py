@@ -17,6 +17,7 @@ from scoreboard_ocr_worker import (
     BatchOcrWorker,
     DetectedText,
     WorkerError,
+    _SocketOcrRuntime,
     _auto_results_by_frame,
     _auto_readings,
     _extract_detected_texts,
@@ -27,6 +28,7 @@ from scoreboard_ocr_worker import (
     _profile_clock_readings,
     _profile_readings,
     _recognize_paths_shared,
+    _restartable_backend_generation,
     _validate_profile_content_quality,
     extract_auto_roi_frames,
     extract_profile_clock_frames,
@@ -676,6 +678,37 @@ class ProfileCropTests(unittest.TestCase):
             [2, 3],
         )
 
+    def test_clock_only_locates_exact_second_after_stream_gap_resynchronization(self):
+        readings, _continuity = _profile_clock_readings(
+            [
+                (["42:52"], [0.9]),
+                (["44:37"], [0.9]),
+                (["44:39"], [0.9]),
+                (["44:40"], [0.9]),
+                (["44:41"], [0.9]),
+            ],
+            profile=self._profile(),
+            sample_interval=1,
+            period=1,
+        )
+
+        result = locate_from_readings(
+            readings,
+            {
+                "event_code": "G",
+                "event_minute": 44,
+                "event_second": 44 * 60 + 40,
+                "clock_only": True,
+                "candidate_start_seconds": 100,
+                "sample_interval_seconds": 1,
+            },
+        )
+
+        self.assertEqual(readings[3].continuity_status, "resynchronized")
+        self.assertEqual(readings[3].clock_seconds, 44 * 60 + 40)
+        self.assertEqual(result["method"], "paddleocr_exact_clock")
+        self.assertEqual(result["anchor_seconds"], 103)
+
     @staticmethod
     def _clock_readings():
         return [
@@ -823,6 +856,39 @@ class ProfileCropTests(unittest.TestCase):
         self.assertEqual(result["method"], "paddleocr_exact_clock")
         self.assertEqual(result["precision"], "observed_second")
         self.assertEqual(result["localization_quality"], "exact")
+
+    def test_goal_second_rejects_isolated_exact_target_reading(self):
+        readings = [frame_reading(0, 7.0, ["69:37"], [0.95])]
+
+        with self.assertRaises(WorkerError) as raised:
+            locate_from_readings(
+                readings,
+                {"event_code": "G", "event_second": 69 * 60 + 37},
+            )
+
+        self.assertEqual(raised.exception.kind, "ocr_exact_second_not_found")
+        diagnostics = raised.exception.diagnostics
+        self.assertEqual(diagnostics["isolated_target_reading_count"], 1)
+        self.assertEqual(
+            diagnostics["accepted_isolated_target_reading_count"], 0
+        )
+        self.assertEqual(diagnostics["direct_observation_candidate_count"], 0)
+        self.assertEqual(diagnostics["exact_second_failure_cause"], "isolated")
+
+    def test_goal_second_accepts_target_with_adjacent_continuity_reading(self):
+        readings = [
+            frame_reading(0, 7.0, ["69:37"], [0.95]),
+            frame_reading(1, 8.0, ["69:38"], [0.95]),
+        ]
+
+        result = locate_from_readings(
+            readings,
+            {"event_code": "G", "event_second": 69 * 60 + 37},
+        )
+
+        self.assertEqual(result["method"], "paddleocr_exact_clock")
+        self.assertEqual(result["precision"], "observed_second")
+        self.assertEqual(result["anchor_seconds"], 7.0)
 
     def test_goal_second_direct_observation_precedes_disjoint_interpolation(self):
         readings = [
@@ -1233,6 +1299,83 @@ class ProfileCropTests(unittest.TestCase):
 
 
 class BatchOcrWorkerTests(unittest.TestCase):
+    def test_runtime_invalidates_only_failed_generation(self):
+        release_first = threading.Event()
+        first_started = threading.Event()
+        calls = 0
+
+        def recognizer(_engine, crops, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                first_started.set()
+                release_first.wait(2)
+            return [([str(crop)], [0.9]) for crop in crops]
+
+        runtime = _SocketOcrRuntime(
+            engine_factory=lambda _language: object(),
+            batch_recognizer=recognizer,
+            max_batch_size=1,
+            batch_wait_seconds=0,
+            queue_capacity=2,
+        )
+        first_worker = runtime.worker_for("en")
+        pending = first_worker.submit(
+            match_id="match-a",
+            video_pts=1,
+            kind="clock",
+            profile="source-a",
+            crop="10:00",
+        )
+        try:
+            self.assertTrue(first_started.wait(1))
+            restart = runtime.invalidate_generation(first_worker.generation)
+            with self.assertRaises(WorkerError) as invalidated:
+                pending.result(timeout=1)
+            self.assertEqual(
+                invalidated.exception.kind,
+                "ocr_backend_generation_invalidated",
+            )
+
+            second_worker = runtime.worker_for("en")
+            recovered = second_worker.submit(
+                match_id="match-b",
+                video_pts=2,
+                kind="clock",
+                profile="source-a",
+                crop="10:01",
+            ).result(timeout=1)
+        finally:
+            release_first.set()
+            runtime.close(timeout=1)
+
+        self.assertTrue(restart["ocr_backend_restarted"])
+        self.assertEqual(restart["backend_generation_before"], 1)
+        self.assertEqual(restart["backend_generation_after"], 2)
+        self.assertEqual(recovered.backend_generation, 2)
+
+    def test_request_local_errors_do_not_select_backend_restart(self):
+        for kind, stage in (
+            ("scoreboard_missing", "profile_content_validation"),
+            ("clock_profile_mismatch", "profile_validation"),
+            ("ocr_exact_second_not_found", "target_localization"),
+        ):
+            with self.subTest(kind=kind):
+                document = {
+                    "ok": False,
+                    "error": {
+                        "kind": kind,
+                        "diagnostics": {
+                            "stage": stage,
+                            # Even a malformed upstream diagnostic must not
+                            # turn a request-local failure into a restart.
+                            "backend_unhealthy": True,
+                            "backend_generation": 1,
+                        },
+                    },
+                }
+                self.assertIsNone(_restartable_backend_generation(document))
+
     def test_shared_path_recognition_streams_more_crops_than_queue_capacity(self):
         def slow_recognizer(_engine, crops, **_kwargs):
             time.sleep(0.35)
@@ -1689,16 +1832,23 @@ class PersistentSocketTests(unittest.TestCase):
 
         self.assertFalse(server.is_alive())
 
-    def test_backend_timeout_stops_daemon_for_clean_restart(self):
+    def test_backend_timeout_restarts_generation_and_requeues_once(self):
         release_backend = threading.Event()
+        backend_calls = 0
+        backend_lock = threading.Lock()
 
         def blocked_recognizer(_engine, crops, **_kwargs):
-            release_backend.wait(2)
+            nonlocal backend_calls
+            with backend_lock:
+                backend_calls += 1
+                call = backend_calls
+            if call == 1:
+                release_backend.wait(2)
             return [([str(crop)], [0.9]) for crop in crops]
 
         def execute(request, *, batch_worker, request_timeout_seconds):
             try:
-                _recognize_paths_shared(
+                recognized, _failed = _recognize_paths_shared(
                     batch_worker,
                     [Path("clock.png")],
                     kinds=["clock"],
@@ -1711,7 +1861,13 @@ class PersistentSocketTests(unittest.TestCase):
                 )
             except WorkerError as exc:
                 return {"ok": False, "error": exc.as_dict()}, 2
-            raise AssertionError("blocked backend unexpectedly completed")
+            return {
+                "ok": True,
+                "result": {
+                    "texts": recognized[0][0],
+                    "diagnostics": {},
+                },
+            }, 0
 
         with tempfile.TemporaryDirectory() as directory:
             socket_path = Path(directory) / "ocr.sock"
@@ -1728,14 +1884,23 @@ class PersistentSocketTests(unittest.TestCase):
             self._wait_for_socket(socket_path)
             response = self._exchange(
                 socket_path,
-                {"id": "slow", "_request_timeout_seconds": 0.2},
+                {"id": "slow", "_request_timeout_seconds": 0.8},
             )
+            healthy = self._exchange(
+                socket_path,
+                {"id": "healthy", "_request_timeout_seconds": 0.8},
+            )
+            self._exchange(socket_path, {"command": "shutdown"})
             release_backend.set()
             server.join(timeout=2)
 
-        self.assertFalse(response["ok"])
-        self.assertEqual(response["error"]["kind"], "inference_timeout")
-        self.assertTrue(response["error"]["diagnostics"]["backend_unhealthy"])
+        self.assertTrue(response["ok"])
+        restart = response["result"]["diagnostics"]
+        self.assertTrue(restart["ocr_backend_restarted"])
+        self.assertEqual(restart["backend_generation_before"], 1)
+        self.assertEqual(restart["backend_generation_after"], 2)
+        self.assertEqual(restart["ocr_backend_restart_retry_count"], 1)
+        self.assertTrue(healthy["ok"])
         self.assertFalse(server.is_alive())
 
     def test_ffprobe_timeout_is_structured(self):

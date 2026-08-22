@@ -15,10 +15,10 @@ from typing import Any, Callable
 
 
 # Keep one shared heavy slot available for the default GIF path while allowing
-# four OCR jobs to run concurrently on the deployment machine.  Both limits
+# two OCR jobs to run concurrently on the deployment machine.  Both limits
 # remain overridable through GIF_MAX_CONCURRENT_* for smaller servers.
 DEFAULT_MAX_CONCURRENT_HEAVY_TASKS = 5
-DEFAULT_MAX_CONCURRENT_VISION_TASKS = 4
+DEFAULT_MAX_CONCURRENT_VISION_TASKS = 2
 DEFAULT_RESERVED_GIF_SLOTS = 1
 DEFAULT_LEASE_SECONDS = 15.0
 DEFAULT_POLL_SECONDS = 0.1
@@ -61,6 +61,10 @@ def _positive_environment_integer(name: str, default: int) -> int:
 
 def configured_limits() -> tuple[int, int]:
     """Return heavy/vision limits from the process environment."""
+    worker_vision_limit = _positive_environment_integer(
+        "GIF_VISION_WORKERS",
+        DEFAULT_MAX_CONCURRENT_VISION_TASKS,
+    )
     return (
         _positive_environment_integer(
             "GIF_MAX_CONCURRENT_HEAVY_TASKS",
@@ -68,7 +72,7 @@ def configured_limits() -> tuple[int, int]:
         ),
         _positive_environment_integer(
             "GIF_MAX_CONCURRENT_VISION_TASKS",
-            DEFAULT_MAX_CONCURRENT_VISION_TASKS,
+            worker_vision_limit,
         ),
     )
 

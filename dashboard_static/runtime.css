@@ -125,6 +125,9 @@
 .ingest-error-message span{color:#c9858d;white-space:nowrap}
 .ingest-error-message b{font-weight:600;overflow-wrap:anywhere;word-break:break-word}
 .runtime-message{margin-top:12px;padding:9px 10px;border-left:2px solid var(--amber);background:#231e16;color:#f2c876;font-size:10px;line-height:1.45;overflow-wrap:anywhere}
+.runtime-issues{display:grid;gap:1px;margin-top:12px;background:#3a2428;border-left:3px solid var(--red)}
+.runtime-issue{display:grid;grid-template-columns:76px minmax(0,1fr);gap:10px;padding:10px 12px;background:#25181d;font-size:10px;line-height:1.65}
+.runtime-issue b{color:#ff9e9e}.runtime-issue span{color:#e5b7bc;overflow-wrap:anywhere;word-break:break-word}
 
 .event-legend{display:flex;gap:17px;flex-wrap:wrap;margin:-8px 0 15px;color:var(--muted);font-size:10px}
 .event-legend span{display:flex;align-items:center;gap:6px}
@@ -140,10 +143,18 @@
 .events-panel .gif-link{display:inline-block;font-size:10px}
 .events-panel .event-row{grid-template-columns:104px 58px minmax(150px,1fr) minmax(270px,1.2fr)}
 .artifact-list{display:grid;gap:6px;min-width:0}
-.artifact{display:flex;align-items:center;justify-content:space-between;gap:8px;background:#182431;border:1px solid #2a3a4c;border-radius:4px;padding:7px 8px;color:#aebdcb;font-size:10px;min-width:0}
+.artifact{display:flex;align-items:flex-start;justify-content:space-between;gap:8px;background:#182431;border:1px solid #2a3a4c;border-radius:4px;padding:7px 8px;color:#aebdcb;font-size:10px;min-width:0}
+.artifact-copy{display:grid;gap:0;min-width:0;flex:1}
 .artifact span{min-width:0;overflow-wrap:anywhere}.artifact small{display:block;min-width:0;color:#ff9999;overflow-wrap:anywhere;word-break:break-word}
 .technical-details{margin-top:5px;color:#8ea0b5;font-size:9px;line-height:1.4}.technical-details summary{color:#8ea0b5;cursor:pointer;list-style:none}.technical-details summary::-webkit-details-marker{display:none}.technical-details summary::before{content:'+';display:inline-block;width:11px;color:#5de1d0;font-weight:700}.technical-details[open] summary::before{content:'-';}.technical-details small{margin-top:4px;color:#718397!important;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
-.artifact.encoded{background:#14372e;color:#72e5b3}.artifact.encoding,.artifact.pending{background:#17353b;color:#76ddd3}.artifact.failed{background:#45262b;color:#ff9999}
+.technical-details small{font-family:inherit;line-height:1.55}
+.failure-report{display:grid;gap:6px;margin-top:8px;padding-top:8px;border-top:1px solid rgba(255,153,153,.28);font-size:10px;line-height:1.55}
+.failure-report>b{color:#ffd0d0;font-size:11px}
+.failure-report>span{display:grid;grid-template-columns:92px minmax(0,1fr);gap:8px;color:#e1b3b8}
+.failure-report strong{color:#ff9999;font-weight:600}
+.event-row:has(.failure-report){align-items:start}
+.event-row:has(.failure-report) .artifact-list{grid-column:1/-1}
+.artifact.encoded{background:#14372e;color:#72e5b3}.artifact.encoding,.artifact.pending{background:#17353b;color:#76ddd3}.artifact.warning{background:#3a311c;color:#ffd47c}.artifact.warning small{color:#ffd47c}.artifact.warning .failure-report{border-top-color:rgba(255,212,124,.3)}.artifact.warning .failure-report>b,.artifact.warning .failure-report strong{color:#ffe0a3}.artifact.warning .failure-report>span{color:#e5c98e}.artifact.failed{background:#45262b;color:#ff9999}
 .vision-toggle{display:grid!important;grid-template-columns:1fr auto;align-items:center;background:#0d1723;border:1px solid var(--line);border-radius:6px;padding:10px 12px}
 .vision-toggle input{width:18px!important;height:18px;margin:0!important;accent-color:var(--cyan)}
 .vision-toggle small{position:static!important;grid-column:1;color:var(--muted)}
@@ -166,6 +177,8 @@
   .runtime-proof div:last-child{border-bottom:0}
   .ingest-error-message{grid-template-columns:1fr;gap:4px}
   .ingest-error-message span{white-space:normal}
+  .runtime-issue{grid-template-columns:1fr;gap:3px}
+  .failure-report>span{grid-template-columns:1fr;gap:2px}
   .logs-panel .log-line{grid-template-columns:1fr}
 }
 

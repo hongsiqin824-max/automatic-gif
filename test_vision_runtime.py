@@ -13,6 +13,7 @@ from pipeline_runtime import PipelineRuntime
 from scoreboard_ocr import ScoreboardOcrError
 from vision_locator import VisionCandidateNotFound
 from vision_runtime import (
+    OCR_FFMPEG_WATCHDOG_SECONDS,
     VisionJob,
     VisualLocationFailed,
     _continuous_search_components,
@@ -24,6 +25,8 @@ from vision_runtime import (
     _ocr_progressive_clock_mapping,
     _ocr_progressive_mapped_target_window,
     _ocr_progressive_merge_clock_samples,
+    _latest_trusted_clock_seconds,
+    _ocr_progressive_state,
     _ocr_progressive_target_rescan_window,
     _ocr_localization_contract,
     _ocr_progressive_target_seconds,
@@ -190,6 +193,11 @@ class VisionRuntimeTests(unittest.TestCase):
                 "candidate_start_seconds": 80.0,
                 "clock_raw_observations": [
                     {
+                        "frame_seconds": 35.0,
+                        "effective_clock_seconds": 115,
+                        "continuity_status": "accepted",
+                    },
+                    {
                         "frame_seconds": 45.0,
                         "effective_clock_seconds": 125,
                         "continuity_status": "accepted",
@@ -198,11 +206,119 @@ class VisionRuntimeTests(unittest.TestCase):
             },
             target_clock_seconds=120,
         )
-        self.assertEqual(window["method"], "one_sided_clock_projection")
-        self.assertEqual(window["start_stream_time"], 100.0)
-        self.assertEqual(window["end_stream_time"], 140.0)
+        self.assertEqual(window["method"], "two_sided_clock_interpolation")
+        self.assertEqual(window["start_stream_time"], 105.0)
+        self.assertEqual(window["end_stream_time"], 135.0)
+        self.assertEqual(window["margin_seconds"], 15.0)
         self.assertEqual(window["sample_interval_seconds"], 1.0)
         self.assertEqual(window["scan_mode"], "target_centered_rescan")
+
+    def test_single_clock_beyond_target_cannot_start_target_rescan(self):
+        window = _ocr_progressive_target_rescan_window(
+            {
+                "candidate_start_seconds": 80.0,
+                "clock_raw_observations": [
+                    {
+                        "frame_seconds": 45.0,
+                        "effective_clock_seconds": 8294,
+                        "continuity_status": "accepted",
+                    }
+                ],
+            },
+            target_clock_seconds=120,
+        )
+        self.assertIsNone(window)
+
+    def test_latest_clock_uses_stream_order_and_ignores_nested_summaries(self):
+        diagnostics = {
+            "target_clock_seconds": 9999,
+            "unrelated": {
+                "clock_raw_observations": [
+                    {
+                        "frame_seconds": 999.0,
+                        "effective_clock_seconds": 9999,
+                        "continuity_status": "accepted",
+                    }
+                ]
+            },
+            "candidate_start_seconds": 100.0,
+            "clock_raw_observations": [
+                {
+                    "frame_seconds": 20.0,
+                    "effective_clock_seconds": 70,
+                    "continuity_status": "accepted",
+                },
+                {
+                    "frame_seconds": 10.0,
+                    "effective_clock_seconds": 60,
+                    "continuity_status": "accepted",
+                },
+            ],
+        }
+        self.assertEqual(_latest_trusted_clock_seconds(diagnostics), 70)
+
+    def test_latest_clock_rejects_repaired_rejected_and_ambiguous_samples(self):
+        diagnostics = {
+            "candidate_start_seconds": 100.0,
+            "clock_raw_observations": [
+                {"frame_seconds": 0.0, "effective_clock_seconds": 50, "continuity_status": "accepted"},
+                {"frame_seconds": 10.0, "effective_clock_seconds": 60, "continuity_status": "accepted"},
+                {"frame_seconds": 20.0, "effective_clock_seconds": 5000, "continuity_status": "repaired"},
+                {"frame_seconds": 21.0, "effective_clock_seconds": 5001, "continuity_status": "rejected"},
+                {"frame_seconds": 22.0, "effective_clock_seconds": 5002, "continuity_status": "accepted", "ambiguous_clock": True},
+            ],
+        }
+        self.assertEqual(_latest_trusted_clock_seconds(diagnostics), 60)
+
+    def test_merge_drops_anomalous_latest_jump_from_durable_state(self):
+        merged = _ocr_progressive_merge_clock_samples(
+            [
+                {"stream_time": 100.0, "match_clock_seconds": 50},
+                {"stream_time": 110.0, "match_clock_seconds": 60},
+            ],
+            {
+                "candidate_start_seconds": 100.0,
+                "clock_raw_observations": [
+                    {"frame_seconds": 20.0, "effective_clock_seconds": 5000, "continuity_status": "accepted"},
+                ],
+            },
+        )
+        self.assertEqual(
+            merged,
+            [
+                {"stream_time": 100.0, "match_clock_seconds": 50},
+                {"stream_time": 110.0, "match_clock_seconds": 60},
+            ],
+        )
+
+    def test_sqlite_restored_latest_is_recomputed_from_valid_samples(self):
+        class RestoredTask:
+            window_metadata = {
+                "progressive_scan": {
+                    "latest_trusted_clock_seconds": 5000,
+                    "clock_samples": [
+                        {"stream_time": 100.0, "match_clock_seconds": 50},
+                        {"stream_time": 110.0, "match_clock_seconds": 60},
+                        {"stream_time": 120.0, "match_clock_seconds": 5000},
+                    ],
+                }
+            }
+
+        restored = _ocr_progressive_state(RestoredTask())
+        self.assertEqual(restored["latest_trusted_clock_seconds"], 60)
+        self.assertEqual(restored["clock_state_recovery"]["stored_latest_trusted_clock_seconds"], 5000)
+
+    def test_sqlite_restored_latest_without_samples_is_cleared(self):
+        class LegacyTask:
+            window_metadata = {
+                "progressive_scan": {
+                    "latest_trusted_clock_seconds": 8294,
+                }
+            }
+
+        restored = _ocr_progressive_state(LegacyTask())
+        self.assertIsNone(restored["latest_trusted_clock_seconds"])
+        self.assertEqual(restored["clock_samples"], [])
 
     def test_ocr_localization_contract_exposes_evidence_grade(self):
         self.assertEqual(
@@ -811,6 +927,11 @@ class VisionRuntimeTests(unittest.TestCase):
                     "candidate_start_seconds": 80.0,
                     "clock_raw_observations": [
                         {
+                            "frame_seconds": 35.0,
+                            "effective_clock_seconds": 115,
+                            "continuity_status": "accepted",
+                        },
+                        {
                             "frame_seconds": 45.0,
                             "effective_clock_seconds": 125,
                             "continuity_status": "accepted",
@@ -866,8 +987,8 @@ class VisionRuntimeTests(unittest.TestCase):
             self.assertEqual(locate.call_args_list[1].kwargs["sample_interval_seconds"], 1.0)
             self.assertEqual(locate.call_args_list[2].kwargs["sample_interval_seconds"], 1.0)
             self.assertEqual(locate.call_args_list[3].kwargs["sample_interval_seconds"], 1.0)
-            self.assertEqual(locate.call_args_list[1].kwargs["window_start"], 100.0)
-            self.assertEqual(locate.call_args_list[1].kwargs["window_end"], 140.0)
+            self.assertEqual(locate.call_args_list[1].kwargs["window_start"], 105.0)
+            self.assertEqual(locate.call_args_list[1].kwargs["window_end"], 135.0)
             self.assertEqual(locate.call_args_list[2].kwargs["window_start"], 90.0)
             self.assertEqual(locate.call_args_list[2].kwargs["window_end"], 150.0)
             self.assertEqual(locate.call_args_list[3].kwargs["window_start"], 90.0)
@@ -894,6 +1015,11 @@ class VisionRuntimeTests(unittest.TestCase):
                 {
                     "candidate_start_seconds": 80.0,
                     "clock_raw_observations": [
+                        {
+                            "frame_seconds": 35.0,
+                            "effective_clock_seconds": 115,
+                            "continuity_status": "accepted",
+                        },
                         {
                             "frame_seconds": 45.0,
                             "effective_clock_seconds": 125,
@@ -1118,6 +1244,7 @@ class VisionRuntimeTests(unittest.TestCase):
                 "location_kind": "match_clock_second",
                 "method": "paddleocr_exact_clock",
                 "precision": "observed_second",
+                "localization_quality": "exact",
                 "target_clock": "02:00",
                 "target_clock_seconds": 120,
                 "diagnostics": {},
@@ -1181,6 +1308,7 @@ class VisionRuntimeTests(unittest.TestCase):
                 "location_kind": "match_clock_second",
                 "method": "paddleocr_exact_clock",
                 "precision": "observed_second",
+                "localization_quality": "exact",
                 "target_clock": "02:00",
                 "target_clock_seconds": 120,
                 "diagnostics": {},
@@ -1249,6 +1377,130 @@ class VisionRuntimeTests(unittest.TestCase):
             )
             runtime.close()
 
+    def test_ocr_output_stitches_internal_video_gap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime, job = self._create_progressive_ocr_job(root, "stitched-output")
+            before_gap = root / "before-gap.ts"
+            after_gap = root / "after-gap.ts"
+            before_gap.write_bytes(b"video")
+            after_gap.write_bytes(b"video")
+            segments = [
+                Segment(before_gap, 170.0, 185.0),
+                Segment(after_gap, 190.0, 235.0),
+            ]
+            located = {
+                "anchor_stream_time": 200.0,
+                "anchor_seconds": 200.0,
+                "location_kind": "match_clock_second",
+                "method": "paddleocr_exact_clock",
+                "precision": "observed_second",
+                "localization_quality": "exact",
+                "target_clock": "02:00",
+                "target_clock_seconds": 120,
+                "diagnostics": {},
+            }
+
+            with (
+                patch(
+                    "vision_runtime._locate_ocr_window_across_components",
+                    return_value=(
+                        located,
+                        {
+                            "window_start_stream_time": 80.0,
+                            "window_end_stream_time": 235.0,
+                        },
+                        [str(before_gap), str(after_gap)],
+                    ),
+                ),
+                patch(
+                    "vision_runtime.encode_gif",
+                    return_value={
+                        "output": str(root / "ocr-stitched.gif"),
+                        "bytes": 1234,
+                        "duration_sec": 55.0,
+                    },
+                ) as encode,
+            ):
+                self.assertTrue(
+                    self._run_progressive_ocr(job, runtime, lambda: segments, root)
+                )
+
+            coverage = encode.call_args.kwargs["coverage"]
+            self.assertEqual(coverage.status, CoverageStatus.READY_DEGRADED)
+            self.assertTrue(coverage.stitched_across_gap)
+            self.assertEqual(coverage.coverage_quality, "stitched_across_gap")
+            self.assertEqual(coverage.video_gap_count, 1)
+            self.assertEqual(coverage.skipped_gap_seconds, 5.0)
+            encoded = runtime.store.get_vision_task(job.event_key, "ocr_window")
+            self.assertEqual(encoded.status, "encoded")
+            self.assertTrue(encoded.result["stitched_across_gap"])
+            self.assertTrue(encoded.result["precise_location"])
+            self.assertTrue(encoded.result["event_frame_present"])
+            runtime.close()
+
+    def test_ocr_output_uses_nearest_boundary_for_small_anchor_gap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime, job = self._create_progressive_ocr_job(root, "anchor-gap-output")
+            before_gap = root / "before-anchor-gap.ts"
+            after_gap = root / "after-anchor-gap.ts"
+            before_gap.write_bytes(b"video")
+            after_gap.write_bytes(b"video")
+            segments = [
+                Segment(before_gap, 170.0, 198.0),
+                Segment(after_gap, 202.0, 235.0),
+            ]
+            located = {
+                "anchor_stream_time": 200.0,
+                "anchor_seconds": 200.0,
+                "location_kind": "match_clock_second",
+                "method": "paddleocr_exact_clock",
+                "precision": "observed_second",
+                "localization_quality": "exact",
+                "target_clock": "02:00",
+                "target_clock_seconds": 120,
+                "diagnostics": {},
+            }
+
+            with (
+                patch(
+                    "vision_runtime._locate_ocr_window_across_components",
+                    return_value=(
+                        located,
+                        {
+                            "window_start_stream_time": 80.0,
+                            "window_end_stream_time": 235.0,
+                        },
+                        [str(before_gap), str(after_gap)],
+                    ),
+                ),
+                patch(
+                    "vision_runtime.encode_gif",
+                    return_value={
+                        "output": str(root / "ocr-anchor-adjusted.gif"),
+                        "bytes": 1234,
+                        "duration_sec": 56.0,
+                    },
+                ) as encode,
+            ):
+                self.assertTrue(
+                    self._run_progressive_ocr(job, runtime, lambda: segments, root)
+                )
+
+            coverage = encode.call_args.kwargs["coverage"]
+            self.assertEqual(coverage.status, CoverageStatus.READY_DEGRADED)
+            self.assertTrue(coverage.stitched_across_gap)
+            self.assertTrue(coverage.anchor_adjusted)
+            self.assertEqual(coverage.anchor_adjusted_to, 198.0)
+            self.assertTrue(coverage.event_frame_may_be_missing)
+            encoded = runtime.store.get_vision_task(job.event_key, "ocr_window")
+            self.assertEqual(encoded.status, "encoded")
+            self.assertTrue(encoded.result["approximate"])
+            self.assertFalse(encoded.result["precise_location"])
+            self.assertFalse(encoded.result["event_frame_present"])
+            runtime.close()
+
     def test_progressive_ocr_deadline_distinguishes_clock_failures(self):
         cases = (
             (
@@ -1271,8 +1523,10 @@ class VisionRuntimeTests(unittest.TestCase):
                 "history-evicted",
                 100.0,
                 {
+                    "candidate_start_seconds": 80.0,
                     "clock_raw_observations": [
-                        {"clock": "02:05", "continuity_status": "accepted"}
+                        {"frame_seconds": 35.0, "clock": "01:55", "continuity_status": "accepted"},
+                        {"frame_seconds": 45.0, "clock": "02:05", "continuity_status": "accepted"},
                     ]
                 },
                 "waiting_for_target_rescan",
@@ -1489,19 +1743,28 @@ class VisionRuntimeTests(unittest.TestCase):
             )
             task = runtime.store.get_vision_task(job.event_key, "ocr_window")
             created = task.created_at_unix
+            passed_samples = [
+                {"stream_time": 90.0, "match_clock_seconds": 115},
+                {"stream_time": 100.0, "match_clock_seconds": 125},
+            ]
             first = _ocr_deadline_policy(
                 task,
                 now_unix=created,
                 target_clock_seconds=120,
                 latest_trusted_clock_seconds=125,
                 latest_media_end_stream_time=100.0,
+                clock_samples=passed_samples,
             )
             runtime.record_vision_readiness_wait(
                 job.event_key,
                 "persist target-passed media baseline",
                 artifact_kind="ocr_window",
                 error_kind="waiting_for_clock_target",
-                window_metadata={"progressive_scan": {"deadline_policy": first}},
+                window_metadata={"progressive_scan": {
+                    "deadline_policy": first,
+                    "clock_samples": passed_samples,
+                    "latest_trusted_clock_seconds": 125,
+                }},
                 now=created,
             )
             persisted = runtime.store.get_vision_task(job.event_key, "ocr_window")
@@ -1511,6 +1774,7 @@ class VisionRuntimeTests(unittest.TestCase):
                 target_clock_seconds=120,
                 latest_trusted_clock_seconds=125,
                 latest_media_end_stream_time=100.0,
+                clock_samples=passed_samples,
             )
 
             self.assertFalse(updated["media_stalled"])
@@ -1877,8 +2141,10 @@ class VisionRuntimeTests(unittest.TestCase):
                 "ocr_exact_second_not_found",
                 "target clock was not located",
                 {
+                    "candidate_start_seconds": 80.0,
                     "clock_raw_observations": [
-                        {"clock": "02:05", "continuity_status": "accepted"}
+                        {"frame_seconds": 35.0, "clock": "01:55", "continuity_status": "accepted"},
+                        {"frame_seconds": 45.0, "clock": "02:05", "continuity_status": "accepted"},
                     ]
                 },
             )
@@ -1905,7 +2171,7 @@ class VisionRuntimeTests(unittest.TestCase):
             task = runtime.store.get_vision_task(job.event_key, "ocr_window")
             self.assertEqual(task.status, "pending")
             progress = task.window_metadata["progressive_scan"]
-            self.assertEqual(progress["target_rescan_window"]["margin_seconds"], 20.0)
+            self.assertEqual(progress["target_rescan_window"]["margin_seconds"], 15.0)
             self.assertEqual(progress["target_rescan_attempt_count"], 0)
             runtime.close()
 
@@ -2528,6 +2794,58 @@ class VisionRuntimeTests(unittest.TestCase):
 
             self.assertEqual(locate.call_args.kwargs["sample_interval_seconds"], 1.0)
 
+    def test_slow_video_preparation_uses_independent_watchdog_and_clear_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            segment = root / "segment.ts"
+            segment.write_bytes(b"video")
+            ocr_python = root / "ocr-python"
+            ocr_python.write_bytes(b"python")
+            job = VisionJob(
+                "match:YC:prepare-timeout",
+                "match",
+                "YC",
+                "yellow_card",
+                10.0,
+                None,
+                1.0,
+                event_minute="1",
+                clock_only=True,
+            )
+            timeout = subprocess.TimeoutExpired(
+                ["ffmpeg"], OCR_FFMPEG_WATCHDOG_SECONDS
+            )
+            with (
+                patch(
+                    "vision_runtime.materialize_analysis_clip",
+                    side_effect=timeout,
+                ) as materialize,
+                patch("vision_runtime.locate_scoreboard_event") as locate,
+                self.assertRaises(VisualLocationFailed) as caught,
+            ):
+                _locate_ocr_window_across_components(
+                    job,
+                    [Segment(segment, 0.0, 10.0)],
+                    window_start=0.0,
+                    window_end=10.0,
+                    analysis_path=root / "candidate.mp4",
+                    ffmpeg="ffmpeg",
+                    ocr_python=ocr_python,
+                    ocr_timeout_seconds=5.0,
+                    minimum_component_seconds=3.0,
+                )
+
+            self.assertEqual(caught.exception.kind, "ocr_video_preparation_timeout")
+            self.assertEqual(
+                caught.exception.diagnostics["stage"],
+                "ocr_video_preparation",
+            )
+            self.assertEqual(
+                materialize.call_args.kwargs["timeout_seconds"],
+                OCR_FFMPEG_WATCHDOG_SECONDS,
+            )
+            locate.assert_not_called()
+
     def test_direct_ts_ocr_failure_falls_back_to_existing_mp4_path(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2924,6 +3242,154 @@ class VisionRuntimeTests(unittest.TestCase):
                 [call.kwargs["event_second"] for call in locate.call_args_list],
                 [4177, 4177],
             )
+
+    def test_exact_ocr_target_stops_before_later_disconnected_components(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = [root / f"part-{index}.ts" for index in range(3)]
+            for path in paths:
+                path.write_bytes(b"video")
+            ocr_python = root / "ocr-python"
+            ocr_python.write_bytes(b"python")
+            segments = [
+                Segment(paths[0], 0.0, 20.0),
+                Segment(paths[1], 40.0, 60.0),
+                Segment(paths[2], 80.0, 100.0),
+            ]
+            job = VisionJob(
+                "match:G:early-exact",
+                "match",
+                "G",
+                "goal",
+                95.0,
+                None,
+                1000.0,
+                event_minute="1",
+                event_second=60,
+                clock_only=True,
+            )
+
+            def materialize(_ffmpeg, _segments, output, **kwargs):
+                return {
+                    "path": str(output),
+                    "window_start_stream_time": kwargs["window_start"],
+                    "window_end_stream_time": kwargs["window_end"],
+                }
+
+            with (
+                patch(
+                    "vision_runtime.materialize_analysis_clip",
+                    side_effect=materialize,
+                ),
+                patch(
+                    "vision_runtime.locate_scoreboard_event",
+                    return_value={
+                        "anchor_seconds": 10.0,
+                        "location_kind": "match_clock_second",
+                        "method": "paddleocr_exact_clock",
+                        "target_clock": "01:00",
+                    },
+                ) as locate,
+            ):
+                located, _materialized, _leased = (
+                    _locate_ocr_window_across_components(
+                        job,
+                        segments,
+                        window_start=0.0,
+                        window_end=100.0,
+                        analysis_path=root / "candidate.mp4",
+                        ffmpeg="ffmpeg",
+                        ocr_python=ocr_python,
+                        ocr_timeout_seconds=10.0,
+                        minimum_component_seconds=3.0,
+                    )
+                )
+
+            locate.assert_called_once()
+            self.assertTrue(located["exact_target_locked"])
+            self.assertEqual(located["unscanned_component_count"], 2)
+            self.assertEqual(len(located["fragment_attempts"]), 1)
+
+    def test_estimated_second_does_not_hide_later_exact_fragment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = [root / f"part-{index}.ts" for index in range(3)]
+            for path in paths:
+                path.write_bytes(b"video")
+            ocr_python = root / "ocr-python"
+            ocr_python.write_bytes(b"python")
+            segments = [
+                Segment(paths[0], 0.0, 20.0),
+                Segment(paths[1], 40.0, 60.0),
+                Segment(paths[2], 80.0, 100.0),
+            ]
+            job = VisionJob(
+                "match:G:estimated-before-exact",
+                "match",
+                "G",
+                "goal",
+                95.0,
+                None,
+                1000.0,
+                event_minute="1",
+                event_second=60,
+                clock_only=True,
+            )
+
+            def materialize(_ffmpeg, _segments, output, **kwargs):
+                return {
+                    "path": str(output),
+                    "window_start_stream_time": kwargs["window_start"],
+                    "window_end_stream_time": kwargs["window_end"],
+                }
+
+            with (
+                patch(
+                    "vision_runtime.materialize_analysis_clip",
+                    side_effect=materialize,
+                ),
+                patch(
+                    "vision_runtime.locate_scoreboard_event",
+                    side_effect=[
+                        {
+                            "anchor_seconds": 10.0,
+                            "location_kind": "match_clock_second",
+                            "method": "paddleocr_near_neighbor_estimate",
+                            "precision": "estimated_second",
+                            "localization_quality": "estimated",
+                            "target_clock": "01:00",
+                        },
+                        {
+                            "anchor_seconds": 50.0,
+                            "location_kind": "match_clock_second",
+                            "method": "paddleocr_exact_clock",
+                            "precision": "observed_second",
+                            "localization_quality": "exact",
+                            "target_clock": "01:00",
+                        },
+                    ],
+                ) as locate,
+            ):
+                located, _materialized, _leased = (
+                    _locate_ocr_window_across_components(
+                        job,
+                        segments,
+                        window_start=0.0,
+                        window_end=100.0,
+                        analysis_path=root / "candidate.mp4",
+                        ffmpeg="ffmpeg",
+                        ocr_python=ocr_python,
+                        ocr_timeout_seconds=10.0,
+                        minimum_component_seconds=3.0,
+                    )
+                )
+
+            self.assertEqual(locate.call_count, 2)
+            self.assertEqual(located["anchor_stream_time"], 50.0)
+            self.assertEqual(located["localization_quality"], "exact")
+            self.assertTrue(located["exact_target_locked"])
+            self.assertEqual(located["unscanned_component_count"], 1)
+            self.assertEqual(len(located["fragment_attempts"]), 2)
 
     def test_minute_ocr_gif_survives_tdeed_failure_with_ai_fallback(self):
         with tempfile.TemporaryDirectory() as directory:

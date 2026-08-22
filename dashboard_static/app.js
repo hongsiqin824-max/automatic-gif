@@ -38,7 +38,9 @@ const FRIENDLY_TERM_REPLACEMENTS = [
   [/overview/gi, '赛况接口'], [/FFmpeg/gi, '视频接收'], [/Worker/gi, '处理进程'],
   [/PID/gi, '进程编号'], [/返回码/g, '结束状态'], [/锚点/g, '对应画面'],
   [/可信时钟/g, '最近读到的比赛时间'], [/目标时钟/g, '接口给出的比赛时间'],
+  [/时钟识别/g, '比赛时间读取'], [/时钟检测/g, '比赛时间读取'], [/时钟连续性/g, '比赛时间前后是否连贯'],
   [/游标/g, '已检查到的位置'], [/扫描窗口/g, '检查范围'], [/缓存被淘汰/g, '历史画面已被删除'],
+  [/缓存尾部/g, '最新保存的视频位置'], [/缓存/g, '视频保存范围'], [/推理/g, '读取画面'],
   [/视频分片/g, '视频片段'], [/分片/g, '片段'], [/resource/g, '直播地址'], [/updated_at/g, '最近更新时间'],
 ];
 function friendlyText(value, fallback = '') {
@@ -50,13 +52,20 @@ function friendlyText(value, fallback = '') {
 }
 function friendlyErrorMessage(value, fallback = '操作暂时没有完成，请稍后再试。') {
   if (value == null || value === '') return fallback;
-  const raw = typeof value === 'object' ? (value.error || value.message || value.detail || '') : String(value);
+  const raw = typeof value === 'object' ? (value.error || value.message || value.detail || value.kind || value.code || '') : String(value);
   const normalized = String(raw || '').trim();
   if (!normalized) return fallback;
+  const objectCode = typeof value === 'object' ? String(value.kind || value.code || value.error_kind || value.last_error_kind || '').trim() : '';
+  const guideKey = window.DashboardErrorMessages.keyFor(objectCode) || window.DashboardErrorMessages.keyFor(normalized);
+  const lower = normalized.toLowerCase();
+  const inferredKey = guideKey || (lower.includes('timeout') || lower.includes('timed out') ? 'timeout' : lower.includes('demux') || lower.includes('input/output error') || lower.includes('broken pipe') || lower.includes('invalid data found') || lower.includes('end of file') ? 'ingest_error' : lower.includes('network') || lower.includes('connection') || lower.includes('fetch') || lower.includes('urlopen') ? 'network_error' : '');
+  if (inferredKey) {
+    const guide = window.DashboardErrorMessages.guideFor(inferredKey);
+    return `${guide.title}。原因：${guide.cause} 影响：${guide.impact} 系统处理：${guide.system} 建议：${guide.action}`;
+  }
   for (const [key, message] of Object.entries(FRIENDLY_ERROR_CODES)) {
     if (normalized === key || normalized.includes(key)) return message;
   }
-  const lower = normalized.toLowerCase();
   if (lower.includes('timeout') || lower.includes('timed out')) return FRIENDLY_ERROR_CODES.timeout;
   if (lower.includes('network') || lower.includes('connection') || lower.includes('fetch')) return FRIENDLY_ERROR_CODES.network_error;
   if (lower.includes('ffmpeg') || lower.includes('ingest')) return '视频接收暂时失败，系统会尝试重连。';
@@ -64,6 +73,19 @@ function friendlyErrorMessage(value, fallback = '操作暂时没有完成，请�
   if (lower.includes('tdeed') || lower.includes('vision')) return '画面处理暂时失败，默认 GIF 仍可继续使用。';
   if (/^[a-z0-9_.:\-/\s]+$/i.test(normalized)) return fallback;
   return friendlyText(normalized, fallback);
+}
+
+function detailedErrorMessage(value, fallback = '操作暂时没有完成，请稍后再试。') {
+  const message = friendlyErrorMessage(value, fallback);
+  if (!message || message.includes('原因：') || message.includes('影响：')) return message;
+  return `${message} 影响：本次更新或操作可能没有完成，已经保存的数据不会因此删除。系统处理：页面会保留现有结果，可重试的请求会继续尝试。建议：核对当前页面状态和最近一次重试时间；持续失败时再检查对应服务。`;
+}
+
+function errorGuide(value, fallbackTitle = '这一步没有完成') {
+  const raw = typeof value === 'object' && value !== null ? (value.kind || value.code || value.error_kind || value.last_error_kind || value.error || value.message || '') : value;
+  const guide = window.DashboardErrorMessages.guideFor(raw, fallbackTitle);
+  if (guide.key) return guide;
+  return {...guide, cause:friendlyErrorMessage(value, guide.cause)};
 }
 function setDiscoveryCollapsed(collapsed) {
   state.discoveryCollapsed = Boolean(collapsed);
@@ -278,7 +300,8 @@ function renderMatches(data) {
   if (health.from_cache && finiteNumber(health.cache_age_seconds) != null) details.push(`缓存 ${Math.round(Number(health.cache_age_seconds))} 秒`);
   if (finiteNumber(health.consecutive_failures) > 0) details.push(`连续失败 ${Math.round(Number(health.consecutive_failures))} 次`);
   if (finiteNumber(health.consecutive_failures) > 0 && health.next_retry_at_unix) details.push(`下次重试 ${fmtTime(health.next_retry_at_unix)}`);
-  if (health.error) details.push(friendlyErrorMessage(health.error, '赛事目录暂时无法刷新'));
+  if (health.error) details.push(detailedErrorMessage(health.error, '赛事目录暂时无法刷新'));
+  if (state.heavyTasks && state.heavyTasks.error) details.push(`任务处理能力：${detailedErrorMessage(state.heavyTasks.error, '暂时无法读取任务处理能力')}`);
   $('discovery-detail').textContent = details.join(' · ') || '赛事目录已更新';
   applyControlAvailability();
   renderSelectionHint();
@@ -356,12 +379,16 @@ function visionPresentation(vision, enabled = true) {
       ocr_clock_paused_timeout:{label:'比赛时间暂时没有继续',cls:'failed'},
       ocr_window_evicted:{label:'需要的历史画面已被删除',cls:'failed'},
       ocr_discontinuous_clock:{label:'画面时间前后对不上',cls:'failed'},
+      ocr_preparation_timeout:{label:'准备识别视频耗时过长',cls:'failed'},
       ocr_encode_failed:{label:'画面 GIF 生成失败',cls:'failed'},
       ocr_dependency_unavailable:{label:'画面识别服务不可用',cls:'failed'},
-      ocr_incomplete:{label:'比赛已结束 · OCR 未完成',cls:'failed'}
+      ocr_incomplete:{label:'比赛已结束 · 画面时间任务未完成',cls:'failed'}
     })[pipelineStatus];
     if (pipelinePresentation) return pipelinePresentation;
-    const degraded = vision.degraded === true || vision.localization_quality === 'degraded';
+    const coverageOnlyDegraded = vision.coverage_degraded === true && vision.localization_degraded !== true;
+    const degraded = vision.localization_degraded === true
+      || vision.localization_quality === 'degraded'
+      || (!coverageOnlyDegraded && vision.degraded === true);
     return ({
       pending:{label:'等待查找比赛时间',cls:'pending'}, locating:{label:'正在查找比赛时间',cls:'encoding'},
       located:{label:degraded ? '已找到分钟附近画面' : '已找到对应比赛画面',cls:'encoding'},
@@ -396,7 +423,7 @@ function visionFailureDetail(vision) {
     locating:'查找对应画面', tdeed:'查找精彩动作', fallback:'使用备用定位',
     tdeed_fallback:'使用备用定位', failed:'查找对应画面', buffer:'检查视频片段',
     encoding:'生成 GIF', encode:'生成 GIF',
-    waiting_for_default_gif:'等待默认 GIF', scoreboard_profile:'识别比分牌布局',
+    waiting_for_default_gif:'等待默认 GIF', scoreboard_profile:'核对画面中的比赛时间区域',
     event_second_localization:'查找事件秒数', event_localization:'查找事件画面',
     fragmented_search:'检查连续视频片段', buffer_coverage:'检查视频覆盖范围',
     ocr_clock_discovery:'读取画面比赛时间', ocr_target_localization:'查找接口对应时间',
@@ -416,14 +443,16 @@ function visionFailureDetail(vision) {
     buffer_history_missing:'需要的历史画面已经删除', buffer_gap:'视频片段中间有缺口',
     vision_deadline_exceeded:'处理等待时间已到', ocr_no_clock:'没有读到画面上的比赛时间',
     ocr_no_match:'没有找到接口对应的比赛时间', ocr_processing_failed:'读取比赛时间失败',
-    scoreboard_missing:'画面中暂时没有比分牌', ocr_clock_unreadable:'画面上的比赛时间不清楚',
+    scoreboard_missing:'指定画面区域没有读到比赛时间', ocr_clock_unreadable:'画面上的比赛时间不清楚',
     ocr_score_unreadable:'画面上的比分不清楚', ocr_no_score_transition:'没有确认比分变化',
     ocr_ambiguous:'读到的时间前后不一致', ocr_no_target:'没有找到对应的比赛画面', ocr_model_unavailable:'画面识别服务不可用',
-    clock_profile_mismatch:'比分牌样式暂时无法识别',
+    clock_profile_mismatch:'配置的比赛时间区域与实际画面不一致',
     tdeed_model_unavailable:'动作识别服务不可用', tdeed_no_candidate:'没有找到合适的精彩动作',
     tdeed_inference_failed:'识别精彩动作失败', inference_timeout:'画面处理等待时间过长',
     encode_failed:'GIF 生成失败', model_inference_failed:'识别精彩动作失败', vision_processing_failed:'画面处理失败',
     video_gap:'视频片段中间有缺口', anchor_gap:'对应画面附近有视频缺口',
+    anchor_gap_too_large:'对应画面的缺口过大', anchor_shift_too_large:'最近可用画面距离过远',
+    anchor_unavailable:'对应画面没有可用视频',
     degraded_clip_too_short:'找到的片段太短', default_gif_failed:'默认 GIF 生成失败',
     fragmented_minute_fallback:'只生成了分钟附近的残缺片段',
     ocr_target_localization_failed:'没有找到接口对应的比赛时间', ocr_window_encoding_failed:'60 秒 GIF 生成失败',
@@ -431,7 +460,9 @@ function visionFailureDetail(vision) {
     upstream_ocr_window_failed:'比赛时间识别失败，因此没有继续动作精剪', tdeed_disabled:'已按设置关闭',
     ocr_no_clock_detected:'整段视频都没有读到清晰的比赛时间', ocr_target_timeout:'在等待结束前没有找到接口对应时间',
     ocr_window_evicted:'需要的历史画面已经删除', ocr_discontinuous_clock:'画面时间前后对不上',
-    ocr_encode_failed:'画面 GIF 生成失败', ocr_dependency_unavailable:'画面识别服务不可用',
+    ocr_preparation_timeout:'准备识别视频耗时过长', ocr_encode_failed:'画面 GIF 生成失败', ocr_dependency_unavailable:'画面识别服务不可用',
+    ocr_video_preparation_timeout:'准备识别视频耗时过长', ocr_window_encoding_timeout:'生成画面 GIF 耗时过长',
+    ocr_processing_budget_exhausted:'旧版本因累计处理时限提前停止',
     ocr_clock_target_timeout:'视频还没播放到接口给出的时间就超时了',
     ocr_target_media_not_arrived:'视频还没播放到接口给出的时间', ocr_target_media_stalled:'视频暂时没有新画面',
     ocr_clock_paused_timeout:'比赛时间暂时没有继续，可能在暂停或回放',
@@ -440,22 +471,23 @@ function visionFailureDetail(vision) {
     ocr_postroll_timeout:'目标时间后面的画面还没有准备好', ocr_output_window_timeout:'GIF 所需画面还没有准备好',
     ocr_search_history_evicted:'视频保存时间不够，目标画面已经删除', ocr_output_history_evicted:'生成 GIF 所需的历史画面已经删除',
     ocr_buffer_never_available:'一直没有可用的视频画面', ocr_output_video_gap:'生成 GIF 的视频片段不完整',
-    ocr_window_encoding_failed:'画面 GIF 生成阶段失败', vision_shutdown_timeout:'比赛已结束，OCR 在收尾时间内未完成',
+    ocr_window_encoding_failed:'画面 GIF 生成阶段失败', vision_shutdown_timeout:'比赛已结束，画面时间任务在收尾时间内未完成',
   })[kind] || friendlyErrorMessage(kind, '暂时无法判断具体原因');
   if (kind === 'ocr_clock_target_not_located') {
     reasonLabel = ({
-      target_passed: '已经越过目标时间，但没有可靠锚点',
-      isolated: '只读到单帧目标时间，证据不足',
+      target_passed: '已经越过目标时间，但没有找到可用的对应画面',
+      isolated: '只在一张画面读到附近时间，其他画面无法核对',
       continuity: '目标附近的比赛时间不连续',
       window_evicted: '目标历史画面已经被删除',
-      media_stalled: '缓存停止增长，暂时没有新画面',
+      media_stalled: '视频停止增长，暂时没有新画面',
       unreadable: '目标附近的比赛时间无法可靠读取'
     })[String(vision.target_failure_cause || '').trim()] || reasonLabel;
   }
-  const message = friendlyText(structured.message || '');
+  const rawMessage = String(structured.message || '');
+  const message = friendlyText(rawMessage);
   const attempts = Array.isArray(vision.fragment_attempts) ? vision.fragment_attempts : [];
   const fragmentDetail = attempts.length ? `，已检查 ${attempts.length} 段视频` : '';
-  const messageDetail = message && message !== reasonLabel && /[\u4e00-\u9fff]/.test(message) ? `（${message}）` : '';
+  const messageDetail = message && message !== reasonLabel && /[\u4e00-\u9fff]{4}/.test(rawMessage) ? `（${message}）` : '';
   const nextAction = friendlyText(vision.failure_next_action || structured.next_action || '');
   const actionDetail = nextAction && /[\u4e00-\u9fff]/.test(nextAction) ? `；建议：${nextAction}` : '';
   return `处理到：${stageLabel}；情况：${reasonLabel}${messageDetail}${fragmentDetail}${actionDetail}`;
@@ -494,29 +526,36 @@ function ocrPipelineDiagnosticsText(vision) {
   if (!vision) return '';
   const parts = [];
   const scanWindow = streamWindowText(vision.scan_window);
-  if (scanWindow) parts.push(`扫描 ${scanWindow}`);
+  if (scanWindow) parts.push(`检查的视频位置 ${scanWindow}`);
   const cursor = streamTimeText(vision.scan_cursor);
-  if (cursor) parts.push(`游标 ${cursor}`);
+  if (cursor) parts.push(`已经检查到视频 ${cursor}`);
   const trustedClock = ocrClockValue(vision.last_trusted_clock, vision.last_trusted_clock_seconds);
-  if (trustedClock) parts.push(`最后可信时钟 ${trustedClock}`);
+  if (trustedClock) parts.push(`最近读到的比赛时间 ${trustedClock}`);
   if (vision.target_clock_gap_seconds != null) {
     const gap = Number(vision.target_clock_gap_seconds);
     if (Number.isFinite(gap) && gap > 0) parts.push(`距离目标还差 ${Math.floor(gap)} 秒`);
   }
   if (vision.latest_media_end_stream_time != null && vision.previous_media_end_stream_time != null) {
     const tailDelta = Number(vision.latest_media_end_stream_time) - Number(vision.previous_media_end_stream_time);
-    if (Number.isFinite(tailDelta)) parts.push(tailDelta > 0.25 ? `缓存继续增长 ${Math.floor(tailDelta)} 秒` : '缓存尾部未增长');
+    if (Number.isFinite(tailDelta)) parts.push(tailDelta > 0.25 ? `新收到约 ${Math.floor(tailDelta)} 秒视频` : '没有收到新视频');
   }
-  if (vision.scan_attempt_count != null) parts.push(`扫描 ${vision.scan_attempt_count} 次`);
+  if (vision.scan_attempt_count != null) parts.push(`已检查 ${vision.scan_attempt_count} 轮`);
+  if (Number(vision.target_rescan_attempt_count) > 0) parts.push(`目标附近重新检查 ${vision.target_rescan_attempt_count} 次`);
+  if (vision.history_missing_seconds != null && Number(vision.history_missing_seconds) > 0) {
+    const missing = Number(vision.history_missing_seconds);
+    parts.push(`前面缺少${missing < 1 ? '不到 1 秒' : `约 ${Math.round(missing)} 秒`}旧视频`);
+  }
+  if (vision.target_history_fully_missing) parts.push('目标附近旧视频已经全部不在');
+  if (Array.isArray(vision.video_gaps) && vision.video_gaps.length) parts.push(`目标范围内发现 ${vision.video_gaps.length} 处视频缺口`);
   const finalWindow = streamWindowText(vision.final_clip_window);
-  if (finalWindow) parts.push(`最终剪辑 ${finalWindow}`);
+  if (finalWindow) parts.push(`GIF 使用的视频位置 ${finalWindow}`);
   const structuredStage = vision.failure_reason && typeof vision.failure_reason === 'object' ? vision.failure_reason.stage : '';
   const stage = String(structuredStage || vision.stage || '').trim();
   if (vision.status === 'failed' && stage) {
     const stageText = ({
       ocr_clock_discovery:'时钟识别', ocr_target_localization:'目标定位',
       ocr_window_encoding:'GIF 编码', buffer_coverage:'缓存覆盖',
-      waiting_for_clock_target:'等待目标时钟', waiting_for_postroll:'等待后置画面',
+      waiting_for_clock_target:'等待接口时间出现在画面中', waiting_for_postroll:'等待目标后面的画面',
       ocr_no_clock_detected:'时钟检测', ocr_target_timeout:'目标定位',
       ocr_window_evicted:'缓存窗口', ocr_discontinuous_clock:'时钟连续性',
       ocr_encode_failed:'GIF 编码', ocr_dependency_unavailable:'依赖检查', ocr_incomplete:'比赛结束收尾', waiting_for_latest_tail_rescan:'扫描新增视频尾部'
@@ -535,29 +574,132 @@ function visionOcrDiagnosticsText(vision) {
   if (!diagnostics) return '';
   if (typeof diagnostics === 'string') return diagnostics.trim();
   if (typeof diagnostics !== 'object') return String(diagnostics);
-  if (diagnostics.summary) return String(diagnostics.summary);
+  if (diagnostics.summary) return friendlyText(String(diagnostics.summary));
   const fields = [
-    ['sampled_frames', '采样'], ['frames_sampled', '采样'],
-    ['clock_readable_frames', '时钟帧'], ['clock_frames', '时钟帧'], ['valid_clock_frames', '时钟帧'],
-    ['score_readable_frames', '比分帧'], ['clock_repaired_frames', '修复帧'],
-    ['scoreboard_missing_frames', '消失帧'],
-    ['candidate_count', '候选'], ['candidates', '候选']
+    ['sampled_frames', '共检查画面'], ['frames_sampled', '共检查画面'],
+    ['clock_readable_frames', '能读清比赛时间的画面'], ['clock_frames', '能读清比赛时间的画面'], ['valid_clock_frames', '能读清比赛时间的画面'],
+    ['clock_repaired_frames', '修正后可用的时间画面'],
+    ['scoreboard_missing_frames', '指定区域没有时间的画面'],
+    ['candidate_count', '可能对应目标的画面'], ['candidates', '可能对应目标的画面']
   ];
   const seen = new Set();
   const parts = [];
   for (const [key, label] of fields) {
     if (diagnostics[key] == null || seen.has(label)) continue;
-    seen.add(label); parts.push(`${label} ${diagnostics[key]}`);
+    seen.add(label); parts.push(`${label} ${diagnostics[key]} 张`);
   }
-  if (diagnostics.target_clock) parts.unshift(`目标时钟 ${diagnostics.target_clock}`);
+  if (diagnostics.target_clock) parts.unshift(`接口给出的比赛时间 ${diagnostics.target_clock}`);
+  if (diagnostics.inference_seconds != null) parts.push(`读取画面用时 ${Number(diagnostics.inference_seconds).toFixed(1)} 秒`);
+  if (diagnostics.worker_wall_seconds != null && diagnostics.inference_seconds == null) parts.push(`本次处理用时 ${Number(diagnostics.worker_wall_seconds).toFixed(1)} 秒`);
   if (diagnostics.exact_second_failure_reason) {
     const reason = ({
       target_clock_not_found:'未找到目标秒',
-      no_trustworthy_clock_readings:'没有可信时钟读数',
+      no_trustworthy_clock_readings:'没有一张画面能稳定读清比赛时间',
       multiple_disjoint_occurrences:'目标秒多处出现'
     })[diagnostics.exact_second_failure_reason] || diagnostics.exact_second_failure_reason;
-    parts.push(`秒级降级 ${reason}`);
+    parts.push(`没有精确到目标秒：${reason}`);
   }
+  return parts.join(' · ');
+}
+
+function visionFailureKind(vision) {
+  if (!vision || typeof vision !== 'object') return '';
+  const structured = vision.failure_reason && typeof vision.failure_reason === 'object' ? vision.failure_reason : {};
+  return String(structured.kind || vision.error_kind || vision.last_error_kind || '').trim();
+}
+
+function visionFailureEvidenceText(vision) {
+  if (!vision || typeof vision !== 'object') return '';
+  const parts = [];
+  const target = ocrClockValue(vision.target_clock, vision.target_clock_seconds);
+  const latest = ocrClockValue(vision.last_trusted_clock, vision.last_trusted_clock_seconds);
+  if (target && target !== '--') parts.push(`接口给出的比赛时间是 ${target}`);
+  if (latest && latest !== '--') parts.push(`最近读到的比赛时间是 ${latest}`);
+  const gap = finiteNumber(vision.target_clock_gap_seconds);
+  if (gap != null && gap > 0) parts.push(`当时距离目标还差约 ${Math.round(gap)} 秒`);
+  const scanWindow = streamWindowText(vision.scan_window);
+  if (scanWindow) parts.push(`检查了视频位置 ${scanWindow}`);
+  if (vision.scan_attempt_count != null) parts.push(`累计检查 ${vision.scan_attempt_count} 轮`);
+  if (Number(vision.target_rescan_attempt_count) > 0) parts.push(`目标附近重新检查 ${vision.target_rescan_attempt_count} 次`);
+  const diagnostics = visionOcrDiagnosticsText(vision);
+  if (diagnostics) parts.push(diagnostics);
+  const missing = finiteNumber(vision.history_missing_seconds);
+  if (missing != null && missing > 0) parts.push(`所需范围前面缺少${missing < 1 ? '不到 1 秒' : `约 ${Math.round(missing)} 秒`}旧视频`);
+  if (vision.target_history_fully_missing) parts.push('目标附近的视频已经全部被清理');
+  if (Array.isArray(vision.video_gaps) && vision.video_gaps.length) parts.push(`检查范围内有 ${vision.video_gaps.length} 处视频缺口`);
+  if (vision.inference_seconds != null) parts.push(`本次画面处理共用时 ${Number(vision.inference_seconds).toFixed(1)} 秒`);
+  const attempts = Array.isArray(vision.fragment_attempts) ? vision.fragment_attempts.length : 0;
+  if (attempts) parts.push(`尝试读取 ${attempts} 段视频`);
+  return [...new Set(parts.filter(Boolean))].join('；');
+}
+
+function failureReportMarkup(value, options = {}) {
+  const guide = errorGuide(value, options.title || '这一步没有完成');
+  const rows = [
+    ['发生原因', options.cause || guide.cause],
+    ['造成的结果', options.impact || guide.impact],
+    ['系统已经做了什么', options.system || guide.system],
+    ['可核对的信息', options.evidence || '当前没有更多可核对数据。'],
+    ['建议怎么处理', options.action || guide.action],
+  ].filter(([, content]) => content);
+  return `<div class="failure-report" role="note"><b>${escapeHtml(options.title || guide.title)}</b>${rows.map(([label, content]) => `<span><strong>${escapeHtml(label)}</strong>${escapeHtml(friendlyText(content))}</span>`).join('')}</div>`;
+}
+
+function visionFailureReportMarkup(vision) {
+  if (!vision || vision.status !== 'failed') return '';
+  const kind = visionFailureKind(vision);
+  const guide = errorGuide(kind || vision.error || vision.failure_reason, '画面处理没有完成');
+  const structured = vision.failure_reason && typeof vision.failure_reason === 'object' ? vision.failure_reason : {};
+  const rawExplanation = String(vision.failure_explanation || vision.target_failure_explanation || structured.message || '');
+  const explanation = friendlyText(rawExplanation);
+  const cause = explanation && /[\u4e00-\u9fff]{4}/.test(rawExplanation) ? `${guide.cause} 补充说明：${explanation}` : guide.cause;
+  const nextAction = friendlyText(vision.failure_next_action || structured.next_action || '');
+  const action = nextAction && /[\u4e00-\u9fff]/.test(nextAction) ? `${guide.action} 本次任务建议：${nextAction}` : guide.action;
+  return failureReportMarkup(kind || vision.error || vision.failure_reason, {title:guide.title, cause, impact:guide.impact, system:guide.system, evidence:visionFailureEvidenceText(vision), action});
+}
+
+function taskFailureReportMarkup(task) {
+  if (!task || task.status !== 'failed') return '';
+  const value = task.last_error_kind || task.error || task.failure_reason || 'default_gif_failed';
+  const evidence = [
+    task.attempt_count != null ? `已经尝试 ${task.attempt_count} 次` : '',
+    task.readiness_check_count != null ? `检查视频是否准备好 ${task.readiness_check_count} 次` : '',
+    task.deadline_at_unix ? `等待截止时间 ${fmtTime(task.deadline_at_unix)}` : '',
+  ].filter(Boolean).join('；');
+  return failureReportMarkup(value, {evidence:evidence || '这条任务没有留下更多次数或时间信息。'});
+}
+
+function coverageStatusText(value) {
+  if (!value || typeof value !== 'object') return '';
+  const quality = String(value.coverage_quality || '').trim().toLowerCase();
+  const approximate = value.approximate === true || value.anchor_adjusted === true || quality.includes('approximate');
+  const stitched = value.stitched_across_gap === true || quality.includes('stitched');
+  const degraded = value.coverage_status === 'ready_degraded' || value.degraded === true;
+  const complete = value.coverage_status === 'ready_full' || quality === 'complete';
+  let label = '';
+  if (approximate) label = stitched ? '近似 · 跨缺口拼接' : '近似';
+  else if (stitched) label = '跨缺口拼接';
+  else if (degraded) label = '降级';
+  else if (complete) label = '完整';
+  if (!label) return '';
+
+  const parts = [`覆盖 ${label}`];
+  const skipped = finiteNumber(value.skipped_gap_seconds);
+  if (skipped != null && skipped > 0) parts.push(`跳过 ${Number(skipped.toFixed(1))} 秒`);
+  const actualDuration = finiteNumber(value.duration_sec);
+  if (stitched && actualDuration != null && actualDuration > 0) {
+    parts.push(`实际 ${Number(actualDuration.toFixed(1))} 秒`);
+  }
+  const shift = finiteNumber(value.anchor_shift_seconds);
+  if (value.anchor_adjusted === true && shift != null) {
+    const signed = shift > 0 ? `+${Number(shift.toFixed(1))}` : `${Number(shift.toFixed(1))}`;
+    parts.push(`对应画面移动 ${signed} 秒`);
+  }
+  const encodedAnchorOffset = finiteNumber(value.estimated_encoded_anchor_offset_seconds);
+  if (stitched && encodedAnchorOffset != null && encodedAnchorOffset >= 0) {
+    parts.push(`${value.event_frame_may_be_missing === true ? '拼接点' : '事件'}约在第 ${Number(encodedAnchorOffset.toFixed(1))} 秒`);
+  }
+  if (value.event_frame_may_be_missing === true) parts.push('事件画面可能缺失');
   return parts.join(' · ');
 }
 
@@ -607,6 +749,31 @@ function ingestErrorText(value) {
   }
   return String(value).trim();
 }
+
+function renderRuntimeIssues(data, worker, telemetry, source, eventApi, lifecycleState, runtimeState) {
+  const issues = [];
+  const add = (area, value, fallback) => {
+    const raw = ingestErrorText(value);
+    if (!raw) return;
+    const message = detailedErrorMessage(value, fallback);
+    if (!message || issues.some(item => item.message === message)) return;
+    issues.push({area, message});
+  };
+  add('直播地址', source.error, '暂时没有获取到直播地址。系统会继续重试；持续失败时请检查直播地址权限和网络。');
+  add('比赛事件', telemetry.last_event_error || eventApi.error, '比赛事件暂时无法获取。已有事件会保留，系统会继续重试。');
+  add('事件时间', telemetry.last_shotmap_error, '事件精确时间暂时无法获取。新进球可能稍后补充，系统会继续重试。');
+  add('视频接收', telemetry.latest_ingest_error || telemetry.last_ingest_error, '视频接收中断。已有片段会保留，系统会尝试重新连接。');
+  add('处理进程', worker.cleanup_failure, '前一个处理任务没有正常清理，系统已阻止重复启动。');
+  if (lifecycleState === 'completed_with_warnings' && !issues.length) {
+    issues.push({area:'比赛收尾', message:`处理已经结束，但有任务没有完成。影响：部分 GIF 可能缺失，已经生成的文件不受影响。建议：逐条查看下方红色任务说明。${exitReasonLabel((data.lifecycle || {}).exit_reason) ? ` 本场状态：${exitReasonLabel((data.lifecycle || {}).exit_reason)}。` : ''}`});
+  } else if (runtimeState === 'failed' && !issues.length) {
+    add('运行状态', telemetry.exit_message || 'vision_processing_failed', '处理异常结束。请查看下方任务和运行日志中的详细原因。');
+  }
+  const container = $('runtime-issues');
+  container.innerHTML = issues.map(item => `<div class="runtime-issue"><b>${escapeHtml(item.area)}</b><span>${escapeHtml(item.message)}</span></div>`).join('');
+  container.classList.toggle('hidden', !issues.length);
+}
+
 function logPresentation(record) {
   const names = {
     worker_started:'处理已启动', worker_exited:'处理已结束', runtime_heartbeat:'运行状态更新',
@@ -691,13 +858,13 @@ function render(data) {
   const startPlay = formatStartPlayBeijing(detail.start_play, true);
   $('start-play').textContent = startPlay ? `北京时间 ${startPlay}` : '开赛时间 --';
   for (const [id, src, letter] of [['team-a-logo', detail.team_A_logo, 'A'], ['team-b-logo', detail.team_B_logo, 'B']]) { const el = $(id); el.innerHTML = src ? `<img src="${escapeHtml(src)}" alt="">` : letter; }
-  const source = data.source_health || {}; $('resource').textContent = source.resource || (source.error ? friendlyErrorMessage(source.error, '暂时没有获取到直播地址') : '尚未获取直播地址'); $('updated-at').textContent = source.updated_at || '--'; $('source-change').classList.toggle('hidden', !source.changed);
+  const source = data.source_health || {}; $('resource').textContent = source.resource || (source.error ? detailedErrorMessage(source.error, '暂时没有获取到直播地址') : '尚未获取直播地址'); $('updated-at').textContent = source.updated_at || '--'; $('source-change').classList.toggle('hidden', !source.changed);
   const setHealth = (id, text, cls) => { const el = $(id); el.textContent = text; el.className = cls || ''; };
   const worker = data.worker || {}; const telemetry = data.telemetry || {}; const counts = telemetry.task_counts || {};
   const lifecycle = data.lifecycle || {}; const lifecycleState = lifecycle.state || '';
   syncSessionSelection(data, worker, lifecycle);
   const runtimeState = telemetry.state || (worker.running ? 'starting' : 'idle');
-  const workerStatus = $('worker-status'); workerStatus.className = `runtime-badge ${runtimeState}`; workerStatus.innerHTML = `<i></i>${escapeHtml(telemetry.label || '未启动')}`;
+  const workerStatus = $('worker-status'); workerStatus.className = `runtime-badge ${runtimeState}`; workerStatus.innerHTML = `<i></i>${escapeHtml(friendlyText(telemetry.label || '未启动'))}`;
   setHealth('source-health', source.resource ? (worker.mode === 'demo' ? '本地素材就绪' : '地址已获取') : (source.error ? '查询失败' : '未配置'), source.resource ? 'ok' : 'warn');
   const segmentCount = telemetry.buffer_segment_count || 0; const segmentAge = telemetry.latest_segment_age_seconds;
   const bufferSuffix = lifecycleState === 'finishing' ? ' · 比赛已结束，正在收尾' : lifecycleState === 'completed' ? ' · 处理完成' : lifecycleState === 'completed_with_warnings' ? ' · 完成但有警告' : runtimeState === 'completed' ? ' · 验收完成' : runtimeState === 'disconnected' ? ' · 流已结束' : segmentAge != null ? ` · ${Math.round(segmentAge)}秒前` : '';
@@ -721,15 +888,16 @@ function render(data) {
   setHealth('reconnect-health', reconnectParts.join(' · '), ingestRunning === false && reconnectDue != null ? 'warn' : ingestRestartCount > 0 ? 'warn' : ingestRestartCount == null ? 'off' : 'ok');
   const lifecycleLabels = {idle:'未启动', starting:'正在启动', playing:'处理中', finishing:'收尾中', completed:'处理完成', completed_with_warnings:'完成但有警告', stopping:'正在停止', stopped:'已停止', failed:'处理失败'};
   const lifecycleText = `${friendlyText(data.status_label, status || '赛况未知')} · ${lifecycleLabels[lifecycleState] || (lifecycleState ? '状态处理中' : '状态未上报')}`;
-  setHealth('lifecycle-health', lifecycleText, lifecycleState === 'completed_with_warnings' || lifecycleState === 'failed' ? 'error' : lifecycleState === 'finishing' || lifecycleState === 'stopping' ? 'warn' : lifecycleState === 'playing' || lifecycleState === 'starting' || lifecycleState === 'completed' ? 'ok' : 'off');
+  setHealth('lifecycle-health', lifecycleText, lifecycleState === 'failed' || lifecycleState === 'completed_with_warnings' && counts.failed ? 'error' : lifecycleState === 'completed_with_warnings' || lifecycleState === 'finishing' || lifecycleState === 'stopping' ? 'warn' : lifecycleState === 'playing' || lifecycleState === 'starting' || lifecycleState === 'completed' ? 'ok' : 'off');
   setHealth('runtime-elapsed', telemetry.elapsed_seconds != null ? fmtDuration(telemetry.elapsed_seconds) : '--', telemetry.elapsed_seconds != null ? 'ok' : 'off');
   const heartbeatAge = finiteNumber(telemetry.heartbeat_age_seconds); const heartbeatFresh = telemetry.heartbeat_fresh === true || heartbeatAge != null && heartbeatAge <= 9;
   const heartbeatText = telemetry.heartbeat_unix ? worker.running ? `${fmtTime(telemetry.heartbeat_unix)} · ${Math.round(heartbeatAge || 0)}秒前` : `最后 ${fmtTime(telemetry.heartbeat_unix)}` : '尚无心跳';
   setHealth('heartbeat-at', heartbeatText, telemetry.heartbeat_unix ? worker.running ? heartbeatFresh ? 'ok' : 'warn' : 'off' : 'off');
   setHealth('polling-health', lifecycleTerminal ? '已停止' : lifecycleState === 'finishing' ? '仅终场事件确认' : worker.running ? '运行中' : '未启动', lifecycleTerminal ? 'ok' : lifecycleState === 'finishing' || worker.running ? 'active' : 'off');
   setStep('source-step', source.resource ? 'ok' : source.error ? 'warn' : 'off'); setStep('buffer-step', segmentCount ? worker.running ? 'active' : 'ok' : 'off'); setStep('event-step', eventHasCurrentError ? 'warn' : telemetry.event_poll_count ? worker.running ? 'active' : 'ok' : 'off'); setStep('gif-step', counts.failed ? 'warn' : activeCount ? 'active' : readyCount ? 'ok' : 'off');
-  const latestIngestError = ingestErrorText(telemetry.latest_ingest_error) || ingestErrorText(telemetry.last_ingest_error); const ingestErrorMessage = $('ingest-error-message'); $('ingest-error').textContent = latestIngestError ? friendlyErrorMessage(latestIngestError, '视频接收失败，系统会尝试重连。') : '--'; ingestErrorMessage.classList.toggle('hidden', !latestIngestError);
-  const runtimeMessage = $('runtime-message'); const finishDeadline = lifecycle.finishing_deadline_unix ? `，最迟 ${fmtTime(lifecycle.finishing_deadline_unix)}` : ''; const reasonLabel = exitReasonLabel(lifecycle.exit_reason); const rawMessage = worker.cleanup_failure || (lifecycleState === 'finishing' ? `比赛已结束，正在确认最后事件并等待后续画面${finishDeadline}` : lifecycleState === 'completed' ? `比赛已结束，处理进程、视频接收和事件查询均已停止${reasonLabel ? `（${reasonLabel}）` : ''}` : lifecycleState === 'completed_with_warnings' ? `处理已停止，但需要检查：${reasonLabel || '有部分任务未完成'}` : telemetry.exit_message || telemetry.last_event_error || ''); const message = friendlyErrorMessage(rawMessage); runtimeMessage.textContent = message ? `最近状态：${message}` : ''; runtimeMessage.classList.toggle('hidden', !message || runtimeState === 'healthy');
+  const latestIngestError = ingestErrorText(telemetry.latest_ingest_error) || ingestErrorText(telemetry.last_ingest_error); const ingestErrorMessage = $('ingest-error-message'); $('ingest-error').textContent = latestIngestError ? detailedErrorMessage(latestIngestError, '视频接收失败，系统会尝试重连。') : '--'; ingestErrorMessage.classList.add('hidden');
+  const runtimeMessage = $('runtime-message'); const finishDeadline = lifecycle.finishing_deadline_unix ? `，最迟 ${fmtTime(lifecycle.finishing_deadline_unix)}` : ''; const reasonLabel = exitReasonLabel(lifecycle.exit_reason); const rawMessage = worker.cleanup_failure || (lifecycleState === 'finishing' ? `比赛已结束，正在确认最后事件并等待后续画面${finishDeadline}` : lifecycleState === 'completed' ? `比赛已结束，处理进程、视频接收和事件查询均已停止${reasonLabel ? `（${reasonLabel}）` : ''}` : lifecycleState === 'completed_with_warnings' ? `处理已停止，但需要检查：${reasonLabel || '有部分任务未完成'}` : ''); const message = rawMessage ? friendlyErrorMessage(rawMessage, '') : ''; runtimeMessage.textContent = message ? `最近状态：${message}` : ''; runtimeMessage.classList.toggle('hidden', !message || runtimeState === 'healthy');
+  renderRuntimeIssues(data, worker, telemetry, source, eventApi, lifecycleState, runtimeState);
   const eventCounts = data.event_counts || {}; $('event-count').textContent = `事件 ${eventCounts.unique || 0} · 已生成 ${eventCounts.encoded || 0} · 处理中 ${eventCounts.processing || 0} · 历史未生成 ${eventCounts.history || 0}`;
   const list = $('events'); const events = data.events || [];
   list.innerHTML = events.length ? events.map(e => {
@@ -739,15 +907,21 @@ function render(data) {
     const tdeed = e.vision || artifacts.tdeed_refined || null;
     const visionEnabled = worker.running ? workerVisionEnabled : configuredVisionEnabled;
     const tdeedEnabled = worker.running ? workerTdeedEnabled : configuredTdeedEnabled;
-    const ocr = e.status === 'history' && !ocrWindow ? {label:'历史事件 · 未运行',cls:'off'} : visionPresentation(ocrWindow, visionEnabled);
+    const ocrBase = e.status === 'history' && !ocrWindow ? {label:'历史事件 · 未运行',cls:'off'} : visionPresentation(ocrWindow, visionEnabled);
+    const ocr = e.status === 'encoded' && ocrWindow && ocrWindow.status === 'failed'
+      ? {label:`默认 GIF 可用 · ${ocrBase.label}`, cls:'warning'}
+      : ocrBase;
     const vision = !tdeed && !tdeedEnabled ? {label:'已停用',cls:'off'} : e.status === 'history' && !tdeed ? {label:'历史事件 · 未运行',cls:'off'} : visionPresentation(tdeed, tdeedEnabled);
     const confidence = tdeed && tdeed.confidence != null ? ` · 识别把握 ${(Number(tdeed.confidence) * 100).toFixed(1)}%` : '';
     const delta = tdeed && tdeed.anchor_delta_seconds != null ? ` · 与事件时间相差 ${Number(tdeed.anchor_delta_seconds).toFixed(1)}秒` : '';
-    const defaultDegraded = e.coverage_status === 'ready_degraded' ? ' · 片段较短' : '';
-    const ocrDegraded = ocrWindow && ocrWindow.coverage_status === 'ready_degraded' ? ' · 片段较短' : '';
-    const visionDegraded = tdeed && tdeed.coverage_status === 'ready_degraded' ? ' · 片段较短' : '';
+    const defaultCoverage = coverageStatusText(e);
+    const ocrCoverage = coverageStatusText(ocrWindow);
+    const visionCoverage = coverageStatusText(tdeed);
     const ocrFailureDetail = visionFailureDetail(ocrWindow);
     const failureDetail = visionFailureDetail(tdeed);
+    const defaultFailureMarkup = taskFailureReportMarkup(e);
+    const ocrFailureMarkup = visionFailureReportMarkup(ocrWindow);
+    const visionFailureMarkup = visionFailureReportMarkup(tdeed);
     const ocrDiagnostics = visionOcrDiagnosticsText(ocrWindow);
     const ocrPipelineDiagnostics = ocrPipelineDiagnosticsText(ocrWindow);
     const metadata = e.metadata && typeof e.metadata === 'object' ? e.metadata : {};
@@ -771,15 +945,15 @@ function render(data) {
       return '';
     })();
     const ocrUserDetail = [secondDetail, ocrSource, ocrFailureDetail, ocrUserDetailText(ocrWindow)].filter(Boolean).join(' · ');
-    const technicalDetail = [ocrPipelineDiagnostics, ocrDiagnostics, tdeed && tdeed.source_ocr_artifact ? 'source_ocr_artifact=60s' : ''].filter(Boolean).join(' · ');
+    const technicalDetail = [ocrPipelineDiagnostics, ocrDiagnostics, tdeed && tdeed.source_ocr_artifact ? '动作精剪使用了上方 60 秒画面时间结果' : ''].filter(Boolean).join(' · ');
     const visionDetail = [failureDetail].filter(Boolean).join(' · ');
-    const technicalMarkup = technicalDetail ? `<details class="technical-details"><summary>技术详情</summary><small>${escapeHtml(technicalDetail)}</small></details>` : '';
+    const technicalMarkup = technicalDetail ? `<details class="technical-details"><summary>查看完整处理记录</summary><small>${escapeHtml(friendlyText(technicalDetail))}</small></details>` : '';
     const gifLink = artifact => artifact && artifact.output ? `<a class="gif-link" href="/api/gif/${encodeURIComponent(data.match_id)}/${encodeURIComponent(artifact.output.split('/').pop())}" target="_blank">预览</a>` : '';
-    return `<div class="event-row ${escapeHtml(task.cls)}"><div class="event-type event-type-${escapeHtml(type.kind)}"><span class="event-symbol" aria-hidden="true"></span><span class="event-type-text"><b>${escapeHtml(type.label)}</b><small>${escapeHtml(type.code)}</small></span></div><div class="event-minute">${escapeHtml(e.minute || '--')}'${e.minute_extra && e.minute_extra !== '0' ? `+${escapeHtml(e.minute_extra)}` : ''}</div><div class="event-person">${escapeHtml(e.person || '未提供球员')}<small>${escapeHtml(e.team || '')}${e.score ? ` · ${escapeHtml(e.score)}` : ''}${e.reason ? ` · ${friendlyText(e.reason)}` : ''}</small></div><div class="artifact-list"><div class="artifact"><span>默认 · ${escapeHtml(task.label)}${defaultDegraded}</span>${e.output ? `<a class="gif-link" href="/api/gif/${encodeURIComponent(data.match_id)}/${encodeURIComponent(e.output.split('/').pop())}" target="_blank">预览</a>` : ''}</div><div class="artifact ${escapeHtml(ocr.cls)}"><span>画面时间 60秒 · ${escapeHtml(ocr.label)}${ocrDegraded}${ocrUserDetail ? `<small>${escapeHtml(ocrUserDetail)}</small>` : ''}</span>${technicalMarkup}${gifLink(ocrWindow)}</div><div class="artifact ${escapeHtml(vision.cls)}"><span>动作精剪 20秒 · ${escapeHtml(vision.label)}${escapeHtml(confidence)}${escapeHtml(delta)}${visionDegraded}${tdeed && tdeed.experimental ? ' · 实验' : ''}${visionDetail ? `<small>${escapeHtml(visionDetail)}</small>` : ''}</span>${gifLink(tdeed)}</div></div></div>`;
+    return `<div class="event-row ${escapeHtml(task.cls)}"><div class="event-type event-type-${escapeHtml(type.kind)}"><span class="event-symbol" aria-hidden="true"></span><span class="event-type-text"><b>${escapeHtml(type.label)}</b><small>${escapeHtml(type.code)}</small></span></div><div class="event-minute">${escapeHtml(e.minute || '--')}'${e.minute_extra && e.minute_extra !== '0' ? `+${escapeHtml(e.minute_extra)}` : ''}</div><div class="event-person">${escapeHtml(e.person || '未提供球员')}<small>${escapeHtml(e.team || '')}${e.score ? ` · ${escapeHtml(e.score)}` : ''}${e.reason ? ` · ${friendlyText(e.reason)}` : ''}</small></div><div class="artifact-list"><div class="artifact ${e.status === 'failed' ? 'failed' : ''}"><div class="artifact-copy"><span>默认 · ${escapeHtml(task.label)}${defaultCoverage ? ` · ${escapeHtml(defaultCoverage)}` : ''}</span>${defaultFailureMarkup}</div>${e.output ? `<a class="gif-link" href="/api/gif/${encodeURIComponent(data.match_id)}/${encodeURIComponent(e.output.split('/').pop())}" target="_blank">预览</a>` : ''}</div><div class="artifact ${escapeHtml(ocr.cls)}"><div class="artifact-copy"><span>画面时间 60秒 · ${escapeHtml(ocr.label)}${ocrCoverage ? ` · ${escapeHtml(ocrCoverage)}` : ''}${ocrUserDetail ? `<small>${escapeHtml(ocrUserDetail)}</small>` : ''}</span>${ocrFailureMarkup}${technicalMarkup}</div>${gifLink(ocrWindow)}</div><div class="artifact ${escapeHtml(vision.cls)}"><div class="artifact-copy"><span>动作精剪 20秒 · ${escapeHtml(vision.label)}${escapeHtml(confidence)}${escapeHtml(delta)}${visionCoverage ? ` · ${escapeHtml(visionCoverage)}` : ''}${tdeed && tdeed.experimental ? ' · 实验' : ''}${visionDetail ? `<small>${escapeHtml(visionDetail)}</small>` : ''}</span>${visionFailureMarkup}</div>${gifLink(tdeed)}</div></div></div>`;
   }).join('') : '<div class="empty">暂无已发现事件。启动处理后，进球、黄牌、红牌和乌龙球会在这里显示。</div>';
   const logs = $('logs'); const records = data.logs || []; let heartbeatSeen = false; const visibleRecords = records.filter(record => record.event !== 'runtime_heartbeat' || (!heartbeatSeen && (heartbeatSeen = true))); logs.innerHTML = visibleRecords.length ? visibleRecords.slice(0, 40).map(l => { const presentation = logPresentation(l); return `<div class="log-line log-${escapeHtml(l.event || '')}"><time>${escapeHtml((l.timestamp || '').replace('T',' ').replace('Z','').slice(0,19))}</time><b>${escapeHtml(presentation.name)}</b><span>${escapeHtml(presentation.detail)}</span></div>`; }).join('') : '<div class="empty">暂无日志</div>';
   $('last-refresh').textContent = `更新于 ${new Date().toLocaleTimeString('zh-CN', {hour12:false})}`;
-  if (data.event_api && data.event_api.error) showNotice(friendlyErrorMessage(data.event_api.error, '比赛事件暂时无法获取，系统会继续重试。')); else if (source.error && source.error.includes('GIF_SOURCE_SECRET')) showNotice('还没有配置直播地址。提供真实比赛 ID 后即可运行演示或实时处理。'); else clearNotice();
+  if (data.event_api && data.event_api.error) showNotice(detailedErrorMessage(data.event_api.error, '比赛事件暂时无法获取，系统会继续重试。')); else if (source.error && source.error.includes('GIF_SOURCE_SECRET')) showNotice(detailedErrorMessage(source.error, '还没有配置直播地址。')); else clearNotice();
 }
 
 async function requestJson(url, options = {}) { const response = await fetch(url, {headers:{'Content-Type':'application/json'}, ...options}); const data = await response.json(); if (!response.ok) throw new Error(data.error || `请求失败 ${response.status}`); return data; }
@@ -794,7 +968,7 @@ async function refresh(requestedId = state.sessionMatchId || matchId()) {
     state.lastRenderedRefreshSerial = requestSerial;
     render(data);
   } catch (error) {
-    if (viewSequence === state.viewSequence && id === state.sessionMatchId && requestSerial > state.lastRenderedRefreshSerial) showNotice(friendlyErrorMessage(error.message), 'error');
+    if (viewSequence === state.viewSequence && id === state.sessionMatchId && requestSerial > state.lastRenderedRefreshSerial) showNotice(detailedErrorMessage(error.message), 'error');
   }
 }
 async function refreshMatches() {
@@ -808,7 +982,7 @@ async function refreshMatches() {
   } catch (error) {
     healthEl.className = `discovery-health ${state.matches ? 'warning' : 'error'}`;
     healthEl.innerHTML = `<i></i>${state.matches ? '刷新失败' : '接口不可用'}`;
-    $('discovery-detail').textContent = `赛事目录暂时无法刷新，仍可手工输入比赛 ID。${friendlyErrorMessage(error.message, '')}`;
+    $('discovery-detail').textContent = `赛事目录暂时无法刷新，仍可手工输入比赛 ID。${detailedErrorMessage(error.message, '')}`;
   } finally {
     state.matchesLoading = false;
   }
@@ -840,7 +1014,7 @@ async function startSelectedMatch(extra = {}) {
     clearNotice();
     await refreshMatches();
   } catch (error) {
-    showNotice(friendlyErrorMessage(error.message), 'error');
+    showNotice(detailedErrorMessage(error.message), 'error');
   } finally {
     state.actionPending = false;
     applyControlAvailability();
@@ -859,7 +1033,7 @@ async function stopCurrentMatch() {
     clearNotice();
     await refreshMatches();
   } catch (error) {
-    showNotice(friendlyErrorMessage(error.message), 'error');
+    showNotice(detailedErrorMessage(error.message), 'error');
   } finally {
     state.actionPending = false;
     applyControlAvailability();

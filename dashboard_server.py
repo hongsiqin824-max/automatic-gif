@@ -115,7 +115,7 @@ DEFAULT_SOURCE_URL = (
     "match/live_source/query"
 )
 MATCH_CATALOG_URL = "https://api.dongqiudi.com/data/tab/new/lotzc"
-MATCH_CATALOG_REFRESH_SECONDS = 30.0
+MATCH_CATALOG_REFRESH_SECONDS = 120.0
 MATCH_CATALOG_BACKOFF_SECONDS = (5.0, 10.0, 20.0, 30.0)
 MATCH_CATALOG_LIMIT = 20
 MATCH_CATALOG_UPCOMING_SECONDS = 15 * 60
@@ -148,7 +148,10 @@ WORKER_FINISH_TIMEOUT_SECONDS = _positive_environment_float(
     "GIF_WORKER_FINISH_TIMEOUT_SECONDS", 600.0
 )
 DASHBOARD_BUFFER_SECONDS = 900.0
-VISION_WORKERS = _positive_environment_integer("GIF_VISION_WORKERS", 4)
+VISION_WORKERS = _positive_environment_integer("GIF_VISION_WORKERS", 2)
+OCR_TIMEOUT_SECONDS = _positive_environment_float(
+    "GIF_OCR_TIMEOUT_SECONDS", 300.0
+)
 VISION_SEARCH_BEFORE_SECONDS = _positive_environment_float(
     "GIF_VISION_SEARCH_BEFORE_SECONDS", 120.0
 )
@@ -667,6 +670,38 @@ def _tasks_from_log(path: Path, limit: int = 1000) -> list[dict[str, Any]]:
     return list(reversed(records.values()))
 
 
+COVERAGE_CONTRACT_FIELDS = (
+    "coverage_quality",
+    "stitched_across_gap",
+    "video_gap_count",
+    "skipped_gap_seconds",
+    "approximate",
+    "anchor_adjusted",
+    "anchor_adjusted_to_stream_time",
+    "anchor_shift_seconds",
+    "event_frame_may_be_missing",
+    "requested_anchor_offset_seconds",
+    "estimated_encoded_anchor_offset_seconds",
+    "timeline_compression_before_anchor_seconds",
+    "anchor_offset_mapping_basis",
+)
+
+
+def _coverage_contract(result: dict[str, Any]) -> dict[str, Any]:
+    """Expose coverage evidence from current and legacy encoded results."""
+    actual = result.get("actual_media_window")
+    if not isinstance(actual, dict):
+        actual = {}
+    return {
+        field: (
+            result.get(field)
+            if result.get(field) is not None
+            else actual.get(field)
+        )
+        for field in COVERAGE_CONTRACT_FIELDS
+    }
+
+
 def _tasks_from_database(
     path: Path,
 ) -> tuple[list[dict[str, Any]], dict[str, str], set[str]]:
@@ -688,12 +723,42 @@ def _tasks_from_database(
                 if "suppressed_by_event_key" in task_columns
                 else "NULL AS suppressed_by_event_key"
             )
+            task_attempt_count_field = (
+                "attempt_count" if "attempt_count" in task_columns
+                else "NULL AS attempt_count"
+            )
+            task_readiness_count_field = (
+                "readiness_check_count" if "readiness_check_count" in task_columns
+                else "NULL AS readiness_check_count"
+            )
+            task_next_attempt_field = (
+                "next_attempt_at_unix" if "next_attempt_at_unix" in task_columns
+                else "NULL AS next_attempt_at_unix"
+            )
+            task_deadline_field = (
+                "deadline_at_unix" if "deadline_at_unix" in task_columns
+                else "NULL AS deadline_at_unix"
+            )
+            task_error_kind_field = (
+                "last_error_kind" if "last_error_kind" in task_columns
+                else "NULL AS last_error_kind"
+            )
             rows = connection.execute(
                 """
                 SELECT event_key, code, event_type, event_json, status,
                        discovered_at_unix, updated_at_unix, output_path,
                        output_bytes, result_json, error, """
                 + suppression_field
+                + ", "
+                + task_attempt_count_field
+                + ", "
+                + task_readiness_count_field
+                + ", "
+                + task_next_attempt_field
+                + ", "
+                + task_deadline_field
+                + ", "
+                + task_error_kind_field
                 + """
                 FROM event_tasks ORDER BY discovered_at_unix, event_key
                 """
@@ -826,9 +891,15 @@ def _tasks_from_database(
                 "duration_sec": result.get("duration_sec"),
                 "coverage_status": result.get("coverage_status"),
                 "coverage_reason": result.get("coverage_reason"),
+                **_coverage_contract(result),
                 "seconds_after_event_observed": result.get(
                     "seconds_after_event_observed"
                 ),
+                "attempt_count": row["attempt_count"],
+                "readiness_check_count": row["readiness_check_count"],
+                "next_attempt_at_unix": row["next_attempt_at_unix"],
+                "deadline_at_unix": row["deadline_at_unix"],
+                "last_error_kind": row["last_error_kind"],
                 "error": row["error"],
             }
         )
@@ -954,6 +1025,7 @@ def _tasks_from_database(
             "ocr_clock_paused_timeout",
             "ocr_window_evicted",
             "ocr_discontinuous_clock",
+            "ocr_preparation_timeout",
             "ocr_encode_failed",
             "ocr_dependency_unavailable",
             "ocr_incomplete",
@@ -1066,7 +1138,9 @@ def _tasks_from_database(
                 "ocr_output_video_gap": "ocr_window_evicted",
                 "buffer_gap": "ocr_discontinuous_clock",
                 "ocr_ambiguous": "ocr_discontinuous_clock",
+                "ocr_video_preparation_timeout": "ocr_preparation_timeout",
                 "ocr_window_encoding_failed": "ocr_encode_failed",
+                "ocr_window_encoding_timeout": "ocr_encode_failed",
                 "ocr_model_unavailable": "ocr_dependency_unavailable",
                 "ocr_inference_failed": "ocr_dependency_unavailable",
                 "ocr_processing_failed": "ocr_dependency_unavailable",
@@ -1200,6 +1274,9 @@ def _tasks_from_database(
             "tdeed_refined" if raw_artifact_kind == "refined" else raw_artifact_kind
         )
         target_wait_outcome = first_ocr_value("target_wait_outcome")
+        coverage_diagnostics = first_ocr_value("coverage_diagnostics")
+        if not isinstance(coverage_diagnostics, dict):
+            coverage_diagnostics = {}
         target_failure_cause = first_ocr_value(
             "target_failure_cause", "ocr_target_failure_cause"
         )
@@ -1208,14 +1285,14 @@ def _tasks_from_database(
         )
         target_failure_coverage_class = first_ocr_value(
             "target_failure_coverage_class", "coverage_class"
-        )
+        ) or coverage_diagnostics.get("coverage_class")
         target_failure_scan_stage = first_ocr_value(
             "target_failure_scan_stage", "scan_stage"
         )
         target_clock_gap_seconds = first_ocr_value("target_clock_gap_seconds")
         latest_media_end_stream_time = first_ocr_value(
             "latest_media_end_stream_time"
-        )
+        ) or coverage_diagnostics.get("latest_media_end_stream_time")
         previous_media_end_stream_time = first_ocr_value(
             "previous_media_end_stream_time"
         )
@@ -1257,9 +1334,11 @@ def _tasks_from_database(
             "model_version": row["model_version"],
             "output": row["output_path"] or vision_result.get("output"),
             "bytes": row["output_bytes"] or vision_result.get("bytes"),
+            "duration_sec": vision_result.get("duration_sec"),
             "anchor_delta_seconds": vision_result.get("anchor_delta_seconds"),
             "coverage_status": vision_result.get("coverage_status"),
             "coverage_reason": vision_result.get("coverage_reason"),
+            **_coverage_contract(vision_result),
             "experimental": bool(vision_result.get("experimental")),
             "disabled": bool(vision_result.get("disabled")),
             "ocr_pipeline_status": ocr_pipeline_status or None,
@@ -1306,6 +1385,19 @@ def _tasks_from_database(
             "target_clock_gap_seconds": target_clock_gap_seconds,
             "latest_media_end_stream_time": latest_media_end_stream_time,
             "previous_media_end_stream_time": previous_media_end_stream_time,
+            "history_missing_seconds": coverage_diagnostics.get(
+                "history_missing_seconds"
+            ),
+            "target_history_missing": bool(
+                coverage_diagnostics.get("target_history_missing")
+            ),
+            "target_history_fully_missing": bool(
+                coverage_diagnostics.get("target_history_fully_missing")
+            ),
+            "earliest_media_start_stream_time": coverage_diagnostics.get(
+                "earliest_media_start_stream_time"
+            ),
+            "video_gaps": coverage_diagnostics.get("video_gaps", []),
             "failure_explanation": failure_explanation,
             "failure_next_action": failure_next_action,
             "scan_attempt_count": first_ocr_value("scan_attempt_count"),
@@ -1360,6 +1452,8 @@ def _tasks_from_database(
             "precision": vision_result.get("precision"),
             "localization_quality": vision_result.get("localization_quality"),
             "degraded": bool(vision_result.get("degraded")),
+            "localization_degraded": vision_result.get("localization_degraded"),
+            "coverage_degraded": vision_result.get("coverage_degraded"),
             "degradation_mode": vision_result.get("degradation_mode"),
             "degradation_reason": vision_result.get("degradation_reason"),
             "requested_media_window": vision_result.get("requested_media_window"),
@@ -3171,6 +3265,7 @@ class Dashboard:
                     "--vision-before", str(session.vision_before_seconds),
                     "--vision-after", str(session.vision_after_seconds),
                     "--vision-workers", str(VISION_WORKERS),
+                    "--ocr-timeout-seconds", str(OCR_TIMEOUT_SECONDS),
                     "--fallback-gif-width", str(FALLBACK_GIF_WIDTH),
                     "--fallback-gif-fps", str(FALLBACK_GIF_FPS),
                     "--fallback-gif-colors", str(FALLBACK_GIF_COLORS),

@@ -19,7 +19,7 @@ from event_driven_pipeline import (
     recovered_event_job,
     release_terminal_event_visual_window_leases,
 )
-from live_goal_pipeline import Segment
+from live_goal_pipeline import CoverageStatus, Segment
 from pipeline_runtime import PipelineRuntime, TaskStateStore
 
 
@@ -1621,6 +1621,69 @@ class PipelineRuntimeTests(unittest.TestCase):
         task = runtime.store.get("match-1:G:key")
         self.assertEqual(task.status, "encoded")
         self.assertEqual(task.attempt_count, 1)
+        runtime.close()
+
+    def test_default_gif_stitches_internal_gap_when_degraded_is_enabled(self):
+        runtime = PipelineRuntime(self.database_path, self.log_path)
+        runtime.discover_task(
+            match_id="match-1",
+            event_data=event_data(),
+            observed_stream_time=25.0,
+            observed_source_time=125.0,
+            clip_anchor_stream_time=24.0,
+            clip_anchor_source_time=124.0,
+            output_due_stream_time=42.0,
+            detected_at_unix=time.time() - 10.0,
+            deadline_at_unix=time.time() + 30.0,
+        )
+        job = recovered_event_job(runtime.store.get("match-1:G:key"))
+        before_gap = self.directory / "default-before-gap.ts"
+        after_gap = self.directory / "default-after-gap.ts"
+        before_gap.write_bytes(b"before")
+        after_gap.write_bytes(b"after")
+        segments = [
+            type("TestSegment", (), {
+                "path": before_gap,
+                "start": 12.0,
+                "end": 26.0,
+            })(),
+            type("TestSegment", (), {
+                "path": after_gap,
+                "start": 30.0,
+                "end": 42.0,
+            })(),
+        ]
+        encoded = {
+            "output": "/tmp/goal-stitched.gif",
+            "bytes": 4000,
+            "duration_sec": 26.0,
+            "encode_seconds": 1.0,
+            "over_size_reference": False,
+            "coverage_status": "ready_degraded",
+        }
+
+        with patch("event_driven_pipeline.encode_gif", return_value=encoded) as encode:
+            self.assertTrue(encode_event_job(
+                job,
+                runtime,
+                "ffmpeg",
+                "ffprobe",
+                lambda: segments,
+                self.directory,
+                before=12.0,
+                after=18.0,
+                width=384,
+                fps=6.0,
+                colors=160,
+                size_reference_bytes=10_000_000,
+                allow_degraded=True,
+            ))
+
+        coverage = encode.call_args.kwargs["coverage"]
+        self.assertEqual(coverage.status, CoverageStatus.READY_DEGRADED)
+        self.assertTrue(coverage.stitched_across_gap)
+        self.assertEqual(coverage.segments, tuple(segments))
+        self.assertEqual(coverage.skipped_gap_seconds, 4.0)
         runtime.close()
 
     def test_expired_tiny_anchor_component_fails_without_encoding(self):

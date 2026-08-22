@@ -92,10 +92,33 @@ class VideoCoverage:
     gaps: tuple[tuple[float, float], ...]
     error_kind: str | None = None
     reason: str = ""
+    coverage_quality: str = "complete"
+    stitched_across_gap: bool = False
+    approximate: bool = False
+    anchor_adjusted_to: float | None = None
+    event_frame_may_be_missing: bool = False
 
     @property
     def skipped_gap_seconds(self) -> float:
         return round(sum(end - start for start, end in self.gaps), 3)
+
+    @property
+    def video_gap_count(self) -> int:
+        return len(self.gaps)
+
+    @property
+    def anchor_adjusted(self) -> bool:
+        return self.anchor_adjusted_to is not None
+
+    @property
+    def anchor_shift_seconds(self) -> float:
+        if self.anchor_adjusted_to is None:
+            return 0.0
+        return round(float(self.anchor_adjusted_to) - self.anchor, 3)
+
+    @property
+    def degraded(self) -> bool:
+        return self.status == CoverageStatus.READY_DEGRADED
 
     def validate_request(
         self,
@@ -123,6 +146,10 @@ def analyze_video_coverage(
     allow_degraded: bool = False,
     force_degraded: bool = False,
     min_degraded_seconds: float = 2.0,
+    stitch_across_gaps: bool = False,
+    allow_anchor_adjustment: bool = False,
+    max_anchor_gap_seconds: float = 10.0,
+    max_anchor_shift_seconds: float = 5.0,
 ) -> VideoCoverage:
     """Classify whether one requested interval can be materialized safely.
 
@@ -141,6 +168,10 @@ def analyze_video_coverage(
         raise ValueError("video coverage tolerances must not be negative")
     if min_degraded_seconds < 0:
         raise ValueError("minimum degraded clip duration must not be negative")
+    if max_anchor_gap_seconds < 0:
+        raise ValueError("maximum anchor gap must not be negative")
+    if max_anchor_shift_seconds < 0:
+        raise ValueError("maximum anchor shift must not be negative")
     if force_degraded and not allow_degraded:
         raise ValueError("force_degraded requires allow_degraded")
 
@@ -168,6 +199,11 @@ def analyze_video_coverage(
         gaps: Iterable[tuple[float, float]] = (),
         error_kind: str | None = None,
         reason: str,
+        coverage_quality: str = "complete",
+        stitched_across_gap: bool = False,
+        approximate: bool = False,
+        anchor_adjusted_to: float | None = None,
+        event_frame_may_be_missing: bool = False,
     ) -> VideoCoverage:
         return VideoCoverage(
             status=status,
@@ -180,6 +216,11 @@ def analyze_video_coverage(
             gaps=tuple(gaps),
             error_kind=error_kind,
             reason=reason,
+            coverage_quality=coverage_quality,
+            stitched_across_gap=stitched_across_gap,
+            approximate=approximate,
+            anchor_adjusted_to=anchor_adjusted_to,
+            event_frame_may_be_missing=event_frame_may_be_missing,
         )
 
     if not selected:
@@ -218,16 +259,208 @@ def analyze_video_coverage(
         (float(items[0].start), component_ends[index])
         for index, items in enumerate(components)
     ]
-    anchor_index = next(
-        (
-            index
-            for index, (start, end) in enumerate(component_bounds)
-            if start - edge_tolerance <= anchor <= end + edge_tolerance
-        ),
+    containing_gap = next(
+        ((start, end) for start, end in gaps if start < anchor < end),
         None,
+    )
+    anchor_index = (
+        None
+        if containing_gap is not None
+        else next(
+            (
+                index
+                for index, (start, end) in enumerate(component_bounds)
+                if start - edge_tolerance <= anchor <= end + edge_tolerance
+            ),
+            None,
+        )
     )
 
     latest_end = max(float(item.end) for item in available)
+    if stitch_across_gaps and allow_degraded:
+        overall_start = max(window_start, component_bounds[0][0])
+        overall_end = min(window_end, component_bounds[-1][1])
+        covers_overall_start = component_bounds[0][0] <= window_start + edge_tolerance
+        covers_overall_end = component_bounds[-1][1] >= window_end - edge_tolerance
+        if (
+            not covers_overall_end
+            and latest_end < window_end - edge_tolerance
+            and not force_degraded
+        ):
+            return decision(
+                CoverageStatus.WAITING,
+                effective_start=overall_start,
+                effective_end=overall_end,
+                chosen=selected,
+                gaps=gaps,
+                error_kind="waiting_for_tail",
+                reason=(
+                    f"video tail has reached {latest_end:.3f}s but "
+                    f"{window_end:.3f}s is required"
+                ),
+                coverage_quality="waiting_for_tail",
+                stitched_across_gap=bool(gaps),
+            )
+
+        adjusted_anchor: float | None = None
+        event_frame_may_be_missing = False
+        if anchor_index is None:
+            if latest_end < anchor - edge_tolerance:
+                return decision(
+                    CoverageStatus.WAITING,
+                    effective_start=overall_start,
+                    effective_end=overall_end,
+                    chosen=selected,
+                    gaps=gaps,
+                    error_kind="waiting_for_anchor",
+                    reason="the live buffer has not reached the event anchor yet",
+                    coverage_quality="waiting_for_anchor",
+                    stitched_across_gap=bool(gaps),
+                )
+            if not allow_anchor_adjustment:
+                return decision(
+                    CoverageStatus.UNAVAILABLE,
+                    effective_start=overall_start,
+                    effective_end=overall_end,
+                    chosen=selected,
+                    gaps=gaps,
+                    error_kind="anchor_gap",
+                    reason="the event anchor falls inside missing video",
+                    coverage_quality="anchor_missing",
+                    stitched_across_gap=bool(gaps),
+                    event_frame_may_be_missing=True,
+                )
+            if containing_gap is None:
+                return decision(
+                    CoverageStatus.UNAVAILABLE,
+                    effective_start=overall_start,
+                    effective_end=overall_end,
+                    chosen=selected,
+                    gaps=gaps,
+                    error_kind="anchor_unavailable",
+                    reason=(
+                        "the event anchor is outside every available video "
+                        "component and cannot be adjusted safely"
+                    ),
+                    coverage_quality="anchor_missing",
+                    stitched_across_gap=bool(gaps),
+                    event_frame_may_be_missing=True,
+                )
+            gap_width = containing_gap[1] - containing_gap[0]
+            if gap_width > max_anchor_gap_seconds:
+                return decision(
+                    CoverageStatus.UNAVAILABLE,
+                    effective_start=overall_start,
+                    effective_end=overall_end,
+                    chosen=selected,
+                    gaps=gaps,
+                    error_kind="anchor_gap_too_large",
+                    reason=(
+                        "the event anchor falls inside a video gap larger than "
+                        f"the allowed limit: {gap_width:.3f}s > "
+                        f"{max_anchor_gap_seconds:.3f}s"
+                    ),
+                    coverage_quality="anchor_missing",
+                    stitched_across_gap=bool(gaps),
+                    event_frame_may_be_missing=True,
+                )
+            adjusted_anchor = min(
+                containing_gap,
+                key=lambda boundary: (abs(boundary - anchor), boundary),
+            )
+            anchor_shift = abs(adjusted_anchor - anchor)
+            if anchor_shift > max_anchor_shift_seconds:
+                return decision(
+                    CoverageStatus.UNAVAILABLE,
+                    effective_start=overall_start,
+                    effective_end=overall_end,
+                    chosen=selected,
+                    gaps=gaps,
+                    error_kind="anchor_shift_too_large",
+                    reason=(
+                        "the nearest available video boundary is farther than "
+                        f"the allowed anchor shift: {anchor_shift:.3f}s > "
+                        f"{max_anchor_shift_seconds:.3f}s"
+                    ),
+                    coverage_quality="anchor_missing",
+                    stitched_across_gap=bool(gaps),
+                    event_frame_may_be_missing=True,
+                )
+            event_frame_may_be_missing = True
+
+        available_duration = sum(
+            max(0.0, min(window_end, end) - max(window_start, start))
+            for start, end in component_bounds
+        )
+        if available_duration < min_degraded_seconds:
+            return decision(
+                CoverageStatus.UNAVAILABLE,
+                effective_start=overall_start,
+                effective_end=overall_end,
+                chosen=selected,
+                gaps=gaps,
+                error_kind="degraded_clip_too_short",
+                reason=(
+                    "the available stitched video is too short for a degraded GIF: "
+                    f"{available_duration:.3f}s < {min_degraded_seconds:.3f}s"
+                ),
+                coverage_quality="unusable",
+                stitched_across_gap=bool(gaps),
+                approximate=adjusted_anchor is not None,
+                anchor_adjusted_to=adjusted_anchor,
+                event_frame_may_be_missing=event_frame_may_be_missing,
+            )
+
+        is_degraded = bool(
+            gaps
+            or not covers_overall_start
+            or not covers_overall_end
+            or adjusted_anchor is not None
+        )
+        if adjusted_anchor is not None:
+            quality = "approximate_anchor_boundary"
+        elif gaps:
+            quality = "stitched_across_gap"
+        elif not covers_overall_start:
+            quality = "degraded_history_available_only"
+        elif not covers_overall_end:
+            quality = "degraded_tail_available_only"
+        else:
+            quality = "complete"
+        reason = (
+            "moved the event anchor to the nearest available video boundary"
+            if adjusted_anchor is not None
+            else "stitched available video across one or more permanent gaps"
+            if gaps
+            else "using available video after requested history was evicted"
+            if not covers_overall_start
+            else "using available video at the output deadline"
+            if not covers_overall_end
+            else "the requested window is continuously covered"
+        )
+        return decision(
+            CoverageStatus.READY_DEGRADED if is_degraded else CoverageStatus.READY_FULL,
+            effective_start=overall_start,
+            effective_end=overall_end,
+            chosen=selected,
+            gaps=gaps,
+            error_kind=(
+                "stitched_video_gap"
+                if gaps
+                else "degraded_deadline"
+                if force_degraded and not covers_overall_end
+                else "degraded_window"
+                if is_degraded
+                else None
+            ),
+            reason=reason,
+            coverage_quality=quality,
+            stitched_across_gap=bool(gaps),
+            approximate=adjusted_anchor is not None,
+            anchor_adjusted_to=adjusted_anchor,
+            event_frame_may_be_missing=event_frame_may_be_missing,
+        )
+
     if anchor_index is None:
         if latest_end < anchor - edge_tolerance:
             return decision(
@@ -371,10 +604,14 @@ def run(
     command: list[str],
     *,
     cancel_event: threading.Event | None = None,
+    timeout_seconds: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    if cancel_event is None:
+    if timeout_seconds is not None and timeout_seconds <= 0:
+        raise ValueError("command timeout_seconds must be positive")
+    if cancel_event is None and timeout_seconds is None:
         return subprocess.run(command, check=True, text=True, capture_output=True)
 
+    started = time.monotonic()
     process = subprocess.Popen(
         command,
         text=True,
@@ -382,7 +619,23 @@ def run(
         stderr=subprocess.PIPE,
     )
     while True:
-        if cancel_event.is_set():
+        if (
+            timeout_seconds is not None
+            and time.monotonic() - started >= timeout_seconds
+        ):
+            process.terminate()
+            try:
+                stdout, stderr = process.communicate(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                stdout, stderr = process.communicate()
+            raise subprocess.TimeoutExpired(
+                command,
+                timeout_seconds,
+                output=stdout,
+                stderr=stderr,
+            )
+        if cancel_event is not None and cancel_event.is_set():
             process.terminate()
             try:
                 process.communicate(timeout=2.0)
@@ -662,6 +915,7 @@ def encode_gif(
     coverage: VideoCoverage | None = None,
     allow_degraded: bool = False,
     output_filename: str | None = None,
+    timeout_seconds: float | None = None,
 ) -> dict:
     requested_start = max(0.0, event.stream_time - before)
     requested_end = event.stream_time + after
@@ -686,6 +940,24 @@ def encode_gif(
     selected = list(coverage.segments)
     wanted_start = coverage.effective_start
     wanted_end = coverage.effective_end
+    effective_anchor = (
+        float(coverage.anchor_adjusted_to)
+        if coverage.anchor_adjusted_to is not None
+        else float(event.stream_time)
+    )
+    requested_anchor_offset = max(0.0, float(event.stream_time) - requested_start)
+    compressed_before_anchor = sum(
+        max(0.0, min(float(gap_end), effective_anchor) - max(float(gap_start), wanted_start))
+        for gap_start, gap_end in coverage.gaps
+    )
+    estimated_encoded_anchor_offset = max(
+        0.0,
+        effective_anchor - wanted_start - compressed_before_anchor,
+    )
+    timeline_compression_before_anchor = max(
+        0.0,
+        requested_anchor_offset - estimated_encoded_anchor_offset,
+    )
 
     if output_filename is not None:
         requested_filename = str(output_filename)
@@ -717,9 +989,28 @@ def encode_gif(
         encoding="utf-8",
     )
     output = output_dir / (output_filename or f"{stem}.gif")
+    encode_deadline = (
+        time.monotonic() + timeout_seconds
+        if timeout_seconds is not None
+        else None
+    )
+
+    def remaining_encode_seconds() -> float | None:
+        if encode_deadline is None:
+            return None
+        remaining = encode_deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired([ffmpeg], timeout_seconds)
+        return remaining
+
     try:
         seek = max(0.0, wanted_start - selected[0].start)
-        wanted_duration = wanted_end - wanted_start
+        wanted_duration = max(
+            0.0,
+            wanted_end - wanted_start - coverage.skipped_gap_seconds,
+        )
+        if wanted_duration <= 0:
+            raise BufferUnavailable("video gaps leave no encodable GIF duration")
         encode_started = time.perf_counter()
         video_filter = (
             f"fps={fps:g},scale={width}:-2:flags=lanczos,split[s0][s1];"
@@ -750,6 +1041,7 @@ def encode_gif(
                 str(output),
             ],
             cancel_event=cancel_event,
+            timeout_seconds=remaining_encode_seconds(),
         )
         if not output.is_file():
             raise RuntimeError(f"FFmpeg did not create GIF output: {output}")
@@ -779,6 +1071,7 @@ def encode_gif(
                     str(output),
                 ],
                 cancel_event=cancel_event,
+                timeout_seconds=remaining_encode_seconds(),
             ).stdout
         )
         stream = (probe.get("streams") or [{}])[0]
@@ -802,13 +1095,28 @@ def encode_gif(
             "over_size_reference": size > size_reference_bytes,
             "coverage_status": coverage.status.value,
             "coverage_reason": coverage.reason,
+            "coverage_quality": coverage.coverage_quality,
+            "degraded": coverage.degraded,
+            "stitched_across_gap": coverage.stitched_across_gap,
+            "video_gap_count": coverage.video_gap_count,
+            "skipped_gap_seconds": coverage.skipped_gap_seconds,
+            "approximate": coverage.approximate,
+            "anchor_adjusted": coverage.anchor_adjusted,
+            "anchor_adjusted_to_stream_time": coverage.anchor_adjusted_to,
+            "anchor_shift_seconds": coverage.anchor_shift_seconds,
+            "event_frame_may_be_missing": coverage.event_frame_may_be_missing,
+            "requested_anchor_offset_seconds": round(requested_anchor_offset, 3),
+            "estimated_encoded_anchor_offset_seconds": round(
+                estimated_encoded_anchor_offset, 3
+            ),
+            "timeline_compression_before_anchor_seconds": round(
+                timeline_compression_before_anchor, 3
+            ),
+            "anchor_offset_mapping_basis": "segment_timeline_estimate",
+            "available_media_duration_seconds": round(wanted_duration, 3),
             **(
                 {"coverage_error_kind": coverage.error_kind}
                 if coverage.error_kind else {}
-            ),
-            **(
-                {"skipped_gap_seconds": coverage.skipped_gap_seconds}
-                if coverage.skipped_gap_seconds else {}
             ),
         }
     finally:

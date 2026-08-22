@@ -83,16 +83,23 @@ it remains usable without network access or a live match.
 
 One console can manage several matches. Active matches appear as tabs, and
 switching tabs only changes the visible match; it does not stop the other
-Workers. The defaults allow eight active matches while reserving one shared
-slot for the default GIF and four shared slots for OCR:
+Workers. The Apple Silicon defaults allow eight active matches while limiting
+the expensive OCR path to two shared slots:
 
 ```bash
 GIF_MAX_CONCURRENT_MATCHES=8
 GIF_MAX_CONCURRENT_HEAVY_TASKS=5
-GIF_MAX_CONCURRENT_VISION_TASKS=4
-GIF_VISION_WORKERS=4
+GIF_MAX_CONCURRENT_VISION_TASKS=2
+GIF_VISION_WORKERS=2
+GIF_OCR_TIMEOUT_SECONDS=300
 GIF_WORKER_FINISH_TIMEOUT_SECONDS=600
 ```
+
+On a stronger server, set both `GIF_MAX_CONCURRENT_VISION_TASKS=4` and
+`GIF_VISION_WORKERS=4` (and use `GIF_MAX_CONCURRENT_HEAVY_TASKS=5`) to run four
+OCR tasks. The OCR timeout applies to one recognition subprocess; slow but
+progressing FFmpeg preparation and earlier OCR passes no longer consume a
+single fatal event budget.
 
 The limits apply across all match Worker processes. A ninth match receives an
 HTTP 409 response until one active match has completely stopped. GIF encoding

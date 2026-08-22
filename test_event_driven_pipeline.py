@@ -22,6 +22,7 @@ from event_driven_pipeline import (
     cross_source_goal_incident,
     encode_event_job,
     event_timing_diagnostics,
+    exact_shotmap_stream_anchor,
     evict_terminal_runtime_jobs,
     protect_incomplete_vision_event_segments,
     maintain_segment_generations,
@@ -35,6 +36,7 @@ from event_driven_pipeline import (
     parse_match_start_play,
     parse_match_events,
     parse_cumulative_match_second,
+    promote_shotmap_goal_candidates,
     normalize_shotmap_goal,
     overview_goal_fallback_status,
     select_cross_source_goal_incident,
@@ -42,12 +44,13 @@ from event_driven_pipeline import (
     refresh_vision_job_event_data,
     reset_vision_artifact_for_target_upgrade,
     split_vision_pool_task_key,
+    shutdown_task_pools,
     sync_completed_default_job,
     vision_artifact_ready_for_submission,
     vision_pool_task_key,
 )
 from live_goal_pipeline import PendingEvent, Segment
-from live_runtime import ProcessExit
+from live_runtime import BoundedTaskPool, ProcessExit
 from segment_manifest import new_segment_manifest, save_segment_manifest, upsert_segment_generation
 from vision_runtime import VisionJob
 
@@ -117,6 +120,95 @@ class EventVisualLeaseTests(unittest.TestCase):
             self.assertEqual(ocr_task.last_error_kind, "vision_shutdown_timeout")
             self.assertEqual(ocr_task.result["completion_state"], "incomplete")
             self.assertEqual(default_task.status, "pending")
+            runtime.close()
+
+    def test_bounded_shutdown_prioritizes_default_and_fences_vision_state(self):
+        import threading
+
+        from pipeline_runtime import PipelineRuntime
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = PipelineRuntime(root / "state.sqlite3", root / "events.jsonl")
+            event_key = "match-1:G:bounded-shutdown"
+            runtime.discover_task(
+                match_id="match-1",
+                event_data={
+                    "event_key": event_key,
+                    "code": "G",
+                    "event_type": "goal",
+                    "minute": "2",
+                    "minute_extra": "0",
+                    "team": "teamA",
+                    "person": "A",
+                    "person_id": "1",
+                    "score": "1-0",
+                    "reason": "",
+                    "metadata": {},
+                },
+                observed_stream_time=200.0,
+                observed_source_time=None,
+                clip_anchor_stream_time=200.0,
+                clip_anchor_source_time=None,
+                output_due_stream_time=230.0,
+                detected_at_unix=1000.0,
+            )
+            runtime.enqueue_vision_task(
+                event_key,
+                artifact_kind="ocr_window",
+                search_start_stream_time=100.0,
+                search_end_stream_time=200.0,
+                clip_before_seconds=30.0,
+                clip_after_seconds=30.0,
+                deadline_at_unix=1400.0,
+            )
+            default_pool = BoundedTaskPool(1)
+            vision_pool = BoundedTaskPool(1, prioritized=True)
+            default_cancel = threading.Event()
+            vision_cancel = threading.Event()
+            vision_started = threading.Event()
+
+            def finish_default_after_vision_is_cancelled():
+                self.assertTrue(vision_cancel.wait(1.0))
+                return default_cancel.is_set()
+
+            def running_vision():
+                vision_started.set()
+                self.assertTrue(vision_cancel.wait(1.0))
+
+            default_pool.submit("default", finish_default_after_vision_is_cancelled)
+            vision_pool.submit("active", running_vision)
+            self.assertTrue(vision_started.wait(1.0))
+            vision_pool.submit("queued", lambda: None)
+
+            summary = shutdown_task_pools(
+                default_pool,
+                vision_pool,
+                default_cancel_event=default_cancel,
+                vision_cancel_event=vision_cancel,
+                runtime=runtime,
+                match_id="match-1",
+                terminal_vision_reason="match_played",
+                default_drain_seconds=0.5,
+                cancel_drain_seconds=0.5,
+            )
+
+            self.assertEqual(summary["cancelled_vision_keys"], ["queued"])
+            self.assertTrue(summary["default_drained_before_cancel"])
+            self.assertTrue(summary["default_drained"])
+            self.assertTrue(summary["vision_drained"])
+            self.assertFalse(default_cancel.is_set())
+            self.assertTrue(vision_cancel.is_set())
+            self.assertFalse(default_pool.collect_done()[0][1])
+            task = runtime.store.get_vision_task(event_key, "ocr_window")
+            self.assertEqual(task.status, "failed")
+            self.assertEqual(task.last_error_kind, "vision_shutdown_timeout")
+            with self.assertRaisesRegex(ValueError, "match-end shutdown"):
+                runtime.transition_vision_task(
+                    event_key,
+                    "pending",
+                    artifact_kind="ocr_window",
+                )
             runtime.close()
 
     def test_progressive_scan_and_output_windows_extend_event_lease(self):
@@ -390,11 +482,257 @@ class ShotmapSecondEnrichmentTests(unittest.TestCase):
                 timeout=1.0,
             )
             restored.start = lambda: None
+            self.assertFalse(restored.initialized)
             self.assertEqual(restored.last_shot_count, 3)
             self.assertEqual(restored.last_goal_count, 2)
             restored._responses.put((updated, {"http_status": 200}, 1010.0))
             self.assertEqual(restored.poll(0.0, 0.0), [])
+            self.assertTrue(restored.initialized)
             reopened.close()
+
+    def test_restart_first_response_is_always_a_fresh_process_baseline(self):
+        from pipeline_runtime import PipelineRuntime
+
+        def goal(person_id: int, second: int) -> dict[str, object]:
+            return {
+                "outcome": "goal",
+                "person_id": person_id,
+                "team_id": 2,
+                "minute": (second + 59) // 60,
+                "minute_extra": 0,
+                "second": second,
+                "situation": "open_play",
+            }
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = PipelineRuntime(root / "state.sqlite3", root / "events.jsonl")
+            source = HttpShotmapGoalSource(
+                "https://example.test/shotmap",
+                "match-restart-baseline",
+                None,
+                runtime.store,
+                timeout=1.0,
+            )
+            source.start = lambda: None
+            first = {"shots": [goal(1, 455)]}
+            second = {"shots": [*first["shots"], goal(2, 701)]}
+            source._responses.put((first, {"http_status": 200}, 1000.0))
+            self.assertEqual(source.poll(0.0, 0.0), [])
+            source._responses.put((second, {"http_status": 200}, 1005.0))
+            emitted = source.poll(0.0, 0.0)
+            self.assertEqual([event.second for event in emitted], [701])
+            source.acknowledge(emitted)
+            runtime.close()
+
+            reopened = PipelineRuntime(
+                root / "state.sqlite3", root / "events.jsonl"
+            )
+            restarted = HttpShotmapGoalSource(
+                "https://example.test/shotmap",
+                "match-restart-baseline",
+                None,
+                reopened.store,
+                timeout=1.0,
+            )
+            restarted.start = lambda: None
+            self.assertFalse(restarted.initialized)
+
+            # This row appeared while the monitor was down. It remains durable
+            # history but must not be promoted by the first process response.
+            during_downtime = {
+                "shots": [*second["shots"], goal(3, 900)]
+            }
+            restarted._responses.put(
+                (during_downtime, {"http_status": 200}, 1010.0)
+            )
+            self.assertEqual(restarted.poll(0.0, 0.0), [])
+            state = reopened.store.load_shotmap_state(
+                "match-restart-baseline"
+            )
+            self.assertEqual(len(state.seen_fingerprints), 3)
+
+            live_update = {
+                "shots": [*during_downtime["shots"], goal(4, 960)]
+            }
+            restarted._responses.put(
+                (live_update, {"http_status": 200}, 1015.0)
+            )
+            emitted = restarted.poll(0.0, 0.0)
+            self.assertEqual([event.second for event in emitted], [960])
+            reopened.close()
+
+    def test_shotmap_candidate_promotes_on_unique_new_overview_event(self):
+        from pipeline_runtime import TimelineState
+
+        normalized = normalize_shotmap_goal(
+            {
+                "outcome": "goal",
+                "person_id": 9,
+                "team_id": 2,
+                "minute": 8,
+                "minute_extra": 0,
+                "second": 455,
+                "situation": "open_play",
+            }
+        )
+        candidate = shotmap_goal_match_event(
+            "match-1",
+            normalized,
+            observed_at_unix=1000.0,
+            request_diagnostics={},
+        )
+        overview = self.goal(
+            event_key="match-1:G:overview-live",
+            minute="8",
+            person_id="50000009",
+            metadata={"team_id": "2", "source": "overview"},
+        )
+        timeline = TimelineState(
+            match_id="match-1",
+            timeline_origin_wall_unix=1000.0,
+            match_start_at_unix=None,
+        )
+
+        promoted = promote_shotmap_goal_candidates(
+            [candidate],
+            [overview],
+            [],
+            timeline,
+            stream_rate=1.0,
+            before=10.0,
+            after=20.0,
+        )
+
+        self.assertEqual(len(promoted), 1)
+        self.assertEqual(
+            promoted[0].metadata["shotmap_promotion"]["reason"],
+            "new_overview_event",
+        )
+        self.assertEqual(
+            promoted[0].metadata["shotmap_promotion"]["overview_event_key"],
+            overview.event_key,
+        )
+        ambiguous = promote_shotmap_goal_candidates(
+            [candidate, replace(candidate, event_key="match-1:G:shotmap-other")],
+            [overview],
+            [],
+            timeline,
+            stream_rate=1.0,
+            before=10.0,
+            after=20.0,
+        )
+        self.assertEqual(ambiguous, [])
+
+    def test_shotmap_candidate_requires_complete_retained_video_without_overview(self):
+        from pipeline_runtime import TimelineState
+
+        normalized = normalize_shotmap_goal(
+            {
+                "outcome": "goal",
+                "person_id": 9,
+                "team_id": 2,
+                "minute": 8,
+                "minute_extra": 0,
+                "second": 455,
+                "situation": "open_play",
+            }
+        )
+        candidate = shotmap_goal_match_event(
+            "match-1",
+            normalized,
+            observed_at_unix=1000.0,
+            request_diagnostics={},
+        )
+        timeline = TimelineState(
+            match_id="match-1",
+            timeline_origin_wall_unix=1000.0,
+            timeline_origin_stream_time=0.0,
+            match_start_at_unix=1000.0,
+        )
+        self.assertEqual(
+            exact_shotmap_stream_anchor(candidate, timeline, stream_rate=1.0),
+            455.0,
+        )
+        second_half_goal = normalize_shotmap_goal(
+            {
+                "outcome": "goal",
+                "person_id": 10,
+                "team_id": 2,
+                "minute": 70,
+                "minute_extra": 0,
+                "second": 4177,
+                "situation": "open_play",
+            }
+        )
+        second_half = shotmap_goal_match_event(
+            "match-1",
+            second_half_goal,
+            observed_at_unix=1000.0,
+            request_diagnostics={},
+        )
+        self.assertEqual(
+            exact_shotmap_stream_anchor(second_half, timeline, stream_rate=1.0),
+            4177.0 + timeline.halftime_break_seconds,
+        )
+        inconsistent = replace(candidate, minute="20")
+        self.assertIsNone(
+            exact_shotmap_stream_anchor(
+                inconsistent, timeline, stream_rate=1.0
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            full_path = root / "full.ts"
+            full_path.write_bytes(b"video")
+            promoted = promote_shotmap_goal_candidates(
+                [candidate],
+                [],
+                [Segment(full_path, 440.0, 480.0)],
+                timeline,
+                stream_rate=1.0,
+                before=10.0,
+                after=20.0,
+            )
+            self.assertEqual(len(promoted), 1)
+            self.assertEqual(
+                promoted[0].metadata["shotmap_promotion"]["reason"],
+                "retained_video_coverage",
+            )
+            self.assertEqual(
+                promoted[0].metadata["shotmap_promotion"]["anchor_stream_time"],
+                455.0,
+            )
+
+            left = root / "left.ts"
+            right = root / "right.ts"
+            left.write_bytes(b"video")
+            right.write_bytes(b"video")
+            rejected_gap = promote_shotmap_goal_candidates(
+                [candidate],
+                [],
+                [Segment(left, 440.0, 450.0), Segment(right, 460.0, 480.0)],
+                timeline,
+                stream_rate=1.0,
+                before=10.0,
+                after=20.0,
+            )
+            self.assertEqual(rejected_gap, [])
+
+        uncalibrated = replace(timeline, match_start_at_unix=None)
+        self.assertEqual(
+            promote_shotmap_goal_candidates(
+                [candidate],
+                [],
+                [],
+                uncalibrated,
+                stream_rate=1.0,
+                before=10.0,
+                after=20.0,
+            ),
+            [],
+        )
 
     def test_empty_shotmap_response_establishes_an_empty_baseline(self):
         from pipeline_runtime import PipelineRuntime

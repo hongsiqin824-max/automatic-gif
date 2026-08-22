@@ -19,6 +19,111 @@ from live_goal_pipeline import (
 
 
 class GifBufferTests(unittest.TestCase):
+    def _encode_gap_offset_case(
+        self,
+        *,
+        gap_start: float,
+        gap_end: float,
+        anchor: float,
+    ) -> dict:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "first.ts"
+            second = root / "second.ts"
+            first.write_bytes(b"first")
+            second.write_bytes(b"second")
+            segments = [
+                Segment(first, 0.0, gap_start),
+                Segment(second, gap_end, 20.0),
+            ]
+            coverage = analyze_video_coverage(
+                segments,
+                window_start=0.0,
+                window_end=20.0,
+                anchor=anchor,
+                allow_degraded=True,
+                stitch_across_gaps=True,
+                allow_anchor_adjustment=True,
+                max_anchor_gap_seconds=10.0,
+                max_anchor_shift_seconds=5.0,
+            )
+            event = PendingEvent(
+                event_type="goal",
+                stream_time=anchor,
+                source_time=None,
+                detected_wall_time=0.0,
+                change_fraction=0.0,
+                stability_fraction=0.0,
+                output_due_stream_time=20.0,
+            )
+
+            def fake_run(command, **_kwargs):
+                if command[0] == "ffmpeg":
+                    self.assertEqual(command[command.index("-t") + 1], "18.000")
+                    Path(command[-1]).write_bytes(b"GIF89a")
+                    return SimpleNamespace(stderr="", stdout="")
+                return SimpleNamespace(
+                    stderr="",
+                    stdout=(
+                        '{"streams":[{"width":384,"height":216,'
+                        '"r_frame_rate":"6/1"}],'
+                        '"format":{"duration":"18.0","size":"6"}}'
+                    ),
+                )
+
+            with patch("live_goal_pipeline.run", side_effect=fake_run):
+                return encode_gif(
+                    "ffmpeg",
+                    "ffprobe",
+                    segments,
+                    event,
+                    root,
+                    before=anchor,
+                    after=20.0 - anchor,
+                    width=384,
+                    fps=6,
+                    colors=160,
+                    size_reference_bytes=10_000_000,
+                    coverage=coverage,
+                )
+
+    def test_encoded_anchor_offset_compresses_gap_before_anchor(self):
+        result = self._encode_gap_offset_case(
+            gap_start=4.0,
+            gap_end=6.0,
+            anchor=10.0,
+        )
+
+        self.assertEqual(result["requested_anchor_offset_seconds"], 10.0)
+        self.assertEqual(result["estimated_encoded_anchor_offset_seconds"], 8.0)
+        self.assertEqual(result["timeline_compression_before_anchor_seconds"], 2.0)
+        self.assertEqual(result["available_media_duration_seconds"], 18.0)
+        self.assertEqual(result["anchor_offset_mapping_basis"], "segment_timeline_estimate")
+
+    def test_encoded_anchor_offset_ignores_gap_after_anchor(self):
+        result = self._encode_gap_offset_case(
+            gap_start=4.0,
+            gap_end=6.0,
+            anchor=3.0,
+        )
+
+        self.assertEqual(result["requested_anchor_offset_seconds"], 3.0)
+        self.assertEqual(result["estimated_encoded_anchor_offset_seconds"], 3.0)
+        self.assertEqual(result["timeline_compression_before_anchor_seconds"], 0.0)
+
+    def test_encoded_anchor_offset_uses_adjusted_gap_boundary(self):
+        result = self._encode_gap_offset_case(
+            gap_start=4.0,
+            gap_end=6.0,
+            anchor=5.0,
+        )
+
+        self.assertTrue(result["anchor_adjusted"])
+        self.assertEqual(result["anchor_adjusted_to_stream_time"], 4.0)
+        self.assertEqual(result["requested_anchor_offset_seconds"], 5.0)
+        self.assertEqual(result["estimated_encoded_anchor_offset_seconds"], 4.0)
+        self.assertEqual(result["timeline_compression_before_anchor_seconds"], 1.0)
+
     def test_rolling_segment_list_capacity_is_finite(self):
         self.assertEqual(rolling_segment_list_size(60.0, 2.0), 34)
         self.assertGreater(

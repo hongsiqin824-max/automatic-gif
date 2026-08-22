@@ -22,6 +22,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from concurrent.futures import CancelledError
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
@@ -125,6 +126,8 @@ MAX_OBSERVED_SEGMENT_PATHS = 4096
 VISION_POOL_KEY_SEPARATOR = "\x1f"
 EVENT_VISUAL_WINDOW_LEASE_OWNER = "event-visual-window"
 MIN_EVENT_VISUAL_WINDOW_LEASE_TTL_SECONDS = 180.0
+SHUTDOWN_DEFAULT_GIF_DRAIN_SECONDS = 5.0
+SHUTDOWN_CANCEL_DRAIN_SECONDS = 3.0
 
 
 def load_scoreboard_profile(path: Path | None) -> dict[str, Any] | None:
@@ -480,19 +483,101 @@ def mark_incomplete_vision_tasks_on_shutdown(
             },
             "shutdown_reason": reason,
         }
-        runtime.transition_vision_task(
-            task.event_key,
-            "failed",
-            artifact_kind=task.artifact_kind,
-            result=result,
-            error=message,
-            error_kind="vision_shutdown_timeout",
-            failure_stage="shutdown",
-            failure_reason=message,
-            reason="match_end_ocr_timeout",
-        )
+        try:
+            runtime.transition_vision_task(
+                task.event_key,
+                "failed",
+                artifact_kind=task.artifact_kind,
+                result=result,
+                error=message,
+                error_kind="vision_shutdown_timeout",
+                failure_stage="shutdown",
+                failure_reason=message,
+                reason="match_end_ocr_timeout",
+            )
+        except ValueError:
+            # A worker may complete between list_incomplete_vision_tasks() and
+            # this transition. Preserve that valid terminal result.
+            current = runtime.store.get_vision_task(
+                task.event_key,
+                artifact_kind=task.artifact_kind,
+            )
+            if current is not None and current.status in {"encoded", "failed"}:
+                continue
+            raise
         marked += 1
     return marked
+
+
+def shutdown_task_pools(
+    task_pool: BoundedTaskPool,
+    vision_pool: BoundedTaskPool | None,
+    *,
+    default_cancel_event: threading.Event,
+    vision_cancel_event: threading.Event,
+    runtime: PipelineRuntime | None = None,
+    match_id: str | None = None,
+    terminal_vision_reason: str | None = None,
+    default_drain_seconds: float = SHUTDOWN_DEFAULT_GIF_DRAIN_SECONDS,
+    cancel_drain_seconds: float = SHUTDOWN_CANCEL_DRAIN_SECONDS,
+) -> dict[str, Any]:
+    """Bound match-end worker shutdown while favoring the default GIF path."""
+    if default_drain_seconds < 0 or cancel_drain_seconds < 0:
+        raise ValueError("shutdown drain durations must be non-negative")
+
+    task_pool.stop_accepting()
+    cancelled_vision_keys: list[str] = []
+    if vision_pool is not None:
+        vision_pool.stop_accepting()
+        cancelled_vision_keys = vision_pool.cancel_pending()
+
+    marked_vision_tasks = 0
+    if terminal_vision_reason is not None:
+        if runtime is None or match_id is None:
+            raise ValueError(
+                "runtime and match_id are required for terminal vision shutdown"
+            )
+        # Install the durable terminal fence before waking active workers with
+        # cancellation. Their late writes then encounter a terminal row rather
+        # than replacing this explicit shutdown diagnosis.
+        marked_vision_tasks = mark_incomplete_vision_tasks_on_shutdown(
+            runtime,
+            match_id,
+            reason=terminal_vision_reason,
+        )
+
+    # Vision work is optional and may be blocked in a coordinator, OCR socket,
+    # or FFmpeg. Releasing it first gives the independent default GIF path the
+    # remaining compute and shutdown time.
+    vision_cancel_event.set()
+    default_drained_before_cancel = task_pool.wait_until_idle(
+        default_drain_seconds
+    )
+    if not default_drained_before_cancel:
+        default_cancel_event.set()
+
+    final_deadline = time.monotonic() + cancel_drain_seconds
+    default_drained = task_pool.wait_until_idle(cancel_drain_seconds)
+    remaining = max(0.0, final_deadline - time.monotonic())
+    vision_drained = (
+        True
+        if vision_pool is None
+        else vision_pool.wait_until_idle(remaining)
+    )
+
+    # wait=False is intentional: the dashboard process-group timeout remains
+    # the final guard for a third-party call that ignores cancellation.
+    task_pool.shutdown(wait=False)
+    if vision_pool is not None:
+        vision_pool.shutdown(wait=False)
+    return {
+        "cancelled_vision_queue_count": len(cancelled_vision_keys),
+        "cancelled_vision_keys": cancelled_vision_keys,
+        "marked_vision_task_count": marked_vision_tasks,
+        "default_drained_before_cancel": default_drained_before_cancel,
+        "default_drained": default_drained,
+        "vision_drained": vision_drained,
+    }
 
 
 BEIJING = ZoneInfo("Asia/Shanghai")
@@ -1303,6 +1388,8 @@ def encode_event_job(
         anchor=pending.stream_time,
         allow_degraded=allow_degraded,
         min_degraded_seconds=min_degraded_seconds,
+        stitch_across_gaps=allow_degraded,
+        allow_anchor_adjustment=allow_degraded,
     )
     if coverage.status == CoverageStatus.WAITING:
         if now >= current.deadline_at_unix:
@@ -1314,6 +1401,8 @@ def encode_event_job(
                 allow_degraded=allow_degraded,
                 force_degraded=allow_degraded,
                 min_degraded_seconds=min_degraded_seconds,
+                stitch_across_gaps=allow_degraded,
+                allow_anchor_adjustment=allow_degraded,
             )
             if coverage.status != CoverageStatus.READY_DEGRADED:
                 error = (
@@ -1740,6 +1829,148 @@ def shotmap_goal_match_event(
         second=second,
         metadata=metadata,
     )
+
+
+def exact_shotmap_stream_anchor(
+    event: MatchEvent,
+    timeline: TimelineState,
+    *,
+    stream_rate: float = 1.0,
+) -> float | None:
+    """Map a direct shotmap clock second onto the persisted stream timeline.
+
+    This estimate is deliberately available only when the operator supplied a
+    match start. Without that durable wall/stream mapping, a delayed shotmap
+    row cannot be distinguished safely from a genuinely new live event.
+    """
+    if _event_source_name(event) != "shotmap":
+        return None
+    second = stable_event_second(asdict(event))
+    if second is None or timeline.match_start_at_unix is None:
+        return None
+    try:
+        rate = float(stream_rate)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(rate) or rate <= 0:
+        return None
+    clock = _shotmap_clock_parts(event.minute, event.minute_extra)
+    if clock is None:
+        return None
+    display_minute, _minute_extra = clock
+    if second // 60 not in {display_minute, max(0, display_minute - 1)}:
+        return None
+    base_minute = _shotmap_clock_value(event.minute)
+    if base_minute is None:
+        return None
+    elapsed = float(second)
+    if base_minute > 45:
+        elapsed += float(timeline.halftime_break_seconds)
+    visible_wall = (
+        float(timeline.match_start_at_unix)
+        + elapsed
+        + float(timeline.broadcast_delay_seconds)
+    )
+    anchor = float(timeline.timeline_origin_stream_time) + (
+        visible_wall - float(timeline.timeline_origin_wall_unix)
+    ) * rate
+    if not math.isfinite(anchor) or anchor < 0:
+        return None
+    return anchor
+
+
+def promote_shotmap_goal_candidates(
+    candidates: list[MatchEvent],
+    overview_events: list[MatchEvent],
+    segments: list[Any],
+    timeline: TimelineState,
+    *,
+    stream_rate: float,
+    before: float,
+    after: float,
+) -> list[MatchEvent]:
+    """Return only direct shotmap goals with conservative freshness evidence.
+
+    A candidate is safe when exactly one newly emitted unified/overview event
+    represents the same incident. Otherwise it needs an exact clock-to-stream
+    estimate whose complete default-GIF window is still continuously retained.
+    Missing timeline calibration, missing history, a live tail, or a video gap
+    all leave the candidate pending rather than creating a false job.
+    """
+    if before < 0 or after <= 0:
+        raise ValueError("shotmap promotion window must be positive")
+    promoted: list[MatchEvent] = []
+    overview_candidate_counts = {
+        event.event_key: sum(
+            1
+            for candidate in candidates
+            if _event_source_name(event) != "shotmap"
+            and cross_source_goal_incident(candidate, event)
+        )
+        for event in overview_events
+    }
+    for candidate in candidates:
+        matching_overview = [
+            event
+            for event in overview_events
+            if _event_source_name(event) != "shotmap"
+            and cross_source_goal_incident(candidate, event)
+        ]
+        if (
+            len(matching_overview) == 1
+            and overview_candidate_counts.get(matching_overview[0].event_key) == 1
+        ):
+            promoted.append(
+                replace(
+                    candidate,
+                    metadata={
+                        **candidate.metadata,
+                        "shotmap_promotion": {
+                            "status": "promoted",
+                            "reason": "new_overview_event",
+                            "overview_event_key": matching_overview[0].event_key,
+                        },
+                    },
+                )
+            )
+            continue
+
+        anchor = exact_shotmap_stream_anchor(
+            candidate,
+            timeline,
+            stream_rate=stream_rate,
+        )
+        if anchor is None:
+            continue
+        window_start = max(0.0, anchor - float(before))
+        window_end = anchor + float(after)
+        if window_end <= window_start:
+            continue
+        coverage = analyze_video_coverage(
+            segments,
+            window_start=window_start,
+            window_end=window_end,
+            anchor=anchor,
+        )
+        if coverage.status != CoverageStatus.READY_FULL:
+            continue
+        promoted.append(
+            replace(
+                candidate,
+                metadata={
+                    **candidate.metadata,
+                    "shotmap_promotion": {
+                        "status": "promoted",
+                        "reason": "retained_video_coverage",
+                        "anchor_stream_time": round(anchor, 3),
+                        "window_start_stream_time": round(window_start, 3),
+                        "window_end_stream_time": round(window_end, 3),
+                        "coverage_status": coverage.status.value,
+                    },
+                },
+            )
+        )
+    return promoted
 
 
 def _event_source_name(value: MatchEvent | dict[str, Any]) -> str:
@@ -2496,8 +2727,13 @@ class HttpShotmapGoalSource:
         self.timeout = float(timeout)
         self.poll_interval = float(poll_interval)
         state = store.load_shotmap_state(self.match_id)
-        self.initialized = state.initialized
+        # Durable rows are diagnostic/history state, not proof of freshness in
+        # this process. Every monitor start must observe one valid response as
+        # its own baseline before a later shotmap row may become a candidate.
+        self.initialized = False
+        self.durable_initialized = state.initialized
         self._seen_fingerprints = set(state.seen_fingerprints)
+        self._pending_events: dict[str, MatchEvent] = {}
         self._known_cores: set[tuple[str, str, int, str]] = set()
         if state.last_snapshot is not None:
             for raw_shot in state.last_snapshot.get("shots", []):
@@ -2637,7 +2873,6 @@ class HttpShotmapGoalSource:
     def poll(self, stream_time: float, now_monotonic: float) -> list[MatchEvent]:
         del stream_time, now_monotonic
         self.start()
-        emitted: list[MatchEvent] = []
         while True:
             try:
                 payload, diagnostics, observed_at_unix = self._responses.get_nowait()
@@ -2682,15 +2917,20 @@ class HttpShotmapGoalSource:
                 core = _shotmap_goal_core(goal)
                 if core is not None and core in known_before:
                     continue
-                emitted.append(
-                    shotmap_goal_match_event(
-                        self.match_id,
-                        goal,
-                        observed_at_unix=observed_at_unix,
-                        request_diagnostics=diagnostics,
-                    )
+                self._pending_events[fingerprint] = shotmap_goal_match_event(
+                    self.match_id,
+                    goal,
+                    observed_at_unix=observed_at_unix,
+                    request_diagnostics=diagnostics,
                 )
-        return emitted
+        return list(self._pending_events.values())
+
+    def acknowledge(self, events: list[MatchEvent]) -> None:
+        """Remove candidates only after the main loop has safely promoted them."""
+        for event in events:
+            fingerprint = str(event.metadata.get("shotmap_fingerprint") or "")
+            if fingerprint:
+                self._pending_events.pop(fingerprint, None)
 
     def report(self) -> dict[str, Any]:
         return {
@@ -2698,6 +2938,7 @@ class HttpShotmapGoalSource:
             "url": self.url,
             "poll_interval_seconds": self.poll_interval,
             "initialized": self.initialized,
+            "durable_initialized": self.durable_initialized,
             "request_count": self.request_count,
             "error_count": self.error_count,
             "last_error": self.last_error,
@@ -2709,6 +2950,7 @@ class HttpShotmapGoalSource:
             "last_shot_count": self.last_shot_count,
             "last_goal_count": self.last_goal_count,
             "seen_fingerprint_count": len(self._seen_fingerprints),
+            "pending_candidate_count": len(self._pending_events),
         }
 
 
@@ -3445,12 +3687,12 @@ def main() -> None:
     parser.add_argument(
         "--vision-workers",
         type=int,
-        default=4,
-        help="simultaneous OCR/vision worker threads (default: 4)",
+        default=2,
+        help="simultaneous OCR/vision worker threads (default: 2)",
     )
     parser.add_argument("--vision-timeout-seconds", type=float, default=90.0)
     parser.add_argument("--ocr-python", type=Path, default=OCR_PYTHON)
-    parser.add_argument("--ocr-timeout-seconds", type=float, default=180.0)
+    parser.add_argument("--ocr-timeout-seconds", type=float, default=300.0)
     parser.add_argument(
         "--ocr-clock-only",
         action="store_true",
@@ -4002,6 +4244,7 @@ def main() -> None:
     stopped_by_user = False
     graceful_stop_requested = threading.Event()
     graceful_stop_cancel_encodes = threading.Event()
+    vision_shutdown_cancel_event = threading.Event()
     graceful_stop_started_monotonic: float | None = None
     graceful_stop_ingest_stopped = False
     graceful_stop_timed_out = False
@@ -4255,7 +4498,6 @@ def main() -> None:
                 graceful_stop_stream_incomplete = any(
                     job.pending.status in ("pending", "encoding") for job in jobs
                 )
-                graceful_stop_cancel_encodes.set()
                 graceful_stop_ingest_stopped = True
                 supervisor.terminate()
                 stop_reason = "match_played_stream_incomplete"
@@ -4307,11 +4549,22 @@ def main() -> None:
 
                 previous_error_count = getattr(event_source, "error_count", 0)
                 overview_events = event_source.poll(stream_time, now_monotonic)
-                shotmap_events = (
+                shotmap_candidates = (
                     shotmap_event_source.poll(stream_time, now_monotonic)
                     if shotmap_event_source is not None
                     else []
                 )
+                shotmap_events = promote_shotmap_goal_candidates(
+                    shotmap_candidates,
+                    overview_events,
+                    segment_reader() if shotmap_candidates else [],
+                    timeline,
+                    stream_rate=stream_rate,
+                    before=args.before,
+                    after=args.after,
+                )
+                if shotmap_event_source is not None and shotmap_events:
+                    shotmap_event_source.acknowledge(shotmap_events)
                 new_events = [*shotmap_events, *overview_events]
                 first_observed_wall_time = time.time() if new_events else None
                 current_error_count = getattr(event_source, "error_count", 0)
@@ -4466,21 +4719,38 @@ def main() -> None:
                         match_event.metadata.get("shotmap_first_observed_at_unix")
                         or first_observed_wall_time
                     )
-                    observed_stream_time = (
-                        observed_stream_time_from_wall(
-                            stream_time,
-                            processed_at_unix=first_observed_wall_time,
-                            observed_at_unix=detected_wall_time,
-                            stream_rate=stream_rate,
+                    shotmap_promotion = (
+                        match_event.metadata.get("shotmap_promotion")
+                        if is_shotmap_event
+                        and isinstance(match_event.metadata, dict)
+                        else None
+                    )
+                    retained_anchor = (
+                        shotmap_promotion.get("anchor_stream_time")
+                        if isinstance(shotmap_promotion, dict)
+                        and shotmap_promotion.get("reason")
+                        == "retained_video_coverage"
+                        else None
+                    )
+                    if isinstance(retained_anchor, (int, float)):
+                        observed_stream_time = float(retained_anchor)
+                        event_offset = 0.0
+                    else:
+                        observed_stream_time = (
+                            observed_stream_time_from_wall(
+                                stream_time,
+                                processed_at_unix=first_observed_wall_time,
+                                observed_at_unix=detected_wall_time,
+                                stream_rate=stream_rate,
+                            )
+                            if is_shotmap_event
+                            else stream_time
                         )
-                        if is_shotmap_event
-                        else stream_time
-                    )
-                    event_offset = (
-                        args.shotmap_offset
-                        if is_shotmap_event
-                        else args.event_to_video_offset
-                    )
+                        event_offset = (
+                            args.shotmap_offset
+                            if is_shotmap_event
+                            else args.event_to_video_offset
+                        )
                     clip_anchor = max(
                         0.0, observed_stream_time + event_offset
                     )
@@ -4911,7 +5181,7 @@ def main() -> None:
                                 ffmpeg,
                                 ffprobe,
                                 args.output_dir,
-                                cancel_event=graceful_stop_cancel_encodes,
+                                cancel_event=vision_shutdown_cancel_event,
                                 on_state_change=vision_queue_phase_callback(
                                     runtime,
                                     event_key=event_key,
@@ -4945,7 +5215,7 @@ def main() -> None:
                                     "min_degraded_seconds": (
                                         args.min_degraded_gif_seconds
                                     ),
-                                    "cancel_event": graceful_stop_cancel_encodes,
+                                    "cancel_event": vision_shutdown_cancel_event,
                                 },
                             ):
                                 print(
@@ -4956,7 +5226,9 @@ def main() -> None:
                         event_key, artifact_kind = split_vision_pool_task_key(
                             pool_key
                         )
-                        if error is not None and not isinstance(error, HeavyTaskCancelled):
+                        if error is not None and not isinstance(
+                            error, (HeavyTaskCancelled, CancelledError)
+                        ):
                             fail_unhandled_vision_worker_error(
                                 runtime,
                                 event_key=event_key,
@@ -5068,8 +5340,6 @@ def main() -> None:
                     timed_out = stop_elapsed >= args.graceful_stop_timeout_seconds
                     if (drain_ready or timed_out) and not graceful_stop_ingest_stopped:
                         graceful_stop_timed_out = timed_out and not drain_ready
-                        if graceful_stop_timed_out:
-                            graceful_stop_cancel_encodes.set()
                         graceful_stop_ingest_stopped = True
                         supervisor.terminate()
                         runtime.logger.log(
@@ -5216,15 +5486,27 @@ def main() -> None:
         supervisor.terminate()
         return_code = process.wait()
     finally:
-        if (
-            graceful_stop_started_monotonic is not None
-            and not graceful_stop_ingest_stopped
-        ):
-            graceful_stop_cancel_encodes.set()
         supervisor.close()
-        task_pool.shutdown(wait=True)
-        if vision_pool is not None:
-            vision_pool.shutdown(wait=True)
+        terminal_vision_reason = (
+            stop_reason
+            if stop_reason in {"match_played", "match_played_stream_incomplete"}
+            else None
+        )
+        shutdown_summary = shutdown_task_pools(
+            task_pool,
+            vision_pool,
+            default_cancel_event=graceful_stop_cancel_encodes,
+            vision_cancel_event=vision_shutdown_cancel_event,
+            runtime=runtime,
+            match_id=args.match_id,
+            terminal_vision_reason=terminal_vision_reason,
+        )
+        runtime.logger.log(
+            "worker_pools_shutdown",
+            match_id=args.match_id,
+            stop_reason=stop_reason,
+            **shutdown_summary,
+        )
         if shotmap_event_source is not None:
             shotmap_event_source.close()
         if graceful_signal is not None and previous_graceful_handler is not None:
@@ -5256,14 +5538,14 @@ def main() -> None:
         for pool_key, _completed, error in vision_pool.collect_done():
             event_key, artifact_kind = split_vision_pool_task_key(pool_key)
             if error is not None:
-                if not isinstance(error, HeavyTaskCancelled):
+                if not isinstance(error, (HeavyTaskCancelled, CancelledError)):
                     fail_unhandled_vision_worker_error(
                         runtime,
                         event_key=event_key,
                         artifact_kind=artifact_kind,
                         error=error,
                     )
-            if error is not None:
+            if error is not None and not isinstance(error, CancelledError):
                 print(
                     f"[vision:worker:error] artifact={artifact_kind} "
                     f"key={event_key} {error}"

@@ -258,6 +258,16 @@ class StoredShotmapState:
 
 
 @dataclass(frozen=True)
+class StoredScoreboardRoiCache:
+    match_id: str
+    profile: dict[str, Any]
+    confidence: float | None
+    success_streak: int
+    failure_streak: int
+    updated_at_unix: float
+
+
+@dataclass(frozen=True)
 class TimelineState:
     """Persistent mapping between wall-clock, match-clock, and stream time."""
 
@@ -546,6 +556,14 @@ class TaskStateStore:
             );
             CREATE INDEX IF NOT EXISTS shotmap_feed_events_match_seen
                 ON shotmap_feed_events(match_id, first_seen_at_unix);
+            CREATE TABLE IF NOT EXISTS scoreboard_roi_cache (
+                match_id TEXT PRIMARY KEY,
+                profile_json TEXT NOT NULL,
+                confidence REAL,
+                success_streak INTEGER NOT NULL DEFAULT 0,
+                failure_streak INTEGER NOT NULL DEFAULT 0,
+                updated_at_unix REAL NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS timeline_states (
                 match_id TEXT PRIMARY KEY,
                 timeline_origin_wall_unix REAL NOT NULL,
@@ -1208,6 +1226,102 @@ class TaskStateStore:
         """Load the last valid shotmap snapshot and latest diagnostics."""
         state = self.load_shotmap_state(match_id)
         return state.last_snapshot, state.diagnostics
+
+    def get_scoreboard_roi_cache(
+        self, match_id: str
+    ) -> StoredScoreboardRoiCache | None:
+        with self._lock:
+            row = self.connection.execute(
+                "SELECT * FROM scoreboard_roi_cache WHERE match_id = ?",
+                (str(match_id),),
+            ).fetchone()
+        if row is None:
+            return None
+        profile = self._decode_json_object(row["profile_json"])
+        if not profile:
+            return None
+        return StoredScoreboardRoiCache(
+            match_id=str(row["match_id"]),
+            profile=profile,
+            confidence=(
+                float(row["confidence"])
+                if row["confidence"] is not None
+                else None
+            ),
+            success_streak=int(row["success_streak"]),
+            failure_streak=int(row["failure_streak"]),
+            updated_at_unix=float(row["updated_at_unix"]),
+        )
+
+    def save_scoreboard_roi_cache(
+        self,
+        match_id: str,
+        profile: Mapping[str, Any],
+        *,
+        confidence: float | None = None,
+        now: float | None = None,
+    ) -> StoredScoreboardRoiCache:
+        normalized_profile = dict(profile)
+        if not normalized_profile:
+            raise ValueError("scoreboard ROI profile must not be empty")
+        normalized_confidence = (
+            None
+            if confidence is None
+            else _finite_float(confidence, "scoreboard ROI confidence")
+        )
+        timestamp = time.time() if now is None else float(now)
+        with self._lock, self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO scoreboard_roi_cache (
+                    match_id, profile_json, confidence,
+                    success_streak, failure_streak, updated_at_unix
+                ) VALUES (?, ?, ?, 1, 0, ?)
+                ON CONFLICT(match_id) DO UPDATE SET
+                    profile_json = excluded.profile_json,
+                    confidence = excluded.confidence,
+                    success_streak = scoreboard_roi_cache.success_streak + 1,
+                    failure_streak = 0,
+                    updated_at_unix = excluded.updated_at_unix
+                """,
+                (
+                    str(match_id),
+                    json.dumps(
+                        normalized_profile,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                    normalized_confidence,
+                    timestamp,
+                ),
+            )
+        cached = self.get_scoreboard_roi_cache(match_id)
+        assert cached is not None
+        return cached
+
+    def record_scoreboard_roi_failure(
+        self,
+        match_id: str,
+        *,
+        invalidate: bool = False,
+        now: float | None = None,
+    ) -> StoredScoreboardRoiCache | None:
+        timestamp = time.time() if now is None else float(now)
+        with self._lock, self.connection:
+            self.connection.execute(
+                """
+                UPDATE scoreboard_roi_cache SET
+                    success_streak = 0,
+                    failure_streak = CASE
+                        WHEN ? THEN 3
+                        ELSE failure_streak + 1
+                    END,
+                    updated_at_unix = ?
+                WHERE match_id = ?
+                """,
+                (1 if invalidate else 0, timestamp, str(match_id)),
+            )
+        return self.get_scoreboard_roi_cache(match_id)
 
     def upsert_shotmap_snapshot(
         self,
@@ -1903,6 +2017,14 @@ class TaskStateStore:
             if current is None:
                 raise KeyError(
                     f"unknown vision task: {event_key} ({normalized_artifact_kind})"
+                )
+            if (
+                current.status == "failed"
+                and current.last_error_kind == "vision_shutdown_timeout"
+                and new_status != "failed"
+            ):
+                raise ValueError(
+                    "vision task is terminal after the match-end shutdown deadline"
                 )
             if new_status not in _ALLOWED_VISION_TRANSITIONS[current.status]:
                 raise ValueError(

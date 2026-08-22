@@ -325,7 +325,7 @@ class DashboardTests(unittest.TestCase):
         with patch(
             "dashboard_server._json_request", return_value={"list": rows}
         ) as request_json, patch(
-            "dashboard_server.time.time", side_effect=[100.0, 104.0, 130.0, 134.0]
+            "dashboard_server.time.time", side_effect=[100.0, 104.0, 220.0, 224.0]
         ):
             catalog.snapshot()
             catalog.snapshot()
@@ -454,7 +454,9 @@ class DashboardTests(unittest.TestCase):
                     event_key TEXT, code TEXT, event_type TEXT, event_json TEXT,
                     status TEXT, discovered_at_unix REAL, updated_at_unix REAL,
                     output_path TEXT, output_bytes INTEGER, result_json TEXT,
-                    error TEXT
+                    error TEXT, attempt_count INTEGER, readiness_check_count INTEGER,
+                    next_attempt_at_unix REAL, deadline_at_unix REAL,
+                    last_error_kind TEXT
                 )
                 """
             )
@@ -471,7 +473,7 @@ class DashboardTests(unittest.TestCase):
                 "reason": "",
             }
             runtime.execute(
-                "INSERT INTO event_tasks VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO event_tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     "m:G:1",
                     "G",
@@ -483,7 +485,12 @@ class DashboardTests(unittest.TestCase):
                     "/tmp/goal.gif",
                     100,
                     "{}",
-                    None,
+                    "video is incomplete",
+                    3,
+                    7,
+                    30.0,
+                    120.0,
+                    "buffer_deadline_exceeded",
                 ),
             )
             runtime.commit()
@@ -495,6 +502,11 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(tasks[0]["score"], "4-1")
         self.assertEqual(tasks[0]["minute_extra"], "1")
         self.assertEqual(tasks[0]["output"], "/tmp/goal.gif")
+        self.assertEqual(tasks[0]["attempt_count"], 3)
+        self.assertEqual(tasks[0]["readiness_check_count"], 7)
+        self.assertEqual(tasks[0]["next_attempt_at_unix"], 30.0)
+        self.assertEqual(tasks[0]["deadline_at_unix"], 120.0)
+        self.assertEqual(tasks[0]["last_error_kind"], "buffer_deadline_exceeded")
 
     def test_database_task_includes_independent_vision_artifact(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -521,7 +533,22 @@ class DashboardTests(unittest.TestCase):
                 "INSERT INTO event_tasks VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 ("m:G:1", "G", "goal", json.dumps(event), "encoded", 1, 2,
                  "/tmp/default.gif", 10,
-                 json.dumps({"coverage_status": "ready_degraded"}), None),
+                 json.dumps({
+                     "coverage_status": "ready_degraded",
+                     "coverage_quality": "stitched_across_gap",
+                     "stitched_across_gap": True,
+                     "video_gap_count": 1,
+                     "skipped_gap_seconds": 2.0,
+                     "approximate": False,
+                     "anchor_adjusted": False,
+                     "anchor_adjusted_to_stream_time": None,
+                     "anchor_shift_seconds": 0.0,
+                     "event_frame_may_be_missing": False,
+                     "requested_anchor_offset_seconds": 30.0,
+                     "estimated_encoded_anchor_offset_seconds": 28.0,
+                     "timeline_compression_before_anchor_seconds": 2.0,
+                     "anchor_offset_mapping_basis": "segment_timeline_estimate",
+                 }), None),
             )
             runtime.execute(
                 "INSERT INTO vision_tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -529,7 +556,21 @@ class DashboardTests(unittest.TestCase):
                  "SoccerNet_small", "/tmp/refined.gif", 8,
                  json.dumps({
                      "anchor_delta_seconds": 2.4,
+                     "duration_sec": 58.0,
                      "coverage_status": "ready_degraded",
+                     "localization_degraded": False,
+                     "coverage_degraded": True,
+                     "actual_media_window": {
+                         "coverage_quality": "approximate_anchor_boundary",
+                         "stitched_across_gap": True,
+                         "video_gap_count": 1,
+                         "skipped_gap_seconds": 2.0,
+                         "approximate": True,
+                         "anchor_adjusted": True,
+                         "anchor_adjusted_to_stream_time": 26.0,
+                         "anchor_shift_seconds": -0.4,
+                         "event_frame_may_be_missing": True,
+                     },
                  }), None, 1),
             )
             runtime.commit(); runtime.close()
@@ -540,6 +581,36 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(tasks[0]["vision"]["locator_method"], "tdeed")
         self.assertEqual(tasks[0]["coverage_status"], "ready_degraded")
         self.assertEqual(tasks[0]["vision"]["coverage_status"], "ready_degraded")
+        self.assertEqual(tasks[0]["vision"]["duration_sec"], 58.0)
+        self.assertFalse(tasks[0]["vision"]["localization_degraded"])
+        self.assertTrue(tasks[0]["vision"]["coverage_degraded"])
+        self.assertEqual(tasks[0]["coverage_quality"], "stitched_across_gap")
+        self.assertTrue(tasks[0]["stitched_across_gap"])
+        self.assertEqual(tasks[0]["video_gap_count"], 1)
+        self.assertEqual(tasks[0]["skipped_gap_seconds"], 2.0)
+        self.assertFalse(tasks[0]["approximate"])
+        self.assertFalse(tasks[0]["anchor_adjusted"])
+        self.assertIsNone(tasks[0]["anchor_adjusted_to_stream_time"])
+        self.assertEqual(tasks[0]["anchor_shift_seconds"], 0.0)
+        self.assertFalse(tasks[0]["event_frame_may_be_missing"])
+        self.assertEqual(tasks[0]["requested_anchor_offset_seconds"], 30.0)
+        self.assertEqual(tasks[0]["estimated_encoded_anchor_offset_seconds"], 28.0)
+        self.assertEqual(tasks[0]["timeline_compression_before_anchor_seconds"], 2.0)
+        self.assertEqual(tasks[0]["anchor_offset_mapping_basis"], "segment_timeline_estimate")
+        self.assertEqual(
+            tasks[0]["vision"]["coverage_quality"],
+            "approximate_anchor_boundary",
+        )
+        self.assertTrue(tasks[0]["vision"]["stitched_across_gap"])
+        self.assertEqual(tasks[0]["vision"]["video_gap_count"], 1)
+        self.assertEqual(tasks[0]["vision"]["skipped_gap_seconds"], 2.0)
+        self.assertTrue(tasks[0]["vision"]["approximate"])
+        self.assertTrue(tasks[0]["vision"]["anchor_adjusted"])
+        self.assertEqual(
+            tasks[0]["vision"]["anchor_adjusted_to_stream_time"], 26.0
+        )
+        self.assertEqual(tasks[0]["vision"]["anchor_shift_seconds"], -0.4)
+        self.assertTrue(tasks[0]["vision"]["event_frame_may_be_missing"])
 
     def test_database_exposes_ocr_and_tdeed_artifacts_without_overwrite(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -806,6 +877,14 @@ class DashboardTests(unittest.TestCase):
                         "target_passed_without_anchor": True,
                         "target_failure_scan_stage": "ocr_progressive_scan",
                         "scan_attempt_count": 3,
+                        "coverage_diagnostics": {
+                            "coverage_class": "history_unavailable",
+                            "history_missing_seconds": 18.5,
+                            "target_history_missing": True,
+                            "target_history_fully_missing": True,
+                            "latest_media_end_stream_time": 100.0,
+                            "video_gaps": [{"duration_seconds": 2.0}],
+                        },
                          "last_scan_start_stream_time": 20.0,
                          "last_scan_end_stream_time": 100.0,
                      },
@@ -826,6 +905,10 @@ class DashboardTests(unittest.TestCase):
         self.assertTrue(ocr["target_passed_without_anchor"])
         self.assertEqual(ocr["target_failure_scan_stage"], "ocr_progressive_scan")
         self.assertEqual(ocr["scan_attempt_count"], 3)
+        self.assertEqual(ocr["target_failure_coverage_class"], "history_unavailable")
+        self.assertEqual(ocr["history_missing_seconds"], 18.5)
+        self.assertTrue(ocr["target_history_fully_missing"])
+        self.assertEqual(len(ocr["video_gaps"]), 1)
         self.assertEqual(ocr["next_attempt_at_unix"], 30.0)
         self.assertEqual(ocr["deadline_at_unix"], 120.0)
         self.assertEqual(ocr["scan_window"]["start_stream_time"], 20.0)
@@ -1452,6 +1535,9 @@ class DashboardTests(unittest.TestCase):
         html = (dashboard_server.ROOT / "dashboard_static" / "index.html").read_text(
             encoding="utf-8"
         )
+        app_js = (dashboard_server.ROOT / "dashboard_static" / "app.js").read_text(
+            encoding="utf-8"
+        )
 
         self.assertIn('id="before" type="number" value="30"', html)
         self.assertIn('id="after" type="number" value="20"', html)
@@ -1459,6 +1545,20 @@ class DashboardTests(unittest.TestCase):
         self.assertIn('id="width" type="number" value="768"', html)
         self.assertIn('id="vision-enabled" type="checkbox" checked', html)
         self.assertIn('id="vision-state">默认开启', html)
+        self.assertIn('id="runtime-issues"', html)
+        self.assertIn('src="/static/error_messages.js"', html)
+        for label in (
+            "发生原因",
+            "造成的结果",
+            "系统已经做了什么",
+            "可核对的信息",
+            "建议怎么处理",
+            "查看完整处理记录",
+        ):
+            self.assertIn(label, app_js)
+        self.assertNotIn("<summary>技术详情</summary>", app_js)
+        self.assertIn("默认 GIF 可用", app_js)
+        self.assertIn("cls:'warning'", app_js)
 
     def test_direct_start_uses_backend_defaults_and_enables_vision(self):
         manager = dashboard_server.Dashboard(background_monitors=False)
@@ -1513,6 +1613,10 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(
             command[command.index("--vision-workers") + 1],
             str(dashboard_server.VISION_WORKERS),
+        )
+        self.assertEqual(
+            command[command.index("--ocr-timeout-seconds") + 1],
+            str(dashboard_server.OCR_TIMEOUT_SECONDS),
         )
         payload = response.get_json()
         self.assertTrue(payload["vision"]["enabled"])

@@ -21,7 +21,11 @@ import sys
 import tempfile
 import threading
 import time
-from concurrent.futures import Future, TimeoutError as FutureTimeoutError
+from concurrent.futures import (
+    Future,
+    InvalidStateError,
+    TimeoutError as FutureTimeoutError,
+)
 from dataclasses import dataclass
 from os import PathLike
 from pathlib import Path
@@ -157,8 +161,8 @@ class _ClockSecondEstimate:
 # A fixed scoreboard ROI can still provide a useful one-sided estimate when
 # only a short, clean run is readable.  Keep the estimate explicitly degraded
 # so it is never confused with a directly observed target second.
-NEAR_NEIGHBOR_MAX_CLOCK_DISTANCE_SECONDS = 4
-NEAR_NEIGHBOR_MIN_DIRECT_READINGS = 2
+NEAR_NEIGHBOR_MAX_CLOCK_DISTANCE_SECONDS = 2
+NEAR_NEIGHBOR_MIN_DIRECT_READINGS = 3
 NEAR_NEIGHBOR_MAX_DIRECT_READINGS = 5
 NEAR_NEIGHBOR_MIN_CLOCK_VIDEO_SLOPE = 0.8
 NEAR_NEIGHBOR_MAX_CLOCK_VIDEO_SLOPE = 1.2
@@ -239,6 +243,7 @@ class OcrCropResult:
     confidences: tuple[float, ...]
     batch_size: int
     inference_seconds: float
+    backend_generation: int = 0
 
     @property
     def profile_id(self) -> str:
@@ -255,6 +260,7 @@ class OcrCropResult:
             "confidences": list(self.confidences),
             "batch_size": self.batch_size,
             "inference_seconds": self.inference_seconds,
+            "backend_generation": self.backend_generation,
         }
 
 
@@ -1486,12 +1492,10 @@ def _locate_goal_second(
             if reading.clock_seconds == event_second:
                 if len(segment) < 2:
                     isolated_target_reading_count += 1
-                    # A fixed scoreboard clock ROI does not need a second
-                    # neighboring frame to identify an exact displayed
-                    # second.  Once the reading has passed the normal
-                    # trustworthiness checks, use the single frame as the
-                    # anchor and expose the weaker evidence in diagnostics.
-                    accepted_isolated_target_reading_count += 1
+                    # One isolated OCR value can be a false positive. Keep it
+                    # in diagnostics, but require an adjacent continuity
+                    # reading before authorizing an exact-second anchor.
+                    continue
                 observed_candidates.append(
                     _ClockSecondCandidate(
                         reading.frame_seconds,
@@ -1624,7 +1628,7 @@ def _locate_goal_second(
             "kind": "near_neighbor_clock_estimate",
             "message": (
                 "target clock was estimated from a consecutive direct OCR run "
-                "within four clock seconds"
+                "within two clock seconds"
             ),
             "error_bound_seconds": NEAR_NEIGHBOR_MAX_CLOCK_DISTANCE_SECONDS,
         }
@@ -2753,6 +2757,7 @@ class BatchOcrWorker:
         max_batch_size: int = 8,
         batch_wait_seconds: float = 0.02,
         queue_capacity: int = 128,
+        generation: int = 0,
         engine_factory: EngineFactory = load_ocr_engine,
         batch_recognizer: Callable[
             ..., list[tuple[list[str], list[float]]]
@@ -2766,11 +2771,14 @@ class BatchOcrWorker:
             raise ValueError("batch_wait_seconds must be in [0, 1]")
         if int(queue_capacity) < int(max_batch_size):
             raise ValueError("queue_capacity must be at least max_batch_size")
+        if int(generation) < 0:
+            raise ValueError("generation must not be negative")
 
         self.language = str(language)
         self.max_batch_size = int(max_batch_size)
         self.batch_wait_seconds = float(batch_wait_seconds)
         self.queue_capacity = int(queue_capacity)
+        self.generation = int(generation)
         self._engine_factory = engine_factory
         self._batch_recognizer = batch_recognizer
         self._queue: queue.Queue[_QueuedCrop] = queue.Queue(
@@ -2781,6 +2789,8 @@ class BatchOcrWorker:
         self._stop_requested = threading.Event()
         self._accepting = True
         self._terminal_error: WorkerError | None = None
+        self._active_lock = threading.Lock()
+        self._active: list[_QueuedCrop] = []
         self._thread = threading.Thread(
             target=self._run,
             name="scoreboard-ocr-batch",
@@ -2914,6 +2924,31 @@ class BatchOcrWorker:
         self._ready.set()
         self._cancel_queued(error)
 
+    def invalidate_generation(self) -> None:
+        """Reject queued/in-flight work without waiting for a stuck backend."""
+        error = WorkerError(
+            "ocr_backend_generation_invalidated",
+            "the OCR backend generation was replaced after an inference timeout",
+            diagnostics={
+                "stage": "batch_inference",
+                "backend_unhealthy": True,
+                "backend_generation": self.generation,
+            },
+        )
+        with self._state_lock:
+            self._terminal_error = error
+            self._accepting = False
+            self._stop_requested.set()
+        self._cancel_queued(error)
+        with self._active_lock:
+            active = list(self._active)
+        for item in active:
+            if not item.future.done():
+                with contextlib.suppress(InvalidStateError):
+                    item.future.set_exception(
+                        self._error_for_request(error, item.request)
+                    )
+
     def _run(self) -> None:
         try:
             engine = self._engine_factory(self.language)
@@ -2955,9 +2990,10 @@ class BatchOcrWorker:
                 )
                 for item in batch:
                     if not item.future.done():
-                        item.future.set_exception(
-                            self._error_for_request(error, item.request)
-                        )
+                        with contextlib.suppress(InvalidStateError):
+                            item.future.set_exception(
+                                self._error_for_request(error, item.request)
+                            )
             finally:
                 for _item in batch:
                     self._queue.task_done()
@@ -2969,6 +3005,8 @@ class BatchOcrWorker:
         ]
         if not active:
             return
+        with self._active_lock:
+            self._active.extend(active)
         started = time.perf_counter()
         try:
             recognized = self._batch_recognizer(
@@ -3008,9 +3046,11 @@ class BatchOcrWorker:
                 normalized.append((text_values, confidence_values))
         except WorkerError as exc:
             for item in active:
-                item.future.set_exception(
-                    self._error_for_request(exc, item.request)
-                )
+                if not item.future.done():
+                    with contextlib.suppress(InvalidStateError):
+                        item.future.set_exception(
+                            self._error_for_request(exc, item.request)
+                        )
             return
         except Exception as exc:
             error = WorkerError(
@@ -3019,26 +3059,36 @@ class BatchOcrWorker:
                 diagnostics={"batch_size": len(active)},
             )
             for item in active:
-                item.future.set_exception(
-                    self._error_for_request(error, item.request)
-                )
+                if not item.future.done():
+                    with contextlib.suppress(InvalidStateError):
+                        item.future.set_exception(
+                            self._error_for_request(error, item.request)
+                        )
             return
-
-        inference_seconds = time.perf_counter() - started
-        for item, (texts, confidences) in zip(active, normalized):
-            request = item.request
-            item.future.set_result(
-                OcrCropResult(
-                    match_id=request.match_id,
-                    video_pts=request.video_pts,
-                    kind=request.kind,
-                    profile=request.profile,
-                    texts=texts,
-                    confidences=confidences,
-                    batch_size=len(active),
-                    inference_seconds=round(inference_seconds, 6),
-                )
-            )
+        else:
+            inference_seconds = time.perf_counter() - started
+            for item, (texts, confidences) in zip(active, normalized):
+                request = item.request
+                if not item.future.done():
+                    with contextlib.suppress(InvalidStateError):
+                        item.future.set_result(
+                            OcrCropResult(
+                                match_id=request.match_id,
+                                video_pts=request.video_pts,
+                                kind=request.kind,
+                                profile=request.profile,
+                                texts=texts,
+                                confidences=confidences,
+                                batch_size=len(active),
+                                inference_seconds=round(inference_seconds, 6),
+                                backend_generation=self.generation,
+                            )
+                        )
+        finally:
+            with self._active_lock:
+                for item in active:
+                    with contextlib.suppress(ValueError):
+                        self._active.remove(item)
 
 
 def _ffprobe_for_ffmpeg(ffmpeg: str) -> str:
@@ -4070,6 +4120,7 @@ def _recognize_paths_shared(
             diagnostics={
                 "stage": "batch_inference",
                 "backend_unhealthy": True,
+                "backend_generation": batch_worker.generation,
             },
         ) from exc
     except WorkerError as exc:
@@ -4080,6 +4131,7 @@ def _recognize_paths_shared(
             "ocr_inference_failed",
             "ocr_model_unavailable",
             "ocr_worker_closed",
+            "ocr_backend_generation_invalidated",
         } or (exc.kind == "inference_timeout" and error_stage == "batch_inference")
         raise WorkerError(
             exc.kind,
@@ -4088,6 +4140,9 @@ def _recognize_paths_shared(
                 **exc.diagnostics,
                 "stage": error_stage,
                 "backend_unhealthy": backend_unhealthy,
+                "backend_generation": exc.diagnostics.get(
+                    "backend_generation", batch_worker.generation
+                ),
             },
         ) from exc
 
@@ -4951,16 +5006,21 @@ class _SocketOcrRuntime:
         self._queue_capacity = queue_capacity
         self._workers: dict[str, BatchOcrWorker] = {}
         self._lock = threading.Lock()
-        self._unhealthy = False
+        self._generation = 1
+        self._closed = False
+
+    @property
+    def generation(self) -> int:
+        with self._lock:
+            return self._generation
 
     def worker_for(self, language: str) -> BatchOcrWorker:
         normalized = str(language or "en").strip() or "en"
         with self._lock:
-            if self._unhealthy:
+            if self._closed:
                 raise WorkerError(
                     "ocr_worker_closed",
-                    "persistent OCR backend is restarting",
-                    diagnostics={"backend_unhealthy": True},
+                    "persistent OCR backend is closed",
                 )
             worker = self._workers.get(normalized)
             if worker is None:
@@ -4969,22 +5029,42 @@ class _SocketOcrRuntime:
                     max_batch_size=self._max_batch_size,
                     batch_wait_seconds=self._batch_wait_seconds,
                     queue_capacity=self._queue_capacity,
+                    generation=self._generation,
                     engine_factory=self._engine_factory,
                     batch_recognizer=self._batch_recognizer,
                 )
                 self._workers[normalized] = worker
             return worker
 
-    def mark_unhealthy(self) -> None:
+    def invalidate_generation(self, generation: int) -> dict[str, Any]:
+        """Atomically replace one unhealthy generation and keep serving."""
         with self._lock:
-            self._unhealthy = True
+            if self._closed or int(generation) != self._generation:
+                return {
+                    "ocr_backend_restarted": self._generation > int(generation),
+                    "backend_generation_before": int(generation),
+                    "backend_generation_after": self._generation,
+                }
+            previous_generation = self._generation
+            self._generation += 1
             workers = list(self._workers.values())
+            self._workers.clear()
         for worker in workers:
-            worker.close(wait=False, cancel_pending=True)
+            worker.invalidate_generation()
+            worker.close(wait=False)
+        return {
+            "ocr_backend_restarted": True,
+            "backend_generation_before": previous_generation,
+            "backend_generation_after": previous_generation + 1,
+        }
+
+    def mark_unhealthy(self) -> None:
+        """Backward-compatible generation invalidation hook."""
+        self.invalidate_generation(self.generation)
 
     def close(self, *, timeout: float = 2.0) -> None:
         with self._lock:
-            self._unhealthy = True
+            self._closed = True
             workers = list(self._workers.values())
             self._workers.clear()
         deadline = time.monotonic() + max(0.0, timeout)
@@ -5016,6 +5096,50 @@ def _write_socket_document(stream: Any, document: Mapping[str, Any]) -> bool:
         return False
 
 
+def _restartable_backend_generation(
+    document: Mapping[str, Any],
+) -> int | None:
+    """Return the failed generation only for shared-backend failures."""
+    error = document.get("error")
+    if not isinstance(error, Mapping):
+        return None
+    diagnostics = error.get("diagnostics")
+    if not isinstance(diagnostics, Mapping):
+        return None
+    kind = str(error.get("kind") or "")
+    stage = str(diagnostics.get("stage") or "")
+    restartable = kind == "ocr_backend_generation_invalidated" or (
+        kind == "inference_timeout" and stage == "batch_inference"
+    )
+    if not restartable or not diagnostics.get("backend_unhealthy"):
+        return None
+    try:
+        generation = int(diagnostics.get("backend_generation"))
+    except (TypeError, ValueError):
+        return None
+    return generation if generation >= 0 else None
+
+
+def _record_backend_restart(
+    document: dict[str, Any],
+    restart: Mapping[str, Any],
+    *,
+    retry_count: int,
+) -> None:
+    container_key = "result" if document.get("ok") else "error"
+    container = document.get(container_key)
+    if not isinstance(container, dict):
+        return
+    diagnostics = container.get("diagnostics")
+    if not isinstance(diagnostics, dict):
+        diagnostics = {}
+        container["diagnostics"] = diagnostics
+    diagnostics.update({
+        **restart,
+        "ocr_backend_restart_retry_count": int(retry_count),
+    })
+
+
 def _serve_socket_connection(
     connection: socket.socket,
     *,
@@ -5023,7 +5147,6 @@ def _serve_socket_connection(
     stop_requested: threading.Event,
     request_executor: Callable[..., tuple[dict[str, Any], int]],
 ) -> None:
-    backend_unhealthy = False
     try:
         with connection:
             connection.settimeout(10.0)
@@ -5076,30 +5199,73 @@ def _serve_socket_connection(
                                     raise ValueError(
                                         "request timeout must be in (0, 3600]"
                                     )
-                                batch_worker = runtime.worker_for(
-                                    str(request.get("language") or "en")
+                                request_deadline = (
+                                    time.monotonic() + timeout_seconds
                                 )
-                                document, _return_code = request_executor(
-                                    request,
-                                    batch_worker=batch_worker,
-                                    request_timeout_seconds=max(
-                                        0.05,
-                                        timeout_seconds * 0.9,
-                                    ),
+                                retry_reserve_seconds = min(
+                                    15.0,
+                                    max(0.05, timeout_seconds * 0.1),
                                 )
+                                restart_diagnostics: dict[str, Any] | None = None
+                                retry_count = 0
+                                while True:
+                                    remaining = request_deadline - time.monotonic()
+                                    if remaining <= 0:
+                                        raise WorkerError(
+                                            "inference_timeout",
+                                            "OCR request budget ended during backend restart",
+                                            diagnostics={
+                                                "stage": "batch_inference",
+                                                **(restart_diagnostics or {}),
+                                            },
+                                        )
+                                    batch_worker = runtime.worker_for(
+                                        str(request.get("language") or "en")
+                                    )
+                                    attempt_budget = remaining
+                                    if retry_count == 0:
+                                        attempt_budget = max(
+                                            0.05,
+                                            remaining - retry_reserve_seconds,
+                                        )
+                                    document, _return_code = request_executor(
+                                        dict(request),
+                                        batch_worker=batch_worker,
+                                        request_timeout_seconds=min(
+                                            remaining, attempt_budget
+                                        ),
+                                    )
+                                    failed_generation = (
+                                        _restartable_backend_generation(document)
+                                    )
+                                    if failed_generation is None:
+                                        if restart_diagnostics is not None:
+                                            _record_backend_restart(
+                                                document,
+                                                restart_diagnostics,
+                                                retry_count=retry_count,
+                                            )
+                                        break
+                                    restart_diagnostics = (
+                                        runtime.invalidate_generation(
+                                            failed_generation
+                                        )
+                                    )
+                                    remaining = request_deadline - time.monotonic()
+                                    if retry_count >= 1 or remaining <= 0.05:
+                                        _record_backend_restart(
+                                            document,
+                                            restart_diagnostics,
+                                            retry_count=retry_count,
+                                        )
+                                        break
+                                    retry_count += 1
                             except (TypeError, ValueError, WorkerError) as exc:
                                 error = (
                                     exc if isinstance(exc, WorkerError)
                                     else WorkerError("ocr_invalid_request", str(exc))
                                 )
                                 document = {"ok": False, "error": error.as_dict()}
-                            error = document.get("error")
-                            if isinstance(error, Mapping):
-                                diagnostics = error.get("diagnostics")
-                                backend_unhealthy = bool(
-                                    isinstance(diagnostics, Mapping)
-                                    and diagnostics.get("backend_unhealthy")
-                                )
                 _write_socket_document(
                     connection if hasattr(connection, "sendall") else stream,
                     document,
@@ -5109,11 +5275,9 @@ def _serve_socket_connection(
         # damaged OCR engine. Drop the response and keep serving other jobs.
         return
     except Exception:
-        backend_unhealthy = True
-    finally:
-        if backend_unhealthy:
-            runtime.mark_unhealthy()
-            stop_requested.set()
+        # A handler failure is request-local. The backend is replaced only by
+        # the generation-aware path above, never by generic protocol errors.
+        return
 
 
 def serve_socket(
