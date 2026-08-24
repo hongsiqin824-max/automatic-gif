@@ -7,7 +7,7 @@ event-driven worker only after a live source has been found.
 """
 
 from __future__ import annotations
-
+import sys
 import errno
 import html
 import json
@@ -3309,7 +3309,7 @@ class Dashboard:
             if demo:
                 source = str(ROOT / "downloads" / "SV Wehen Wiesbaden vs FC Bayern Munchen [zqJI-83XFhM].mp4")
                 command = [
-                    "python3", str(ROOT / "event_driven_pipeline.py"), source,
+                    sys.executable, str(ROOT / "event_driven_pipeline.py"), source,
                     "--simulate-live", "--replay-speed", "4", "--start", "1037", "--duration", "95",
                     "--match-id", session.match_id, "--replay-events",
                     str(ROOT / "mock_events" / "api_snapshot_scenario.json"),
@@ -3328,7 +3328,7 @@ class Dashboard:
                 if not source:
                     raise RuntimeError("尚未获取到可用的 RTMP resource")
                 command = [
-                    "python3", str(ROOT / "event_driven_pipeline.py"), source,
+                    sys.executable, str(ROOT / "event_driven_pipeline.py"), source,
                     "--match-id", session.match_id,
                     "--event-url", DEFAULT_EVENT_URL,
                     "--event-user", _user(),
