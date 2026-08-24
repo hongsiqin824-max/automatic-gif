@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import types
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -22,6 +23,7 @@ from scoreboard_ocr_worker import (
     _auto_readings,
     _extract_detected_texts,
     _first_clock_missing_run,
+    _AUTO_DISCOVERY_ENGINES,
     _merge_auto_results,
     _normalize_clock_recognition_results,
     _prepare_clock_only_recognition,
@@ -35,6 +37,8 @@ from scoreboard_ocr_worker import (
     extract_profile_frames,
     extract_scoreboard_frames,
     frame_reading,
+    load_auto_discovery_engine,
+    load_ocr_engine,
     locate_from_readings,
     probe_video_dimensions,
     recognize_batch,
@@ -57,6 +61,29 @@ class FakeEngine:
 
 
 class BatchRecognitionTests(unittest.TestCase):
+    def test_ocr_engines_disable_mkldnn(self):
+        calls: list[tuple[str, dict[str, object]]] = []
+        paddleocr = types.ModuleType("paddleocr")
+
+        class TextRecognition:
+            def __init__(self, **kwargs):
+                calls.append(("recognition", kwargs))
+
+        class PaddleOCR:
+            def __init__(self, **kwargs):
+                calls.append(("discovery", kwargs))
+
+        paddleocr.TextRecognition = TextRecognition
+        paddleocr.PaddleOCR = PaddleOCR
+        with patch.dict("sys.modules", {"paddleocr": paddleocr}):
+            load_ocr_engine("en")
+            _AUTO_DISCOVERY_ENGINES.clear()
+            load_auto_discovery_engine("en")
+            _AUTO_DISCOVERY_ENGINES.clear()
+
+        self.assertEqual([name for name, _kwargs in calls], ["recognition", "discovery"])
+        self.assertTrue(all(kwargs["enable_mkldnn"] is False for _name, kwargs in calls))
+
     def test_recognize_batch_calls_backend_once_and_keeps_alignment(self):
         engine = FakeEngine()
 

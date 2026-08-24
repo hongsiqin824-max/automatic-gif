@@ -19,6 +19,7 @@ from scoreboard_ocr import (
     ScoreboardOcrError,
     ScoreboardOcrRequest,
     ScoreboardProfile,
+    _ensure_persistent_worker,
     _run_persistent_worker,
     locate_scoreboard_event,
     parse_clock_texts,
@@ -1326,7 +1327,30 @@ class ScoreboardClientTests(unittest.TestCase):
         self.assertEqual(request["candidate_start_seconds"], 100.0)
         self.assertEqual(request["target_score"], "1-0")
         self.assertEqual(request["event_second"], 4177)
+        self.assertEqual(runner.call_args.kwargs["env"]["FLAGS_use_mkldnn"], "0")
         self.assertEqual(result["diagnostics"]["worker_python"], "ocr-python")
+
+    def test_persistent_worker_disables_onednn_in_child_environment(self):
+        ready_connection = Mock()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            worker = root / "worker.py"
+            worker.write_text("# worker", encoding="utf-8")
+            socket_path = root / "ocr.sock"
+            with (
+                patch(
+                    "scoreboard_ocr._connect_worker",
+                    side_effect=[OSError("missing"), OSError("missing"), ready_connection],
+                ),
+                patch("scoreboard_ocr.subprocess.Popen") as popen,
+            ):
+                _ensure_persistent_worker(
+                    socket_path=socket_path,
+                    worker=worker,
+                    python="ocr-python",
+                )
+
+        self.assertEqual(popen.call_args.kwargs["env"]["FLAGS_use_mkldnn"], "0")
 
     def test_client_uses_persistent_worker_protocol_when_enabled(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -45,6 +45,12 @@ STRUCTURED_ERROR_KINDS = frozenset(
 
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
+OCR_WORKER_ENVIRONMENT = {"FLAGS_use_mkldnn": "0"}
+
+
+def _ocr_worker_environment() -> dict[str, str]:
+    """Return an isolated OCR environment with unstable oneDNN kernels disabled."""
+    return {**os.environ, **OCR_WORKER_ENVIRONMENT}
 
 
 class ScoreboardOcrError(RuntimeError):
@@ -1127,6 +1133,7 @@ def _ensure_persistent_worker(
                         stdin=subprocess.DEVNULL,
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
+                        env=_ocr_worker_environment(),
                         close_fds=True,
                         start_new_session=True,
                     )
@@ -1336,6 +1343,7 @@ def run_scoreboard_ocr(
                 text=True,
                 capture_output=True,
                 timeout=timeout_seconds,
+                env=_ocr_worker_environment(),
             )
         except subprocess.TimeoutExpired as exc:
             raise ScoreboardOcrError(

@@ -17,6 +17,7 @@ from vision_runtime import (
     VisionJob,
     VisualLocationFailed,
     _continuous_search_components,
+    _configured_ocr_python,
     _encode_ocr_api_range_fallback,
     _locate_across_search_components,
     _locate_ocr_window_across_components,
@@ -43,6 +44,14 @@ from vision_runtime import (
 
 
 class VisionRuntimeTests(unittest.TestCase):
+    def test_ocr_python_path_supports_override_and_ignores_blank_value(self):
+        with patch.dict("os.environ", {"GIF_OCR_PYTHON": "/opt/ocr/bin/python"}):
+            self.assertEqual(_configured_ocr_python(), Path("/opt/ocr/bin/python"))
+        with patch.dict("os.environ", {"GIF_OCR_PYTHON": ""}):
+            self.assertTrue(
+                str(_configured_ocr_python()).endswith("tmp/ocr_venv/bin/python")
+            )
+
     def test_progressive_coverage_diagnostics_classifies_media_states(self):
         with tempfile.TemporaryDirectory() as directory:
             segment_path = Path(directory) / "segment.ts"
