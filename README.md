@@ -81,6 +81,15 @@ structured runtime log. Enter a real `match_id` for production API data. The
 "运行演示链路" button uses the supplied MP4 and cumulative API snapshots, so
 it remains usable without network access or a live match.
 
+When a default GIF reaches `encoded`, the Dashboard also shows a manual
+**发布** button. It validates and copies that GIF to permanent SHA-256 storage,
+checks its public HTTPS URL, and only then submits a formal GIF article. The
+default article fields are `archive_level=B`, `add_to_tab=1`, `type=article`,
+and `style=gif`; no `user_id` is sent, so the authorized default operation
+account is used. Publishing is an independent action and never delays or
+retries GIF generation. See [PUBLISHING_DEPLOYMENT.md](PUBLISHING_DEPLOYMENT.md)
+for HTTPS, persistent storage, and first OAuth authorization.
+
 One console can manage several matches. Active matches appear as tabs, and
 switching tabs only changes the visible match; it does not stop the other
 Workers. The Apple Silicon defaults allow eight active matches while limiting

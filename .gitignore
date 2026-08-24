@@ -23,6 +23,7 @@ downloads/
 
 # 生成产物
 output_gifs/
+data/
 
 # 系统文件
 .DS_Store

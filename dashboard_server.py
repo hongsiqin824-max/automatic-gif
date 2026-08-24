@@ -9,6 +9,7 @@ event-driven worker only after a live source has been found.
 from __future__ import annotations
 
 import errno
+import html
 import json
 import math
 import os
@@ -26,12 +27,23 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from flask import Flask, abort, jsonify, request, send_from_directory
+from flask import Flask, abort, jsonify, redirect, request, send_from_directory
 
+from article_publisher import (
+    ArticlePublishError,
+    ArticlePublisher,
+    PublishedGifStore,
+    environment_boolean,
+)
 from disk_lifecycle import DiskLifecycleManager, DiskLifecyclePolicy
 from event_api_response import EventApiResponseError, normalize_event_api_response
 from heavy_task_coordinator import HeavyTaskCoordinator, HeavyTaskCoordinatorError
 from match_event_identity import events_represent_same_incident
+from open_platform_client import (
+    OpenPlatformClient,
+    OpenPlatformConfig,
+    OpenPlatformError,
+)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -104,6 +116,8 @@ ORPHAN_CLEANUP_GRACE_SECONDS = _positive_environment_float(
     "GIF_ORPHAN_CLEANUP_GRACE_SECONDS", 15 * 60
 )
 DEFAULT_OUTPUT = ROOT / "output_gifs" / "dashboard"
+DEFAULT_PUBLISHED_GIF_DIR = ROOT / "data" / "published_gifs"
+DEFAULT_ARTICLE_PUBLISH_DATABASE = ROOT / "data" / "article_publish.sqlite3"
 DEFAULT_EVENT_URL = (
     "https://openapi.dongqiudi.com/internal/api/data/overview/match/{match_id}"
 )
@@ -1988,6 +2002,10 @@ def _session_json(session: MatchSession) -> dict[str, Any]:
     tasks = _canonicalize_event_rows(
         list(task_map.values()), flatten_events(session.event_payload), aliases
     )
+    publish_records = article_publisher.records_for_match(session.match_id)
+    for task in tasks:
+        event_key = str(task.get("event_key") or "")
+        task["publish"] = publish_records.get(event_key)
     event_counts = {
         "unique": len(tasks),
         "encoded": sum(item.get("status") == "encoded" for item in tasks),
@@ -3492,6 +3510,33 @@ class Dashboard:
 dashboard = Dashboard()
 match_catalog = MatchCatalog()
 heavy_task_monitor = HeavyTaskCoordinator.from_environment()
+open_platform_client = OpenPlatformClient(
+    OpenPlatformConfig.from_environment(ROOT)
+)
+article_publisher = ArticlePublisher(
+    platform_client=open_platform_client,
+    gif_store=PublishedGifStore(
+        Path(
+            os.environ.get(
+                "ARTICLE_PUBLISH_GIF_DIR", str(DEFAULT_PUBLISHED_GIF_DIR)
+            )
+        ),
+        os.environ.get(
+            "GIF_PUBLIC_ORIGIN", "https://matchgif.aisportsapp.com"
+        ),
+        max_bytes=_positive_environment_integer(
+            "ARTICLE_PUBLISH_GIF_MAX_BYTES", 50 * 1024 * 1024
+        ),
+    ),
+    database_path=Path(
+        os.environ.get(
+            "ARTICLE_PUBLISH_DB_PATH", str(DEFAULT_ARTICLE_PUBLISH_DATABASE)
+        )
+    ),
+    verify_public_url=environment_boolean(
+        "ARTICLE_PUBLISH_VERIFY_PUBLIC_URL", True
+    ),
+)
 app = Flask(__name__, static_folder="dashboard_static", static_url_path="/static")
 
 
@@ -3572,6 +3617,45 @@ def index():
 @app.get("/api/health")
 def health():
     return jsonify({"ok": True, "port": PORT, "time_unix": time.time()})
+
+
+@app.get("/api/article-publish/status")
+def article_publish_status():
+    return jsonify({"ok": True, **article_publisher.status()})
+
+
+@app.get("/api/open-platform/oauth/start")
+def open_platform_oauth_start():
+    try:
+        return redirect(open_platform_client.authorization_url(), code=302)
+    except OpenPlatformError as exc:
+        return jsonify(
+            {
+                "ok": False,
+                "error": str(exc),
+                "stage": "authorization",
+                "code": exc.code or "open_platform_not_configured",
+            }
+        ), exc.status_code
+
+
+@app.get("/api/open-platform/oauth/callback")
+def open_platform_oauth_callback():
+    try:
+        open_platform_client.exchange_oauth_code(
+            str(request.args.get("code") or ""),
+            str(request.args.get("state") or ""),
+        )
+    except OpenPlatformError as exc:
+        return (
+            "<!doctype html><meta charset='utf-8'>"
+            "<title>开放平台授权失败</title>"
+            f"<h1>授权失败</h1><p>{html.escape(str(exc))}</p>"
+            "<p><a href='/'>返回 GIF 控制台</a></p>",
+            exc.status_code,
+            {"Content-Type": "text/html; charset=utf-8"},
+        )
+    return redirect("/?open_platform=authorized", code=302)
 
 
 @app.get("/api/matches")
@@ -3678,6 +3762,113 @@ def session_stop():
     except Exception as exc:
         return jsonify({"error": str(exc), "session": _session_json(session)}), 409
     return jsonify(_session_json(session))
+
+
+def _default_gif_source_path(match_id: str, event: dict[str, Any]) -> Path:
+    output = str(event.get("output") or "").strip()
+    if not output:
+        raise ArticlePublishError(
+            "事件记录没有默认 GIF 文件路径",
+            code="default_gif_path_missing",
+            stage="request_validation",
+            status_code=409,
+        )
+    match_directory = (DEFAULT_OUTPUT / match_id).resolve()
+    raw_path = Path(output).expanduser()
+    candidates = [raw_path] if raw_path.is_absolute() else [ROOT / raw_path, match_directory / raw_path]
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if (
+            resolved.suffix.lower() == ".gif"
+            and resolved.is_relative_to(match_directory)
+            and resolved.is_file()
+        ):
+            return resolved
+    raise ArticlePublishError(
+        "默认 GIF 文件不存在，或文件不属于当前比赛目录",
+        code="default_gif_not_found",
+        stage="gif_validation",
+        status_code=404,
+    )
+
+
+@app.post("/api/article-publish")
+def article_publish():
+    body = request.get_json(silent=True) or {}
+    try:
+        match_id = validate_match_id(str(body.get("match_id") or ""))
+        event_key = str(body.get("event_key") or "").strip()
+        if not event_key:
+            raise ArticlePublishError(
+                "请求缺少 event_key",
+                code="publish_event_key_missing",
+                stage="request_validation",
+                status_code=400,
+            )
+        session = dashboard.get(match_id)
+        session_payload = _session_json(session)
+        event = next(
+            (
+                item
+                for item in session_payload.get("events", [])
+                if str(item.get("event_key") or "") == event_key
+            ),
+            None,
+        )
+        if not event:
+            raise ArticlePublishError(
+                "没有找到对应事件，请刷新页面后重试",
+                code="publish_event_not_found",
+                stage="request_validation",
+                status_code=404,
+            )
+        result = article_publisher.publish(
+            match_id=match_id,
+            event=event,
+            match_detail=session_payload.get("detail") or {},
+            source_path=_default_gif_source_path(match_id, event),
+        )
+        return jsonify({"ok": True, "publish": result})
+    except ValueError as exc:
+        return jsonify(
+            {
+                "ok": False,
+                "error": str(exc),
+                "code": "publish_request_invalid",
+                "stage": "request_validation",
+            }
+        ), 400
+    except ArticlePublishError as exc:
+        payload = {
+            "ok": False,
+            "error": str(exc),
+            "code": exc.code,
+            "stage": exc.stage,
+            "auth_required": exc.auth_required,
+            "retriable": exc.retriable,
+        }
+        if exc.auth_required:
+            payload["oauth_url"] = "/api/open-platform/oauth/start"
+        return jsonify(payload), exc.status_code
+    except Exception as exc:
+        return jsonify(
+            {
+                "ok": False,
+                "error": f"发布服务内部异常：{exc}",
+                "code": "publish_internal_error",
+                "stage": "internal",
+            }
+        ), 500
+
+
+@app.get("/publish-gifs/<gif_id>.gif")
+def published_gif_file(gif_id: str):
+    if not re.fullmatch(r"[a-f0-9]{64}", gif_id):
+        abort(404)
+    path = article_publisher.gif_store.path_for(gif_id)
+    if not path.is_file():
+        abort(404)
+    return send_from_directory(path.parent, path.name, mimetype="image/gif")
 
 
 @app.get("/api/gif/<match_id>/<path:filename>")

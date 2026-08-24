@@ -155,6 +155,12 @@
 .event-row:has(.failure-report){align-items:start}
 .event-row:has(.failure-report) .artifact-list{grid-column:1/-1}
 .artifact.encoded{background:#14372e;color:#72e5b3}.artifact.encoding,.artifact.pending{background:#17353b;color:#76ddd3}.artifact.warning{background:#3a311c;color:#ffd47c}.artifact.warning small{color:#ffd47c}.artifact.warning .failure-report{border-top-color:rgba(255,212,124,.3)}.artifact.warning .failure-report>b,.artifact.warning .failure-report strong{color:#ffe0a3}.artifact.warning .failure-report>span{color:#e5c98e}.artifact.failed{background:#45262b;color:#ff9999}
+.notice.error{background:#361e24;border-color:#70404a;color:#ffb2ba}.notice.success{background:#15372e;border-color:#2f705c;color:#89e6bc}
+.default-artifact-actions{display:flex;align-items:flex-start;justify-content:flex-end;gap:8px;min-width:0}
+.publish-control{display:grid;justify-items:end;gap:5px;min-width:74px;max-width:220px}
+.publish-button{min-width:62px;height:25px;padding:0 10px;border:1px solid #3b8f82;border-radius:4px;background:#153b35;color:#81eadb;font:600 10px inherit;cursor:pointer}
+.publish-button:hover{background:#1b4a42}.publish-button:focus-visible{outline:2px solid var(--cyan);outline-offset:1px}.publish-button:disabled{cursor:not-allowed;opacity:.62}
+.artifact .publish-result{color:#aebdcb;text-align:right;font-size:9px;line-height:1.45;overflow-wrap:anywhere}.artifact .publish-result.success{color:#72e5b3}.artifact .publish-result.pending{color:#76ddd3}.artifact .publish-result.failed{color:#ff9999}.publish-result a{color:#7be8da}
 .vision-toggle{display:grid!important;grid-template-columns:1fr auto;align-items:center;background:#0d1723;border:1px solid var(--line);border-radius:6px;padding:10px 12px}
 .vision-toggle input{width:18px!important;height:18px;margin:0!important;accent-color:var(--cyan)}
 .vision-toggle small{position:static!important;grid-column:1;color:var(--muted)}
@@ -172,6 +178,7 @@
   .events-panel .event-status{white-space:normal}
   .events-panel .event-row{grid-template-columns:90px 44px minmax(0,1fr)}
   .artifact-list{grid-column:1/-1}
+  .default-artifact-actions{flex-wrap:wrap}.publish-control{max-width:100%}
   .runtime-proof{grid-template-columns:1fr}
   .runtime-proof div,.runtime-proof div:nth-child(4n),.runtime-proof div:nth-last-child(-n+4){border-right:0;border-bottom:1px solid var(--line);padding:8px 0}
   .runtime-proof div:last-child{border-bottom:0}

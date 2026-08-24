@@ -15,10 +15,11 @@ const state = {
   refreshRequestSerial: 0,
   lastRenderedRefreshSerial: 0,
   actionPending: false,
+  publishStates: new Map(),
 };
 
 function matchId() { return $('match-id').value.trim(); }
-function showNotice(message, kind = 'warning') { const el = $('notice'); el.textContent = message; el.className = `notice ${kind === 'error' ? 'error' : ''}`; }
+function showNotice(message, kind = 'warning') { const el = $('notice'); el.textContent = message; el.className = `notice ${kind === 'error' ? 'error' : kind === 'success' ? 'success' : ''}`; }
 function clearNotice() { $('notice').className = 'notice hidden'; }
 function statusClass(value) { return String(value || 'uncertain').toLowerCase(); }
 function fmtTime(unix) { return unix ? new Date(unix * 1000).toLocaleTimeString('zh-CN', {hour12:false}) : '--'; }
@@ -86,6 +87,36 @@ function errorGuide(value, fallbackTitle = '这一步没有完成') {
   const guide = window.DashboardErrorMessages.guideFor(raw, fallbackTitle);
   if (guide.key) return guide;
   return {...guide, cause:friendlyErrorMessage(value, guide.cause)};
+}
+function publishStateKey(matchId, eventKey) { return `${String(matchId || '')}\n${String(eventKey || '')}`; }
+function publishStageLabel(stage) {
+  return ({request_validation:'请求检查',gif_validation:'GIF 校验',gif_storage:'永久保存',gif_prepared:'GIF 已保存',public_url_check:'公网地址检查',authorization:'开放平台授权',platform_publish:'正式发布',record_persistence:'发布记录保存',completed:'发布完成',internal:'发布服务'})[String(stage || '')] || '发布处理';
+}
+function publishStateFor(matchId, event) {
+  const local = state.publishStates.get(publishStateKey(matchId, event.event_key));
+  const persisted = event.publish && typeof event.publish === 'object' ? event.publish : null;
+  if (persisted && persisted.status === 'success') return persisted;
+  return local || persisted;
+}
+function publishControls(matchId, event) {
+  if (event.status !== 'encoded' || !event.output || !event.event_key) return '';
+  const publication = publishStateFor(matchId, event);
+  const status = String((publication && publication.status) || 'ready');
+  const pending = status === 'publishing' || status === 'prepared';
+  const success = status === 'success';
+  const failed = status === 'failed';
+  const articleId = publication && publication.article_id ? String(publication.article_id) : '';
+  const stage = publication && publication.stage ? publishStageLabel(publication.stage) : '';
+  const error = publication && publication.error ? String(publication.error) : '';
+  const oauthUrl = publication && publication.oauth_url ? String(publication.oauth_url) : '';
+  const statusMarkup = success
+    ? `<small class="publish-result success">已正式发布${articleId ? ` · 文章 ${escapeHtml(articleId)}` : ''}</small>`
+    : pending
+      ? `<small class="publish-result pending">${escapeHtml(stage || '正在正式发布')}</small>`
+      : failed
+        ? `<small class="publish-result failed">${escapeHtml(stage)}失败：${escapeHtml(error || '未提供原因')}${oauthUrl ? ` · <a href="${escapeHtml(oauthUrl)}" target="_blank" rel="noopener">完成授权</a>` : ''}</small>`
+        : '';
+  return `<div class="publish-control"><button class="publish-button" type="button" data-publish-match-id="${escapeHtml(matchId)}" data-publish-event-key="${escapeHtml(event.event_key)}" ${pending || success ? 'disabled' : ''}>${success ? '已发布' : pending ? '发布中' : failed ? '重试发布' : '发布'}</button>${statusMarkup}</div>`;
 }
 function setDiscoveryCollapsed(collapsed) {
   state.discoveryCollapsed = Boolean(collapsed);
@@ -967,7 +998,9 @@ function render(data) {
     const technicalMarkup = technicalDetail ? `<details class="technical-details"><summary>查看完整处理记录</summary><small>${escapeHtml(friendlyText(technicalDetail))}</small></details>` : '';
     const gifLink = artifact => artifact && artifact.output ? `<a class="gif-link" href="/api/gif/${encodeURIComponent(data.match_id)}/${encodeURIComponent(artifact.output.split('/').pop())}" target="_blank">预览</a>` : '';
     const ocrArtifactLabel = ocrWindow && ocrWindow.output_kind === 'api_time_range_fallback' ? '接口时间范围兜底' : '画面时间 60秒';
-    return `<div class="event-row ${escapeHtml(task.cls)}"><div class="event-type event-type-${escapeHtml(type.kind)}"><span class="event-symbol" aria-hidden="true"></span><span class="event-type-text"><b>${escapeHtml(type.label)}</b><small>${escapeHtml(type.code)}</small></span></div><div class="event-minute">${escapeHtml(e.minute || '--')}'${e.minute_extra && e.minute_extra !== '0' ? `+${escapeHtml(e.minute_extra)}` : ''}</div><div class="event-person">${escapeHtml(e.person || '未提供球员')}<small>${escapeHtml(e.team || '')}${e.score ? ` · ${escapeHtml(e.score)}` : ''}${e.reason ? ` · ${friendlyText(e.reason)}` : ''}</small></div><div class="artifact-list"><div class="artifact ${e.status === 'failed' ? 'failed' : ''}"><div class="artifact-copy"><span>默认 · ${escapeHtml(task.label)}${defaultCoverage ? ` · ${escapeHtml(defaultCoverage)}` : ''}</span>${defaultFailureMarkup}</div>${e.output ? `<a class="gif-link" href="/api/gif/${encodeURIComponent(data.match_id)}/${encodeURIComponent(e.output.split('/').pop())}" target="_blank">预览</a>` : ''}</div><div class="artifact ${escapeHtml(ocr.cls)}"><div class="artifact-copy"><span>${escapeHtml(ocrArtifactLabel)} · ${escapeHtml(ocr.label)}${ocrCoverage ? ` · ${escapeHtml(ocrCoverage)}` : ''}${ocrUserDetail ? `<small>${escapeHtml(ocrUserDetail)}</small>` : ''}</span>${ocrFailureMarkup}${technicalMarkup}</div>${gifLink(ocrWindow)}</div><div class="artifact ${escapeHtml(vision.cls)}"><div class="artifact-copy"><span>动作精剪 20秒 · ${escapeHtml(vision.label)}${escapeHtml(confidence)}${escapeHtml(delta)}${visionCoverage ? ` · ${escapeHtml(visionCoverage)}` : ''}${tdeed && tdeed.experimental ? ' · 实验' : ''}${visionDetail ? `<small>${escapeHtml(visionDetail)}</small>` : ''}</span>${visionFailureMarkup}</div>${gifLink(tdeed)}</div></div></div>`;
+    const defaultPreview = e.output ? `<a class="gif-link" href="/api/gif/${encodeURIComponent(data.match_id)}/${encodeURIComponent(e.output.split('/').pop())}" target="_blank">预览</a>` : '';
+    const defaultActions = e.output ? `<div class="default-artifact-actions">${defaultPreview}${publishControls(data.match_id, e)}</div>` : '';
+    return `<div class="event-row ${escapeHtml(task.cls)}"><div class="event-type event-type-${escapeHtml(type.kind)}"><span class="event-symbol" aria-hidden="true"></span><span class="event-type-text"><b>${escapeHtml(type.label)}</b><small>${escapeHtml(type.code)}</small></span></div><div class="event-minute">${escapeHtml(e.minute || '--')}'${e.minute_extra && e.minute_extra !== '0' ? `+${escapeHtml(e.minute_extra)}` : ''}</div><div class="event-person">${escapeHtml(e.person || '未提供球员')}<small>${escapeHtml(e.team || '')}${e.score ? ` · ${escapeHtml(e.score)}` : ''}${e.reason ? ` · ${friendlyText(e.reason)}` : ''}</small></div><div class="artifact-list"><div class="artifact ${e.status === 'failed' ? 'failed' : ''}"><div class="artifact-copy"><span>默认 · ${escapeHtml(task.label)}${defaultCoverage ? ` · ${escapeHtml(defaultCoverage)}` : ''}</span>${defaultFailureMarkup}</div>${defaultActions}</div><div class="artifact ${escapeHtml(ocr.cls)}"><div class="artifact-copy"><span>${escapeHtml(ocrArtifactLabel)} · ${escapeHtml(ocr.label)}${ocrCoverage ? ` · ${escapeHtml(ocrCoverage)}` : ''}${ocrUserDetail ? `<small>${escapeHtml(ocrUserDetail)}</small>` : ''}</span>${ocrFailureMarkup}${technicalMarkup}</div>${gifLink(ocrWindow)}</div><div class="artifact ${escapeHtml(vision.cls)}"><div class="artifact-copy"><span>动作精剪 20秒 · ${escapeHtml(vision.label)}${escapeHtml(confidence)}${escapeHtml(delta)}${visionCoverage ? ` · ${escapeHtml(visionCoverage)}` : ''}${tdeed && tdeed.experimental ? ' · 实验' : ''}${visionDetail ? `<small>${escapeHtml(visionDetail)}</small>` : ''}</span>${visionFailureMarkup}</div>${gifLink(tdeed)}</div></div></div>`;
   }).join('') : '<div class="empty">暂无已发现事件。启动处理后，进球、黄牌、红牌和乌龙球会在这里显示。</div>';
   const logs = $('logs'); const records = data.logs || []; let heartbeatSeen = false; const visibleRecords = records.filter(record => record.event !== 'runtime_heartbeat' || (!heartbeatSeen && (heartbeatSeen = true))); logs.innerHTML = visibleRecords.length ? visibleRecords.slice(0, 40).map(l => { const presentation = logPresentation(l); return `<div class="log-line log-${escapeHtml(l.event || '')}"><time>${escapeHtml((l.timestamp || '').replace('T',' ').replace('Z','').slice(0,19))}</time><b>${escapeHtml(presentation.name)}</b><span>${escapeHtml(presentation.detail)}</span></div>`; }).join('') : '<div class="empty">暂无日志</div>';
   $('last-refresh').textContent = `更新于 ${new Date().toLocaleTimeString('zh-CN', {hour12:false})}`;
@@ -975,6 +1008,47 @@ function render(data) {
 }
 
 async function requestJson(url, options = {}) { const response = await fetch(url, {headers:{'Content-Type':'application/json'}, ...options}); const data = await response.json(); if (!response.ok) throw new Error(data.error || `请求失败 ${response.status}`); return data; }
+async function publishDefaultGif(button) {
+  const targetMatchId = String(button.dataset.publishMatchId || '');
+  const eventKey = String(button.dataset.publishEventKey || '');
+  if (!targetMatchId || !eventKey || button.disabled) return;
+  const key = publishStateKey(targetMatchId, eventKey);
+  state.publishStates.set(key, {status:'publishing', stage:'platform_publish'});
+  button.disabled = true;
+  button.textContent = '发布中';
+  if (targetMatchId === state.sessionMatchId) refresh(targetMatchId);
+  let finalNotice = '';
+  let finalNoticeKind = 'error';
+  try {
+    const response = await fetch('/api/article-publish', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({match_id:targetMatchId, event_key:eventKey}),
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || !payload.ok) {
+      const failure = {
+        status:'failed',
+        stage:payload.stage || 'platform_publish',
+        error:payload.error || `发布请求失败 ${response.status}`,
+        oauth_url:payload.oauth_url || '',
+      };
+      state.publishStates.set(key, failure);
+      finalNotice = `${publishStageLabel(failure.stage)}失败：${failure.error}`;
+    } else {
+      const publication = payload.publish || {};
+      state.publishStates.set(key, publication);
+      finalNotice = `正式发布成功${publication.article_id ? `，文章 ID ${publication.article_id}` : ''}`;
+      finalNoticeKind = 'success';
+    }
+  } catch (error) {
+    state.publishStates.set(key, {status:'failed', stage:'platform_publish', error:error.message || '网络请求失败'});
+    finalNotice = `正式发布失败：${error.message || '网络请求失败'}`;
+  } finally {
+    if (targetMatchId === state.sessionMatchId) await refresh(targetMatchId);
+    if (finalNotice) showNotice(finalNotice, finalNoticeKind);
+  }
+}
 async function refresh(requestedId = state.sessionMatchId || matchId()) {
   const id = String(requestedId || '').trim();
   if (!id || state.actionPending) return;
@@ -1090,6 +1164,10 @@ $('demo-btn').addEventListener('click', () => {
 });
 $('start-btn').addEventListener('click', () => startSelectedMatch());
 $('stop-btn').addEventListener('click', stopCurrentMatch);
+$('events').addEventListener('click', event => {
+  const button = event.target.closest('.publish-button');
+  if (button) publishDefaultGif(button);
+});
 refresh();
 refreshMatches();
 state.timer = setInterval(refresh, 1000);
