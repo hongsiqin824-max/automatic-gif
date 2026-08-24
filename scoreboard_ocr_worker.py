@@ -2913,8 +2913,7 @@ def load_ocr_engine(language: str) -> Any:
                 return TextRecognition(
                     model_name=os.environ.get(
                         "GIF_OCR_RECOGNITION_MODEL", "PP-OCRv6_medium_rec"
-                    ),
-                    enable_mkldnn=False,
+                    )
                 )
             except ImportError:
                 from paddleocr import PaddleOCR
@@ -2925,7 +2924,6 @@ def load_ocr_engine(language: str) -> Any:
                     use_doc_orientation_classify=False,
                     use_doc_unwarping=False,
                     use_textline_orientation=False,
-                    enable_mkldnn=False,
                 )
             except (TypeError, ValueError):
                 try:
@@ -2933,14 +2931,9 @@ def load_ocr_engine(language: str) -> Any:
                         use_angle_cls=False,
                         lang=language,
                         show_log=False,
-                        enable_mkldnn=False,
                     )
                 except TypeError:
-                    return PaddleOCR(
-                        use_angle_cls=False,
-                        lang=language,
-                        enable_mkldnn=False,
-                    )
+                    return PaddleOCR(use_angle_cls=False, lang=language)
     except Exception as exc:
         raise WorkerError(
             "ocr_model_unavailable",
@@ -2977,7 +2970,6 @@ def load_auto_discovery_engine(
                         use_doc_orientation_classify=False,
                         use_doc_unwarping=False,
                         use_textline_orientation=False,
-                        enable_mkldnn=False,
                     )
                 except (TypeError, ValueError):
                     # PaddleOCR v2 accepts the legacy constructor and still
@@ -2986,7 +2978,6 @@ def load_auto_discovery_engine(
                         lang=normalized,
                         use_angle_cls=False,
                         show_log=False,
-                        enable_mkldnn=False,
                     )
         except Exception as exc:
             raise WorkerError(

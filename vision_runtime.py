@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import math
-import os
 import shutil
 import subprocess
 import tempfile
@@ -149,14 +148,7 @@ OCR_MINUTE_FALLBACK_WIDTH = 384
 OCR_MINUTE_FALLBACK_FPS = 6.0
 OCR_MINUTE_FALLBACK_COLORS = 160
 OCR_MINUTE_FALLBACK_COMPLETE_RATIO = 0.9
-def _configured_ocr_python() -> Path:
-    configured = os.environ.get("GIF_OCR_PYTHON", "").strip()
-    if configured:
-        return Path(configured).expanduser()
-    return Path(__file__).resolve().parent / "tmp" / "ocr_venv" / "bin" / "python"
-
-
-OCR_PYTHON = _configured_ocr_python()
+OCR_PYTHON = Path(__file__).resolve().parent / "tmp" / "ocr_venv" / "bin" / "python"
 
 
 class VisualLocationFailed(RuntimeError):
