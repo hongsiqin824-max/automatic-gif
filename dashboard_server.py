@@ -3645,6 +3645,8 @@ def open_platform_oauth_callback():
         open_platform_client.exchange_oauth_code(
             str(request.args.get("code") or ""),
             str(request.args.get("state") or ""),
+            error=str(request.args.get("error") or ""),
+            error_description=str(request.args.get("error_description") or ""),
         )
     except OpenPlatformError as exc:
         return (

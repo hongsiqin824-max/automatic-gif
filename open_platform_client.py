@@ -48,6 +48,7 @@ class OpenPlatformConfig:
     api_name: str
     redirect_uri: str
     token_path: Path
+    token_service_url: str = ""
 
     @classmethod
     def from_environment(cls, root: Path) -> "OpenPlatformConfig":
@@ -65,6 +66,7 @@ class OpenPlatformConfig:
                     str(root / "data" / "open-platform-token.json"),
                 )
             ).expanduser(),
+            token_service_url=os.environ.get("TOKEN_SERVICE_URL", "").strip().rstrip("/"),
         )
 
 
@@ -105,6 +107,8 @@ class OpenPlatformClient:
         self._token_cache: dict[str, Any] | None | object = _UNSET
 
     def status(self) -> dict[str, Any]:
+        if self.config.token_service_url:
+            return self._token_service_status()
         with self._lock:
             token = self._read_token()
         now = time.time()
@@ -140,9 +144,62 @@ class OpenPlatformClient:
             "api_name": self.config.api_name,
             "redirect_uri": self.config.redirect_uri or None,
             "token_path": str(self.config.token_path),
+            "token_service_url": None,
+            "token_storage": "local_file",
         }
 
+    def _token_service_status(self) -> dict[str, Any]:
+        """Read central auth state without making the dashboard wait on a dead service."""
+        base = {
+            "configured": bool(self.config.appid and self.config.app_secret),
+            "oauth_configured": True,
+            "authorized": False,
+            "renewable": False,
+            "reauthorization_required": False,
+            "expires_at_unix": None,
+            "refresh_expires_at_unix": None,
+            "api_name": self.config.api_name,
+            "redirect_uri": self.config.redirect_uri or None,
+            "token_path": None,
+            "token_service_url": self.config.token_service_url,
+            "token_storage": "token_service",
+            "token_service_available": False,
+        }
+        try:
+            payload = self._request_token_service_json(
+                "GET", "/auth/status", timeout_seconds=min(self.request_timeout_seconds, 2.0)
+            )
+        except OpenPlatformError as exc:
+            base["token_service_error"] = str(exc)
+            return base
+        base["token_service_available"] = bool(payload.get("ok"))
+        base["auth_status"] = payload.get("auth_status")
+        base["authorized"] = bool(
+            payload.get("ok")
+            and payload.get("has_access_token")
+            and str(payload.get("auth_status") or "") == "AUTHORIZED"
+        )
+        base["renewable"] = bool(payload.get("has_refresh_token"))
+        base["reauthorization_required"] = str(
+            payload.get("auth_status") or ""
+        ) in {"EXPIRED", "ERROR"}
+        base["expires_at"] = payload.get("token_expires_at")
+        base["refresh_expires_at"] = payload.get("refresh_token_expires_at")
+        if payload.get("last_error"):
+            base["token_service_error"] = payload["last_error"]
+        return base
+
     def authorization_url(self) -> str:
+        if self.config.token_service_url:
+            payload = self._request_token_service_json("POST", "/auth/start")
+            authorize_url = str(payload.get("authorize_url") or "").strip()
+            if not payload.get("ok") or not authorize_url:
+                raise OpenPlatformError(
+                    str(payload.get("error") or "Token Service 未返回授权地址"),
+                    status_code=503,
+                    retriable=True,
+                )
+            return authorize_url
         self._require_configuration(require_redirect_uri=True)
         now = time.time()
         with self._lock:
@@ -163,7 +220,55 @@ class OpenPlatformClient:
         )
         return f"{PLATFORM_ORIGIN}/open/oauth/authorize?{query}"
 
-    def exchange_oauth_code(self, code: str, state: str) -> dict[str, Any]:
+    def exchange_oauth_code(
+        self,
+        code: str,
+        state: str,
+        *,
+        error: str = "",
+        error_description: str = "",
+    ) -> dict[str, Any]:
+        if self.config.token_service_url:
+            if error:
+                query = {
+                    "error": error,
+                    "state": state,
+                }
+                if error_description:
+                    query["error_description"] = error_description
+                self._request_token_service_raw(
+                    "GET",
+                    "/auth/callback?" + urllib.parse.urlencode(query),
+                    timeout_seconds=self.request_timeout_seconds,
+                )
+                raise OpenPlatformError(
+                    error_description or error,
+                    status_code=400,
+                    auth_required=True,
+                )
+            if not code:
+                raise OpenPlatformError("OAuth 回调缺少 code", status_code=400)
+            if not state:
+                raise OpenPlatformError("OAuth 回调缺少 state", status_code=400)
+            raw = self._request_token_service_raw(
+                "GET",
+                "/auth/callback?"
+                + urllib.parse.urlencode({"code": code, "state": state}),
+                timeout_seconds=self.request_timeout_seconds,
+            )
+            if "授权成功" not in raw:
+                raise OpenPlatformError(
+                    "Token Service 未确认授权成功",
+                    status_code=502,
+                    retriable=True,
+                )
+            return {"authorized": True, "token_service": True}
+        if error:
+            raise OpenPlatformError(
+                error_description or error,
+                status_code=400,
+                auth_required=True,
+            )
         with self._lock:
             deadline = self._oauth_states.pop(state, None)
         if not state or deadline is None or deadline <= time.time():
@@ -261,6 +366,20 @@ class OpenPlatformClient:
             )
 
     def _ensure_access_token(self, *, force_refresh: bool = False) -> str:
+        if self.config.token_service_url:
+            path = "/token?force=1" if force_refresh else "/token"
+            payload = self._request_token_service_json("GET", path)
+            access_token = str(payload.get("access_token") or "").strip()
+            if payload.get("ok") and access_token:
+                return access_token
+            error = str(payload.get("error") or "Token Service 未返回 access_token")
+            auth_required = "AUTH_REQUIRED" in error or "AUTH_EXPIRED" in error
+            raise OpenPlatformError(
+                error,
+                status_code=401 if auth_required else 503,
+                auth_required=auth_required,
+                retriable=not auth_required,
+            )
         with self._lock:
             token = self._read_token()
             if not token:
@@ -424,6 +543,76 @@ class OpenPlatformClient:
             raise OpenPlatformError("开放平台返回的不是有效 JSON")
         return payload
 
+    def _request_token_service_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, Any]:
+        raw = self._request_token_service_raw(
+            method,
+            path,
+            body=b"" if method.upper() == "GET" else b"{}",
+            content_type="application/json",
+            timeout_seconds=timeout_seconds,
+        )
+        payload = _parse_json(raw)
+        if not payload:
+            raise OpenPlatformError("Token Service 返回的不是有效 JSON", retriable=True)
+        return payload
+
+    def _request_token_service_raw(
+        self,
+        method: str,
+        path: str,
+        *,
+        body: bytes = b"",
+        content_type: str = "application/json",
+        timeout_seconds: float | None = None,
+    ) -> str:
+        url = f"{self.config.token_service_url}{path}"
+        headers = {
+            "Accept": "application/json, text/html",
+            "Content-Type": content_type,
+            "Content-Length": str(len(body)),
+            "User-Agent": "football-gif-dashboard/1.0",
+        }
+        request = urllib.request.Request(url, data=body, method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(
+                request,
+                timeout=timeout_seconds or self.request_timeout_seconds,
+            ) as response:
+                return response.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode("utf-8", errors="replace")
+            payload = _parse_json(raw)
+            message = str(
+                payload.get("error")
+                or payload.get("message")
+                or _html_text(raw)
+                or f"Token Service HTTP {exc.code}"
+            )
+            auth_required = exc.code == 401 or "AUTH_REQUIRED" in message or "AUTH_EXPIRED" in message
+            status_code = (
+                401
+                if auth_required
+                else (exc.code if 400 <= exc.code < 500 else 503)
+            )
+            raise OpenPlatformError(
+                message,
+                status_code=status_code,
+                auth_required=auth_required,
+                retriable=exc.code == 429 or exc.code >= 500,
+            ) from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise OpenPlatformError(
+                f"无法连接 Token Service：{exc}",
+                status_code=503,
+                retriable=True,
+            ) from exc
+
 
 def _parse_json(raw: str) -> dict[str, Any]:
     try:
@@ -431,6 +620,12 @@ def _parse_json(raw: str) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {}
     return value if isinstance(value, dict) else {}
+
+
+def _html_text(raw: str) -> str:
+    """Extract a short readable message from the token service HTML callback."""
+    text = re.sub(r"<[^>]+>", " ", raw or "")
+    return re.sub(r"\s+", " ", text).strip()[:500]
 
 
 def _article_id(result: dict[str, Any]) -> str:
