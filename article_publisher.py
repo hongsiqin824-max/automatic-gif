@@ -364,6 +364,66 @@ class ArticlePublisher:
                 )
             return record
 
+    def create_or_update_draft(
+        self,
+        *,
+        match_id: str,
+        event: dict[str, Any],
+        match_detail: dict[str, Any],
+        source_path: Path,
+        archive_id: str | int | None = None,
+    ) -> dict[str, Any]:
+        """Create or update an OCR GIF draft without touching publish records."""
+        event_key = str(event.get("event_key") or "").strip()
+        if not event_key:
+            raise ArticlePublishError(
+                "事件缺少稳定标识，无法创建草稿",
+                code="draft_event_key_missing",
+                stage="request_validation",
+            )
+
+        with self._lock:
+            gif = self.gif_store.create(source_path)
+            title = build_article_title(event, match_detail)
+            fields = build_article_fields(
+                match_id=match_id,
+                event=event,
+                gif_url=str(gif["url"]),
+                title=title,
+                delivery_mode="draft",
+                archive_id=archive_id,
+            )
+            try:
+                if self.verify_public_url:
+                    self.public_url_checker(str(gif["url"]))
+                result = self.platform_client.create_article(fields)
+            except ArticlePublishError:
+                raise
+            except OpenPlatformError as exc:
+                stage = "authorization" if exc.auth_required else "platform_publish"
+                raise ArticlePublishError(
+                    str(exc),
+                    code=(
+                        "open_platform_auth_required"
+                        if exc.auth_required
+                        else "open_platform_rejected"
+                    ),
+                    stage=stage,
+                    status_code=exc.status_code,
+                    auth_required=exc.auth_required,
+                    retriable=exc.retriable,
+                ) from exc
+
+            return {
+                "article_id": str(result["article_id"]),
+                "gif": gif,
+                "title": title,
+                "delivery_mode": "draft",
+                "updated": archive_id is not None,
+                "duplicate": bool(result.get("duplicate")),
+                "platform_code": result.get("code"),
+            }
+
     def _connect(self) -> sqlite3.Connection:
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         connection = sqlite3.connect(self.database_path, timeout=5.0)
@@ -505,22 +565,43 @@ def build_article_fields(
     event: dict[str, Any],
     gif_url: str,
     title: str,
+    delivery_mode: str = "publish",
+    archive_id: str | int | None = None,
 ) -> dict[str, Any]:
+    if delivery_mode not in {"publish", "draft"}:
+        raise ArticlePublishError(
+            "文章处理方式必须是 publish 或 draft",
+            code="publish_delivery_mode_invalid",
+            stage="request_validation",
+            status_code=400,
+        )
     if not re.fullmatch(r"\d{1,20}", match_id):
         raise ArticlePublishError(
-            "正式发布需要有效的数字比赛 ID",
+            "创建文章需要有效的数字比赛 ID",
             code="publish_match_id_invalid",
             stage="request_validation",
             status_code=400,
         )
     if not gif_url.startswith("https://"):
         raise ArticlePublishError(
-            "正式发布的 GIF 公网地址必须使用 HTTPS",
+            "文章使用的 GIF 公网地址必须使用 HTTPS",
             code="publish_gif_https_required",
             stage="public_url_check",
             status_code=503,
         )
+    normalized_archive_id: int | None = None
+    if archive_id is not None:
+        archive_id_text = str(archive_id).strip()
+        if not re.fullmatch(r"\d{1,20}", archive_id_text):
+            raise ArticlePublishError(
+                "更新草稿需要有效的数字文章 ID",
+                code="publish_archive_id_invalid",
+                stage="request_validation",
+                status_code=400,
+            )
+        normalized_archive_id = int(archive_id_text)
     code = str(event.get("code") or "").upper()
+    is_draft = delivery_mode == "draft"
     fields: dict[str, Any] = {
         "title": title,
         "body": (
@@ -528,12 +609,14 @@ def build_article_fields(
             f'<p><img src="{html.escape(gif_url, quote=True)}" alt="比赛 GIF"></p>'
         ),
         "archive_level": "B",
-        "status": 1,
+        "status": 0 if is_draft else 1,
         "type": "article",
         "style": "gif",
         "match_id": match_id,
         "add_to_tab": 1,
     }
+    if normalized_archive_id is not None:
+        fields["archive_id"] = normalized_archive_id
     match_time = _match_time(event)
     if match_time:
         fields["match_time"] = match_time

@@ -31,6 +31,7 @@ from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from artifact_naming import build_gif_filename
+from article_draft_queue import ArticleDraftQueue
 from event_snapshot_replay import SnapshotReplayEventSource
 from heavy_task_coordinator import (
     DEFAULT_DATABASE_PATH as DEFAULT_HEAVY_TASK_COORDINATOR_DATABASE,
@@ -3572,6 +3573,101 @@ def observe_segment_progress(
     return len(new_paths)
 
 
+def enqueue_encoded_ocr_draft(
+    draft_queue: ArticleDraftQueue | None,
+    runtime: PipelineRuntime,
+    *,
+    match_id: str,
+    event_key: str,
+    match_detail: dict[str, Any],
+) -> bool:
+    """Register only a durably encoded OCR artifact for asynchronous delivery."""
+    if draft_queue is None:
+        return False
+    task = runtime.store.get_vision_task(
+        event_key,
+        artifact_kind="ocr_window",
+    )
+    if task is None or task.status != "encoded" or not task.output_path:
+        return False
+    default_task = runtime.store.get(event_key)
+    if default_task is None or default_task.suppressed_by_event_key:
+        return False
+    event = {
+        **default_task.event_data,
+        "event_key": event_key,
+        "code": default_task.code,
+        "event_type": default_task.event_type,
+        "status": "encoded",
+    }
+    try:
+        record = draft_queue.enqueue(
+            match_id=match_id,
+            event=event,
+            match_detail=match_detail,
+            source_path=Path(task.output_path),
+            artifact_result=task.result,
+        )
+    except Exception as exc:
+        runtime.logger.log(
+            "ocr_draft_enqueue_failed",
+            match_id=match_id,
+            event_key=event_key,
+            artifact_kind="ocr_window",
+            error=str(exc),
+        )
+        return False
+    runtime.logger.log(
+        "ocr_draft_enqueued",
+        match_id=match_id,
+        event_key=event_key,
+        artifact_kind="ocr_window",
+        draft_status=record.get("status"),
+        article_id=record.get("article_id"),
+        quality_label=record.get("quality_label"),
+    )
+    return True
+
+
+def enqueue_all_encoded_ocr_drafts(
+    draft_queue: ArticleDraftQueue | None,
+    runtime: PipelineRuntime,
+    *,
+    match_id: str,
+    match_detail: dict[str, Any],
+) -> int:
+    if draft_queue is None:
+        return 0
+    enqueued = 0
+    for task in runtime.store.list_vision_tasks(match_id, artifact_kind="ocr_window"):
+        if task.status != "encoded" or not task.output_path:
+            continue
+        enqueued += int(
+            enqueue_encoded_ocr_draft(
+                draft_queue,
+                runtime,
+                match_id=match_id,
+                event_key=task.event_key,
+                match_detail=match_detail,
+            )
+        )
+    return enqueued
+
+
+def build_ocr_draft_queue(
+    database_path: Path | None,
+    *,
+    staging_directory: Path | None,
+) -> ArticleDraftQueue | None:
+    """Build the worker-side registration client without starting a consumer."""
+    if database_path is None:
+        return None
+    return ArticleDraftQueue(
+        database_path=database_path,
+        staging_directory=staging_directory,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", help="RTMP URL or local MP4 path")
@@ -3663,6 +3759,18 @@ def main() -> None:
         type=Path,
         help="durable task database (default: OUTPUT_DIR/pipeline_state.sqlite3)",
     )
+    parser.add_argument(
+        "--ocr-draft-db",
+        type=Path,
+        help="shared delivery database for automatic OCR GIF drafts",
+    )
+    parser.add_argument(
+        "--ocr-draft-staging-dir",
+        type=Path,
+        help="permanent GIF directory used before an OCR draft is delivered",
+    )
+    parser.add_argument("--ocr-draft-team-a-name", default="")
+    parser.add_argument("--ocr-draft-team-b-name", default="")
     parser.add_argument(
         "--event-log",
         type=Path,
@@ -3879,6 +3987,14 @@ def main() -> None:
     state_db_path = args.state_db or args.output_dir / "pipeline_state.sqlite3"
     event_log_path = args.event_log or args.output_dir / "pipeline_events.jsonl"
     runtime = PipelineRuntime(state_db_path, event_log_path)
+    draft_queue = build_ocr_draft_queue(
+        args.ocr_draft_db,
+        staging_directory=args.ocr_draft_staging_dir,
+    )
+    draft_match_detail = {
+        "team_A_name": str(args.ocr_draft_team_a_name or "").strip(),
+        "team_B_name": str(args.ocr_draft_team_b_name or "").strip(),
+    }
     try:
         heavy_task_coordinator = HeavyTaskCoordinator.from_environment(
             heavy_task_coordinator_database(args.output_dir)
@@ -4123,6 +4239,18 @@ def main() -> None:
     )
 
     report_path = args.output_dir / "event_pipeline_report.json"
+    recovered_draft_count = enqueue_all_encoded_ocr_drafts(
+        draft_queue,
+        runtime,
+        match_id=args.match_id,
+        match_detail=draft_match_detail,
+    )
+    if recovered_draft_count:
+        runtime.logger.log(
+            "ocr_drafts_recovered",
+            match_id=args.match_id,
+            count=recovered_draft_count,
+        )
     jobs = [recovered_event_job(task) for task in runtime.recover_incomplete(args.match_id)]
     event_report_order = [job.match_event.event_key for job in jobs]
     event_report_contexts: dict[str, dict[str, Any]] = {}
@@ -5239,6 +5367,14 @@ def main() -> None:
                                 f"[vision:worker:error] artifact={artifact_kind} "
                                 f"key={event_key} {error}"
                             )
+                        if artifact_kind == "ocr_window":
+                            enqueue_encoded_ocr_draft(
+                                draft_queue,
+                                runtime,
+                                match_id=args.match_id,
+                                event_key=event_key,
+                                match_detail=draft_match_detail,
+                            )
 
                 evict_terminal_runtime_jobs(
                     jobs,
@@ -5652,6 +5788,18 @@ def main() -> None:
                 f"[vision] {marked_vision_tasks} 个 OCR 任务在收尾期限内未完成，已标记为未完成",
                 flush=True,
             )
+    final_draft_count = enqueue_all_encoded_ocr_drafts(
+        draft_queue,
+        runtime,
+        match_id=args.match_id,
+        match_detail=draft_match_detail,
+    )
+    if final_draft_count:
+        runtime.logger.log(
+            "ocr_drafts_finalized",
+            match_id=args.match_id,
+            count=final_draft_count,
+        )
     stored_default_tasks = {
         task.event_key: task for task in runtime.store.list_for_match(args.match_id)
     }

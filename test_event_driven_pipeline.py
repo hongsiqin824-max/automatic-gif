@@ -19,8 +19,11 @@ from event_driven_pipeline import (
     MockMatchEventSource,
     SegmentGeneration,
     associate_shotmap_second,
+    build_ocr_draft_queue,
     cross_source_goal_incident,
     encode_event_job,
+    enqueue_all_encoded_ocr_drafts,
+    enqueue_encoded_ocr_draft,
     event_timing_diagnostics,
     exact_shotmap_stream_anchor,
     evict_terminal_runtime_jobs,
@@ -70,6 +73,121 @@ class FakeHttpResponse:
 
 
 class EventVisualLeaseTests(unittest.TestCase):
+    def test_worker_draft_queue_uses_shared_staging_directory(self):
+        database = Path("/tmp/article-publish.sqlite3")
+        staging = Path("/tmp/published-gifs")
+        with patch("event_driven_pipeline.ArticleDraftQueue") as queue_class:
+            queue = build_ocr_draft_queue(
+                database,
+                staging_directory=staging,
+            )
+
+        self.assertIs(queue, queue_class.return_value)
+        queue_class.assert_called_once_with(
+            database_path=database,
+            staging_directory=staging,
+        )
+
+    def test_encoded_ocr_is_registered_but_pending_ocr_is_not(self):
+        from pipeline_runtime import PipelineRuntime
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = PipelineRuntime(root / "state.sqlite3", root / "events.jsonl")
+            event_key = "54478914:G:draft"
+            runtime.discover_task(
+                match_id="54478914",
+                event_data={
+                    "event_key": event_key,
+                    "code": "G",
+                    "event_type": "goal",
+                    "minute": "19",
+                    "team": "teamA",
+                    "person": "球员甲",
+                    "score": "1-0",
+                },
+                observed_stream_time=100.0,
+                observed_source_time=None,
+                clip_anchor_stream_time=100.0,
+                clip_anchor_source_time=None,
+                output_due_stream_time=130.0,
+                detected_at_unix=1000.0,
+            )
+            runtime.enqueue_vision_task(
+                event_key,
+                artifact_kind="ocr_window",
+                search_start_stream_time=0.0,
+                search_end_stream_time=100.0,
+                clip_before_seconds=30.0,
+                clip_after_seconds=30.0,
+            )
+            draft_queue = Mock()
+            draft_queue.enqueue.return_value = {
+                "status": "queued",
+                "article_id": None,
+                "quality_label": "精确到秒",
+            }
+
+            self.assertFalse(
+                enqueue_encoded_ocr_draft(
+                    draft_queue,
+                    runtime,
+                    match_id="54478914",
+                    event_key=event_key,
+                    match_detail={},
+                )
+            )
+            runtime.transition_vision_task(
+                event_key, "locating", artifact_kind="ocr_window"
+            )
+            runtime.transition_vision_task(
+                event_key,
+                "located",
+                artifact_kind="ocr_window",
+                result={"anchor_stream_time": 80.0},
+            )
+            runtime.transition_vision_task(
+                event_key, "encoding", artifact_kind="ocr_window"
+            )
+            runtime.transition_vision_task(
+                event_key,
+                "encoded",
+                artifact_kind="ocr_window",
+                result={
+                    "output": str(root / "ocr.gif"),
+                    "bytes": 100,
+                    "visual_resolution": "ocr_second_exact",
+                },
+            )
+
+            self.assertEqual(
+                enqueue_all_encoded_ocr_drafts(
+                    draft_queue,
+                    runtime,
+                    match_id="54478914",
+                    match_detail={"team_A_name": "主队"},
+                ),
+                1,
+            )
+            called = draft_queue.enqueue.call_args.kwargs
+            self.assertEqual(called["event"]["event_key"], event_key)
+            self.assertEqual(called["event"]["status"], "encoded")
+            self.assertEqual(called["source_path"], root / "ocr.gif")
+            self.assertEqual(called["artifact_result"]["visual_resolution"], "ocr_second_exact")
+            draft_queue.reset_mock()
+            runtime.store.suppress_task(event_key, "54478914:G:canonical")
+            self.assertFalse(
+                enqueue_encoded_ocr_draft(
+                    draft_queue,
+                    runtime,
+                    match_id="54478914",
+                    event_key=event_key,
+                    match_detail={},
+                )
+            )
+            draft_queue.enqueue.assert_not_called()
+            runtime.close()
+
     def test_shutdown_marks_ocr_incomplete_without_touching_default_gif(self):
         from pipeline_runtime import PipelineRuntime
 

@@ -11,6 +11,7 @@ from article_publisher import (
     build_article_title,
     inspect_animated_gif,
 )
+from open_platform_client import OpenPlatformError
 
 
 def animated_gif_bytes():
@@ -63,6 +64,7 @@ class ArticlePublisherTests(unittest.TestCase):
             title="自动标题",
         )
         self.assertEqual(fields["archive_level"], "B")
+        self.assertEqual(fields["status"], 1)
         self.assertEqual(fields["add_to_tab"], 1)
         self.assertEqual(fields["type"], "article")
         self.assertEqual(fields["style"], "gif")
@@ -71,6 +73,36 @@ class ArticlePublisherTests(unittest.TestCase):
         self.assertEqual(fields["match_score"], "1-0")
         self.assertNotIn("user_id", fields)
         self.assertIn('src="https://matchgif.aisportsapp.com/', fields["body"])
+
+    def test_draft_fields_disable_publish_and_include_archive_id(self):
+        fields = build_article_fields(
+            match_id="54478914",
+            event={"code": "G", "minute": "19", "score": "1-0"},
+            gif_url="https://matchgif.aisportsapp.com/publish-gifs/a.gif",
+            title="进球草稿",
+            delivery_mode="draft",
+            archive_id="3801234",
+        )
+
+        self.assertEqual(fields["status"], 0)
+        self.assertEqual(fields["add_to_tab"], 1)
+        self.assertEqual(fields["archive_id"], 3801234)
+
+    def test_draft_fields_reject_invalid_delivery_mode_and_archive_id(self):
+        common = {
+            "match_id": "54478914",
+            "event": {"code": "G", "minute": "19"},
+            "gif_url": "https://matchgif.aisportsapp.com/publish-gifs/a.gif",
+            "title": "进球草稿",
+        }
+        with self.assertRaisesRegex(ArticlePublishError, "publish 或 draft"):
+            build_article_fields(**common, delivery_mode="preview")
+        with self.assertRaisesRegex(ArticlePublishError, "文章 ID"):
+            build_article_fields(
+                **common,
+                delivery_mode="draft",
+                archive_id="not-an-id",
+            )
 
     def test_yellow_card_does_not_claim_red_card_event_type(self):
         fields = build_article_fields(
@@ -139,6 +171,9 @@ class ArticlePublisherTests(unittest.TestCase):
             self.assertEqual(first["article_id"], "3801234")
             self.assertTrue(second["idempotent_replay"])
             self.assertEqual(len(platform.calls), 1)
+            self.assertEqual(platform.calls[0]["status"], 1)
+            self.assertEqual(platform.calls[0]["add_to_tab"], 1)
+            self.assertNotIn("archive_id", platform.calls[0])
             self.assertEqual(
                 publisher.records_for_match("54478914")["goal-19"]["article_id"],
                 "3801234",
@@ -185,6 +220,94 @@ class ArticlePublisherTests(unittest.TestCase):
             record = publisher.records_for_match("54478914")["goal-20"]
             self.assertEqual(record["status"], "failed")
             self.assertEqual(record["stage"], "public_url_check")
+
+    def test_create_and_update_draft_without_publish_records(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "ocr.gif"
+            source.write_bytes(animated_gif_bytes())
+            platform = FakePlatformClient()
+            checked_urls = []
+            database_path = root / "publish.sqlite3"
+            publisher = ArticlePublisher(
+                platform_client=platform,
+                gif_store=PublishedGifStore(
+                    root / "published",
+                    "https://matchgif.aisportsapp.com",
+                ),
+                database_path=database_path,
+                public_url_checker=checked_urls.append,
+            )
+            event = {
+                "event_key": "goal-19",
+                "code": "G",
+                "minute": "19",
+                "person": "球员甲",
+                "score": "1-0",
+            }
+            detail = {"team_A_name": "主队", "team_B_name": "客队"}
+
+            created = publisher.create_or_update_draft(
+                match_id="54478914",
+                event=event,
+                match_detail=detail,
+                source_path=source,
+            )
+            updated = publisher.create_or_update_draft(
+                match_id="54478914",
+                event=event,
+                match_detail=detail,
+                source_path=source,
+                archive_id=created["article_id"],
+            )
+
+            self.assertEqual(created["article_id"], "3801234")
+            self.assertFalse(created["updated"])
+            self.assertTrue(updated["updated"])
+            self.assertEqual(created["gif"]["url"], checked_urls[0])
+            self.assertEqual(len(platform.calls), 2)
+            self.assertEqual(platform.calls[0]["status"], 0)
+            self.assertEqual(platform.calls[0]["add_to_tab"], 1)
+            self.assertNotIn("archive_id", platform.calls[0])
+            self.assertEqual(platform.calls[1]["archive_id"], 3801234)
+            self.assertFalse(database_path.exists())
+
+    def test_draft_preserves_open_platform_error_classification(self):
+        class FailingPlatformClient(FakePlatformClient):
+            def create_article(self, fields):
+                raise OpenPlatformError(
+                    "授权服务暂时不可用",
+                    code=50001,
+                    status_code=503,
+                    auth_required=True,
+                    retriable=True,
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "ocr.gif"
+            source.write_bytes(animated_gif_bytes())
+            publisher = ArticlePublisher(
+                platform_client=FailingPlatformClient(),
+                gif_store=PublishedGifStore(
+                    root / "published",
+                    "https://matchgif.aisportsapp.com",
+                ),
+                database_path=root / "publish.sqlite3",
+                public_url_checker=lambda _url: None,
+            )
+
+            with self.assertRaises(ArticlePublishError) as caught:
+                publisher.create_or_update_draft(
+                    match_id="54478914",
+                    event={"event_key": "goal-19", "code": "G", "minute": "19"},
+                    match_detail={},
+                    source_path=source,
+                )
+
+            self.assertEqual(caught.exception.stage, "authorization")
+            self.assertTrue(caught.exception.auth_required)
+            self.assertTrue(caught.exception.retriable)
 
 
 if __name__ == "__main__":

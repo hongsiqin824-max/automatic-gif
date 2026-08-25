@@ -35,6 +35,7 @@ from article_publisher import (
     PublishedGifStore,
     environment_boolean,
 )
+from article_draft_queue import ArticleDraftQueue
 from disk_lifecycle import DiskLifecycleManager, DiskLifecyclePolicy
 from event_api_response import EventApiResponseError, normalize_event_api_response
 from heavy_task_coordinator import HeavyTaskCoordinator, HeavyTaskCoordinatorError
@@ -118,6 +119,16 @@ ORPHAN_CLEANUP_GRACE_SECONDS = _positive_environment_float(
 DEFAULT_OUTPUT = ROOT / "output_gifs" / "dashboard"
 DEFAULT_PUBLISHED_GIF_DIR = ROOT / "data" / "published_gifs"
 DEFAULT_ARTICLE_PUBLISH_DATABASE = ROOT / "data" / "article_publish.sqlite3"
+OCR_DRAFT_AUTO_CREATE = environment_boolean("OCR_DRAFT_AUTO_CREATE", True)
+OCR_DRAFT_POLL_SECONDS = _positive_environment_float(
+    "OCR_DRAFT_POLL_SECONDS", 2.0
+)
+OCR_DRAFT_LEASE_SECONDS = _positive_environment_float(
+    "OCR_DRAFT_LEASE_SECONDS", 180.0
+)
+OCR_DRAFT_RECONCILE_LOOKBACK_SECONDS = _positive_environment_float(
+    "OCR_DRAFT_RECONCILE_LOOKBACK_SECONDS", 15 * 60
+)
 DEFAULT_EVENT_URL = (
     "https://openapi.dongqiudi.com/internal/api/data/overview/match/{match_id}"
 )
@@ -2003,9 +2014,11 @@ def _session_json(session: MatchSession) -> dict[str, Any]:
         list(task_map.values()), flatten_events(session.event_payload), aliases
     )
     publish_records = article_publisher.records_for_match(session.match_id)
+    draft_records = article_draft_queue.records_for_match(session.match_id)
     for task in tasks:
         event_key = str(task.get("event_key") or "")
         task["publish"] = publish_records.get(event_key)
+        task["ocr_draft"] = draft_records.get(event_key)
     event_counts = {
         "unique": len(tasks),
         "encoded": sum(item.get("status") == "encoded" for item in tasks),
@@ -2619,8 +2632,135 @@ class Dashboard:
                 continue
         return cleaned
 
+    @staticmethod
+    def _log_ocr_draft_reconcile_failure(
+        output_dir: Path,
+        *,
+        match_id: str,
+        event_key: str,
+        error: Exception,
+    ) -> None:
+        message = "OCR GIF 已生成，但自动创建草稿的登记暂时失败，系统稍后会再试"
+        record = {
+            "timestamp_unix": time.time(),
+            "event": "ocr_draft_reconcile_failed",
+            "match_id": match_id,
+            "event_key": event_key,
+            "message": message,
+            "error": str(error),
+        }
+        try:
+            with (output_dir / "pipeline_events.jsonl").open(
+                "a", encoding="utf-8"
+            ) as handle:
+                handle.write(
+                    json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+                    + "\n"
+                )
+        except OSError:
+            pass
+        print(
+            f"[ocr-draft] match={match_id} event={event_key} {message}: {error}",
+            flush=True,
+        )
+
+    def reconcile_ocr_drafts(
+        self,
+        *,
+        draft_queue: ArticleDraftQueue | None = None,
+        output_root: Path | None = None,
+    ) -> int:
+        """Recover encoded OCR GIFs whose first queue registration was missed."""
+        queue = draft_queue or globals().get("article_draft_queue")
+        if queue is None:
+            return 0
+        root = DEFAULT_OUTPUT if output_root is None else output_root
+        generated_after = time.time() - OCR_DRAFT_RECONCILE_LOOKBACK_SECONDS
+        try:
+            entries = list(os.scandir(root))
+        except (FileNotFoundError, OSError):
+            return 0
+        with self.lock:
+            match_details = {
+                match_id: dict(session.detail)
+                for match_id, session in self.sessions.items()
+            }
+        enqueued = 0
+        for entry in entries:
+            try:
+                if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
+                    continue
+                match_id = validate_match_id(entry.name)
+                if not re.fullmatch(r"\d{1,20}", match_id):
+                    continue
+            except (OSError, ValueError):
+                continue
+            output_dir = Path(entry.path)
+            tasks, aliases, suppressed_keys = _tasks_from_database(
+                output_dir / "pipeline_state.sqlite3"
+            )
+            for task in tasks:
+                event_key = str(task.get("event_key") or "")
+                canonical_key = str(aliases.get(event_key) or event_key)
+                if (
+                    not event_key
+                    or event_key in suppressed_keys
+                    or canonical_key in suppressed_keys
+                ):
+                    continue
+                ocr = task.get("ocr_window")
+                if not isinstance(ocr, dict) or ocr.get("status") != "encoded":
+                    continue
+                source_value = ocr.get("output")
+                if not source_value:
+                    continue
+                source_path = Path(str(source_value)).expanduser()
+                try:
+                    if (
+                        not source_path.is_file()
+                        or source_path.stat().st_mtime < generated_after
+                    ):
+                        continue
+                    event = {
+                        key: task.get(key)
+                        for key in EVENT_DETAIL_FIELDS
+                        if task.get(key) is not None
+                    }
+                    event.update(
+                        event_key=canonical_key,
+                        code=str(task.get("code") or ""),
+                        event_type=str(task.get("event_type") or ""),
+                        status="encoded",
+                    )
+                    queue.enqueue(
+                        match_id=match_id,
+                        event=event,
+                        match_detail=match_details.get(match_id, {}),
+                        source_path=source_path,
+                        artifact_result=ocr,
+                    )
+                except Exception as exc:
+                    self._log_ocr_draft_reconcile_failure(
+                        output_dir,
+                        match_id=match_id,
+                        event_key=canonical_key,
+                        error=exc,
+                    )
+                    continue
+                enqueued += 1
+        return enqueued
+
     def run_maintenance(self, *, now: float | None = None) -> list[str]:
         timestamp = time.time() if now is None else now
+        if OCR_DRAFT_AUTO_CREATE:
+            try:
+                self.reconcile_ocr_drafts()
+            except Exception as exc:
+                print(
+                    "[ocr-draft] 自动草稿补偿扫描暂时失败，系统稍后会再试: "
+                    f"{exc}",
+                    flush=True,
+                )
         with self.lock:
             sessions = list(self.sessions.values())
         for session in sessions:
@@ -3378,6 +3518,19 @@ class Dashboard:
                             f"记分牌 profile 文件不存在: {profile_path}"
                         )
                     command.extend(["--scoreboard-profile", str(profile_path)])
+                if OCR_DRAFT_AUTO_CREATE:
+                    command.extend(
+                        [
+                            "--ocr-draft-db",
+                            str(article_publisher.database_path),
+                            "--ocr-draft-staging-dir",
+                            str(article_publisher.gif_store.directory),
+                            "--ocr-draft-team-a-name",
+                            str(session.detail.get("team_A_name") or ""),
+                            "--ocr-draft-team-b-name",
+                            str(session.detail.get("team_B_name") or ""),
+                        ]
+                    )
             session.worker_command = command
             session.worker_mode = "demo" if demo else "live"
             previous_lifecycle_state = session.lifecycle_state
@@ -3537,6 +3690,14 @@ article_publisher = ArticlePublisher(
         "ARTICLE_PUBLISH_VERIFY_PUBLIC_URL", True
     ),
 )
+article_draft_queue = ArticleDraftQueue(
+    database_path=article_publisher.database_path,
+    publisher=article_publisher,
+    allowed_output_root=DEFAULT_OUTPUT,
+    poll_seconds=OCR_DRAFT_POLL_SECONDS,
+    lease_seconds=OCR_DRAFT_LEASE_SECONDS,
+    start_worker=False,
+)
 app = Flask(__name__, static_folder="dashboard_static", static_url_path="/static")
 
 
@@ -3621,7 +3782,16 @@ def health():
 
 @app.get("/api/article-publish/status")
 def article_publish_status():
-    return jsonify({"ok": True, **article_publisher.status()})
+    return jsonify(
+        {
+            "ok": True,
+            **article_publisher.status(),
+            "ocr_drafts": {
+                "automatic": OCR_DRAFT_AUTO_CREATE,
+                **article_draft_queue.status(),
+            },
+        }
+    )
 
 
 @app.get("/api/open-platform/oauth/start")
@@ -3885,6 +4055,15 @@ def gif_file(match_id: str, filename: str):
     return send_from_directory(output_dir, filename)
 
 
+def start_ocr_draft_delivery() -> int:
+    """Start automatic draft delivery only for the real Dashboard process."""
+    if not OCR_DRAFT_AUTO_CREATE:
+        return 0
+    article_draft_queue.start()
+    return dashboard.reconcile_ocr_drafts()
+
+
 if __name__ == "__main__":
+    start_ocr_draft_delivery()
     print(f"Football GIF dashboard: http://{HOST}:{PORT}")
     app.run(host=HOST, port=PORT, threaded=True, debug=False)
