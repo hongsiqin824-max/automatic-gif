@@ -10,6 +10,7 @@ from __future__ import annotations
 import sys
 import errno
 import html
+import hmac
 import json
 import math
 import os
@@ -33,6 +34,7 @@ from article_publisher import (
     ArticlePublishError,
     ArticlePublisher,
     PublishedGifStore,
+    RemoteGifUploadClient,
     environment_boolean,
 )
 from article_draft_queue import ArticleDraftQueue
@@ -119,7 +121,16 @@ ORPHAN_CLEANUP_GRACE_SECONDS = _positive_environment_float(
 DEFAULT_OUTPUT = ROOT / "output_gifs" / "dashboard"
 DEFAULT_PUBLISHED_GIF_DIR = ROOT / "data" / "published_gifs"
 DEFAULT_ARTICLE_PUBLISH_DATABASE = ROOT / "data" / "article_publish.sqlite3"
-OCR_DRAFT_AUTO_CREATE = environment_boolean("OCR_DRAFT_AUTO_CREATE", True)
+GIF_UPLOAD_TOKEN = os.environ.get("GIF_UPLOAD_TOKEN", "").strip()
+GIF_UPLOAD_ENDPOINT = os.environ.get("GIF_UPLOAD_ENDPOINT", "").strip()
+GIF_UPLOAD_TIMEOUT_SECONDS = _positive_environment_float(
+    "GIF_UPLOAD_TIMEOUT_SECONDS", 120.0
+)
+ARTICLE_PUBLISH_ENABLED = environment_boolean("ARTICLE_PUBLISH_ENABLED", True)
+# OCR GIFs are published explicitly from the event row.  Keep the old draft
+# queue available for existing records and manual retries, but do not create
+# drafts in the background before the operator clicks Publish.
+OCR_DRAFT_AUTO_CREATE = environment_boolean("OCR_DRAFT_AUTO_CREATE", False)
 OCR_DRAFT_POLL_SECONDS = _positive_environment_float(
     "OCR_DRAFT_POLL_SECONDS", 2.0
 )
@@ -1035,7 +1046,9 @@ def _tasks_from_database(
                 or nested_diagnostics.get("exact_second_failure_reason"),
             )
         ocr_pipeline_statuses = {
+            "waiting_for_clock_readiness",
             "waiting_for_clock_target",
+            "waiting_for_target_media",
             "waiting_for_latest_tail_rescan",
             "ocr_target_rescan",
             "waiting_for_postroll",
@@ -1050,6 +1063,8 @@ def _tasks_from_database(
             "ocr_target_media_not_arrived",
             "ocr_target_media_stalled",
             "ocr_clock_paused_timeout",
+            "ocr_target_before_recording",
+            "ocr_target_history_cleaned",
             "ocr_window_evicted",
             "ocr_discontinuous_clock",
             "ocr_preparation_timeout",
@@ -1212,6 +1227,9 @@ def _tasks_from_database(
                 "ocr_clock_target_not_located": "ocr_target_timeout",
                 "ocr_postroll_timeout": "ocr_target_timeout",
                 "ocr_output_window_timeout": "ocr_target_timeout",
+                "ocr_target_before_recording": "ocr_target_before_recording",
+                "target_before_recording": "ocr_target_before_recording",
+                "target_not_recorded": "ocr_target_before_recording",
                 "ocr_search_history_evicted": "ocr_window_evicted",
                 "ocr_output_history_evicted": "ocr_window_evicted",
                 "ocr_buffer_never_available": "ocr_window_evicted",
@@ -1367,6 +1385,9 @@ def _tasks_from_database(
         coverage_diagnostics = first_ocr_value("coverage_diagnostics")
         if not isinstance(coverage_diagnostics, dict):
             coverage_diagnostics = {}
+        clock_readiness = first_ocr_value("clock_readiness")
+        if not isinstance(clock_readiness, dict):
+            clock_readiness = {}
         target_failure_cause = first_ocr_value(
             "target_failure_cause", "ocr_target_failure_cause"
         )
@@ -1379,6 +1400,11 @@ def _tasks_from_database(
         target_failure_scan_stage = first_ocr_value(
             "target_failure_scan_stage", "scan_stage"
         )
+        target_media_availability = first_ocr_value(
+            "target_media_availability",
+            "target_media_status",
+            "target_history_status",
+        ) or coverage_diagnostics.get("target_media_availability")
         target_clock_gap_seconds = first_ocr_value("target_clock_gap_seconds")
         latest_media_end_stream_time = first_ocr_value(
             "latest_media_end_stream_time"
@@ -1432,6 +1458,19 @@ def _tasks_from_database(
             "experimental": bool(vision_result.get("experimental")),
             "disabled": bool(vision_result.get("disabled")),
             "ocr_pipeline_status": ocr_pipeline_status or None,
+            "clock_readiness_status": clock_readiness.get("status"),
+            "clock_readiness_accepted_sample_count": clock_readiness.get(
+                "accepted_sample_count"
+            ),
+            "clock_readiness_last_probe_media_end_stream_time": (
+                clock_readiness.get("last_probe_media_end_stream_time")
+            ),
+            "clock_readiness_required_media_growth_seconds": clock_readiness.get(
+                "required_media_growth_seconds"
+            ),
+            "clock_readiness_source_event_key": clock_readiness.get(
+                "source_event_key"
+            ),
             "target_rescan_pending": target_rescan_pending,
             "target_rescan_window": target_rescan_window
             if isinstance(target_rescan_window, dict)
@@ -1472,6 +1511,7 @@ def _tasks_from_database(
             "target_failure_explanation": first_ocr_value(
                 "target_failure_explanation"
             ),
+            "target_media_availability": target_media_availability,
             "target_clock_gap_seconds": target_clock_gap_seconds,
             "latest_media_end_stream_time": latest_media_end_stream_time,
             "previous_media_end_stream_time": previous_media_end_stream_time,
@@ -2017,7 +2057,62 @@ def _session_json(session: MatchSession) -> dict[str, Any]:
     draft_records = article_draft_queue.records_for_match(session.match_id)
     for task in tasks:
         event_key = str(task.get("event_key") or "")
-        task["publish"] = publish_records.get(event_key)
+        default_output = str(task.get("output") or "").strip()
+        default_record = publish_records.get(event_key)
+        if default_output and hasattr(article_publisher, "record_for_source_path"):
+            try:
+                record = article_publisher.record_for_source_path(
+                    session.match_id,
+                    event_key,
+                    Path(default_output),
+                )
+                if isinstance(record, dict):
+                    default_record = record
+            except (OSError, TypeError, ValueError):
+                pass
+        task["publish"] = default_record
+        if hasattr(article_publisher, "uploaded_gif_for"):
+            try:
+                uploaded_default = article_publisher.uploaded_gif_for(
+                    session.match_id, event_key, "default"
+                )
+                if isinstance(uploaded_default, dict):
+                    task["uploaded_gif"] = {
+                        key: value
+                        for key, value in uploaded_default.items()
+                        if key != "path"
+                    }
+            except (OSError, TypeError, ValueError):
+                pass
+        ocr_window = task.get("ocr_window")
+        ocr_output = (
+            ocr_window.get("output")
+            if isinstance(ocr_window, dict)
+            else None
+        )
+        if ocr_output and hasattr(article_publisher, "record_for_source_path"):
+            try:
+                record = article_publisher.record_for_source_path(
+                    session.match_id,
+                    event_key,
+                    Path(str(ocr_output)),
+                )
+                task["ocr_publish"] = record if isinstance(record, dict) else None
+            except (OSError, TypeError, ValueError):
+                task["ocr_publish"] = None
+        if hasattr(article_publisher, "uploaded_gif_for"):
+            try:
+                uploaded_ocr = article_publisher.uploaded_gif_for(
+                    session.match_id, event_key, "ocr_window"
+                )
+                if isinstance(uploaded_ocr, dict):
+                    task["ocr_uploaded_gif"] = {
+                        key: value
+                        for key, value in uploaded_ocr.items()
+                        if key != "path"
+                    }
+            except (OSError, TypeError, ValueError):
+                pass
         task["ocr_draft"] = draft_records.get(event_key)
     event_counts = {
         "unique": len(tasks),
@@ -2032,6 +2127,10 @@ def _session_json(session: MatchSession) -> dict[str, Any]:
     telemetry = _runtime_evidence(session, report, tasks)
     return {
         "match_id": session.match_id,
+        "publishing": {
+            "enabled": ARTICLE_PUBLISH_ENABLED,
+            "remote_upload_enabled": bool(GIF_UPLOAD_ENDPOINT),
+        },
         "status": session.status(),
         "status_label": MATCH_STATUS_LABELS.get(session.status(), "未知"),
         "lifecycle": {
@@ -3689,6 +3788,15 @@ article_publisher = ArticlePublisher(
     verify_public_url=environment_boolean(
         "ARTICLE_PUBLISH_VERIFY_PUBLIC_URL", True
     ),
+    remote_upload_client=(
+        RemoteGifUploadClient(
+            GIF_UPLOAD_ENDPOINT,
+            GIF_UPLOAD_TOKEN,
+            timeout=GIF_UPLOAD_TIMEOUT_SECONDS,
+        )
+        if GIF_UPLOAD_ENDPOINT
+        else None
+    ),
 )
 article_draft_queue = ArticleDraftQueue(
     database_path=article_publisher.database_path,
@@ -3785,10 +3893,15 @@ def article_publish_status():
     return jsonify(
         {
             "ok": True,
+            "publish_enabled": ARTICLE_PUBLISH_ENABLED,
             **article_publisher.status(),
             "ocr_drafts": {
                 "automatic": OCR_DRAFT_AUTO_CREATE,
                 **article_draft_queue.status(),
+            },
+            "gif_upload": {
+                "enabled": bool(GIF_UPLOAD_TOKEN),
+                "max_bytes": article_publisher.gif_store.max_bytes,
             },
         }
     )
@@ -3847,7 +3960,9 @@ def session_view():
         session = dashboard.get(request.args.get("match_id", "demo-match-54154533"))
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
-    return jsonify(_session_json(session))
+    payload = _session_json(session)
+    payload["heavy_tasks"] = _heavy_task_status()
+    return jsonify(payload)
 
 
 @app.post("/api/session")
@@ -3964,12 +4079,153 @@ def _default_gif_source_path(match_id: str, event: dict[str, Any]) -> Path:
     )
 
 
+def _ocr_gif_source_path(match_id: str, event: dict[str, Any]) -> Path:
+    artifact = event.get("ocr_window")
+    if not isinstance(artifact, dict):
+        artifacts = event.get("vision_artifacts")
+        artifact = artifacts.get("ocr_window") if isinstance(artifacts, dict) else None
+    output = str(artifact.get("output") or "").strip() if isinstance(artifact, dict) else ""
+    if not output:
+        raise ArticlePublishError(
+            "画面时间 GIF 还没有生成完成",
+            code="ocr_gif_not_ready",
+            stage="request_validation",
+            status_code=409,
+        )
+    match_directory = (DEFAULT_OUTPUT / match_id).resolve()
+    raw_path = Path(output).expanduser()
+    candidates = [raw_path] if raw_path.is_absolute() else [ROOT / raw_path, match_directory / raw_path]
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if (
+            resolved.suffix.lower() == ".gif"
+            and resolved.is_relative_to(match_directory)
+            and resolved.is_file()
+        ):
+            return resolved
+    raise ArticlePublishError(
+        "画面时间 GIF 文件不存在，或文件不属于当前比赛目录",
+        code="ocr_gif_not_found",
+        stage="gif_validation",
+        status_code=404,
+    )
+
+
+def _check_gif_upload_token() -> None:
+    """Require the one-time configured token for remote GIF uploads."""
+    if not GIF_UPLOAD_TOKEN:
+        raise ArticlePublishError(
+            "服务器还没有配置 GIF 上传密钥，请先设置 GIF_UPLOAD_TOKEN",
+            code="publish_upload_not_configured",
+            stage="request_validation",
+            status_code=503,
+        )
+    authorization = str(request.headers.get("Authorization") or "")
+    supplied = authorization[7:].strip() if authorization.lower().startswith("bearer ") else ""
+    if not supplied or not hmac.compare_digest(supplied, GIF_UPLOAD_TOKEN):
+        raise ArticlePublishError(
+            "GIF 上传密钥不正确",
+            code="publish_upload_unauthorized",
+            stage="request_validation",
+            status_code=401,
+        )
+
+
+@app.post("/api/article-publish/upload")
+def article_publish_upload():
+    """Receive a locally generated GIF and associate it with one event."""
+    try:
+        _check_gif_upload_token()
+        match_id = validate_match_id(str(request.form.get("match_id") or ""))
+        event_key = str(request.form.get("event_key") or "").strip()
+        artifact_kind = str(request.form.get("artifact_kind") or "default").strip().lower()
+        if not event_key:
+            raise ArticlePublishError(
+                "上传 GIF 需要事件标识",
+                code="publish_event_key_missing",
+                stage="request_validation",
+                status_code=400,
+            )
+        if artifact_kind not in {"default", "ocr_window"}:
+            raise ArticlePublishError(
+                "不支持的 GIF 类型",
+                code="publish_artifact_kind_invalid",
+                stage="request_validation",
+                status_code=400,
+            )
+        uploaded = request.files.get("gif") or request.files.get("file")
+        if uploaded is None:
+            raise ArticlePublishError(
+                "请求没有附带 GIF 文件（字段名应为 gif）",
+                code="publish_upload_file_missing",
+                stage="request_validation",
+                status_code=400,
+            )
+        max_bytes = int(article_publisher.gif_store.max_bytes)
+        body = uploaded.stream.read(max_bytes + 1)
+        if len(body) > max_bytes:
+            raise ArticlePublishError(
+                f"GIF 超过发布上限（当前上限 {max_bytes} 字节）",
+                code="publish_gif_too_large",
+                stage="gif_validation",
+            )
+        result = article_publisher.upload_gif(
+            body=body,
+            match_id=match_id,
+            event_key=event_key,
+            artifact_kind=artifact_kind,
+        )
+        return jsonify({"ok": True, **result})
+    except ValueError as exc:
+        return jsonify(
+            {
+                "ok": False,
+                "error": str(exc),
+                "code": "publish_request_invalid",
+                "stage": "request_validation",
+            }
+        ), 400
+    except ArticlePublishError as exc:
+        return jsonify(
+            {
+                "ok": False,
+                "error": str(exc),
+                "code": exc.code,
+                "stage": exc.stage,
+            }
+        ), exc.status_code
+    except Exception as exc:
+        return jsonify(
+            {
+                "ok": False,
+                "error": f"上传服务内部异常：{exc}",
+                "code": "publish_upload_internal_error",
+                "stage": "internal",
+            }
+        ), 500
+
+
 @app.post("/api/article-publish")
 def article_publish():
     body = request.get_json(silent=True) or {}
     try:
+        if not ARTICLE_PUBLISH_ENABLED:
+            raise ArticlePublishError(
+                "这台服务只负责保存和提供 GIF 公网地址，请回到本地页面点击发布",
+                code="article_publish_disabled",
+                stage="request_validation",
+                status_code=403,
+            )
         match_id = validate_match_id(str(body.get("match_id") or ""))
         event_key = str(body.get("event_key") or "").strip()
+        artifact_kind = str(body.get("artifact_kind") or "default").strip().lower()
+        if artifact_kind not in {"default", "ocr_window"}:
+            raise ArticlePublishError(
+                "不支持的 GIF 类型",
+                code="publish_artifact_kind_invalid",
+                stage="request_validation",
+                status_code=400,
+            )
         if not event_key:
             raise ArticlePublishError(
                 "请求缺少 event_key",
@@ -3994,11 +4250,41 @@ def article_publish():
                 stage="request_validation",
                 status_code=404,
             )
+        gif_id = str(body.get("gif_id") or "").strip()
+        uploaded = None
+        if gif_id:
+            source_path = article_publisher.gif_store.path_for(gif_id)
+            if not source_path.is_file():
+                raise ArticlePublishError(
+                    "上传的 GIF 已不存在，请重新上传",
+                    code="publish_uploaded_gif_not_found",
+                    stage="gif_storage",
+                    status_code=404,
+                )
+        else:
+            uploaded_candidate = article_publisher.uploaded_gif_for(
+                match_id, event_key, artifact_kind
+            )
+            uploaded = uploaded_candidate if isinstance(uploaded_candidate, dict) else None
+            if uploaded:
+                source_path = Path(str(uploaded["path"])).resolve()
+            else:
+                source_path = (
+                    _ocr_gif_source_path(match_id, event)
+                    if artifact_kind == "ocr_window"
+                    else _default_gif_source_path(match_id, event)
+                )
+        publish_event = dict(event)
+        # OCR and the default clip are independent artifacts.  An OCR clip can
+        # still be published when the default clip for the same event failed.
+        if artifact_kind == "ocr_window" or gif_id or uploaded:
+            publish_event["status"] = "encoded"
         result = article_publisher.publish(
             match_id=match_id,
-            event=event,
+            event=publish_event,
             match_detail=session_payload.get("detail") or {},
-            source_path=_default_gif_source_path(match_id, event),
+            source_path=source_path,
+            artifact_kind=artifact_kind,
         )
         return jsonify({"ok": True, "publish": result})
     except ValueError as exc:
@@ -4018,6 +4304,8 @@ def article_publish():
             "stage": exc.stage,
             "auth_required": exc.auth_required,
             "retriable": exc.retriable,
+            "platform_code": exc.platform_code,
+            "diagnostics": exc.diagnostics,
         }
         if exc.auth_required:
             payload["oauth_url"] = "/api/open-platform/oauth/start"
@@ -4031,6 +4319,58 @@ def article_publish():
                 "stage": "internal",
             }
         ), 500
+
+
+@app.post("/api/article-draft/retry")
+def article_draft_retry():
+    """Retry one existing OCR draft task; the server owns the GIF path."""
+    body = request.get_json(silent=True) or {}
+    try:
+        match_id = validate_match_id(str(body.get("match_id") or ""))
+        event_key = str(body.get("event_key") or "").strip()
+        if not event_key:
+            raise ArticlePublishError(
+                "请求缺少 event_key",
+                code="draft_event_key_missing",
+                stage="request_validation",
+                status_code=400,
+            )
+        task = article_draft_queue.retry(match_id=match_id, event_key=event_key)
+        if task is None:
+            raise ArticlePublishError(
+                "没有找到这条 OCR 草稿任务，请先确认画面时间 GIF 已生成",
+                code="draft_task_not_found",
+                stage="request_validation",
+                status_code=404,
+            )
+        return jsonify({"ok": True, "ocr_draft": task})
+    except ValueError as exc:
+        return jsonify(
+            {
+                "ok": False,
+                "error": str(exc),
+                "code": "draft_request_invalid",
+                "stage": "request_validation",
+            }
+        ), 400
+    except ArticlePublishError as exc:
+        return jsonify(
+            {
+                "ok": False,
+                "error": str(exc),
+                "code": exc.code,
+                "stage": exc.stage,
+            }
+        ), exc.status_code
+    except Exception as exc:
+        return jsonify(
+            {
+                "ok": False,
+                "error": f"草稿队列暂时不可用，请稍后再试：{exc}",
+                "code": "draft_retry_internal_error",
+                "stage": "internal",
+            }
+        ), 503
 
 
 @app.get("/publish-gifs/<gif_id>.gif")

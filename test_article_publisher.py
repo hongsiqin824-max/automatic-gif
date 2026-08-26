@@ -2,11 +2,13 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from article_publisher import (
     ArticlePublishError,
     ArticlePublisher,
     PublishedGifStore,
+    RemoteGifUploadClient,
     build_article_fields,
     build_article_title,
     inspect_animated_gif,
@@ -42,6 +44,147 @@ class FakePlatformClient:
 
 
 class ArticlePublisherTests(unittest.TestCase):
+    def test_remote_upload_client_returns_server_public_url(self):
+        class Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return json.dumps({
+                    "ok": True,
+                    "gif": {
+                        "gif_id": expected_id,
+                        "url": f"https://matchgif.aisportsapp.com/publish-gifs/{expected_id}.gif",
+                    },
+                }).encode()
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "goal.gif"
+            source.write_bytes(animated_gif_bytes())
+            import hashlib
+            expected_id = hashlib.sha256(animated_gif_bytes()).hexdigest()
+            client = RemoteGifUploadClient(
+                "https://matchgif.aisportsapp.com/api/article-publish/upload",
+                "upload-secret",
+            )
+            with patch("article_publisher.urllib.request.urlopen", return_value=Response()) as opened:
+                result = client.upload(
+                    source_path=source,
+                    match_id="54478914",
+                    event_key="goal-19",
+                    artifact_kind="ocr_window",
+                    max_bytes=1024,
+                )
+
+        request = opened.call_args.args[0]
+        self.assertEqual(request.get_header("Authorization"), "Bearer upload-secret")
+        self.assertIn(b'name="match_id"', request.data)
+        self.assertIn(b"54478914", request.data)
+        self.assertEqual(result["gif_id"], expected_id)
+        self.assertTrue(result["url"].startswith("https://"))
+
+    def test_local_publish_uploads_then_calls_platform_locally(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "goal.gif"
+            source.write_bytes(animated_gif_bytes())
+            platform = FakePlatformClient()
+            remote = RemoteGifUploadClient("https://upload.example/api", "secret")
+            publisher = ArticlePublisher(
+                platform_client=platform,
+                gif_store=PublishedGifStore(
+                    root / "published", "https://matchgif.aisportsapp.com"
+                ),
+                database_path=root / "publish.sqlite3",
+                public_url_checker=lambda _url: None,
+                remote_upload_client=remote,
+            )
+            gif_id = __import__("hashlib").sha256(animated_gif_bytes()).hexdigest()
+            remote_result = {
+                "gif_id": gif_id,
+                "path": str(root / "published" / f"{gif_id}.gif"),
+                "url": f"https://matchgif.aisportsapp.com/publish-gifs/{gif_id}.gif",
+                "bytes": len(animated_gif_bytes()),
+                "animated": True,
+                "frame_count": 2,
+                "header": "GIF89a",
+            }
+            event = {
+                "event_key": "goal-19",
+                "status": "encoded",
+                "code": "G",
+                "minute": "19",
+            }
+            with patch.object(remote, "upload", return_value=remote_result) as upload:
+                first = publisher.publish(
+                    match_id="54478914",
+                    event=event,
+                    match_detail={},
+                    source_path=source,
+                    artifact_kind="ocr_window",
+                )
+                second = publisher.publish(
+                    match_id="54478914",
+                    event=event,
+                    match_detail={},
+                    source_path=source,
+                    artifact_kind="ocr_window",
+                )
+
+            upload.assert_called_once()
+            self.assertEqual(len(platform.calls), 1)
+            self.assertIn(remote_result["url"], platform.calls[0]["body"])
+            self.assertEqual(first["status"], "success")
+            self.assertTrue(second["idempotent_replay"])
+
+    def test_upload_gif_persists_and_associates_with_event(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            publisher = ArticlePublisher(
+                platform_client=FakePlatformClient(),
+                gif_store=PublishedGifStore(
+                    root / "published", "https://matchgif.aisportsapp.com"
+                ),
+                database_path=root / "publish.sqlite3",
+                public_url_checker=lambda url: None,
+            )
+            result = publisher.upload_gif(
+                body=animated_gif_bytes(),
+                match_id="54478914",
+                event_key="goal-19",
+                artifact_kind="ocr_window",
+            )
+            uploaded = publisher.uploaded_gif_for(
+                "54478914", "goal-19", "ocr_window"
+            )
+
+            self.assertEqual(result["gif"]["gif_id"], uploaded["gif_id"])
+            self.assertTrue(Path(uploaded["path"]).is_file())
+            self.assertTrue(uploaded["url"].startswith("https://"))
+
+    def test_upload_gif_rejects_unknown_artifact_kind(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            publisher = ArticlePublisher(
+                platform_client=FakePlatformClient(),
+                gif_store=PublishedGifStore(
+                    root / "published", "https://matchgif.aisportsapp.com"
+                ),
+                database_path=root / "publish.sqlite3",
+            )
+            with self.assertRaisesRegex(ArticlePublishError, "不支持"):
+                publisher.upload_gif(
+                    body=animated_gif_bytes(),
+                    match_id="54478914",
+                    event_key="goal-19",
+                    artifact_kind="scoreboard",
+                )
+
     def test_gif_validation_requires_animation(self):
         info = inspect_animated_gif(animated_gif_bytes())
         self.assertEqual(info["frame_count"], 2)
@@ -308,6 +451,8 @@ class ArticlePublisherTests(unittest.TestCase):
             self.assertEqual(caught.exception.stage, "authorization")
             self.assertTrue(caught.exception.auth_required)
             self.assertTrue(caught.exception.retriable)
+            self.assertEqual(caught.exception.platform_code, 50001)
+            self.assertEqual(caught.exception.diagnostics["gif_bytes"], len(animated_gif_bytes()))
 
 
 if __name__ == "__main__":

@@ -33,12 +33,14 @@ class OpenPlatformError(RuntimeError):
         status_code: int = 502,
         auth_required: bool = False,
         retriable: bool = False,
+        http_status: int | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.status_code = status_code
         self.auth_required = auth_required
         self.retriable = retriable
+        self.http_status = http_status
 
 
 @dataclass(frozen=True)
@@ -342,6 +344,7 @@ class OpenPlatformClient:
                 status_code=401 if auth_required else 502,
                 auth_required=auth_required,
                 retriable=code in (4, 5, 10006, 50001, 50002),
+                http_status=payload.get("__http_status"),
             )
         article_id = _article_id(result)
         if not article_id:
@@ -351,6 +354,7 @@ class OpenPlatformClient:
             "duplicate": code == 2,
             "code": code,
             "message": str(result.get("message") or "ok"),
+            "http_status": payload.get("__http_status"),
         }
 
     def _require_configuration(self, *, require_redirect_uri: bool = False) -> None:
@@ -517,6 +521,11 @@ class OpenPlatformClient:
                 request, timeout=self.request_timeout_seconds
             ) as response:
                 raw = response.read().decode("utf-8", errors="replace")
+                payload = _parse_json(raw)
+                if not payload:
+                    raise OpenPlatformError("开放平台返回的不是有效 JSON")
+                payload["__http_status"] = int(getattr(response, "status", 200))
+                return payload
         except urllib.error.HTTPError as exc:
             raw = exc.read().decode("utf-8", errors="replace")
             payload = _parse_json(raw)
@@ -533,6 +542,7 @@ class OpenPlatformClient:
                 status_code=401 if auth_required else 502,
                 auth_required=auth_required,
                 retriable=exc.code == 429 or exc.code >= 500,
+                http_status=exc.code,
             ) from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             raise OpenPlatformError(

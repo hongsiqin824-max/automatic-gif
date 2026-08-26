@@ -1,4 +1,4 @@
-"""Publish an already generated default GIF as a Dongqiudi GIF article."""
+"""Store and publish generated GIFs as Dongqiudi GIF articles."""
 
 from __future__ import annotations
 
@@ -41,6 +41,8 @@ class ArticlePublishError(RuntimeError):
         status_code: int = 422,
         auth_required: bool = False,
         retriable: bool = False,
+        platform_code: int | str | None = None,
+        diagnostics: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
@@ -48,6 +50,8 @@ class ArticlePublishError(RuntimeError):
         self.status_code = status_code
         self.auth_required = auth_required
         self.retriable = retriable
+        self.platform_code = platform_code
+        self.diagnostics = dict(diagnostics or {})
 
 
 def inspect_animated_gif(body: bytes) -> dict[str, Any]:
@@ -167,20 +171,29 @@ class PublishedGifStore:
             body = source_path.read_bytes()
         except OSError as exc:
             raise ArticlePublishError(
-                f"无法读取默认 GIF：{exc}",
+                f"无法读取 GIF：{exc}",
                 code="default_gif_unreadable",
                 stage="gif_validation",
                 status_code=404 if not source_path.exists() else 500,
             ) from exc
+        return self.create_bytes(body, empty_code="default_gif_empty")
+
+    def create_bytes(
+        self,
+        body: bytes,
+        *,
+        empty_code: str = "publish_gif_empty",
+    ) -> dict[str, Any]:
+        """Validate and persist GIF bytes using the content-addressed path."""
         if not body:
             raise ArticlePublishError(
-                "默认 GIF 是空文件",
-                code="default_gif_empty",
+                "GIF 是空文件",
+                code=empty_code,
                 stage="gif_validation",
             )
         if len(body) > self.max_bytes:
             raise ArticlePublishError(
-                f"默认 GIF 超过发布上限（{len(body)} > {self.max_bytes} 字节）",
+                f"GIF 超过发布上限（{len(body)} > {self.max_bytes} 字节）",
                 code="publish_gif_too_large",
                 stage="gif_validation",
             )
@@ -210,6 +223,170 @@ class PublishedGifStore:
         }
 
 
+class RemoteGifUploadClient:
+    """Upload a locally generated GIF to the storage-only server."""
+
+    def __init__(self, endpoint: str, token: str, *, timeout: float = 120.0) -> None:
+        self.endpoint = str(endpoint or "").strip()
+        self.token = str(token or "").strip()
+        self.timeout = float(timeout)
+        if self.endpoint:
+            parsed = urllib.parse.urlsplit(self.endpoint)
+            if parsed.scheme != "https" or not parsed.netloc:
+                raise RuntimeError("GIF_UPLOAD_ENDPOINT 必须是完整的 HTTPS 地址")
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.endpoint)
+
+    def status(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "configured": bool(self.endpoint and self.token),
+            "endpoint": self.endpoint,
+            "timeout_seconds": self.timeout,
+        }
+
+    def upload(
+        self,
+        *,
+        source_path: Path,
+        match_id: str,
+        event_key: str,
+        artifact_kind: str,
+        max_bytes: int,
+    ) -> dict[str, Any]:
+        if not self.endpoint:
+            raise ArticlePublishError(
+                "未配置 GIF 上传地址；本地发布需要先把 GIF 上传到服务器",
+                code="remote_gif_upload_not_configured",
+                stage="remote_gif_upload",
+                status_code=503,
+            )
+        if not self.token:
+            raise ArticlePublishError(
+                "未配置 GIF 上传密钥；请在本机 .env 设置 GIF_UPLOAD_TOKEN",
+                code="remote_gif_upload_token_missing",
+                stage="remote_gif_upload",
+                status_code=503,
+            )
+        try:
+            body = source_path.read_bytes()
+        except OSError as exc:
+            raise ArticlePublishError(
+                f"读取本地 GIF 失败：{exc}",
+                code="remote_gif_source_unreadable",
+                stage="remote_gif_upload",
+                status_code=404,
+            ) from exc
+        if not body:
+            raise ArticlePublishError(
+                "本地 GIF 是空文件，无法上传",
+                code="publish_gif_empty",
+                stage="gif_validation",
+            )
+        if len(body) > max_bytes:
+            raise ArticlePublishError(
+                f"GIF 超过发布上限（当前上限 {max_bytes} 字节）",
+                code="publish_gif_too_large",
+                stage="gif_validation",
+            )
+        gif_info = inspect_animated_gif(body)
+        boundary = f"----automatic-gif-{os.urandom(12).hex()}"
+        fields = {
+            "match_id": str(match_id),
+            "event_key": str(event_key),
+            "artifact_kind": str(artifact_kind),
+        }
+        payload = bytearray()
+        for name, value in fields.items():
+            payload.extend(f"--{boundary}\r\n".encode())
+            payload.extend(
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode()
+            )
+        payload.extend(f"--{boundary}\r\n".encode())
+        payload.extend(
+            b'Content-Disposition: form-data; name="gif"; filename="event.gif"\r\n'
+            b"Content-Type: image/gif\r\n\r\n"
+        )
+        payload.extend(body)
+        payload.extend(f"\r\n--{boundary}--\r\n".encode())
+        request = urllib.request.Request(
+            self.endpoint,
+            data=bytes(payload),
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {self.token}",
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+                "Accept": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                response_body = response.read()
+                status_code = int(getattr(response, "status", 200) or 200)
+        except urllib.error.HTTPError as exc:
+            detail = exc.read(4096).decode("utf-8", errors="replace")
+            raise ArticlePublishError(
+                f"GIF 上传服务器拒绝请求（HTTP {exc.code}）：{_remote_error_message(detail)}",
+                code="remote_gif_upload_rejected",
+                stage="remote_gif_upload",
+                status_code=502 if exc.code >= 500 else exc.code,
+                retriable=exc.code >= 500 or exc.code == 429,
+            ) from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise ArticlePublishError(
+                f"无法连接 GIF 上传服务器：{exc}",
+                code="remote_gif_upload_unreachable",
+                stage="remote_gif_upload",
+                status_code=503,
+                retriable=True,
+            ) from exc
+        try:
+            parsed = json.loads(response_body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ArticlePublishError(
+                f"GIF 上传服务器返回了无法识别的结果（HTTP {status_code}）",
+                code="remote_gif_upload_invalid_response",
+                stage="remote_gif_upload",
+                status_code=502,
+                retriable=True,
+            ) from exc
+        if not isinstance(parsed, dict) or not parsed.get("ok"):
+            message = parsed.get("error") if isinstance(parsed, dict) else "未知错误"
+            raise ArticlePublishError(
+                f"GIF 上传失败：{message}",
+                code="remote_gif_upload_rejected",
+                stage="remote_gif_upload",
+                status_code=502,
+                retriable=True,
+            )
+        remote_gif = parsed.get("gif")
+        if not isinstance(remote_gif, dict):
+            raise ArticlePublishError(
+                "GIF 上传成功但没有返回公网地址",
+                code="remote_gif_upload_invalid_response",
+                stage="remote_gif_upload",
+                status_code=502,
+            )
+        gif_id = str(remote_gif.get("gif_id") or "").strip()
+        gif_url = str(remote_gif.get("url") or "").strip()
+        if not GIF_ID_PATTERN.fullmatch(gif_id) or not gif_url.startswith("https://"):
+            raise ArticlePublishError(
+                "GIF 上传成功但返回的文件标识或公网地址无效",
+                code="remote_gif_upload_invalid_response",
+                stage="remote_gif_upload",
+                status_code=502,
+            )
+        return {
+            "gif_id": gif_id,
+            "path": str(source_path.expanduser().resolve()),
+            "url": gif_url,
+            "bytes": len(body),
+            **gif_info,
+        }
+
+
 class ArticlePublisher:
     def __init__(
         self,
@@ -219,12 +396,14 @@ class ArticlePublisher:
         database_path: Path,
         verify_public_url: bool = True,
         public_url_checker: Callable[[str], None] | None = None,
+        remote_upload_client: RemoteGifUploadClient | None = None,
     ) -> None:
         self.platform_client = platform_client
         self.gif_store = gif_store
         self.database_path = database_path.expanduser().resolve()
         self.verify_public_url = verify_public_url
         self.public_url_checker = public_url_checker or _check_public_gif_url
+        self.remote_upload_client = remote_upload_client
         self._lock = threading.RLock()
 
     def status(self) -> dict[str, Any]:
@@ -240,6 +419,11 @@ class ArticlePublisher:
             "gif_directory": str(self.gif_store.directory),
             "database_path": str(self.database_path),
             "oauth": self.platform_client.status(),
+            "remote_upload": (
+                self.remote_upload_client.status()
+                if self.remote_upload_client
+                else {"enabled": False, "configured": False}
+            ),
         }
 
     def records_for_match(self, match_id: str) -> dict[str, dict[str, Any]]:
@@ -263,6 +447,138 @@ class ArticlePublisher:
             records.setdefault(event_key, _public_record(row))
         return records
 
+    def record_for_source_path(
+        self, match_id: str, event_key: str, source_path: Path
+    ) -> dict[str, Any] | None:
+        """Return the publish record for one concrete GIF artifact."""
+        resolved_source = str(source_path.expanduser().resolve())
+        if not self.database_path.exists():
+            return None
+        try:
+            with self._connect() as connection:
+                row = connection.execute(
+                    """
+                    SELECT * FROM article_publish_records
+                    WHERE match_id=? AND event_key=? AND source_path=?
+                    ORDER BY updated_at_unix DESC LIMIT 1
+                    """,
+                    (str(match_id), str(event_key), resolved_source),
+                ).fetchone()
+        except sqlite3.Error:
+            return None
+        return _public_record(row) if row else None
+
+    def upload_gif(
+        self,
+        *,
+        body: bytes,
+        match_id: str,
+        event_key: str,
+        artifact_kind: str = "default",
+    ) -> dict[str, Any]:
+        """Store an externally generated GIF and associate it with an event."""
+        if not str(match_id).strip():
+            raise ArticlePublishError(
+                "上传 GIF 需要比赛 ID",
+                code="publish_match_id_missing",
+                stage="request_validation",
+                status_code=400,
+            )
+        if not str(event_key).strip():
+            raise ArticlePublishError(
+                "上传 GIF 需要事件标识",
+                code="publish_event_key_missing",
+                stage="request_validation",
+                status_code=400,
+            )
+        if artifact_kind not in {"default", "ocr_window"}:
+            raise ArticlePublishError(
+                "不支持的 GIF 类型",
+                code="publish_artifact_kind_invalid",
+                stage="request_validation",
+                status_code=400,
+            )
+        with self._lock:
+            gif = self.gif_store.create_bytes(body)
+            self._save_uploaded_mapping(
+                match_id=match_id,
+                event_key=event_key,
+                artifact_kind=artifact_kind,
+                gif=gif,
+            )
+        return {
+            "gif": gif,
+            "match_id": str(match_id),
+            "event_key": str(event_key),
+            "artifact_kind": artifact_kind,
+        }
+
+    def _save_uploaded_mapping(
+        self,
+        *,
+        match_id: str,
+        event_key: str,
+        artifact_kind: str,
+        gif: dict[str, Any],
+    ) -> None:
+        now = time.time()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO article_uploaded_gifs (
+                    match_id, event_key, artifact_kind, gif_sha256,
+                    gif_path, gif_url, uploaded_at_unix
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(match_id, event_key, artifact_kind) DO UPDATE SET
+                    gif_sha256=excluded.gif_sha256,
+                    gif_path=excluded.gif_path,
+                    gif_url=excluded.gif_url,
+                    uploaded_at_unix=excluded.uploaded_at_unix
+                """,
+                (
+                    str(match_id).strip(),
+                    str(event_key).strip(),
+                    artifact_kind,
+                    str(gif["gif_id"]),
+                    str(gif["path"]),
+                    str(gif["url"]),
+                    now,
+                ),
+            )
+
+    def uploaded_gif_for(
+        self,
+        match_id: str,
+        event_key: str,
+        artifact_kind: str = "default",
+    ) -> dict[str, Any] | None:
+        """Return the most recent externally uploaded GIF for one event."""
+        if not self.database_path.exists():
+            return None
+        try:
+            with self._connect() as connection:
+                row = connection.execute(
+                    """
+                    SELECT * FROM article_uploaded_gifs
+                    WHERE match_id=? AND event_key=? AND artifact_kind=?
+                    LIMIT 1
+                    """,
+                    (str(match_id), str(event_key), str(artifact_kind)),
+                ).fetchone()
+        except sqlite3.Error:
+            return None
+        if not row:
+            return None
+        path = Path(str(row["gif_path"])).expanduser()
+        if not path.is_file():
+            return None
+        return {
+            "gif_id": str(row["gif_sha256"]),
+            "path": str(path),
+            "url": str(row["gif_url"]),
+            "uploaded_at_unix": row["uploaded_at_unix"],
+        }
+
     def publish(
         self,
         *,
@@ -270,6 +586,7 @@ class ArticlePublisher:
         event: dict[str, Any],
         match_detail: dict[str, Any],
         source_path: Path,
+        artifact_kind: str = "default",
     ) -> dict[str, Any]:
         event_key = str(event.get("event_key") or "").strip()
         if not event_key:
@@ -280,14 +597,51 @@ class ArticlePublisher:
             )
         if str(event.get("status")) != "encoded":
             raise ArticlePublishError(
-                "默认 GIF 尚未生成完成",
-                code="default_gif_not_ready",
+                "要发布的 GIF 尚未生成完成",
+                code="gif_not_ready",
                 stage="request_validation",
                 status_code=409,
             )
 
+        if artifact_kind not in {"default", "ocr_window"}:
+            raise ArticlePublishError(
+                "不支持的 GIF 类型",
+                code="publish_artifact_kind_invalid",
+                stage="request_validation",
+                status_code=400,
+            )
+
         with self._lock:
-            gif = self.gif_store.create(source_path)
+            # Keep a local content-addressed copy for retry/idempotency, then
+            # optionally upload that copy to the storage-only server.  The
+            # Open Platform request below always runs in this process.
+            local_gif = self.gif_store.create(source_path)
+            uploaded = self.uploaded_gif_for(match_id, event_key, artifact_kind)
+            if uploaded and uploaded.get("gif_id") == local_gif["gif_id"]:
+                gif = uploaded
+            elif self.remote_upload_client and self.remote_upload_client.enabled:
+                gif = self.remote_upload_client.upload(
+                    source_path=Path(local_gif["path"]),
+                    match_id=match_id,
+                    event_key=event_key,
+                    artifact_kind=artifact_kind,
+                    max_bytes=self.gif_store.max_bytes,
+                )
+                if gif["gif_id"] != local_gif["gif_id"]:
+                    raise ArticlePublishError(
+                        "服务器保存后的 GIF 与本地文件不一致，已停止发布",
+                        code="remote_gif_upload_hash_mismatch",
+                        stage="remote_gif_upload",
+                        status_code=502,
+                    )
+                self._save_uploaded_mapping(
+                    match_id=match_id,
+                    event_key=event_key,
+                    artifact_kind=artifact_kind,
+                    gif=gif,
+                )
+            else:
+                gif = local_gif
             stable_id = hashlib.sha256(
                 f"{match_id}\n{event_key}\n{gif['gif_id']}".encode("utf-8")
             ).hexdigest()
@@ -307,6 +661,7 @@ class ArticlePublisher:
                 stable_id=stable_id,
                 match_id=match_id,
                 event_key=event_key,
+                source_path=source_path,
                 gif=gif,
                 title=title,
                 status="prepared",
@@ -319,6 +674,7 @@ class ArticlePublisher:
                     stable_id=stable_id,
                     match_id=match_id,
                     event_key=event_key,
+                    source_path=source_path,
                     gif=gif,
                     title=title,
                     status="publishing",
@@ -338,6 +694,7 @@ class ArticlePublisher:
                     status_code=exc.status_code,
                     auth_required=exc.auth_required,
                     retriable=exc.retriable,
+                    platform_code=exc.code,
                 ) from exc
 
             published_at = time.time()
@@ -345,6 +702,7 @@ class ArticlePublisher:
                 stable_id=stable_id,
                 match_id=match_id,
                 event_key=event_key,
+                source_path=source_path,
                 gif=gif,
                 title=title,
                 status="success",
@@ -383,6 +741,7 @@ class ArticlePublisher:
             )
 
         with self._lock:
+            started_at = time.monotonic()
             gif = self.gif_store.create(source_path)
             title = build_article_title(event, match_detail)
             fields = build_article_fields(
@@ -397,10 +756,24 @@ class ArticlePublisher:
                 if self.verify_public_url:
                     self.public_url_checker(str(gif["url"]))
                 result = self.platform_client.create_article(fields)
-            except ArticlePublishError:
+            except ArticlePublishError as exc:
+                if not exc.diagnostics:
+                    exc.diagnostics = _draft_diagnostics(
+                        fields=fields,
+                        gif=gif,
+                        elapsed_ms=(time.monotonic() - started_at) * 1000,
+                        platform_message=str(exc),
+                    )
                 raise
             except OpenPlatformError as exc:
                 stage = "authorization" if exc.auth_required else "platform_publish"
+                diagnostics = _draft_diagnostics(
+                    fields=fields,
+                    gif=gif,
+                    elapsed_ms=(time.monotonic() - started_at) * 1000,
+                    platform_message=str(exc),
+                    http_status=exc.http_status or exc.status_code,
+                )
                 raise ArticlePublishError(
                     str(exc),
                     code=(
@@ -412,8 +785,17 @@ class ArticlePublisher:
                     status_code=exc.status_code,
                     auth_required=exc.auth_required,
                     retriable=exc.retriable,
+                    platform_code=exc.code,
+                    diagnostics=diagnostics,
                 ) from exc
 
+            diagnostics = _draft_diagnostics(
+                fields=fields,
+                gif=gif,
+                elapsed_ms=(time.monotonic() - started_at) * 1000,
+                platform_message=str(result.get("message") or "ok"),
+                http_status=result.get("http_status"),
+            )
             return {
                 "article_id": str(result["article_id"]),
                 "gif": gif,
@@ -422,6 +804,7 @@ class ArticlePublisher:
                 "updated": archive_id is not None,
                 "duplicate": bool(result.get("duplicate")),
                 "platform_code": result.get("code"),
+                "diagnostics": diagnostics,
             }
 
     def _connect(self) -> sqlite3.Connection:
@@ -434,6 +817,7 @@ class ArticlePublisher:
                 stable_id TEXT PRIMARY KEY,
                 match_id TEXT NOT NULL,
                 event_key TEXT NOT NULL,
+                source_path TEXT,
                 gif_sha256 TEXT NOT NULL,
                 gif_url TEXT NOT NULL,
                 gif_path TEXT NOT NULL,
@@ -450,6 +834,30 @@ class ArticlePublisher:
             )
             """
         )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS article_uploaded_gifs (
+                match_id TEXT NOT NULL,
+                event_key TEXT NOT NULL,
+                artifact_kind TEXT NOT NULL,
+                gif_sha256 TEXT NOT NULL,
+                gif_path TEXT NOT NULL,
+                gif_url TEXT NOT NULL,
+                uploaded_at_unix REAL NOT NULL,
+                PRIMARY KEY(match_id, event_key, artifact_kind)
+            )
+            """
+        )
+        columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(article_publish_records)"
+            )
+        }
+        if "source_path" not in columns:
+            connection.execute(
+                "ALTER TABLE article_publish_records ADD COLUMN source_path TEXT"
+            )
         connection.execute(
             """
             CREATE INDEX IF NOT EXISTS article_publish_match_event
@@ -472,6 +880,7 @@ class ArticlePublisher:
         stable_id: str,
         match_id: str,
         event_key: str,
+        source_path: Path,
         gif: dict[str, Any],
         title: str,
         status: str,
@@ -486,10 +895,10 @@ class ArticlePublisher:
             connection.execute(
                 """
                 INSERT INTO article_publish_records (
-                    stable_id, match_id, event_key, gif_sha256, gif_url, gif_path,
+                    stable_id, match_id, event_key, source_path, gif_sha256, gif_url, gif_path,
                     title, status, stage, article_id, platform_code, duplicate,
                     error, created_at_unix, updated_at_unix, published_at_unix
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
                 ON CONFLICT(stable_id) DO UPDATE SET
                     status=excluded.status,
                     stage=excluded.stage,
@@ -504,6 +913,7 @@ class ArticlePublisher:
                     stable_id,
                     match_id,
                     event_key,
+                    str(source_path.expanduser().resolve()),
                     gif["gif_id"],
                     gif["url"],
                     gif["path"],
@@ -628,6 +1038,51 @@ def build_article_fields(
     return fields
 
 
+def _draft_diagnostics(
+    *,
+    fields: dict[str, Any],
+    gif: dict[str, Any],
+    elapsed_ms: float,
+    platform_message: str,
+    http_status: int | None = None,
+) -> dict[str, Any]:
+    """Return safe debugging details without credentials or request bodies."""
+    summary = {
+        key: fields.get(key)
+        for key in (
+            "status",
+            "type",
+            "style",
+            "match_id",
+            "match_time",
+            "match_event",
+            "match_score",
+            "add_to_tab",
+            "archive_id",
+        )
+        if fields.get(key) is not None
+    }
+    return {
+        "http_status": http_status,
+        "gif_bytes": int(gif.get("bytes") or 0),
+        "elapsed_ms": round(max(float(elapsed_ms), 0.0), 1),
+        "request_summary": summary,
+        "platform_message": str(platform_message or ""),
+    }
+
+
+def _remote_error_message(raw: str) -> str:
+    """Extract a short server-side error without echoing a full response."""
+    try:
+        payload = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        payload = None
+    if isinstance(payload, dict) and payload.get("error"):
+        return str(payload["error"])[:240]
+    text = " ".join(str(raw or "").split())
+    return text[:240] or "未知错误"
+
+
 def _match_time(event: dict[str, Any]) -> str:
     minute = str(event.get("minute") or "").strip().rstrip("'")
     extra = str(event.get("minute_extra") or "").strip()
@@ -695,6 +1150,7 @@ def _public_record(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
         "stable_id": value.get("stable_id"),
         "match_id": value.get("match_id"),
         "event_key": value.get("event_key"),
+        "source_path": value.get("source_path"),
         "gif_url": value.get("gif_url"),
         "title": value.get("title"),
         "status": value.get("status"),

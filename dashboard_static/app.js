@@ -16,6 +16,9 @@ const state = {
   lastRenderedRefreshSerial: 0,
   actionPending: false,
   publishStates: new Map(),
+  publishingEnabled: true,
+  remoteUploadEnabled: false,
+  openTechnicalDetails: new Set(),
 };
 
 function matchId() { return $('match-id').value.trim(); }
@@ -40,7 +43,7 @@ const FRIENDLY_TERM_REPLACEMENTS = [
   [/PID/gi, '进程编号'], [/返回码/g, '结束状态'], [/锚点/g, '对应画面'],
   [/可信时钟/g, '最近读到的比赛时间'], [/目标时钟/g, '接口给出的比赛时间'],
   [/时钟识别/g, '比赛时间读取'], [/时钟检测/g, '比赛时间读取'], [/时钟连续性/g, '比赛时间前后是否连贯'],
-  [/游标/g, '已检查到的位置'], [/扫描窗口/g, '检查范围'], [/缓存被淘汰/g, '历史画面已被删除'],
+  [/游标/g, '已检查到的位置'], [/扫描窗口/g, '检查范围'], [/缓存被淘汰/g, '历史画面当前已不在'],
   [/缓存尾部/g, '最新保存的视频位置'], [/缓存/g, '视频保存范围'], [/推理/g, '读取画面'],
   [/视频分片/g, '视频片段'], [/分片/g, '片段'], [/resource/g, '直播地址'], [/updated_at/g, '最近更新时间'],
 ];
@@ -88,19 +91,29 @@ function errorGuide(value, fallbackTitle = '这一步没有完成') {
   if (guide.key) return guide;
   return {...guide, cause:friendlyErrorMessage(value, guide.cause)};
 }
-function publishStateKey(matchId, eventKey) { return `${String(matchId || '')}\n${String(eventKey || '')}`; }
+function publishStateKey(matchId, eventKey, artifactKind = 'default') { return `${String(matchId || '')}\n${String(eventKey || '')}\n${String(artifactKind || 'default')}`; }
 function publishStageLabel(stage) {
-  return ({request_validation:'请求检查',gif_validation:'GIF 校验',gif_storage:'永久保存',gif_prepared:'GIF 已保存',public_url_check:'公网地址检查',authorization:'开放平台授权',platform_publish:'正式发布',record_persistence:'发布记录保存',completed:'发布完成',internal:'发布服务'})[String(stage || '')] || '发布处理';
+  return ({request_validation:'请求检查',gif_validation:'GIF 校验',gif_storage:'永久保存',remote_gif_upload:'上传到公网服务器',gif_prepared:'GIF 已保存',public_url_check:'公网地址检查',authorization:'开放平台授权',platform_publish:'正式发布',record_persistence:'发布记录保存',completed:'发布完成',internal:'发布服务'})[String(stage || '')] || '发布处理';
 }
-function publishStateFor(matchId, event) {
-  const local = state.publishStates.get(publishStateKey(matchId, event.event_key));
-  const persisted = event.publish && typeof event.publish === 'object' ? event.publish : null;
+function publishStateFor(matchId, event, artifactKind = 'default') {
+  const local = state.publishStates.get(publishStateKey(matchId, event.event_key, artifactKind));
+  const persistedValue = artifactKind === 'ocr_window' ? event.ocr_publish : event.publish;
+  const persisted = persistedValue && typeof persistedValue === 'object' ? persistedValue : null;
   if (persisted && persisted.status === 'success') return persisted;
   return local || persisted;
 }
-function publishControls(matchId, event) {
-  if (event.status !== 'encoded' || !event.output || !event.event_key) return '';
-  const publication = publishStateFor(matchId, event);
+function publishControls(matchId, event, artifactKind = 'default', artifact = event) {
+  if (!state.publishingEnabled) return '';
+  const output = artifactKind === 'ocr_window' ? artifact && artifact.output : event.output;
+  const uploaded = artifactKind === 'ocr_window'
+    ? (artifact && artifact.uploaded_gif)
+    : (event && event.uploaded_gif);
+  const uploadedGifId = uploaded && uploaded.gif_id ? String(uploaded.gif_id) : '';
+  const ready = artifactKind === 'ocr_window'
+    ? artifact && (artifact.status === 'encoded' || uploadedGifId)
+    : event.status === 'encoded' || uploadedGifId;
+  if (!ready || (!output && !uploadedGifId) || !event.event_key) return '';
+  const publication = publishStateFor(matchId, event, artifactKind);
   const status = String((publication && publication.status) || 'ready');
   const pending = status === 'publishing' || status === 'prepared';
   const success = status === 'success';
@@ -116,29 +129,7 @@ function publishControls(matchId, event) {
       : failed
         ? `<small class="publish-result failed">${escapeHtml(stage)}失败：${escapeHtml(error || '未提供原因')}${oauthUrl ? ` · <a href="${escapeHtml(oauthUrl)}" target="_blank" rel="noopener">完成授权</a>` : ''}</small>`
         : '';
-  return `<div class="publish-control"><button class="publish-button" type="button" data-publish-match-id="${escapeHtml(matchId)}" data-publish-event-key="${escapeHtml(event.event_key)}" ${pending || success ? 'disabled' : ''}>${success ? '已发布' : pending ? '发布中' : failed ? '重试发布' : '发布'}</button>${statusMarkup}</div>`;
-}
-function ocrDraftControls(event, ocrWindow) {
-  if (!ocrWindow || ocrWindow.status !== 'encoded' || !ocrWindow.output) return '';
-  const draft = event.ocr_draft && typeof event.ocr_draft === 'object' ? event.ocr_draft : null;
-  if (!draft) return '';
-  const status = String(draft.status || '');
-  const rawError = draft.failure_explanation || draft.last_error || draft.error || draft.message || '';
-  const error = friendlyErrorMessage(rawError, '草稿平台暂时没有完成这次操作。');
-  const draftUrl = String(draft.draft_url || '').trim();
-  let statusMarkup = '';
-  if (status === 'queued') {
-    statusMarkup = '<small class="publish-result pending">等待创建草稿</small>';
-  } else if (status === 'creating') {
-    statusMarkup = '<small class="publish-result pending">正在创建草稿</small>';
-  } else if (status === 'retry_wait') {
-    statusMarkup = `<small class="publish-result retry">暂时没有创建成功：${escapeHtml(error)} · 系统稍后重试</small>`;
-  } else if (status === 'success') {
-    statusMarkup = `<small class="publish-result success">草稿已创建</small>${draftUrl ? `<a class="draft-link" href="${escapeHtml(draftUrl)}" target="_blank" rel="noopener">查看草稿</a>` : ''}`;
-  } else if (status === 'failed') {
-    statusMarkup = `<small class="publish-result failed">草稿创建失败：${escapeHtml(error)}</small>`;
-  }
-  return statusMarkup ? `<div class="draft-control">${statusMarkup}</div>` : '';
+  return `<div class="publish-control"><button class="publish-button" type="button" data-publish-match-id="${escapeHtml(matchId)}" data-publish-event-key="${escapeHtml(event.event_key)}" data-publish-artifact-kind="${escapeHtml(artifactKind)}" data-publish-gif-id="${escapeHtml(uploadedGifId)}" ${pending || success ? 'disabled' : ''}>${success ? '已发布' : pending ? '发布中' : failed ? '重试发布' : '发布'}</button>${statusMarkup}</div>`;
 }
 function setDiscoveryCollapsed(collapsed) {
   state.discoveryCollapsed = Boolean(collapsed);
@@ -281,6 +272,27 @@ function renderHeavyTasks(payload) {
   element.className = `heavy-task-summary${queued ? ' queued' : ''}`;
   element.innerHTML = `<span>处理能力</span><b>可处理 ${metric(total)}</b><b>处理中 ${metric(occupied)}</b><b>排队 ${metric(queued)}</b><b>画面 ${metric(vision)}</b>`;
 }
+function heavyTaskWaitFor(targetMatchId, eventKey, artifactKind) {
+  const raw = state.heavyTasks;
+  const waiting = raw && Array.isArray(raw.waiting_items) ? raw.waiting_items : [];
+  const expectedKinds = artifactKind === 'ocr_window'
+    ? new Set(['vision', 'vision_ocr'])
+    : artifactKind === 'tdeed_refined'
+      ? new Set(['vision', 'vision_tdeed'])
+      : new Set(['gif']);
+  const index = waiting.findIndex(item => String(item && item.match_id || '') === String(targetMatchId || '')
+    && String(item && item.event_key || '') === String(eventKey || '')
+    && expectedKinds.has(String(item && item.task_kind || '')));
+  if (index < 0) return null;
+  const item = waiting[index] || {};
+  return {
+    position: index + 1,
+    waitSeconds: finiteNumber(item.wait_seconds),
+    queued: firstMetric(raw, ['queued', 'queue', 'pending', 'waiting']),
+    occupied: firstMetric(raw, ['occupied', 'used', 'active', 'running']),
+    total: firstMetric(raw, ['total_slots', 'total', 'max', 'capacity', 'slots']),
+  };
+}
 function activeStateLabel(match) {
   const stateValue = String(match.lifecycle_state || '').toLowerCase();
   if (stateValue === 'finishing') return '收尾中';
@@ -402,11 +414,15 @@ function visionLocatorMethodLabel(vision) {
   return raw ? friendlyText(raw, '画面定位') : '画面定位';
 }
 
-function visionPresentation(vision, enabled = true) {
+function visionPresentation(vision, enabled = true, resourceWait = null) {
   if (!vision) return enabled ? {label:'等待画面处理', cls:'off'} : {label:'已关闭', cls:'off'};
   if (vision.disabled === true || vision.last_error_kind === 'tdeed_disabled' || vision.error_kind === 'tdeed_disabled') return {label:'已关闭', cls:'off'};
+  if (resourceWait && ['pending', 'locating'].includes(String(vision.status || ''))) return {label:'正在等待处理资源',cls:'pending'};
   if (vision.artifact_kind === 'ocr_window') {
     const pipelineStatus = String(vision.ocr_pipeline_status || '').trim();
+    const availabilityGuideKey = targetAvailabilityGuideKey(vision);
+    if (availabilityGuideKey === 'ocr_target_before_recording') return {label:'目标画面早于本次录像开始',cls:'failed'};
+    if (availabilityGuideKey === 'ocr_target_history_cleaned') return {label:'目标历史画面当前不可用',cls:'failed'};
     const rawRescanAttempt = vision.target_rescan_attempt_count;
     const parsedRescanAttempt = Number(rawRescanAttempt);
     const rescanAttempt = rawRescanAttempt != null && rawRescanAttempt !== ''
@@ -417,7 +433,9 @@ function visionPresentation(vision, enabled = true) {
       ? `已越过目标，正在重新扫描（第${rescanAttempt + 1}次）`
       : '已越过目标，正在重新扫描';
     const pipelinePresentation = ({
+      waiting_for_clock_readiness:{label:'尚未检测到比赛计时器 · 等待新增视频后再检查',cls:'pending'},
       waiting_for_clock_target:{label:'正在查找比赛时间',cls:'encoding'},
+      waiting_for_target_media:{label:'计时器已确认 · 等待目标画面',cls:'pending'},
       waiting_for_latest_tail_rescan:{label:'正在扫描新增视频尾部',cls:'encoding'},
       ocr_target_rescan:{label:rescanLabel,cls:'encoding'},
       waiting_for_postroll:{label:'已找到画面 · 等待后续画面',cls:'pending'},
@@ -432,7 +450,9 @@ function visionPresentation(vision, enabled = true) {
       ocr_target_media_not_arrived:{label:'视频还没播放到这个时间',cls:'failed'},
       ocr_target_media_stalled:{label:'视频暂时没有新画面',cls:'failed'},
       ocr_clock_paused_timeout:{label:'比赛时间暂时没有继续',cls:'failed'},
-      ocr_window_evicted:{label:'需要的历史画面已被删除',cls:'failed'},
+      ocr_target_before_recording:{label:'目标画面早于本次录像开始',cls:'failed'},
+      ocr_target_history_cleaned:{label:'目标历史画面已经被清理',cls:'failed'},
+      ocr_window_evicted:{label:'需要的历史画面当前已不在',cls:'failed'},
       ocr_discontinuous_clock:{label:'画面时间前后对不上',cls:'failed'},
       ocr_preparation_timeout:{label:'准备识别视频耗时过长',cls:'failed'},
       ocr_encode_failed:{label:'画面 GIF 生成失败',cls:'failed'},
@@ -481,8 +501,8 @@ function visionFailureDetail(vision) {
     waiting_for_default_gif:'等待默认 GIF', scoreboard_profile:'核对画面中的比赛时间区域',
     event_second_localization:'查找事件秒数', event_localization:'查找事件画面',
     fragmented_search:'检查连续视频片段', buffer_coverage:'检查视频覆盖范围',
-    ocr_clock_discovery:'读取画面比赛时间', ocr_target_localization:'查找接口对应时间',
-    ocr_window_encoding:'生成 60 秒 GIF', waiting_for_clock_target:'等待比赛时间出现', waiting_for_latest_tail_rescan:'扫描新增视频尾部',
+    ocr_clock_discovery:'读取画面比赛时间', ocr_target_localization:'查找接口对应时间', ocr_target_media_availability:'核对目标画面是否曾进入本次录像',
+    ocr_window_encoding:'生成 60 秒 GIF', waiting_for_clock_readiness:'确认比赛计时器已经出现', waiting_for_clock_target:'等待比赛时间出现', waiting_for_target_media:'等待目标画面进入视频', waiting_for_latest_tail_rescan:'扫描新增视频尾部',
     waiting_for_postroll:'等待目标后的画面', ocr_second_exact:'精确到秒', ocr_second_interpolated:'根据前后画面推算秒数', ocr_second_estimated:'估算附近几秒',
     ocr_second_projected:'时钟被遮挡后按前后时间推算',
     ocr_minute_fallback:'查找分钟附近画面', ocr_range_fallback:'生成接口时间范围兜底', ocr_no_clock_detected:'读取比赛时间',
@@ -496,7 +516,7 @@ function visionFailureDetail(vision) {
   })[stage] || '处理过程';
   let reasonLabel = ({
     waiting_for_video:'视频片段还没有准备好', video_unavailable:'暂时没有可用视频',
-    buffer_history_missing:'需要的历史画面已经删除', buffer_gap:'视频片段中间有缺口',
+    buffer_history_missing:'需要的历史画面当前已经不在', buffer_gap:'视频片段中间有缺口',
     vision_deadline_exceeded:'处理等待时间已到', ocr_no_clock:'没有读到画面上的比赛时间',
     ocr_no_match:'没有找到接口对应的比赛时间', ocr_processing_failed:'读取比赛时间失败',
     scoreboard_missing:'指定画面区域没有读到比赛时间', ocr_clock_unreadable:'画面上的比赛时间不清楚',
@@ -515,17 +535,21 @@ function visionFailureDetail(vision) {
     tdeed_candidate_selection_failed:'没有找到合适的动作片段', tdeed_output_encoding_failed:'动作 GIF 生成失败',
     upstream_ocr_window_failed:'比赛时间识别失败，因此没有继续动作精剪', tdeed_disabled:'已按设置关闭',
     ocr_no_clock_detected:'整段视频都没有读到清晰的比赛时间', ocr_target_timeout:'在等待结束前没有找到接口对应时间',
-    ocr_window_evicted:'需要的历史画面已经删除', ocr_discontinuous_clock:'画面时间前后对不上',
+    ocr_window_evicted:'需要的历史画面当前已经不在', ocr_discontinuous_clock:'画面时间前后对不上',
     ocr_preparation_timeout:'准备识别视频耗时过长', ocr_encode_failed:'画面 GIF 生成失败', ocr_dependency_unavailable:'画面识别服务不可用',
     ocr_video_preparation_timeout:'准备识别视频耗时过长', ocr_window_encoding_timeout:'生成画面 GIF 耗时过长',
     ocr_processing_budget_exhausted:'旧版本因累计处理时限提前停止',
     ocr_clock_target_timeout:'视频还没播放到接口给出的时间就超时了',
     ocr_target_media_not_arrived:'视频还没播放到接口给出的时间', ocr_target_media_stalled:'视频暂时没有新画面',
     ocr_clock_paused_timeout:'比赛时间暂时没有继续，可能在暂停或回放',
+    ocr_target_before_recording:'目标画面早于本次录像开始',
+    target_before_recording:'目标画面早于本次录像开始',
+    target_not_recorded:'目标画面早于本次录像开始',
+    ocr_target_history_cleaned:'目标历史画面已经被清理',
     ocr_clock_target_not_located:'视频已经超过这个时间，但没有找到清晰的比赛时间',
     ocr_no_trustworthy_clock_before_deadline:'一直没有读到清晰的比赛时间',
     ocr_postroll_timeout:'目标时间后面的画面还没有准备好', ocr_output_window_timeout:'GIF 所需画面还没有准备好',
-    ocr_search_history_evicted:'视频保存时间不够，目标画面已经删除', ocr_output_history_evicted:'生成 GIF 所需的历史画面已经删除',
+    ocr_search_history_evicted:'目标附近历史画面当前已经不在，现有记录无法确认是未录到还是后来被清理', ocr_output_history_evicted:'生成 GIF 所需的历史画面当前已经不在',
     ocr_buffer_never_available:'一直没有可用的视频画面', ocr_output_video_gap:'生成 GIF 的视频片段不完整',
     ocr_window_encoding_failed:'画面 GIF 生成阶段失败', vision_shutdown_timeout:'比赛已结束，画面时间任务在收尾时间内未完成',
   })[kind] || friendlyErrorMessage(kind, '暂时无法判断具体原因');
@@ -581,6 +605,16 @@ function streamWindowText(window) {
 function ocrPipelineDiagnosticsText(vision) {
   if (!vision) return '';
   const parts = [];
+  if (vision.clock_readiness_status === 'waiting') {
+    const accepted = finiteNumber(vision.clock_readiness_accepted_sample_count) ?? 0;
+    parts.push(`比赛计时器确认进度 ${Math.floor(accepted)}/2 个有效时间读数`);
+    const probe = streamTimeText(vision.clock_readiness_last_probe_media_end_stream_time);
+    if (probe) parts.push(`上次检查到视频 ${probe}`);
+    const required = finiteNumber(vision.clock_readiness_required_media_growth_seconds);
+    if (required != null) parts.push(`新增约 ${Math.ceil(required)} 秒画面后再检查`);
+  } else if (vision.clock_readiness_status === 'ready') {
+    parts.push('比赛计时器已确认可用');
+  }
   const scanWindow = streamWindowText(vision.scan_window);
   if (scanWindow) parts.push(`检查的视频位置 ${scanWindow}`);
   const cursor = streamTimeText(vision.scan_cursor);
@@ -601,7 +635,7 @@ function ocrPipelineDiagnosticsText(vision) {
     const missing = Number(vision.history_missing_seconds);
     parts.push(`前面缺少${missing < 1 ? '不到 1 秒' : `约 ${Math.round(missing)} 秒`}旧视频`);
   }
-  if (vision.target_history_fully_missing) parts.push('目标附近旧视频已经全部不在');
+  if (vision.target_history_fully_missing) parts.push('目标附近旧视频当前已经全部不在保留范围');
   if (Array.isArray(vision.video_gaps) && vision.video_gaps.length) parts.push(`目标范围内发现 ${vision.video_gaps.length} 处视频缺口`);
   const finalWindow = streamWindowText(vision.final_clip_window);
   if (finalWindow) parts.push(`GIF 使用的视频位置 ${finalWindow}`);
@@ -609,12 +643,14 @@ function ocrPipelineDiagnosticsText(vision) {
   const stage = String(structuredStage || vision.stage || '').trim();
   if (vision.status === 'failed' && stage) {
     const stageText = ({
-      ocr_clock_discovery:'时钟识别', ocr_target_localization:'目标定位',
-      ocr_window_encoding:'GIF 编码', buffer_coverage:'缓存覆盖',
+      ocr_clock_discovery:'读取画面比赛时间', ocr_target_localization:'查找目标画面', ocr_target_media_availability:'核对目标画面是否在本次录像内',
+      ocr_window_encoding:'生成 GIF', buffer_coverage:'检查视频范围',
+      waiting_for_clock_readiness:'确认比赛计时器', waiting_for_target_media:'等待目标画面',
       waiting_for_clock_target:'等待接口时间出现在画面中', waiting_for_postroll:'等待目标后面的画面',
-      ocr_no_clock_detected:'时钟检测', ocr_target_timeout:'目标定位',
-      ocr_window_evicted:'缓存窗口', ocr_discontinuous_clock:'时钟连续性',
-      ocr_encode_failed:'GIF 编码', ocr_dependency_unavailable:'依赖检查', ocr_incomplete:'比赛结束收尾', waiting_for_latest_tail_rescan:'扫描新增视频尾部'
+      ocr_no_clock_detected:'读取画面比赛时间', ocr_target_timeout:'查找目标画面',
+      ocr_target_before_recording:'核对录像开始时间', ocr_target_history_cleaned:'核对历史画面',
+      ocr_window_evicted:'检查历史画面', ocr_discontinuous_clock:'核对比赛时间是否连贯',
+      ocr_encode_failed:'生成 GIF', ocr_dependency_unavailable:'检查画面读取服务', ocr_incomplete:'比赛结束收尾', waiting_for_latest_tail_rescan:'扫描新增视频尾部'
     })[stage] || stage;
     parts.push(`失败阶段 ${stageText}`);
   }
@@ -667,6 +703,17 @@ function visionFailureKind(vision) {
 function visionFailureEvidenceText(vision) {
   if (!vision || typeof vision !== 'object') return '';
   const parts = [];
+  const availability = vision.target_media_availability && typeof vision.target_media_availability === 'object'
+    ? vision.target_media_availability
+    : null;
+  if (availability && availability.status === 'before_recording') {
+    const estimate = finiteNumber(availability.estimated_stream_time);
+    if (estimate != null) parts.push(`推算目标画面位于本次录像开始前约 ${Math.ceil(Math.abs(estimate))} 秒`);
+  } else if (availability && availability.status === 'history_unavailable') {
+    const targetEnd = finiteNumber(availability.target_window_end_stream_time);
+    const earliest = finiteNumber(availability.earliest_retained_stream_time);
+    if (targetEnd != null && earliest != null) parts.push(`目标范围最晚到视频 ${streamTimeText(targetEnd)}，当前最早只保留到 ${streamTimeText(earliest)}`);
+  }
   const target = ocrClockValue(vision.target_clock, vision.target_clock_seconds);
   const latest = ocrClockValue(vision.last_trusted_clock, vision.last_trusted_clock_seconds);
   if (target && target !== '--') parts.push(`接口给出的比赛时间是 ${target}`);
@@ -681,7 +728,7 @@ function visionFailureEvidenceText(vision) {
   if (diagnostics) parts.push(diagnostics);
   const missing = finiteNumber(vision.history_missing_seconds);
   if (missing != null && missing > 0) parts.push(`所需范围前面缺少${missing < 1 ? '不到 1 秒' : `约 ${Math.round(missing)} 秒`}旧视频`);
-  if (vision.target_history_fully_missing) parts.push('目标附近的视频已经全部被清理');
+  if (vision.target_history_fully_missing) parts.push('目标附近的视频当前已经全部不在保留范围，现有数据无法判断是未录到还是后来被清理');
   if (Array.isArray(vision.video_gaps) && vision.video_gaps.length) parts.push(`检查范围内有 ${vision.video_gaps.length} 处视频缺口`);
   if (vision.inference_seconds != null) parts.push(`本次画面处理共用时 ${Number(vision.inference_seconds).toFixed(1)} 秒`);
   const attempts = Array.isArray(vision.fragment_attempts) ? vision.fragment_attempts.length : 0;
@@ -704,14 +751,15 @@ function failureReportMarkup(value, options = {}) {
 function visionFailureReportMarkup(vision) {
   if (!vision || vision.status !== 'failed') return '';
   const kind = visionFailureKind(vision);
-  const guide = errorGuide(kind || vision.error || vision.failure_reason, '画面处理没有完成');
+  const availabilityGuideKey = targetAvailabilityGuideKey(vision);
+  const guide = errorGuide(availabilityGuideKey || kind || vision.error || vision.failure_reason, '画面处理没有完成');
   const structured = vision.failure_reason && typeof vision.failure_reason === 'object' ? vision.failure_reason : {};
   const rawExplanation = String(vision.failure_explanation || vision.target_failure_explanation || structured.message || '');
   const explanation = friendlyText(rawExplanation);
   const cause = explanation && /[\u4e00-\u9fff]{4}/.test(rawExplanation) ? `${guide.cause} 补充说明：${explanation}` : guide.cause;
   const nextAction = friendlyText(vision.failure_next_action || structured.next_action || '');
   const action = nextAction && /[\u4e00-\u9fff]/.test(nextAction) ? `${guide.action} 本次任务建议：${nextAction}` : guide.action;
-  return failureReportMarkup(kind || vision.error || vision.failure_reason, {title:guide.title, cause, impact:guide.impact, system:guide.system, evidence:visionFailureEvidenceText(vision), action});
+  return failureReportMarkup(availabilityGuideKey || kind || vision.error || vision.failure_reason, {title:guide.title, cause, impact:guide.impact, system:guide.system, evidence:visionFailureEvidenceText(vision), action});
 }
 
 function taskFailureReportMarkup(task) {
@@ -779,6 +827,43 @@ function ocrUserDetailText(vision) {
   if (vision.failure_explanation) parts.push(friendlyText(vision.failure_explanation));
   if (!parts.length && vision.status === 'failed') return '系统会保留默认 GIF，并继续记录失败原因。';
   return parts.join(' · ');
+}
+
+function visionResourceWaitText(wait) {
+  if (!wait) return '';
+  const parts = ['正在等待处理资源'];
+  if (wait.position != null) parts.push(`当前排在第 ${wait.position} 位`);
+  if (wait.waitSeconds != null) parts.push(`已等待 ${fmtDuration(wait.waitSeconds)}`);
+  if (wait.occupied != null && wait.total != null) parts.push(`处理资源正在使用 ${wait.occupied}/${wait.total}`);
+  parts.push('资源空闲后会自动开始，不需要重启服务');
+  return parts.join(' · ');
+}
+
+function ocrPendingStatusText(vision, resourceWait) {
+  const resourceText = visionResourceWaitText(resourceWait);
+  if (resourceText) return resourceText;
+  if (!vision || !['pending', 'locating'].includes(String(vision.status || ''))) return '';
+  const status = String(vision.ocr_pipeline_status || vision.progressive_status || '');
+  if (status === 'waiting_for_clock_readiness') {
+    const accepted = finiteNumber(vision.clock_readiness_accepted_sample_count) ?? 0;
+    const lastProbe = finiteNumber(vision.clock_readiness_last_probe_media_end_stream_time);
+    const latest = finiteNumber(vision.latest_media_end_stream_time);
+    const required = finiteNumber(vision.clock_readiness_required_media_growth_seconds) ?? 15;
+    const growth = lastProbe != null && latest != null ? Math.max(0, latest - lastProbe) : null;
+    const remaining = growth == null ? required : Math.max(0, required - growth);
+    return `尚未检测到比赛计时器 · 已获得 ${Math.floor(accepted)} 个有效时间读数，需要至少 2 个连续向前的读数 · 等待新增视频后再检查${remaining > 0 ? `，还需约 ${Math.ceil(remaining)} 秒新画面` : ''}`;
+  }
+  if (status === 'waiting_for_target_media') return '比赛计时器已经确认，但目标时间对应的画面还没有进入视频保存范围；系统收到新画面后会自动继续。';
+  return '';
+}
+
+function targetAvailabilityGuideKey(vision) {
+  if (!vision || typeof vision !== 'object') return '';
+  const availability = vision.target_media_availability;
+  const status = String(availability && typeof availability === 'object' ? availability.status || '' : availability || '').trim().toLowerCase();
+  if (['before_recording', 'target_before_recording', 'not_recorded', 'recording_started_after_target'].includes(status)) return 'ocr_target_before_recording';
+  if (['history_unavailable', 'history_cleaned', 'target_history_cleaned', 'confirmed_evicted'].includes(status)) return 'ocr_target_history_cleaned';
+  return '';
 }
 
 function matchClockText(value) {
@@ -912,6 +997,9 @@ function logPresentation(record) {
 }
 
 function render(data) {
+  state.publishingEnabled = !data.publishing || data.publishing.enabled !== false;
+  state.remoteUploadEnabled = Boolean(data.publishing && data.publishing.remote_upload_enabled);
+  if (data.heavy_tasks && typeof data.heavy_tasks === 'object') renderHeavyTasks(data);
   const detail = data.detail || {};
   const status = data.status || 'Uncertain';
   const statusEl = $('match-status'); statusEl.textContent = `${friendlyText(data.status_label, '') || '赛况未知'} · ${friendlyText(status, '未知')}`; statusEl.className = `status-pill ${statusClass(status)}`;
@@ -973,13 +1061,15 @@ function render(data) {
     const artifacts = e.vision_artifacts && typeof e.vision_artifacts === 'object' ? e.vision_artifacts : {};
     const ocrWindow = e.ocr_window || artifacts.ocr_window || null;
     const tdeed = e.vision || artifacts.tdeed_refined || null;
+    const ocrResourceWait = heavyTaskWaitFor(data.match_id, e.event_key, 'ocr_window');
+    const tdeedResourceWait = heavyTaskWaitFor(data.match_id, e.event_key, 'tdeed_refined');
     const visionEnabled = worker.running ? workerVisionEnabled : configuredVisionEnabled;
     const tdeedEnabled = worker.running ? workerTdeedEnabled : configuredTdeedEnabled;
-    const ocrBase = e.status === 'history' && !ocrWindow ? {label:'历史事件 · 未运行',cls:'off'} : visionPresentation(ocrWindow, visionEnabled);
+    const ocrBase = e.status === 'history' && !ocrWindow ? {label:'历史事件 · 未运行',cls:'off'} : visionPresentation(ocrWindow, visionEnabled, ocrResourceWait);
     const ocr = e.status === 'encoded' && ocrWindow && ocrWindow.status === 'failed'
       ? {label:`默认 GIF 可用 · ${ocrBase.label}`, cls:'warning'}
       : ocrBase;
-    const vision = !tdeed && !tdeedEnabled ? {label:'已停用',cls:'off'} : e.status === 'history' && !tdeed ? {label:'历史事件 · 未运行',cls:'off'} : visionPresentation(tdeed, tdeedEnabled);
+    const vision = !tdeed && !tdeedEnabled ? {label:'已停用',cls:'off'} : e.status === 'history' && !tdeed ? {label:'历史事件 · 未运行',cls:'off'} : visionPresentation(tdeed, tdeedEnabled, tdeedResourceWait);
     const confidence = tdeed && tdeed.confidence != null ? ` · 识别把握 ${(Number(tdeed.confidence) * 100).toFixed(1)}%` : '';
     const delta = tdeed && tdeed.anchor_delta_seconds != null ? ` · 与事件时间相差 ${Number(tdeed.anchor_delta_seconds).toFixed(1)}秒` : '';
     const defaultCoverage = coverageStatusText(e);
@@ -1014,17 +1104,23 @@ function render(data) {
       if (source === 'minute_boundary') return '分钟附近';
       return '';
     })();
-    const ocrUserDetail = [secondDetail, ocrSource, ocrFailureDetail, ocrUserDetailText(ocrWindow)].filter(Boolean).join(' · ');
+    const ocrUserDetail = [secondDetail, ocrSource, ocrPendingStatusText(ocrWindow, ocrResourceWait), ocrFailureDetail, ocrUserDetailText(ocrWindow)].filter(Boolean).join(' · ');
     const technicalDetail = [ocrPipelineDiagnostics, ocrDiagnostics, tdeed && tdeed.source_ocr_artifact ? '动作精剪使用了上方 60 秒画面时间结果' : ''].filter(Boolean).join(' · ');
-    const visionDetail = [failureDetail].filter(Boolean).join(' · ');
-    const technicalMarkup = technicalDetail ? `<details class="technical-details"><summary>查看完整处理记录</summary><small>${escapeHtml(friendlyText(technicalDetail))}</small></details>` : '';
+    const visionDetail = [visionResourceWaitText(tdeedResourceWait), failureDetail].filter(Boolean).join(' · ');
+    const technicalDetailsKey = `${data.match_id || ''}\n${e.event_key || ''}\nocr_window`;
+    const technicalMarkup = technicalDetail ? `<details class="technical-details" data-details-key="${escapeHtml(technicalDetailsKey)}"${state.openTechnicalDetails.has(technicalDetailsKey) ? ' open' : ''}><summary>查看完整处理记录</summary><small>${escapeHtml(friendlyText(technicalDetail))}</small></details>` : '';
     const gifLink = artifact => artifact && artifact.output ? `<a class="gif-link" href="/api/gif/${encodeURIComponent(data.match_id)}/${encodeURIComponent(artifact.output.split('/').pop())}" target="_blank">预览</a>` : '';
     const ocrArtifactLabel = ocrWindow && ocrWindow.output_kind === 'api_time_range_fallback' ? '接口时间范围兜底' : '画面时间 60秒';
-    const defaultPreview = e.output ? `<a class="gif-link" href="/api/gif/${encodeURIComponent(data.match_id)}/${encodeURIComponent(e.output.split('/').pop())}" target="_blank">预览</a>` : '';
-    const defaultActions = e.output ? `<div class="default-artifact-actions">${defaultPreview}${publishControls(data.match_id, e)}</div>` : '';
+    const defaultUploaded = e.uploaded_gif && e.uploaded_gif.url ? e.uploaded_gif : null;
+    const defaultPreview = e.output ? `<a class="gif-link" href="/api/gif/${encodeURIComponent(data.match_id)}/${encodeURIComponent(e.output.split('/').pop())}" target="_blank">预览</a>` : defaultUploaded ? `<a class="gif-link" href="${escapeHtml(defaultUploaded.url)}" target="_blank" rel="noopener">预览</a>` : '';
+    const defaultActions = e.output || defaultUploaded ? `<div class="default-artifact-actions">${defaultPreview}${publishControls(data.match_id, e)}</div>` : '';
     const ocrPreview = gifLink(ocrWindow);
-    const ocrDraft = ocrDraftControls(e, ocrWindow);
-    const ocrActions = ocrPreview || ocrDraft ? `<div class="artifact-actions ocr-artifact-actions">${ocrPreview}${ocrDraft}</div>` : '';
+    const ocrArtifact = ocrWindow
+      ? {...ocrWindow, ...(e.ocr_uploaded_gif ? {uploaded_gif:e.ocr_uploaded_gif} : {})}
+      : (e.ocr_uploaded_gif ? {status:'encoded', uploaded_gif:e.ocr_uploaded_gif} : null);
+    const ocrUploadedPreview = !ocrPreview && e.ocr_uploaded_gif && e.ocr_uploaded_gif.url ? `<a class="gif-link" href="${escapeHtml(e.ocr_uploaded_gif.url)}" target="_blank" rel="noopener">预览</a>` : '';
+    const ocrPublish = publishControls(data.match_id, e, 'ocr_window', ocrArtifact);
+    const ocrActions = ocrPreview || ocrUploadedPreview || ocrPublish ? `<div class="artifact-actions ocr-artifact-actions">${ocrPreview || ocrUploadedPreview}${ocrPublish}</div>` : '';
     return `<div class="event-row ${escapeHtml(task.cls)}"><div class="event-type event-type-${escapeHtml(type.kind)}"><span class="event-symbol" aria-hidden="true"></span><span class="event-type-text"><b>${escapeHtml(type.label)}</b><small>${escapeHtml(type.code)}</small></span></div><div class="event-minute">${escapeHtml(e.minute || '--')}'${e.minute_extra && e.minute_extra !== '0' ? `+${escapeHtml(e.minute_extra)}` : ''}</div><div class="event-person">${escapeHtml(e.person || '未提供球员')}<small>${escapeHtml(e.team || '')}${e.score ? ` · ${escapeHtml(e.score)}` : ''}${e.reason ? ` · ${friendlyText(e.reason)}` : ''}</small></div><div class="artifact-list"><div class="artifact ${e.status === 'failed' ? 'failed' : ''}"><div class="artifact-copy"><span>默认 · ${escapeHtml(task.label)}${defaultCoverage ? ` · ${escapeHtml(defaultCoverage)}` : ''}</span>${defaultFailureMarkup}</div>${defaultActions}</div><div class="artifact ${escapeHtml(ocr.cls)}"><div class="artifact-copy"><span>${escapeHtml(ocrArtifactLabel)} · ${escapeHtml(ocr.label)}${ocrCoverage ? ` · ${escapeHtml(ocrCoverage)}` : ''}${ocrUserDetail ? `<small>${escapeHtml(ocrUserDetail)}</small>` : ''}</span>${ocrFailureMarkup}${technicalMarkup}</div>${ocrActions}</div><div class="artifact ${escapeHtml(vision.cls)}"><div class="artifact-copy"><span>动作精剪 20秒 · ${escapeHtml(vision.label)}${escapeHtml(confidence)}${escapeHtml(delta)}${visionCoverage ? ` · ${escapeHtml(visionCoverage)}` : ''}${tdeed && tdeed.experimental ? ' · 实验' : ''}${visionDetail ? `<small>${escapeHtml(visionDetail)}</small>` : ''}</span>${visionFailureMarkup}</div>${gifLink(tdeed)}</div></div></div>`;
   }).join('') : '<div class="empty">暂无已发现事件。启动处理后，进球、黄牌、红牌和乌龙球会在这里显示。</div>';
   const logs = $('logs'); const records = data.logs || []; let heartbeatSeen = false; const visibleRecords = records.filter(record => record.event !== 'runtime_heartbeat' || (!heartbeatSeen && (heartbeatSeen = true))); logs.innerHTML = visibleRecords.length ? visibleRecords.slice(0, 40).map(l => { const presentation = logPresentation(l); return `<div class="log-line log-${escapeHtml(l.event || '')}"><time>${escapeHtml((l.timestamp || '').replace('T',' ').replace('Z','').slice(0,19))}</time><b>${escapeHtml(presentation.name)}</b><span>${escapeHtml(presentation.detail)}</span></div>`; }).join('') : '<div class="empty">暂无日志</div>';
@@ -1033,22 +1129,26 @@ function render(data) {
 }
 
 async function requestJson(url, options = {}) { const response = await fetch(url, {headers:{'Content-Type':'application/json'}, ...options}); const data = await response.json(); if (!response.ok) throw new Error(data.error || `请求失败 ${response.status}`); return data; }
-async function publishDefaultGif(button) {
+async function publishGif(button) {
   const targetMatchId = String(button.dataset.publishMatchId || '');
   const eventKey = String(button.dataset.publishEventKey || '');
+  const artifactKind = String(button.dataset.publishArtifactKind || 'default');
+  const gifId = String(button.dataset.publishGifId || '');
   if (!targetMatchId || !eventKey || button.disabled) return;
-  const key = publishStateKey(targetMatchId, eventKey);
-  state.publishStates.set(key, {status:'publishing', stage:'platform_publish'});
+  const key = publishStateKey(targetMatchId, eventKey, artifactKind);
+  state.publishStates.set(key, {status:'publishing', stage:state.remoteUploadEnabled ? 'remote_gif_upload' : 'platform_publish'});
   button.disabled = true;
   button.textContent = '发布中';
   if (targetMatchId === state.sessionMatchId) refresh(targetMatchId);
   let finalNotice = '';
   let finalNoticeKind = 'error';
   try {
+    const requestBody = {match_id:targetMatchId, event_key:eventKey, artifact_kind:artifactKind};
+    if (gifId) requestBody.gif_id = gifId;
     const response = await fetch('/api/article-publish', {
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({match_id:targetMatchId, event_key:eventKey}),
+      body:JSON.stringify(requestBody),
     });
     const payload = await response.json().catch(() => ({}));
     if (!response.ok || !payload.ok) {
@@ -1191,8 +1291,16 @@ $('start-btn').addEventListener('click', () => startSelectedMatch());
 $('stop-btn').addEventListener('click', stopCurrentMatch);
 $('events').addEventListener('click', event => {
   const button = event.target.closest('.publish-button');
-  if (button) publishDefaultGif(button);
+  if (button) publishGif(button);
 });
+$('events').addEventListener('toggle', event => {
+  const details = event.target.closest('details[data-details-key]');
+  if (!details) return;
+  const key = String(details.dataset.detailsKey || '');
+  if (!key) return;
+  if (details.open) state.openTechnicalDetails.add(key);
+  else state.openTechnicalDetails.delete(key);
+}, true);
 refresh();
 refreshMatches();
 state.timer = setInterval(refresh, 1000);

@@ -1,4 +1,5 @@
 import json
+import io
 import os
 import tempfile
 import unittest
@@ -6,22 +7,190 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 import dashboard_server
-from article_publisher import ArticlePublishError, PublishedGifStore
+from article_publisher import (
+    ArticlePublishError,
+    ArticlePublisher,
+    PublishedGifStore,
+)
+
+
+def animated_gif_bytes_for_tests():
+    header = (
+        b"GIF89a"
+        b"\x01\x00\x01\x00"
+        b"\x80\x00\x00"
+        b"\x00\x00\x00\xff\xff\xff"
+    )
+    frame = (
+        b"\x2c"
+        b"\x00\x00\x00\x00\x01\x00\x01\x00\x00"
+        b"\x02\x02\x44\x01\x00"
+    )
+    return header + frame + frame + b"\x3b"
+
+
+def publisher_for_tests(root):
+    return ArticlePublisher(
+        platform_client=Mock(),
+        gif_store=PublishedGifStore(
+            root / "published", "https://matchgif.aisportsapp.com"
+        ),
+        database_path=root / "publish.sqlite3",
+        public_url_checker=lambda url: None,
+    )
 
 
 class DashboardPublishRoutesTests(unittest.TestCase):
-    def test_ocr_draft_success_uses_a_separate_admin_button(self):
+    def test_upload_route_requires_token_and_returns_public_gif(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            publisher = publisher_for_tests(root)
+            with patch.object(dashboard_server, "GIF_UPLOAD_TOKEN", "upload-secret"), patch.object(
+                dashboard_server, "article_publisher", publisher
+            ):
+                client = dashboard_server.app.test_client()
+                unauthorized = client.post(
+                    "/api/article-publish/upload",
+                    data={
+                        "match_id": "54478914",
+                        "event_key": "goal-19",
+                        "gif": (io.BytesIO(animated_gif_bytes_for_tests()), "goal.gif"),
+                    },
+                    content_type="multipart/form-data",
+                )
+                response = client.post(
+                    "/api/article-publish/upload",
+                    headers={"Authorization": "Bearer upload-secret"},
+                    data={
+                        "match_id": "54478914",
+                        "event_key": "goal-19",
+                        "artifact_kind": "ocr_window",
+                        "gif": (io.BytesIO(animated_gif_bytes_for_tests()), "goal.gif"),
+                    },
+                    content_type="multipart/form-data",
+                )
+            self.assertEqual(unauthorized.status_code, 401)
+            self.assertEqual(response.status_code, 200)
+            self.assertTrue(response.get_json()["gif"]["url"].startswith("https://"))
+            publisher.platform_client.create_article.assert_not_called()
+
+    def test_publish_route_uses_uploaded_gif_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            publisher = publisher_for_tests(root)
+            uploaded = publisher.upload_gif(
+                body=animated_gif_bytes_for_tests(),
+                match_id="54478914",
+                event_key="goal-19",
+                artifact_kind="ocr_window",
+            )
+            publisher.publish = Mock(
+                return_value={"status": "success", "article_id": "3801234"}
+            )
+            session_payload = {
+                "detail": {"team_A_name": "主队", "team_B_name": "客队"},
+                "events": [
+                    {
+                        "event_key": "goal-19",
+                        "status": "failed",
+                        "code": "G",
+                    }
+                ],
+            }
+            with patch.object(
+                dashboard_server.dashboard, "get", return_value=Mock()
+            ), patch.object(
+                dashboard_server, "_session_json", return_value=session_payload
+            ), patch.object(dashboard_server, "article_publisher", publisher):
+                response = dashboard_server.app.test_client().post(
+                    "/api/article-publish",
+                    json={
+                        "match_id": "54478914",
+                        "event_key": "goal-19",
+                        "artifact_kind": "ocr_window",
+                        "gif_id": uploaded["gif"]["gif_id"],
+                    },
+                )
+            self.assertEqual(response.status_code, 200)
+            called = publisher.publish.call_args.kwargs
+            self.assertEqual(
+                called["source_path"],
+                Path(uploaded["gif"]["path"]).resolve(),
+            )
+            self.assertEqual(called["event"]["status"], "encoded")
+
+    def test_publish_route_can_be_disabled_on_storage_only_server(self):
+        with patch.object(dashboard_server, "ARTICLE_PUBLISH_ENABLED", False):
+            response = dashboard_server.app.test_client().post(
+                "/api/article-publish",
+                json={"match_id": "54478914", "event_key": "goal-19"},
+            )
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.get_json()["code"], "article_publish_disabled")
+
+    def test_ocr_gif_uses_the_same_publish_button_as_default_gif(self):
         script = (
             Path(dashboard_server.ROOT) / "dashboard_static" / "app.js"
         ).read_text(encoding="utf-8")
-        self.assertIn('class="draft-link"', script)
-        self.assertIn("查看草稿", script)
-        self.assertIn('target="_blank"', script)
+        self.assertIn("data-publish-artifact-kind", script)
+        self.assertIn("artifact_kind:artifactKind", script)
+        self.assertIn("publishGif(button)", script)
+
+    def test_ocr_publish_route_resolves_server_owned_gif(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            match_dir = root / "54478914"
+            match_dir.mkdir()
+            gif_path = match_dir / "ocr.gif"
+            gif_path.write_bytes(b"GIF89a")
+            fake_publisher = Mock()
+            fake_publisher.publish.return_value = {
+                "status": "success", "article_id": "3801234"
+            }
+            fake_session = Mock()
+            session_payload = {
+                "detail": {"team_A_name": "主队", "team_B_name": "客队"},
+                "events": [{
+                    "event_key": "goal-19", "status": "failed", "code": "G",
+                    "ocr_window": {"status": "encoded", "output": str(gif_path)},
+                }],
+            }
+            with patch.object(dashboard_server, "DEFAULT_OUTPUT", root), patch.object(
+                dashboard_server.dashboard, "get", return_value=fake_session
+            ), patch.object(
+                dashboard_server, "_session_json", return_value=session_payload
+            ), patch.object(dashboard_server, "article_publisher", fake_publisher):
+                response = dashboard_server.app.test_client().post(
+                    "/api/article-publish",
+                    json={
+                        "match_id": "54478914",
+                        "event_key": "goal-19",
+                        "artifact_kind": "ocr_window",
+                    },
+                )
+        self.assertEqual(response.status_code, 200)
+        called = fake_publisher.publish.call_args.kwargs
+        self.assertEqual(called["source_path"], gif_path.resolve())
+        self.assertEqual(called["event"]["status"], "encoded")
+
+    def test_ocr_draft_retry_route_remains_compatible_for_old_tasks(self):
+        queue = Mock()
+        queue.retry.return_value = {"match_id": "54478914", "event_key": "goal-19", "status": "queued"}
+        with patch.object(dashboard_server, "article_draft_queue", queue):
+            response = dashboard_server.app.test_client().post(
+                "/api/article-draft/retry",
+                json={"match_id": "54478914", "event_key": "goal-19"},
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["ocr_draft"]["status"], "queued")
+        queue.retry.assert_called_once_with(
+            match_id="54478914", event_key="goal-19"
+        )
 
     def test_imported_dashboard_does_not_start_draft_delivery_thread(self):
         self.assertIsNone(dashboard_server.article_draft_queue._thread)
 
-    def test_dashboard_worker_receives_permanent_draft_staging_directory(self):
+    def test_dashboard_worker_does_not_enable_automatic_draft_delivery(self):
         manager = dashboard_server.Dashboard(background_monitors=False)
         session = manager.get("54478914")
         session.source = {"resource": "rtmp://example/live"}
@@ -38,10 +207,7 @@ class DashboardPublishRoutesTests(unittest.TestCase):
             manager.start(session)
 
         command = popen.call_args.args[0]
-        self.assertEqual(
-            command[command.index("--ocr-draft-staging-dir") + 1],
-            str(dashboard_server.article_publisher.gif_store.directory),
-        )
+        self.assertNotIn("--ocr-draft-staging-dir", command)
 
     def test_reconcile_registers_only_existing_encoded_unsuppressed_ocr(self):
         manager = dashboard_server.Dashboard(background_monitors=False)
@@ -319,6 +485,7 @@ class DashboardPublishRoutesTests(unittest.TestCase):
             stage="authorization",
             status_code=401,
             auth_required=True,
+            platform_code=10007,
         )
         event = {
             "event_key": "goal-19",
@@ -346,6 +513,7 @@ class DashboardPublishRoutesTests(unittest.TestCase):
         self.assertEqual(response.status_code, 401)
         self.assertEqual(payload["stage"], "authorization")
         self.assertEqual(payload["oauth_url"], "/api/open-platform/oauth/start")
+        self.assertEqual(payload["platform_code"], 10007)
 
     def test_published_gif_route_serves_only_sha_named_files(self):
         with tempfile.TemporaryDirectory() as directory:
