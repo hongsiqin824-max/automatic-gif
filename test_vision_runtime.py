@@ -22,6 +22,7 @@ from vision_runtime import (
     _locate_ocr_window_across_components,
     _normalized_ocr_clip_window,
     _ocr_deadline_policy,
+    _ocr_target_media_availability,
     _ocr_target_wait_failure,
     _ocr_progressive_clock_mapping,
     _ocr_progressive_mapped_target_window,
@@ -123,6 +124,37 @@ class VisionRuntimeTests(unittest.TestCase):
         self.assertEqual(window["estimated_stream_time"], 110.0)
         self.assertEqual(window["start_stream_time"], 95.0)
         self.assertEqual(window["end_stream_time"], 125.0)
+
+    def test_target_media_availability_proves_first_half_target_precedes_recording(self):
+        availability = _ocr_target_media_availability(
+            [
+                {"stream_time": 190.0, "match_clock_seconds": 3870},
+                {"stream_time": 200.0, "match_clock_seconds": 3880},
+            ],
+            target_clock_seconds=2700,
+            earliest_retained_stream_time=80.0,
+        )
+
+        self.assertEqual(availability["status"], "before_recording")
+        self.assertEqual(availability["halftime_adjustment_seconds"], 900.0)
+        self.assertLess(availability["target_window_end_stream_time"], 0.0)
+
+    def test_target_media_availability_distinguishes_unavailable_history(self):
+        availability = _ocr_target_media_availability(
+            [
+                {"stream_time": 190.0, "match_clock_seconds": 190},
+                {"stream_time": 200.0, "match_clock_seconds": 200},
+            ],
+            target_clock_seconds=100,
+            earliest_retained_stream_time=150.0,
+        )
+
+        self.assertEqual(availability["status"], "history_unavailable")
+        self.assertGreaterEqual(availability["estimated_stream_time"], 0.0)
+        self.assertLessEqual(
+            availability["target_window_end_stream_time"],
+            availability["earliest_retained_stream_time"],
+        )
 
     def test_clock_mapping_rejects_a_paused_match_clock(self):
         samples = [
@@ -682,7 +714,7 @@ class VisionRuntimeTests(unittest.TestCase):
             self.assertEqual(default_task.result["source"], "default")
             runtime.close()
 
-    def test_invalid_clock_mapping_falls_back_to_incremental_progressive_scan(self):
+    def test_invalid_clock_mapping_falls_back_to_tail_readiness_probe(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             runtime, job = self._create_progressive_ocr_job(
@@ -734,8 +766,8 @@ class VisionRuntimeTests(unittest.TestCase):
                     )
                 )
 
-            self.assertEqual(locate.call_args.kwargs["window_start"], 145.0)
-            self.assertEqual(locate.call_args.kwargs["window_end"], 180.0)
+            self.assertEqual(locate.call_args.kwargs["window_start"], 185.0)
+            self.assertEqual(locate.call_args.kwargs["window_end"], 200.0)
             visual = runtime.store.get_vision_task(job.event_key, "ocr_window")
             mapping = visual.window_metadata["progressive_scan"]["clock_mapping"]
             self.assertEqual(mapping["status"], "rejected_jump")
@@ -743,8 +775,8 @@ class VisionRuntimeTests(unittest.TestCase):
             runtime.close()
 
     @staticmethod
-    def _create_progressive_ocr_job(
-        root: Path,
+    def _add_progressive_ocr_job(
+        runtime: PipelineRuntime,
         suffix: str,
         *,
         observed_stream_time: float = 200.0,
@@ -752,8 +784,7 @@ class VisionRuntimeTests(unittest.TestCase):
         event_second: int | None = 120,
         search_start_stream_time: float = 80.0,
         deadline_at_unix: float | None = None,
-    ) -> tuple[PipelineRuntime, VisionJob]:
-        runtime = PipelineRuntime(root / "state.sqlite3", root / "events.jsonl")
+    ) -> VisionJob:
         event_key = f"match:G:{suffix}"
         runtime.discover_task(
             match_id="match",
@@ -791,7 +822,7 @@ class VisionRuntimeTests(unittest.TestCase):
                 else deadline_at_unix
             ),
         )
-        return runtime, VisionJob(
+        return VisionJob(
             event_key,
             "match",
             "G",
@@ -805,6 +836,29 @@ class VisionRuntimeTests(unittest.TestCase):
             target_score="1-0",
             clock_only=True,
         )
+
+    @staticmethod
+    def _create_progressive_ocr_job(
+        root: Path,
+        suffix: str,
+        *,
+        observed_stream_time: float = 200.0,
+        event_minute: str = "2",
+        event_second: int | None = 120,
+        search_start_stream_time: float = 80.0,
+        deadline_at_unix: float | None = None,
+    ) -> tuple[PipelineRuntime, VisionJob]:
+        runtime = PipelineRuntime(root / "state.sqlite3", root / "events.jsonl")
+        job = VisionRuntimeTests._add_progressive_ocr_job(
+            runtime,
+            suffix,
+            observed_stream_time=observed_stream_time,
+            event_minute=event_minute,
+            event_second=event_second,
+            search_start_stream_time=search_start_stream_time,
+            deadline_at_unix=deadline_at_unix,
+        )
+        return runtime, job
 
     @staticmethod
     def _run_progressive_ocr(
@@ -1065,6 +1119,58 @@ class VisionRuntimeTests(unittest.TestCase):
             )
             runtime.close()
 
+    def test_target_before_recording_does_not_generate_unrelated_range_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime, job = self._create_progressive_ocr_job(
+                root,
+                "before-recording-no-fallback",
+                event_minute="45",
+                event_second=2700,
+            )
+            task = runtime.store.get_vision_task(job.event_key, "ocr_window")
+            runtime.record_vision_readiness_wait(
+                job.event_key,
+                "second-half clock mapping ready",
+                artifact_kind="ocr_window",
+                error_kind="waiting_for_clock_target",
+                window_metadata={
+                    "progressive_scan": {
+                        "clock_samples": [
+                            {"stream_time": 190.0, "match_clock_seconds": 3870},
+                            {"stream_time": 200.0, "match_clock_seconds": 3880},
+                        ],
+                    }
+                },
+                now=task.created_at_unix,
+                next_attempt_at_unix=task.created_at_unix,
+            )
+            segment_path = root / "segment.ts"
+            segment_path.write_bytes(b"video")
+
+            with (
+                patch("vision_runtime._encode_ocr_api_range_fallback") as fallback,
+                patch("vision_runtime._locate_ocr_window_across_components") as locate,
+            ):
+                completed = self._run_progressive_ocr(
+                    job,
+                    runtime,
+                    lambda: [Segment(segment_path, 0.0, 220.0)],
+                    root,
+                )
+
+            self.assertTrue(completed)
+            fallback.assert_not_called()
+            locate.assert_not_called()
+            failed = runtime.store.get_vision_task(job.event_key, "ocr_window")
+            self.assertEqual(failed.status, "failed")
+            self.assertEqual(failed.last_error_kind, "ocr_target_before_recording")
+            self.assertEqual(
+                failed.result["target_media_availability"]["status"],
+                "before_recording",
+            )
+            runtime.close()
+
     def test_process_vision_artifact_advances_only_requested_artifact(self):
         with (
             patch("vision_runtime._process_ocr_window", return_value=True) as ocr,
@@ -1132,7 +1238,7 @@ class VisionRuntimeTests(unittest.TestCase):
                 first = runtime.store.get_vision_task(job.event_key, "ocr_window")
                 first_progress = first.window_metadata["progressive_scan"]
                 self.assertEqual(first.last_error_kind, "waiting_for_clock_target")
-                self.assertEqual(first_progress["last_scan_start_stream_time"], 80.0)
+                self.assertEqual(first_progress["last_scan_start_stream_time"], 205.0)
                 self.assertEqual(first_progress["scan_cursor_stream_time"], 220.0)
                 self.assertEqual(first_progress["latest_trusted_clock_seconds"], 90)
                 self.assertEqual(first_progress["scan_attempt_count"], 1)
@@ -1151,10 +1257,254 @@ class VisionRuntimeTests(unittest.TestCase):
 
             second = runtime.store.get_vision_task(job.event_key, "ocr_window")
             second_progress = second.window_metadata["progressive_scan"]
-            self.assertEqual(locate.call_args.kwargs["window_start"], 215.0)
+            self.assertEqual(locate.call_args.kwargs["window_start"], 225.0)
             self.assertEqual(locate.call_args.kwargs["window_end"], 240.0)
             self.assertEqual(second_progress["latest_trusted_clock_seconds"], 110)
             self.assertEqual(second_progress["scan_attempt_count"], 2)
+            runtime.close()
+
+    def test_clock_readiness_probes_tail_and_waits_for_fifteen_seconds_growth(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime, job = self._create_progressive_ocr_job(root, "readiness-tail")
+            segment_path = root / "segment.ts"
+            segment_path.write_bytes(b"video")
+            segments = [Segment(segment_path, 80.0, 220.0)]
+            miss = VisualLocationFailed(
+                "ocr_clock_unreadable",
+                "no trustworthy clock in the newest media",
+                {},
+            )
+
+            with patch(
+                "vision_runtime._locate_ocr_window_across_components",
+                side_effect=[miss, miss],
+            ) as locate:
+                self.assertFalse(
+                    self._run_progressive_ocr(job, runtime, lambda: segments, root)
+                )
+                first = runtime.store.get_vision_task(job.event_key, "ocr_window")
+                first_progress = first.window_metadata["progressive_scan"]
+                self.assertEqual(locate.call_args.kwargs["window_start"], 205.0)
+                self.assertEqual(locate.call_args.kwargs["window_end"], 220.0)
+                self.assertEqual(
+                    first_progress["clock_readiness"][
+                        "last_probe_media_end_stream_time"
+                    ],
+                    220.0,
+                )
+                self.assertEqual(
+                    first_progress["clock_readiness"]["status"], "waiting"
+                )
+
+                segments[:] = [Segment(segment_path, 80.0, 234.9)]
+                with patch(
+                    "vision_runtime.time.time",
+                    return_value=first.next_attempt_at_unix + 0.1,
+                ):
+                    self.assertFalse(
+                        self._run_progressive_ocr(
+                            job, runtime, lambda: segments, root
+                        )
+                    )
+                self.assertEqual(locate.call_count, 1)
+                waiting = runtime.store.get_vision_task(job.event_key, "ocr_window")
+                self.assertEqual(
+                    waiting.last_error_kind, "waiting_for_clock_readiness"
+                )
+
+                segments[:] = [Segment(segment_path, 80.0, 235.0)]
+                with patch(
+                    "vision_runtime.time.time",
+                    return_value=waiting.next_attempt_at_unix + 0.1,
+                ):
+                    self.assertFalse(
+                        self._run_progressive_ocr(
+                            job, runtime, lambda: segments, root
+                        )
+                    )
+
+            self.assertEqual(locate.call_count, 2)
+            self.assertEqual(locate.call_args.kwargs["window_start"], 220.0)
+            self.assertEqual(locate.call_args.kwargs["window_end"], 235.0)
+            runtime.close()
+
+    def test_clock_readiness_requires_two_progressing_readings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime, job = self._create_progressive_ocr_job(
+                root,
+                "readiness-two-samples",
+                event_second=120,
+            )
+            segment_path = root / "segment.ts"
+            segment_path.write_bytes(b"video")
+            segments = [Segment(segment_path, 80.0, 220.0)]
+            miss = VisualLocationFailed(
+                "ocr_exact_second_not_found",
+                "target clock is ahead of the newest media",
+                {
+                    "candidate_start_seconds": 205.0,
+                    "clock_readable_rate": 0.8,
+                    "auto_clock": {
+                        "clock_roi": [288, 129, 423, 186],
+                        "frame_resolution": [1920, 1080],
+                    },
+                    "clock_raw_observations": [
+                        {
+                            "frame_seconds": 5.0,
+                            "effective_clock_seconds": 90,
+                            "continuity_status": "accepted",
+                        },
+                        {
+                            "frame_seconds": 10.0,
+                            "effective_clock_seconds": 95,
+                            "continuity_status": "accepted",
+                        },
+                    ],
+                },
+            )
+
+            with patch(
+                "vision_runtime._locate_ocr_window_across_components",
+                side_effect=miss,
+            ) as locate:
+                self.assertFalse(
+                    self._run_progressive_ocr(job, runtime, lambda: segments, root)
+                )
+
+            self.assertEqual(locate.call_count, 1)
+            waiting = runtime.store.get_vision_task(job.event_key, "ocr_window")
+            readiness = waiting.window_metadata["progressive_scan"][
+                "clock_readiness"
+            ]
+            self.assertEqual(readiness["status"], "ready")
+            self.assertEqual(readiness["accepted_sample_count"], 2)
+            self.assertEqual(readiness["last_probe_media_end_stream_time"], 220.0)
+            cached = runtime.store.get_scoreboard_roi_cache(job.match_id)
+            self.assertIsNotNone(cached)
+            self.assertEqual(cached.profile["clock_roi"], [288, 129, 423, 186])
+            runtime.close()
+
+    def test_clock_readiness_shares_no_clock_probe_tail_with_same_match(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime, source_job = self._create_progressive_ocr_job(
+                root, "readiness-wait-source"
+            )
+            segment_path = root / "segment.ts"
+            segment_path.write_bytes(b"video")
+            segments = [Segment(segment_path, 80.0, 220.0)]
+            miss = VisualLocationFailed(
+                "ocr_clock_unreadable",
+                "no trustworthy clock in the newest media",
+                {},
+            )
+            with patch(
+                "vision_runtime._locate_ocr_window_across_components",
+                side_effect=miss,
+            ):
+                self.assertFalse(
+                    self._run_progressive_ocr(
+                        source_job, runtime, lambda: segments, root
+                    )
+                )
+
+            consumer_job = self._add_progressive_ocr_job(
+                runtime, "readiness-wait-consumer"
+            )
+            with patch(
+                "vision_runtime._locate_ocr_window_across_components"
+            ) as locate:
+                self.assertFalse(
+                    self._run_progressive_ocr(
+                        consumer_job, runtime, lambda: segments, root
+                    )
+                )
+
+            locate.assert_not_called()
+            consumer = runtime.store.get_vision_task(
+                consumer_job.event_key, "ocr_window"
+            )
+            self.assertEqual(
+                consumer.last_error_kind, "waiting_for_clock_readiness"
+            )
+            readiness = consumer.window_metadata["progressive_scan"][
+                "clock_readiness"
+            ]
+            self.assertEqual(readiness["status"], "waiting")
+            self.assertTrue(readiness["reused_from_match"])
+            self.assertEqual(
+                readiness["source_event_key"], source_job.event_key
+            )
+            self.assertEqual(
+                readiness["last_probe_media_end_stream_time"], 220.0
+            )
+            runtime.close()
+
+    def test_clock_readiness_reuses_ready_mapping_from_same_match(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime, source_job = self._create_progressive_ocr_job(
+                root,
+                "readiness-source",
+                event_second=120,
+            )
+            source = runtime.store.get_vision_task(
+                source_job.event_key, "ocr_window"
+            )
+            runtime.record_vision_readiness_wait(
+                source_job.event_key,
+                "clock readiness established",
+                artifact_kind="ocr_window",
+                error_kind="waiting_for_clock_target",
+                window_metadata={
+                    "progressive_scan": {
+                        "clock_samples": [
+                            {"stream_time": 190.0, "match_clock_seconds": 90},
+                            {"stream_time": 200.0, "match_clock_seconds": 100},
+                        ],
+                        "clock_readiness": {"status": "ready"},
+                    }
+                },
+                now=source.created_at_unix,
+                next_attempt_at_unix=source.created_at_unix,
+            )
+
+            consumer_job = self._add_progressive_ocr_job(
+                runtime,
+                "readiness-consumer",
+                event_second=120,
+            )
+            segment_path = root / "segment.ts"
+            segment_path.write_bytes(b"video")
+
+            with patch(
+                "vision_runtime._locate_ocr_window_across_components"
+            ) as locate:
+                self.assertFalse(
+                    self._run_progressive_ocr(
+                        consumer_job,
+                        runtime,
+                        lambda: [Segment(segment_path, 80.0, 200.0)],
+                        root,
+                    )
+                )
+
+            locate.assert_not_called()
+            consumer = runtime.store.get_vision_task(
+                consumer_job.event_key, "ocr_window"
+            )
+            self.assertEqual(
+                consumer.last_error_kind, "waiting_for_target_media"
+            )
+            progress = consumer.window_metadata["progressive_scan"]
+            self.assertEqual(progress["last_scan_start_stream_time"], 205.0)
+            self.assertEqual(progress["last_scan_end_stream_time"], 235.0)
+            self.assertEqual(len(progress["clock_samples"]), 2)
+            readiness = progress["clock_readiness"]
+            self.assertEqual(readiness["status"], "ready")
+            self.assertEqual(readiness["source_event_key"], source_job.event_key)
             runtime.close()
 
     def test_progressive_ocr_rechecks_crossed_target_before_new_tail(self):

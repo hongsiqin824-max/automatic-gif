@@ -203,6 +203,41 @@ class ArticleDraftQueueTests(unittest.TestCase):
             self.assertEqual(completed["status"], "success")
             self.assertEqual(len(platform.calls), 2)
 
+    def test_manual_retry_exposes_platform_code_and_diagnostics(self):
+        rejected = OpenPlatformError(
+            "服务异常",
+            code=5,
+            status_code=502,
+            retriable=False,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = self.write_source(root)
+            platform = SequencePlatformClient([rejected])
+            queue = self.make_queue(root, platform)
+            queue.enqueue(
+                match_id="54478914",
+                event=self.event(),
+                match_detail={"team_A_name": "主队", "team_B_name": "客队"},
+                source_path=source,
+            )
+
+            self.assertTrue(queue.run_once(now=100.0))
+            failed = queue.records_for_match("54478914")[self.event()["event_key"]]
+            self.assertEqual(failed["status"], "failed")
+            self.assertEqual(failed["platform_code"], "5")
+            self.assertIn("code=5", failed["error"])
+            self.assertGreater(failed["diagnostics"]["gif_bytes"], 0)
+            self.assertIn("match_id", failed["diagnostics"]["request_summary"])
+
+            queued = queue.retry(
+                match_id="54478914", event_key=self.event()["event_key"]
+            )
+            self.assertEqual(queued["status"], "queued")
+            self.assertTrue(queue.run_once(now=101.0))
+            completed = queue.records_for_match("54478914")[self.event()["event_key"]]
+            self.assertEqual(completed["status"], "success")
+
     def test_expired_creating_lease_recovers_after_restart(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

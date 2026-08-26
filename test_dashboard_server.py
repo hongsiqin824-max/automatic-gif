@@ -863,12 +863,18 @@ class DashboardTests(unittest.TestCase):
                 ("m:G:incremental-ocr", "pending", None, None, None,
                  "PaddleOCR", "1", None, None,
                  json.dumps({
-                     "stage": "waiting_for_clock_target",
-                 }), "waiting", "waiting_for_clock_target", None, None,
+                     "stage": "waiting_for_clock_readiness",
+                 }), "waiting", "waiting_for_clock_readiness", None, None,
                  json.dumps({}),
                  json.dumps({
                      "progressive_scan": {
-                         "state": "waiting_for_clock_target",
+                         "state": "waiting_for_clock_readiness",
+                         "clock_readiness": {
+                             "status": "waiting",
+                             "accepted_sample_count": 0,
+                             "last_probe_media_end_stream_time": 100.0,
+                             "required_media_growth_seconds": 15.0,
+                         },
                          "scan_cursor_stream_time": 88.5,
                         "latest_trusted_clock": "07:35",
                         "latest_trusted_clock_seconds": 455,
@@ -897,7 +903,17 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(tasks[0]["status"], "encoded")
         ocr = tasks[0]["ocr_window"]
         self.assertEqual(ocr["status"], "pending")
-        self.assertEqual(ocr["ocr_pipeline_status"], "waiting_for_clock_target")
+        self.assertEqual(
+            ocr["ocr_pipeline_status"], "waiting_for_clock_readiness"
+        )
+        self.assertEqual(ocr["clock_readiness_status"], "waiting")
+        self.assertEqual(ocr["clock_readiness_accepted_sample_count"], 0)
+        self.assertEqual(
+            ocr["clock_readiness_last_probe_media_end_stream_time"], 100.0
+        )
+        self.assertEqual(
+            ocr["clock_readiness_required_media_growth_seconds"], 15.0
+        )
         self.assertEqual(ocr["scan_cursor"], 88.5)
         self.assertEqual(ocr["last_trusted_clock"], "07:35")
         self.assertEqual(ocr["last_trusted_clock_seconds"], 455)
@@ -1061,6 +1077,8 @@ class DashboardTests(unittest.TestCase):
     def test_database_normalizes_ocr_window_failure_families(self):
         mappings = {
             "ocr_output_video_gap": "ocr_window_evicted",
+            "ocr_target_before_recording": "ocr_target_before_recording",
+            "ocr_target_history_cleaned": "ocr_target_history_cleaned",
             "ocr_inference_failed": "ocr_dependency_unavailable",
             "ocr_processing_failed": "ocr_dependency_unavailable",
             "ocr_window_encoding_failed": "ocr_encode_failed",
@@ -1090,6 +1108,12 @@ class DashboardTests(unittest.TestCase):
             for index, error_kind in enumerate(mappings):
                 event_key = f"m:G:ocr-family-{index}"
                 event = {"event_key": event_key, "code": "G", "event_type": "goal"}
+                result = {"error_kind": error_kind}
+                if error_kind == "ocr_target_before_recording":
+                    result["target_media_availability"] = {
+                        "status": "before_recording",
+                        "estimated_stream_time": -120.0,
+                    }
                 runtime.execute(
                     "INSERT INTO event_tasks VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                     (event_key, "G", "goal", json.dumps(event),
@@ -1098,7 +1122,7 @@ class DashboardTests(unittest.TestCase):
                 runtime.execute(
                     "INSERT INTO vision_tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (event_key, "failed", None, None, None, "PaddleOCR", "1",
-                     None, None, json.dumps({"error_kind": error_kind}),
+                     None, None, json.dumps(result),
                      error_kind, error_kind, "ocr_progressive_scan", error_kind,
                      "ocr_window", index + 1),
                 )
@@ -1112,6 +1136,16 @@ class DashboardTests(unittest.TestCase):
         }
         for index, (error_kind, expected) in enumerate(mappings.items()):
             self.assertEqual(actual[f"m:G:ocr-family-{index}"], expected)
+        before_recording = next(
+            task["ocr_window"]
+            for task in tasks
+            if task["ocr_window"]["ocr_pipeline_status"]
+            == "ocr_target_before_recording"
+        )
+        self.assertEqual(
+            before_recording["target_media_availability"]["status"],
+            "before_recording",
+        )
 
     def test_database_maps_ocr_resolution_and_final_clip_window(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1691,6 +1725,21 @@ class DashboardTests(unittest.TestCase):
         self.assertNotIn("<summary>技术详情</summary>", app_js)
         self.assertIn("默认 GIF 可用", app_js)
         self.assertIn("cls:'warning'", app_js)
+        self.assertIn("openTechnicalDetails", app_js)
+        self.assertIn('data-details-key=', app_js)
+        self.assertIn("addEventListener('toggle'", app_js)
+
+        error_messages_js = (
+            dashboard_server.ROOT / "dashboard_static" / "error_messages.js"
+        ).read_text(encoding="utf-8")
+        for message in (
+            "尚未检测到比赛计时器",
+            "等待新增视频后再检查",
+            "目标画面早于本次录像开始",
+            "目标历史画面已经被清理",
+            "正在等待处理资源",
+        ):
+            self.assertIn(message, app_js + error_messages_js)
 
     def test_direct_start_uses_backend_defaults_and_enables_vision(self):
         manager = dashboard_server.Dashboard(background_monitors=False)
@@ -2271,9 +2320,18 @@ class DashboardTests(unittest.TestCase):
     def test_health_and_demo_api(self):
         client = dashboard_server.app.test_client()
         self.assertEqual(client.get("/api/health").status_code, 200)
-        response = client.get("/api/session?match_id=demo-api-test")
+        heavy_status = {
+            "state": "healthy",
+            "queued": 1,
+            "waiting_items": [{"event_key": "demo-api-test:G:1"}],
+        }
+        with patch(
+            "dashboard_server._heavy_task_status", return_value=heavy_status
+        ):
+            response = client.get("/api/session?match_id=demo-api-test")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["status_label"], "进行中")
+        self.assertEqual(response.get_json()["heavy_tasks"], heavy_status)
         self.assertEqual(client.get("/api/session?match_id=../../bad").status_code, 400)
 
     def test_empty_source_response_keeps_last_valid_resource(self):

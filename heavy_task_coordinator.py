@@ -341,7 +341,15 @@ class HeavyTaskCoordinator:
                     raise HeavyTaskCancelled(
                         f"cancelled while waiting for a {task_kind} task slot"
                     )
-                lease_id = self._try_promote_request(request_id)
+                lease_id = self._try_promote_request(
+                    request_id,
+                    task_kind=task_kind,
+                    match_id=match,
+                    event_key=event,
+                    heavy_units=heavy_units,
+                    vision_units=vision_units,
+                    requested_at=requested_at,
+                )
                 if lease_id is not None:
                     with self._local_lock:
                         self._owned_request_ids.discard(request_id)
@@ -417,11 +425,65 @@ class HeavyTaskCoordinator:
             connection.close()
         self._publish_snapshot()
 
-    def _try_promote_request(self, request_id: str) -> str | None:
+    def _try_promote_request(
+        self,
+        request_id: str,
+        *,
+        task_kind: str,
+        match_id: str,
+        event_key: str,
+        heavy_units: int,
+        vision_units: int,
+        requested_at: float,
+    ) -> str | None:
         now = time.time()
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            request = connection.execute(
+                "SELECT * FROM task_slot_requests WHERE request_id = ?",
+                (request_id,),
+            ).fetchone()
+            if request is None:
+                with self._local_lock:
+                    request_is_owned = request_id in self._owned_request_ids
+                if self._closed or not request_is_owned:
+                    raise HeavyTaskCoordinatorError(
+                        "heavy task request is no longer active in this coordinator"
+                    )
+                # The acquire loop is still alive; retain its original queue order.
+                connection.execute(
+                    """
+                    INSERT INTO task_slot_requests (
+                        request_id, owner_id, owner_pid, task_kind, match_id,
+                        event_key, heavy_units, vision_units, requested_at_unix,
+                        heartbeat_at_unix, expires_at_unix
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        request_id,
+                        self.owner_id,
+                        os.getpid(),
+                        task_kind,
+                        match_id,
+                        event_key,
+                        heavy_units,
+                        vision_units,
+                        requested_at,
+                        now,
+                        now + self.lease_seconds,
+                    ),
+                )
+            else:
+                if request["owner_id"] != self.owner_id:
+                    raise HeavyTaskCoordinatorError(
+                        "heavy task request is owned by another coordinator"
+                    )
+                connection.execute(
+                    "UPDATE task_slot_requests SET heartbeat_at_unix = ?, "
+                    "expires_at_unix = ? WHERE request_id = ?",
+                    (now, now + self.lease_seconds, request_id),
+                )
             self._purge_expired(connection, now)
             request = connection.execute(
                 "SELECT * FROM task_slot_requests WHERE request_id = ?",
@@ -429,13 +491,8 @@ class HeavyTaskCoordinator:
             ).fetchone()
             if request is None:
                 raise HeavyTaskCoordinatorError(
-                    "heavy task request expired before it could be renewed"
+                    "heavy task request could not be renewed"
                 )
-            connection.execute(
-                "UPDATE task_slot_requests SET heartbeat_at_unix = ?, "
-                "expires_at_unix = ? WHERE request_id = ?",
-                (now, now + self.lease_seconds, request_id),
-            )
             config = connection.execute(
                 "SELECT max_heavy_tasks, max_vision_tasks FROM coordinator_config "
                 "WHERE singleton = 1"

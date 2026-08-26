@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import multiprocessing
 import os
+import sqlite3
 import tempfile
 import threading
 import time
@@ -292,6 +293,137 @@ class HeavyTaskCoordinatorTests(unittest.TestCase):
                 self.assertEqual(waiter.snapshot()["waiting"]["tasks"], 0)
             finally:
                 first_lease.release()
+                thread.join(timeout=2.0)
+                holder.close()
+                waiter.close()
+
+    def test_expired_waiting_request_is_requeued_then_acquires(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            holder = self.make_coordinator(root, heavy=1, vision=1)
+            waiter = self.make_coordinator(root, heavy=1, vision=1)
+            acquired = threading.Event()
+            errors: list[BaseException] = []
+            holder_lease = holder.acquire("gif", match_id="holder", event_key="g0")
+
+            def wait_for_slot():
+                try:
+                    with waiter.acquire("gif", match_id="m1", event_key="g1"):
+                        acquired.set()
+                except BaseException as exc:
+                    errors.append(exc)
+
+            thread = threading.Thread(target=wait_for_slot)
+            thread.start()
+            try:
+                deadline = time.monotonic() + 2.0
+                original_request = None
+                while original_request is None:
+                    with sqlite3.connect(waiter.database_path) as connection:
+                        original_request = connection.execute(
+                            "SELECT request_id, requested_at_unix "
+                            "FROM task_slot_requests WHERE event_key = ?",
+                            ("g1",),
+                        ).fetchone()
+                    self.assertLess(time.monotonic(), deadline)
+
+                with sqlite3.connect(waiter.database_path) as connection:
+                    connection.execute(
+                        "UPDATE task_slot_requests SET expires_at_unix = 0 "
+                        "WHERE request_id = ?",
+                        (original_request[0],),
+                    )
+                    waiter._purge_expired(connection, time.time())
+
+                restored_request = None
+                while restored_request is None:
+                    with sqlite3.connect(waiter.database_path) as connection:
+                        restored_request = connection.execute(
+                            "SELECT request_id, requested_at_unix "
+                            "FROM task_slot_requests WHERE event_key = ?",
+                            ("g1",),
+                        ).fetchone()
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(0.01)
+
+                self.assertEqual(restored_request[0], original_request[0])
+                self.assertEqual(restored_request[1], original_request[1])
+                holder_lease.release()
+                self.assertTrue(acquired.wait(2.0))
+                thread.join(timeout=2.0)
+                self.assertFalse(thread.is_alive())
+                self.assertEqual(errors, [])
+                self.assertEqual(waiter.snapshot()["waiting"]["tasks"], 0)
+            finally:
+                holder_lease.release()
+                thread.join(timeout=2.0)
+                holder.close()
+                waiter.close()
+
+    def test_cancelled_requeued_request_is_removed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            holder = self.make_coordinator(root, heavy=1, vision=1)
+            waiter = self.make_coordinator(root, heavy=1, vision=1)
+            cancelled = threading.Event()
+            outcome: list[BaseException] = []
+            holder_lease = holder.acquire("gif", match_id="holder", event_key="g0")
+
+            def wait_for_slot():
+                try:
+                    waiter.acquire(
+                        "gif",
+                        match_id="m1",
+                        event_key="g1",
+                        cancel_event=cancelled,
+                    )
+                except BaseException as exc:
+                    outcome.append(exc)
+
+            thread = threading.Thread(target=wait_for_slot)
+            thread.start()
+            try:
+                deadline = time.monotonic() + 2.0
+                request_id = None
+                while request_id is None:
+                    with sqlite3.connect(waiter.database_path) as connection:
+                        row = connection.execute(
+                            "SELECT request_id FROM task_slot_requests "
+                            "WHERE event_key = ?",
+                            ("g1",),
+                        ).fetchone()
+                    request_id = row[0] if row is not None else None
+                    self.assertLess(time.monotonic(), deadline)
+
+                with sqlite3.connect(waiter.database_path) as connection:
+                    connection.execute(
+                        "UPDATE task_slot_requests SET expires_at_unix = 0 "
+                        "WHERE request_id = ?",
+                        (request_id,),
+                    )
+                    waiter._purge_expired(connection, time.time())
+
+                restored = False
+                while not restored:
+                    with sqlite3.connect(waiter.database_path) as connection:
+                        restored = connection.execute(
+                            "SELECT 1 FROM task_slot_requests WHERE request_id = ?",
+                            (request_id,),
+                        ).fetchone() is not None
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(0.01)
+
+                cancelled.set()
+                thread.join(timeout=2.0)
+                self.assertFalse(thread.is_alive())
+                self.assertEqual(len(outcome), 1)
+                self.assertIsInstance(outcome[0], HeavyTaskCancelled)
+                snapshot = waiter.snapshot()
+                self.assertEqual(snapshot["waiting"]["tasks"], 0)
+                self.assertEqual(snapshot["active"]["tasks"], 1)
+            finally:
+                cancelled.set()
+                holder_lease.release()
                 thread.join(timeout=2.0)
                 holder.close()
                 waiter.close()

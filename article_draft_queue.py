@@ -315,6 +315,8 @@ class ArticleDraftQueue:
                             "staged_path=?",
                             "gif_url=NULL",
                             "platform_code=NULL",
+                            "platform_status_code=NULL",
+                            "diagnostics_json=NULL",
                             "duplicate=0",
                             "attempt_count=0",
                             "next_attempt_at_unix=NULL",
@@ -424,6 +426,50 @@ class ArticleDraftQueue:
             records.setdefault(str(row["event_key"]), _public_task(row))
         return records
 
+    def retry(self, *, match_id: str, event_key: str) -> dict[str, Any] | None:
+        """Put one existing OCR draft task at the front of the queue."""
+        normalized_match = str(match_id).strip()
+        normalized_event = str(event_key).strip()
+        if not re.fullmatch(r"\d{1,20}", normalized_match):
+            raise ValueError("重新创建草稿需要有效的数字比赛 ID")
+        if not normalized_event:
+            raise ValueError("重新创建草稿缺少事件标识")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT * FROM article_delivery_tasks
+                WHERE match_id=? AND event_key=? AND artifact_kind=? AND delivery_mode=?
+                ORDER BY updated_at_unix DESC LIMIT 1
+                """,
+                (
+                    normalized_match,
+                    normalized_event,
+                    OCR_ARTIFACT_KIND,
+                    DRAFT_DELIVERY_MODE,
+                ),
+            ).fetchone()
+            if row is None:
+                return None
+            if str(row["status"] or "") in {"failed", "retry_wait"}:
+                connection.execute(
+                    """
+                    UPDATE article_delivery_tasks
+                    SET status='queued', stage='manual_retry', next_attempt_at_unix=NULL,
+                        lease_until_unix=NULL, lease_token=NULL, retriable=0,
+                        auth_required=0, error_code=NULL, error=NULL,
+                        updated_at_unix=?
+                    WHERE task_key=? AND status IN ('failed', 'retry_wait')
+                    """,
+                    (time.time(), row["task_key"]),
+                )
+                row = connection.execute(
+                    "SELECT * FROM article_delivery_tasks WHERE task_key=?",
+                    (row["task_key"],),
+                ).fetchone()
+        self._wake.set()
+        return _public_task(row) if row is not None else None
+
     def run_once(self, *, now: float | None = None) -> bool:
         if self.publisher is None:
             raise RuntimeError("草稿队列缺少文章发布器")
@@ -509,6 +555,8 @@ class ArticleDraftQueue:
                 generation INTEGER NOT NULL DEFAULT 1,
                 lease_token TEXT,
                 previous_staged_path TEXT,
+                platform_status_code INTEGER,
+                diagnostics_json TEXT,
                 UNIQUE(match_id, event_key, artifact_kind, delivery_mode)
             )
             """
@@ -521,6 +569,8 @@ class ArticleDraftQueue:
             ("generation", "INTEGER NOT NULL DEFAULT 1"),
             ("lease_token", "TEXT"),
             ("previous_staged_path", "TEXT"),
+            ("platform_status_code", "INTEGER"),
+            ("diagnostics_json", "TEXT"),
         ):
             if name not in columns:
                 connection.execute(
@@ -695,6 +745,7 @@ class ArticleDraftQueue:
                 UPDATE article_delivery_tasks
                 SET status='success', stage=?, article_id=?, artifact_sha256=?,
                     staged_path=?, gif_url=?, platform_code=?, duplicate=?,
+                    platform_status_code=?, diagnostics_json=?,
                     next_attempt_at_unix=NULL, lease_until_unix=NULL, lease_token=NULL,
                     retriable=0, auth_required=0, error_code=NULL, error=NULL,
                     previous_staged_path=NULL, updated_at_unix=?, completed_at_unix=?
@@ -710,6 +761,8 @@ class ArticleDraftQueue:
                     if result.get("platform_code") is None
                     else str(result.get("platform_code")),
                     int(bool(result.get("duplicate"))),
+                    _diagnostic_value(result.get("diagnostics"), "http_status"),
+                    _json_value(result.get("diagnostics")),
                     now,
                     now,
                     task["task_key"],
@@ -739,13 +792,18 @@ class ArticleDraftQueue:
             status = "failed"
             next_attempt = None
             retriable = False
-        friendly_error = _friendly_draft_error(exc.stage, str(exc))
+        friendly_error = _friendly_draft_error(
+            exc.stage,
+            str(exc),
+            platform_code=exc.platform_code,
+        )
         with self._connect() as connection:
             connection.execute(
                 """
                 UPDATE article_delivery_tasks
                 SET status=?, stage=?, next_attempt_at_unix=?, lease_until_unix=NULL,
                     lease_token=NULL, retriable=?, auth_required=?, error_code=?, error=?,
+                    platform_code=?, platform_status_code=?, diagnostics_json=?,
                     updated_at_unix=?
                 WHERE task_key=? AND generation=? AND lease_token=? AND status='creating'
                 """,
@@ -757,6 +815,9 @@ class ArticleDraftQueue:
                     int(exc.auth_required),
                     exc.code,
                     friendly_error,
+                    None if exc.platform_code is None else str(exc.platform_code),
+                    _diagnostic_value(exc.diagnostics, "http_status"),
+                    _json_value(exc.diagnostics),
                     now,
                     task["task_key"],
                     task["generation"],
@@ -848,14 +909,47 @@ def _source_signature(path: Path) -> tuple[str, str | None]:
     return f"{stat.st_size}:{stat.st_mtime_ns}", None
 
 
-def _friendly_draft_error(stage: str, detail: str) -> str:
+def _json_value(value: Any) -> str | None:
+    if not isinstance(value, dict):
+        return None
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _json_object(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, dict):
+        return value
+    try:
+        parsed = json.loads(str(value or ""))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _diagnostic_value(value: Any, key: str) -> Any:
+    return value.get(key) if isinstance(value, dict) else None
+
+
+def _friendly_draft_error(
+    stage: str,
+    detail: str,
+    *,
+    platform_code: Any = None,
+) -> str:
     cleaned = str(detail or "").strip()
     if stage == "authorization":
         return "懂球帝开放平台尚未授权或授权已过期；授权恢复后会继续创建草稿。"
     if stage == "public_url_check":
         return "OCR GIF 已生成，但公网地址暂时无法访问；系统会稍后重试。"
     if stage == "platform_publish":
-        return f"OCR GIF 已生成，但懂球帝草稿接口没有接受请求：{cleaned or '未说明原因'}"
+        code_text = (
+            f"（平台返回 code={platform_code}）"
+            if platform_code is not None
+            else ""
+        )
+        return (
+            "OCR GIF 已生成，但懂球帝草稿接口没有接受请求"
+            f"{code_text}：{cleaned or '未说明原因'}"
+        )
     if stage in {"gif_validation", "gif_storage", "source_check"}:
         return f"未创建草稿：{cleaned or 'OCR GIF 文件无法使用'}"
     return f"草稿创建暂时失败：{cleaned or '未说明原因'}"
@@ -881,6 +975,9 @@ def _public_task(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
         "auth_required": bool(value.get("auth_required")),
         "error_code": value.get("error_code"),
         "error": value.get("error"),
+        "platform_code": value.get("platform_code"),
+        "platform_status_code": value.get("platform_status_code"),
+        "diagnostics": _json_object(value.get("diagnostics_json")),
         "gif_url": value.get("gif_url"),
         "updated_at_unix": value.get("updated_at_unix"),
         "completed_at_unix": value.get("completed_at_unix"),
