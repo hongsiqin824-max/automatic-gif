@@ -40,6 +40,34 @@ def publisher_for_tests(root):
     )
 
 
+def trusted_ocr_artifact(output: str):
+    return {
+        "status": "encoded",
+        "output": output,
+        "output_kind": "ocr_window",
+        "localization_source": "exact_second",
+        "localization_quality": "exact",
+        "ocr_verified": True,
+        "event_frame_may_be_missing": False,
+        "anchor_adjusted": False,
+        "stitched_across_gap": False,
+        "video_gap_count": 0,
+        "anchor_stream_time": 130.0,
+        "clip_before_seconds": 30.0,
+        "clip_after_seconds": 30.0,
+        "requested_media_window": {
+            "start_stream_time": 100.0,
+            "end_stream_time": 160.0,
+        },
+        "actual_media_window": {
+            "start_stream_time": 100.0,
+            "end_stream_time": 160.0,
+        },
+        "available_media_duration_seconds": 60.0,
+        "duration_sec": 60.0,
+    }
+
+
 class DashboardPublishRoutesTests(unittest.TestCase):
     def test_upload_route_requires_token_and_returns_public_gif(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -94,6 +122,9 @@ class DashboardPublishRoutesTests(unittest.TestCase):
                         "event_key": "goal-19",
                         "status": "failed",
                         "code": "G",
+                        "ocr_window": trusted_ocr_artifact(
+                            str(Path(uploaded["gif"]["path"]).resolve())
+                        ),
                     }
                 ],
             }
@@ -128,13 +159,73 @@ class DashboardPublishRoutesTests(unittest.TestCase):
         self.assertEqual(response.status_code, 403)
         self.assertEqual(response.get_json()["code"], "article_publish_disabled")
 
-    def test_ocr_gif_uses_the_same_publish_button_as_default_gif(self):
+    def test_dashboard_uses_automatic_ocr_article_status_without_publish_buttons(self):
         script = (
             Path(dashboard_server.ROOT) / "dashboard_static" / "app.js"
         ).read_text(encoding="utf-8")
-        self.assertIn("data-publish-artifact-kind", script)
-        self.assertIn("artifact_kind:artifactKind", script)
-        self.assertIn("publishGif(button)", script)
+        self.assertIn("function automaticArticleStatus(event, artifact)", script)
+        self.assertIn("等待自动创建文章", script)
+        self.assertIn("文章任务尚未登记", script)
+        self.assertIn("草稿已创建 · 等待球员信息", script)
+        self.assertIn("等待接口补齐球员信息", script)
+        self.assertIn("错误码", script)
+        self.assertIn("未自动发布", script)
+        self.assertIn("publication_gate", script)
+        self.assertIn("publication_eligibility", script)
+        self.assertIn("ocr_article_eligibility", script)
+        self.assertIn("auto_publish_not_eligible", script)
+        self.assertIn("已自动发布", script)
+        self.assertNotIn("publish-button", script)
+        self.assertNotIn("publishGif(button)", script)
+
+    def test_successful_publish_exposes_article_admin_link(self):
+        script = (
+            Path(dashboard_server.ROOT) / "dashboard_static" / "app.js"
+        ).read_text(encoding="utf-8")
+        self.assertIn("function articleAdminUrl(articleId)", script)
+        self.assertIn(
+            "https://dadmin.dongqiudi.com/admin/archives/articlePublish?articleId=",
+            script,
+        )
+        self.assertIn("查看文章", script)
+
+    def test_latest_article_event_uses_fresh_matching_api_revision(self):
+        current = {
+            "event_key": "stable-goal",
+            "code": "G",
+            "minute": "19",
+            "team": "teamA",
+            "person": "",
+            "person_id": "0",
+            "score": "1-0",
+            "metadata": {"event_id": "event-19"},
+        }
+        payload = {
+            "events": {
+                "19": {
+                    "minute": "19",
+                    "teamAEvents": [
+                        {
+                            "id": "event-19",
+                            "code": "G",
+                            "person": "接口补齐球员",
+                            "person_id": "91",
+                            "score": "1-0",
+                        }
+                    ],
+                }
+            }
+        }
+        with patch.object(
+            dashboard_server, "_tasks_from_database", return_value=([], {}, set())
+        ), patch.object(dashboard_server, "query_events", return_value=payload):
+            latest = dashboard_server._latest_ocr_article_event(
+                "54478914", "stable-goal", current
+            )
+
+        self.assertEqual(latest["event_key"], "stable-goal")
+        self.assertEqual(latest["person"], "接口补齐球员")
+        self.assertEqual(latest["person_id"], "91")
 
     def test_ocr_publish_route_resolves_server_owned_gif(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -152,7 +243,7 @@ class DashboardPublishRoutesTests(unittest.TestCase):
                 "detail": {"team_A_name": "主队", "team_B_name": "客队"},
                 "events": [{
                     "event_key": "goal-19", "status": "failed", "code": "G",
-                    "ocr_window": {"status": "encoded", "output": str(gif_path)},
+                    "ocr_window": trusted_ocr_artifact(str(gif_path)),
                 }],
             }
             with patch.object(dashboard_server, "DEFAULT_OUTPUT", root), patch.object(
@@ -173,6 +264,47 @@ class DashboardPublishRoutesTests(unittest.TestCase):
         self.assertEqual(called["source_path"], gif_path.resolve())
         self.assertEqual(called["event"]["status"], "encoded")
 
+    def test_ocr_publish_route_rejects_unverified_artifact(self):
+        fake_publisher = Mock()
+        session_payload = {
+            "detail": {"team_A_name": "主队", "team_B_name": "客队"},
+            "events": [{
+                "event_key": "goal-19",
+                "status": "encoded",
+                "code": "G",
+                "ocr_window": {
+                    "status": "encoded",
+                    "output": "/tmp/not-used.gif",
+                    "output_kind": "api_time_range_fallback",
+                    "localization_source": "api_time_range",
+                },
+            }],
+        }
+        with patch.object(
+            dashboard_server.dashboard, "get", return_value=Mock()
+        ), patch.object(
+            dashboard_server, "_session_json", return_value=session_payload
+        ), patch.object(
+            dashboard_server, "article_publisher", fake_publisher
+        ):
+            response = dashboard_server.app.test_client().post(
+                "/api/article-publish",
+                json={
+                    "match_id": "54478914",
+                    "event_key": "goal-19",
+                    "artifact_kind": "ocr_window",
+                },
+            )
+
+        payload = response.get_json()
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(payload["stage"], "publication_gate")
+        self.assertEqual(payload["code"], "unverified_api_fallback")
+        self.assertFalse(
+            payload["diagnostics"]["publication_eligibility"]["eligible"]
+        )
+        fake_publisher.publish.assert_not_called()
+
     def test_ocr_draft_retry_route_remains_compatible_for_old_tasks(self):
         queue = Mock()
         queue.retry.return_value = {"match_id": "54478914", "event_key": "goal-19", "status": "queued"}
@@ -190,7 +322,7 @@ class DashboardPublishRoutesTests(unittest.TestCase):
     def test_imported_dashboard_does_not_start_draft_delivery_thread(self):
         self.assertIsNone(dashboard_server.article_draft_queue._thread)
 
-    def test_dashboard_worker_does_not_enable_automatic_draft_delivery(self):
+    def test_dashboard_worker_enables_automatic_ocr_article_delivery(self):
         manager = dashboard_server.Dashboard(background_monitors=False)
         session = manager.get("54478914")
         session.source = {"resource": "rtmp://example/live"}
@@ -207,7 +339,10 @@ class DashboardPublishRoutesTests(unittest.TestCase):
             manager.start(session)
 
         command = popen.call_args.args[0]
-        self.assertNotIn("--ocr-draft-staging-dir", command)
+        self.assertIn("--ocr-draft-db", command)
+        self.assertIn("--ocr-draft-staging-dir", command)
+        self.assertIn("--ocr-draft-team-a-name", command)
+        self.assertIn("--ocr-draft-team-b-name", command)
 
     def test_reconcile_registers_only_existing_encoded_unsuppressed_ocr(self):
         manager = dashboard_server.Dashboard(background_monitors=False)

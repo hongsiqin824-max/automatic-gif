@@ -11,6 +11,7 @@ from pipeline_runtime import PipelineRuntime
 from vision_runtime import (
     VisionJob,
     VisualLocationFailed,
+    _ocr_recoverable_profile_mismatch,
     _ocr_target_not_located_diagnostics,
     _ocr_progressive_coverage_diagnostics,
     process_vision_artifact,
@@ -19,6 +20,128 @@ from vision_runtime import (
 
 class OcrFailureModeTests(unittest.TestCase):
     """Regression coverage for OCR deadline and retained-history diagnostics."""
+
+    @staticmethod
+    def _short_profile_mismatch() -> VisualLocationFailed:
+        return VisualLocationFailed(
+            "clock_profile_mismatch",
+            "the available fragment is too short to validate the clock region",
+            {
+                "stage": "ocr_target_localization",
+                "fragment_attempts": [
+                    {
+                        "window_start": 150.0,
+                        "window_end": 155.0,
+                        "error_kind": "clock_profile_mismatch",
+                        "error": "not enough frames for two clock readings",
+                        "diagnostics": {},
+                    }
+                ],
+            },
+        )
+
+    @staticmethod
+    def _ready_clock_samples() -> list[dict[str, float | int]]:
+        return [
+            {"stream_time": 100.0, "match_clock_seconds": 44},
+            {"stream_time": 110.0, "match_clock_seconds": 54},
+        ]
+
+    def test_short_profile_mismatch_is_recoverable_only_after_ready_mapping(self):
+        mismatch = self._short_profile_mismatch()
+
+        self.assertTrue(
+            _ocr_recoverable_profile_mismatch(
+                mismatch.kind,
+                mismatch.diagnostics,
+                self._ready_clock_samples(),
+            )
+        )
+        self.assertFalse(
+            _ocr_recoverable_profile_mismatch(
+                mismatch.kind,
+                mismatch.diagnostics,
+                [],
+            )
+        )
+
+    def test_profile_mismatch_recovery_rejects_long_or_mixed_fragments(self):
+        clock_samples = self._ready_clock_samples()
+        long_fragment = {
+            "fragment_attempts": [
+                {
+                    "window_start": 100.0,
+                    "window_end": 116.0,
+                    "error_kind": "clock_profile_mismatch",
+                }
+            ]
+        }
+        mixed_failures = {
+            "fragment_attempts": [
+                {
+                    "window_start": 100.0,
+                    "window_end": 105.0,
+                    "error_kind": "clock_profile_mismatch",
+                },
+                {
+                    "window_start": 106.0,
+                    "window_end": 111.0,
+                    "error_kind": "ocr_clock_unreadable",
+                },
+            ]
+        }
+        explicit_layout_mismatch = {
+            "fragment_attempts": [
+                {
+                    "window_start": 100.0,
+                    "window_end": 105.0,
+                    "error_kind": "clock_profile_mismatch",
+                    "diagnostics": {
+                        "reference_resolution": [1920, 1080],
+                        "aspect_ratio_difference": 0.2,
+                        "aspect_ratio_tolerance": 0.04,
+                    },
+                }
+            ]
+        }
+        nested_direct_mismatch = {
+            "fragment_attempts": [
+                {
+                    "window_start": 100.0,
+                    "window_end": 105.0,
+                    "error_kind": "ocr_minute_boundary_not_found",
+                    "direct_clock_roi_fallback": {
+                        "error_kind": "clock_profile_mismatch",
+                        "error": "not enough trusted readings",
+                    },
+                }
+            ]
+        }
+
+        self.assertFalse(
+            _ocr_recoverable_profile_mismatch(
+                "clock_profile_mismatch", long_fragment, clock_samples
+            )
+        )
+        self.assertFalse(
+            _ocr_recoverable_profile_mismatch(
+                "clock_profile_mismatch", mixed_failures, clock_samples
+            )
+        )
+        self.assertFalse(
+            _ocr_recoverable_profile_mismatch(
+                "clock_profile_mismatch",
+                explicit_layout_mismatch,
+                clock_samples,
+            )
+        )
+        self.assertTrue(
+            _ocr_recoverable_profile_mismatch(
+                "clock_profile_mismatch",
+                nested_direct_mismatch,
+                clock_samples,
+            )
+        )
 
     def test_target_not_located_classifies_crossed_target(self):
         details = _ocr_target_not_located_diagnostics(
@@ -233,6 +356,151 @@ class OcrFailureModeTests(unittest.TestCase):
             # artifact or turn it into a successful visual result.
             self.assertTrue(waiting.result["default_gif_preserved"])
             runtime.close()
+
+    def test_short_profile_mismatch_after_ready_mapping_waits_and_keeps_roi(self):
+        """A post-gap fragment must not erase previously validated clock state."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime, job = self._create_progressive_ocr_job(
+                root, "profile-mismatch-after-ready-mapping"
+            )
+            task = runtime.store.get_vision_task(job.event_key, "ocr_window")
+            self.assertIsNotNone(task)
+            runtime.transition(job.event_key, "encoding")
+            runtime.transition(
+                job.event_key,
+                "encoded",
+                result={"output": str(root / "default.gif"), "source": "default"},
+            )
+            runtime.store.save_scoreboard_roi_cache(
+                job.match_id,
+                {
+                    "profile_id": "known-clock-region",
+                    "reference_resolution": [1920, 1080],
+                    "clock_roi": [40, 30, 180, 82],
+                },
+            )
+            runtime.record_vision_readiness_wait(
+                job.event_key,
+                "clock mapping established before a stream gap",
+                artifact_kind="ocr_window",
+                error_kind="waiting_for_clock_target",
+                window_metadata={
+                    "progressive_scan": {
+                        "scan_cursor_stream_time": 155.0,
+                        "clock_samples": self._ready_clock_samples(),
+                        "latest_trusted_clock_seconds": 54,
+                    }
+                },
+                now=task.created_at_unix,
+                next_attempt_at_unix=task.created_at_unix,
+            )
+            segment_path = root / "segment.ts"
+            segment_path.write_bytes(b"video")
+            segment_sets = iter(
+                (
+                    [Segment(segment_path, 80.0, 160.0)],
+                    [Segment(segment_path, 80.0, 190.0)],
+                )
+            )
+
+            try:
+                with patch(
+                    "vision_runtime._locate_ocr_window_across_components",
+                    side_effect=self._short_profile_mismatch(),
+                ):
+                    completed = self._run_progressive_ocr(
+                        job,
+                        runtime,
+                        lambda: next(segment_sets),
+                        root,
+                    )
+
+                waiting = runtime.store.get_vision_task(
+                    job.event_key, "ocr_window"
+                )
+                self.assertFalse(completed)
+                self.assertEqual(waiting.status, "pending")
+                self.assertEqual(
+                    waiting.last_error_kind, "waiting_for_clock_target"
+                )
+                self.assertIn(
+                    "直播中断后正在继续检查恢复画面", waiting.error
+                )
+                progress = waiting.window_metadata["progressive_scan"]
+                self.assertEqual(progress["clock_mapping"]["status"], "ready")
+                self.assertEqual(progress["latest_trusted_clock_seconds"], 54)
+                self.assertTrue(
+                    progress["last_scan_diagnostics"][
+                        "recoverable_profile_mismatch"
+                    ]
+                )
+                self.assertTrue(
+                    progress["last_scan_diagnostics"][
+                        "media_tail_grew_during_scan"
+                    ]
+                )
+                roi_cache = runtime.store.get_scoreboard_roi_cache(job.match_id)
+                self.assertIsNotNone(roi_cache)
+                self.assertEqual(roi_cache.failure_streak, 0)
+                default_task = runtime.store.get(job.event_key)
+                self.assertEqual(default_task.status, "encoded")
+                self.assertEqual(default_task.result["source"], "default")
+            finally:
+                runtime.close()
+
+    def test_profile_mismatch_without_mapping_still_fails_and_invalidates_roi(self):
+        """A genuine first-pass layout mismatch remains a terminal diagnosis."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime, job = self._create_progressive_ocr_job(
+                root, "profile-mismatch-without-mapping"
+            )
+            runtime.store.save_scoreboard_roi_cache(
+                job.match_id,
+                {
+                    "profile_id": "wrong-clock-region",
+                    "reference_resolution": [1920, 1080],
+                    "clock_roi": [40, 30, 180, 82],
+                },
+            )
+            segment_path = root / "segment.ts"
+            segment_path.write_bytes(b"video")
+
+            try:
+                with (
+                    patch(
+                        "vision_runtime._locate_ocr_window_across_components",
+                        side_effect=self._short_profile_mismatch(),
+                    ),
+                    patch(
+                        "vision_runtime._encode_ocr_api_range_fallback",
+                        return_value=False,
+                    ),
+                ):
+                    completed = self._run_progressive_ocr(
+                        job,
+                        runtime,
+                        lambda: [Segment(segment_path, 80.0, 155.0)],
+                        root,
+                    )
+
+                failed = runtime.store.get_vision_task(
+                    job.event_key, "ocr_window"
+                )
+                self.assertTrue(completed)
+                self.assertEqual(failed.status, "failed")
+                self.assertEqual(
+                    failed.last_error_kind, "clock_profile_mismatch"
+                )
+                self.assertEqual(
+                    runtime.store.get_scoreboard_roi_cache(
+                        job.match_id
+                    ).failure_streak,
+                    3,
+                )
+            finally:
+                runtime.close()
 
     def test_coverage_classifies_evicted_target_window(self):
         """An absent target window is different from a merely short look-back."""

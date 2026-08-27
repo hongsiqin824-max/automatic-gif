@@ -15,9 +15,7 @@ const state = {
   refreshRequestSerial: 0,
   lastRenderedRefreshSerial: 0,
   actionPending: false,
-  publishStates: new Map(),
-  publishingEnabled: true,
-  remoteUploadEnabled: false,
+  ocrAutomaticPublishing: true,
   openTechnicalDetails: new Set(),
 };
 
@@ -91,45 +89,70 @@ function errorGuide(value, fallbackTitle = '这一步没有完成') {
   if (guide.key) return guide;
   return {...guide, cause:friendlyErrorMessage(value, guide.cause)};
 }
-function publishStateKey(matchId, eventKey, artifactKind = 'default') { return `${String(matchId || '')}\n${String(eventKey || '')}\n${String(artifactKind || 'default')}`; }
-function publishStageLabel(stage) {
-  return ({request_validation:'请求检查',gif_validation:'GIF 校验',gif_storage:'永久保存',remote_gif_upload:'上传到公网服务器',gif_prepared:'GIF 已保存',public_url_check:'公网地址检查',authorization:'开放平台授权',platform_publish:'正式发布',record_persistence:'发布记录保存',completed:'发布完成',internal:'发布服务'})[String(stage || '')] || '发布处理';
+function articleAdminUrl(articleId) {
+  const value = String(articleId || '').trim();
+  return /^\d{1,20}$/.test(value)
+    ? `https://dadmin.dongqiudi.com/admin/archives/articlePublish?articleId=${encodeURIComponent(value)}`
+    : '';
 }
-function publishStateFor(matchId, event, artifactKind = 'default') {
-  const local = state.publishStates.get(publishStateKey(matchId, event.event_key, artifactKind));
-  const persistedValue = artifactKind === 'ocr_window' ? event.ocr_publish : event.publish;
-  const persisted = persistedValue && typeof persistedValue === 'object' ? persistedValue : null;
-  if (persisted && persisted.status === 'success') return persisted;
-  return local || persisted;
-}
-function publishControls(matchId, event, artifactKind = 'default', artifact = event) {
-  if (!state.publishingEnabled) return '';
-  const output = artifactKind === 'ocr_window' ? artifact && artifact.output : event.output;
-  const uploaded = artifactKind === 'ocr_window'
-    ? (artifact && artifact.uploaded_gif)
-    : (event && event.uploaded_gif);
-  const uploadedGifId = uploaded && uploaded.gif_id ? String(uploaded.gif_id) : '';
-  const ready = artifactKind === 'ocr_window'
-    ? artifact && (artifact.status === 'encoded' || uploadedGifId)
-    : event.status === 'encoded' || uploadedGifId;
-  if (!ready || (!output && !uploadedGifId) || !event.event_key) return '';
-  const publication = publishStateFor(matchId, event, artifactKind);
-  const status = String((publication && publication.status) || 'ready');
-  const pending = status === 'publishing' || status === 'prepared';
-  const success = status === 'success';
-  const failed = status === 'failed';
-  const articleId = publication && publication.article_id ? String(publication.article_id) : '';
-  const stage = publication && publication.stage ? publishStageLabel(publication.stage) : '';
-  const error = publication && publication.error ? String(publication.error) : '';
-  const oauthUrl = publication && publication.oauth_url ? String(publication.oauth_url) : '';
-  const statusMarkup = success
-    ? `<small class="publish-result success">已正式发布${articleId ? ` · 文章 ${escapeHtml(articleId)}` : ''}</small>`
-    : pending
-      ? `<small class="publish-result pending">${escapeHtml(stage || '正在正式发布')}</small>`
-      : failed
-        ? `<small class="publish-result failed">${escapeHtml(stage)}失败：${escapeHtml(error || '未提供原因')}${oauthUrl ? ` · <a href="${escapeHtml(oauthUrl)}" target="_blank" rel="noopener">完成授权</a>` : ''}</small>`
-        : '';
-  return `<div class="publish-control"><button class="publish-button" type="button" data-publish-match-id="${escapeHtml(matchId)}" data-publish-event-key="${escapeHtml(event.event_key)}" data-publish-artifact-kind="${escapeHtml(artifactKind)}" data-publish-gif-id="${escapeHtml(uploadedGifId)}" ${pending || success ? 'disabled' : ''}>${success ? '已发布' : pending ? '发布中' : failed ? '重试发布' : '发布'}</button>${statusMarkup}</div>`;
+function automaticArticleStatus(event, artifact) {
+  const uploaded = artifact && artifact.uploaded_gif;
+  const ready = artifact && (artifact.status === 'encoded' || (uploaded && uploaded.gif_id));
+  if (!ready || !event.event_key) return '';
+  const publication = event.ocr_draft && typeof event.ocr_draft === 'object' ? event.ocr_draft : null;
+  if (!publication) {
+    const label = state.ocrAutomaticPublishing ? '等待自动创建文章' : '自动发布未启用';
+    const reason = state.ocrAutomaticPublishing
+      ? 'OCR GIF 已生成，但文章任务尚未登记'
+      : '服务配置关闭了 OCR 自动文章流程';
+    return `<small class="publish-result pending">${label} · ${reason}</small>`;
+  }
+  const status = String(publication.status || 'queued');
+  const eligibility = publication.publication_eligibility && typeof publication.publication_eligibility === 'object'
+    ? publication.publication_eligibility
+    : publication.ocr_article_eligibility && typeof publication.ocr_article_eligibility === 'object'
+      ? publication.ocr_article_eligibility
+      : publication.eligibility && typeof publication.eligibility === 'object'
+        ? publication.eligibility
+        : null;
+  const publicationHeld = status === 'held'
+    || publication.stage === 'publication_gate'
+    || (eligibility && eligibility.eligible === false && !['published', 'success'].includes(status));
+  const labels = {
+    queued:'等待自动创建文章', creating:'正在创建文章草稿', creating_draft:'正在创建文章草稿',
+    waiting_person:'草稿已创建 · 等待球员信息', publishing:'正在自动发布',
+    retry_wait:'自动发布暂时失败 · 系统将重试',
+    published:'已自动发布', success:'草稿已创建', failed:'自动发布失败',
+    held:'未自动发布'
+  };
+  const articleId = publication.article_id ? String(publication.article_id) : '';
+  const articleUrl = articleAdminUrl(articleId);
+  const error = publicationHeld || !publication.error ? '' : `：${escapeHtml(publication.error)}`;
+  const holdReason = eligibility && eligibility.reason
+    ? String(eligibility.reason)
+    : (publicationHeld && publication.error ? String(publication.error) : 'OCR GIF 未满足自动发布条件');
+  const holdCode = eligibility && eligibility.reason_code
+    ? String(eligibility.reason_code)
+    : (publicationHeld && publication.error_code ? String(publication.error_code) : 'auto_publish_not_eligible');
+  const reason = publicationHeld
+    ? ` · 原因：${escapeHtml(holdReason)} · 错误码 ${escapeHtml(holdCode)}`
+    : status === 'waiting_person'
+    ? (publication.person_deadline_at_unix
+      ? ` · 等待球员信息至 ${new Date(Number(publication.person_deadline_at_unix) * 1000).toLocaleTimeString('zh-CN', {hour12:false})}`
+      : ' · 等待接口补齐球员信息')
+    : status === 'retry_wait'
+      ? ' · 平台或网络暂时不可用，系统会自动重试'
+      : status === 'failed'
+        ? ` · ${publication.error_code ? `错误码 ${escapeHtml(publication.error_code)}` : '任务未完成'}`
+        : status === 'success'
+          ? ' · 旧任务仅创建了草稿，等待后续处理'
+          : '';
+  const link = articleId
+    ? ` · ${articleUrl ? `<a href="${articleUrl}" target="_blank" rel="noopener noreferrer">查看文章 ${escapeHtml(articleId)}</a>` : `文章 ${escapeHtml(articleId)}`}`
+    : '';
+  const style = status === 'published' ? 'success' : publicationHeld ? 'retry' : status === 'failed' ? 'failed' : 'pending';
+  const label = publicationHeld ? '未自动发布' : (labels[status] || '自动文章处理中');
+  return `<small class="publish-result ${style}">${escapeHtml(label)}${reason}${error}${link}</small>`;
 }
 function setDiscoveryCollapsed(collapsed) {
   state.discoveryCollapsed = Boolean(collapsed);
@@ -997,8 +1020,7 @@ function logPresentation(record) {
 }
 
 function render(data) {
-  state.publishingEnabled = !data.publishing || data.publishing.enabled !== false;
-  state.remoteUploadEnabled = Boolean(data.publishing && data.publishing.remote_upload_enabled);
+  state.ocrAutomaticPublishing = !data.publishing || data.publishing.ocr_automatic !== false;
   if (data.heavy_tasks && typeof data.heavy_tasks === 'object') renderHeavyTasks(data);
   const detail = data.detail || {};
   const status = data.status || 'Uncertain';
@@ -1113,14 +1135,14 @@ function render(data) {
     const ocrArtifactLabel = ocrWindow && ocrWindow.output_kind === 'api_time_range_fallback' ? '接口时间范围兜底' : '画面时间 60秒';
     const defaultUploaded = e.uploaded_gif && e.uploaded_gif.url ? e.uploaded_gif : null;
     const defaultPreview = e.output ? `<a class="gif-link" href="/api/gif/${encodeURIComponent(data.match_id)}/${encodeURIComponent(e.output.split('/').pop())}" target="_blank">预览</a>` : defaultUploaded ? `<a class="gif-link" href="${escapeHtml(defaultUploaded.url)}" target="_blank" rel="noopener">预览</a>` : '';
-    const defaultActions = e.output || defaultUploaded ? `<div class="default-artifact-actions">${defaultPreview}${publishControls(data.match_id, e)}</div>` : '';
+    const defaultActions = e.output || defaultUploaded ? `<div class="default-artifact-actions">${defaultPreview}</div>` : '';
     const ocrPreview = gifLink(ocrWindow);
     const ocrArtifact = ocrWindow
       ? {...ocrWindow, ...(e.ocr_uploaded_gif ? {uploaded_gif:e.ocr_uploaded_gif} : {})}
       : (e.ocr_uploaded_gif ? {status:'encoded', uploaded_gif:e.ocr_uploaded_gif} : null);
     const ocrUploadedPreview = !ocrPreview && e.ocr_uploaded_gif && e.ocr_uploaded_gif.url ? `<a class="gif-link" href="${escapeHtml(e.ocr_uploaded_gif.url)}" target="_blank" rel="noopener">预览</a>` : '';
-    const ocrPublish = publishControls(data.match_id, e, 'ocr_window', ocrArtifact);
-    const ocrActions = ocrPreview || ocrUploadedPreview || ocrPublish ? `<div class="artifact-actions ocr-artifact-actions">${ocrPreview || ocrUploadedPreview}${ocrPublish}</div>` : '';
+    const ocrArticleStatus = automaticArticleStatus(e, ocrArtifact);
+    const ocrActions = ocrPreview || ocrUploadedPreview || ocrArticleStatus ? `<div class="artifact-actions ocr-artifact-actions">${ocrPreview || ocrUploadedPreview}${ocrArticleStatus}</div>` : '';
     return `<div class="event-row ${escapeHtml(task.cls)}"><div class="event-type event-type-${escapeHtml(type.kind)}"><span class="event-symbol" aria-hidden="true"></span><span class="event-type-text"><b>${escapeHtml(type.label)}</b><small>${escapeHtml(type.code)}</small></span></div><div class="event-minute">${escapeHtml(e.minute || '--')}'${e.minute_extra && e.minute_extra !== '0' ? `+${escapeHtml(e.minute_extra)}` : ''}</div><div class="event-person">${escapeHtml(e.person || '未提供球员')}<small>${escapeHtml(e.team || '')}${e.score ? ` · ${escapeHtml(e.score)}` : ''}${e.reason ? ` · ${friendlyText(e.reason)}` : ''}</small></div><div class="artifact-list"><div class="artifact ${e.status === 'failed' ? 'failed' : ''}"><div class="artifact-copy"><span>默认 · ${escapeHtml(task.label)}${defaultCoverage ? ` · ${escapeHtml(defaultCoverage)}` : ''}</span>${defaultFailureMarkup}</div>${defaultActions}</div><div class="artifact ${escapeHtml(ocr.cls)}"><div class="artifact-copy"><span>${escapeHtml(ocrArtifactLabel)} · ${escapeHtml(ocr.label)}${ocrCoverage ? ` · ${escapeHtml(ocrCoverage)}` : ''}${ocrUserDetail ? `<small>${escapeHtml(ocrUserDetail)}</small>` : ''}</span>${ocrFailureMarkup}${technicalMarkup}</div>${ocrActions}</div><div class="artifact ${escapeHtml(vision.cls)}"><div class="artifact-copy"><span>动作精剪 20秒 · ${escapeHtml(vision.label)}${escapeHtml(confidence)}${escapeHtml(delta)}${visionCoverage ? ` · ${escapeHtml(visionCoverage)}` : ''}${tdeed && tdeed.experimental ? ' · 实验' : ''}${visionDetail ? `<small>${escapeHtml(visionDetail)}</small>` : ''}</span>${visionFailureMarkup}</div>${gifLink(tdeed)}</div></div></div>`;
   }).join('') : '<div class="empty">暂无已发现事件。启动处理后，进球、黄牌、红牌和乌龙球会在这里显示。</div>';
   const logs = $('logs'); const records = data.logs || []; let heartbeatSeen = false; const visibleRecords = records.filter(record => record.event !== 'runtime_heartbeat' || (!heartbeatSeen && (heartbeatSeen = true))); logs.innerHTML = visibleRecords.length ? visibleRecords.slice(0, 40).map(l => { const presentation = logPresentation(l); return `<div class="log-line log-${escapeHtml(l.event || '')}"><time>${escapeHtml((l.timestamp || '').replace('T',' ').replace('Z','').slice(0,19))}</time><b>${escapeHtml(presentation.name)}</b><span>${escapeHtml(presentation.detail)}</span></div>`; }).join('') : '<div class="empty">暂无日志</div>';
@@ -1129,51 +1151,6 @@ function render(data) {
 }
 
 async function requestJson(url, options = {}) { const response = await fetch(url, {headers:{'Content-Type':'application/json'}, ...options}); const data = await response.json(); if (!response.ok) throw new Error(data.error || `请求失败 ${response.status}`); return data; }
-async function publishGif(button) {
-  const targetMatchId = String(button.dataset.publishMatchId || '');
-  const eventKey = String(button.dataset.publishEventKey || '');
-  const artifactKind = String(button.dataset.publishArtifactKind || 'default');
-  const gifId = String(button.dataset.publishGifId || '');
-  if (!targetMatchId || !eventKey || button.disabled) return;
-  const key = publishStateKey(targetMatchId, eventKey, artifactKind);
-  state.publishStates.set(key, {status:'publishing', stage:state.remoteUploadEnabled ? 'remote_gif_upload' : 'platform_publish'});
-  button.disabled = true;
-  button.textContent = '发布中';
-  if (targetMatchId === state.sessionMatchId) refresh(targetMatchId);
-  let finalNotice = '';
-  let finalNoticeKind = 'error';
-  try {
-    const requestBody = {match_id:targetMatchId, event_key:eventKey, artifact_kind:artifactKind};
-    if (gifId) requestBody.gif_id = gifId;
-    const response = await fetch('/api/article-publish', {
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify(requestBody),
-    });
-    const payload = await response.json().catch(() => ({}));
-    if (!response.ok || !payload.ok) {
-      const failure = {
-        status:'failed',
-        stage:payload.stage || 'platform_publish',
-        error:payload.error || `发布请求失败 ${response.status}`,
-        oauth_url:payload.oauth_url || '',
-      };
-      state.publishStates.set(key, failure);
-      finalNotice = `${publishStageLabel(failure.stage)}失败：${failure.error}`;
-    } else {
-      const publication = payload.publish || {};
-      state.publishStates.set(key, publication);
-      finalNotice = `正式发布成功${publication.article_id ? `，文章 ID ${publication.article_id}` : ''}`;
-      finalNoticeKind = 'success';
-    }
-  } catch (error) {
-    state.publishStates.set(key, {status:'failed', stage:'platform_publish', error:error.message || '网络请求失败'});
-    finalNotice = `正式发布失败：${error.message || '网络请求失败'}`;
-  } finally {
-    if (targetMatchId === state.sessionMatchId) await refresh(targetMatchId);
-    if (finalNotice) showNotice(finalNotice, finalNoticeKind);
-  }
-}
 async function refresh(requestedId = state.sessionMatchId || matchId()) {
   const id = String(requestedId || '').trim();
   if (!id || state.actionPending) return;
@@ -1289,10 +1266,6 @@ $('demo-btn').addEventListener('click', () => {
 });
 $('start-btn').addEventListener('click', () => startSelectedMatch());
 $('stop-btn').addEventListener('click', stopCurrentMatch);
-$('events').addEventListener('click', event => {
-  const button = event.target.closest('.publish-button');
-  if (button) publishGif(button);
-});
 $('events').addEventListener('toggle', event => {
   const details = event.target.closest('details[data-details-key]');
   if (!details) return;

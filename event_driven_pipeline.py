@@ -4749,6 +4749,17 @@ def main() -> None:
                                     job.match_event,
                                     canonical_update,
                                 )
+                        # The article task may already be waiting for a player
+                        # name. Re-enqueueing the same encoded OCR artifact only
+                        # refreshes its event snapshot; it does not create a
+                        # second task because the queue key is stable.
+                        enqueue_encoded_ocr_draft(
+                            draft_queue,
+                            runtime,
+                            match_id=args.match_id,
+                            event_key=canonical_update.event_key,
+                            match_detail=draft_match_detail,
+                        )
                         print(
                             f"[event:update] code={canonical_update.code} "
                             f"minute={canonical_update.minute} "
@@ -4784,6 +4795,13 @@ def main() -> None:
                         for job in jobs:
                             if job.match_event.event_key == existing_incident.event_key:
                                 job.match_event = merged_event
+                        enqueue_encoded_ocr_draft(
+                            draft_queue,
+                            runtime,
+                            match_id=args.match_id,
+                            event_key=existing_incident.event_key,
+                            match_detail=draft_match_detail,
+                        )
                         runtime.logger.log(
                             "event_cross_source_merged",
                             match_id=args.match_id,

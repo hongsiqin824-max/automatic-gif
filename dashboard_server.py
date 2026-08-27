@@ -37,7 +37,7 @@ from article_publisher import (
     RemoteGifUploadClient,
     environment_boolean,
 )
-from article_draft_queue import ArticleDraftQueue
+from article_draft_queue import ArticleDraftQueue, ocr_publication_eligibility
 from disk_lifecycle import DiskLifecycleManager, DiskLifecyclePolicy
 from event_api_response import EventApiResponseError, normalize_event_api_response
 from heavy_task_coordinator import HeavyTaskCoordinator, HeavyTaskCoordinatorError
@@ -127,15 +127,17 @@ GIF_UPLOAD_TIMEOUT_SECONDS = _positive_environment_float(
     "GIF_UPLOAD_TIMEOUT_SECONDS", 120.0
 )
 ARTICLE_PUBLISH_ENABLED = environment_boolean("ARTICLE_PUBLISH_ENABLED", True)
-# OCR GIFs are published explicitly from the event row.  Keep the old draft
-# queue available for existing records and manual retries, but do not create
-# drafts in the background before the operator clicks Publish.
-OCR_DRAFT_AUTO_CREATE = environment_boolean("OCR_DRAFT_AUTO_CREATE", False)
+# OCR GIF article delivery is automatic. The environment switch remains so an
+# operator can stop article delivery without stopping GIF generation.
+OCR_DRAFT_AUTO_CREATE = environment_boolean("OCR_DRAFT_AUTO_CREATE", True)
 OCR_DRAFT_POLL_SECONDS = _positive_environment_float(
     "OCR_DRAFT_POLL_SECONDS", 2.0
 )
 OCR_DRAFT_LEASE_SECONDS = _positive_environment_float(
     "OCR_DRAFT_LEASE_SECONDS", 180.0
+)
+OCR_DRAFT_PERSON_WAIT_SECONDS = _positive_environment_float(
+    "OCR_DRAFT_PERSON_WAIT_SECONDS", 60.0
 )
 OCR_DRAFT_RECONCILE_LOOKBACK_SECONDS = _positive_environment_float(
     "OCR_DRAFT_RECONCILE_LOOKBACK_SECONDS", 15 * 60
@@ -1749,6 +1751,38 @@ def _canonicalize_event_rows(
     return list(reversed(canonical_rows))
 
 
+def _latest_ocr_article_event(
+    match_id: str, event_key: str, current_event: dict[str, Any]
+) -> dict[str, Any]:
+    """Resolve one article event from durable state and one fresh API snapshot."""
+    latest = dict(current_event)
+    database_path = DEFAULT_OUTPUT / str(match_id) / "pipeline_state.sqlite3"
+    tasks, aliases, suppressed_keys = _tasks_from_database(database_path)
+    for task in tasks:
+        task_key = str(task.get("event_key") or "")
+        canonical_key = str(aliases.get(task_key) or task_key)
+        if (
+            canonical_key == event_key
+            and task_key not in suppressed_keys
+            and canonical_key not in suppressed_keys
+        ):
+            latest = _merge_event_details(latest, task)
+
+    try:
+        api_events = flatten_events(query_events(str(match_id)))
+    except Exception:
+        api_events = []
+    candidates = [
+        event
+        for event in api_events
+        if events_represent_same_incident(latest, event)
+    ]
+    if len(candidates) == 1:
+        latest = _merge_event_details(latest, candidates[0])
+    latest["event_key"] = event_key
+    return latest
+
+
 def _latest_ingest_message(
     output_dir: Path,
     *,
@@ -2130,6 +2164,7 @@ def _session_json(session: MatchSession) -> dict[str, Any]:
         "publishing": {
             "enabled": ARTICLE_PUBLISH_ENABLED,
             "remote_upload_enabled": bool(GIF_UPLOAD_ENDPOINT),
+            "ocr_automatic": OCR_DRAFT_AUTO_CREATE,
         },
         "status": session.status(),
         "status_label": MATCH_STATUS_LABELS.get(session.status(), "未知"),
@@ -2775,6 +2810,8 @@ class Dashboard:
             return 0
         root = DEFAULT_OUTPUT if output_root is None else output_root
         generated_after = time.time() - OCR_DRAFT_RECONCILE_LOOKBACK_SECONDS
+        if isinstance(queue.auto_publish_after_unix, (int, float)):
+            generated_after = max(generated_after, queue.auto_publish_after_unix)
         try:
             entries = list(os.scandir(root))
         except (FileNotFoundError, OSError):
@@ -3804,6 +3841,8 @@ article_draft_queue = ArticleDraftQueue(
     allowed_output_root=DEFAULT_OUTPUT,
     poll_seconds=OCR_DRAFT_POLL_SECONDS,
     lease_seconds=OCR_DRAFT_LEASE_SECONDS,
+    person_wait_seconds=OCR_DRAFT_PERSON_WAIT_SECONDS,
+    latest_event_loader=_latest_ocr_article_event,
     start_worker=False,
 )
 app = Flask(__name__, static_folder="dashboard_static", static_url_path="/static")
@@ -4250,6 +4289,30 @@ def article_publish():
                 stage="request_validation",
                 status_code=404,
             )
+        if artifact_kind == "ocr_window":
+            ocr_artifact = event.get("ocr_window")
+            if not isinstance(ocr_artifact, dict):
+                artifacts = event.get("vision_artifacts")
+                ocr_artifact = (
+                    artifacts.get("ocr_window")
+                    if isinstance(artifacts, dict)
+                    else None
+                )
+            eligibility = ocr_publication_eligibility(ocr_artifact)
+            if not eligibility.get("eligible"):
+                raise ArticlePublishError(
+                    str(
+                        eligibility.get("reason")
+                        or "OCR GIF 不符合文章发布条件"
+                    ),
+                    code=str(
+                        eligibility.get("reason_code")
+                        or "auto_publish_not_eligible"
+                    ),
+                    stage="publication_gate",
+                    status_code=409,
+                    diagnostics={"publication_eligibility": eligibility},
+                )
         gif_id = str(body.get("gif_id") or "").strip()
         uploaded = None
         if gif_id:

@@ -379,6 +379,71 @@ def _record_scoreboard_roi_failure(
         )
 
 
+def _ocr_recoverable_profile_mismatch(
+    error_kind: str,
+    diagnostics: Any,
+    clock_samples: Any,
+) -> bool:
+    """Treat a short post-gap probe as insufficient media, not a bad ROI."""
+    if (
+        error_kind != "clock_profile_mismatch"
+        or _ocr_progressive_clock_mapping(clock_samples).get("status") != "ready"
+        or not isinstance(diagnostics, dict)
+    ):
+        return False
+    attempts = diagnostics.get("fragment_attempts")
+    if not isinstance(attempts, list) or not attempts:
+        return False
+    for attempt in attempts:
+        if not isinstance(attempt, dict):
+            return False
+        attempt_kind = attempt.get("error_kind")
+        direct_fallback = attempt.get("direct_clock_roi_fallback")
+        fallback_kind = (
+            direct_fallback.get("error_kind")
+            if isinstance(direct_fallback, dict)
+            else None
+        )
+        if (
+            attempt_kind != "clock_profile_mismatch"
+            and fallback_kind != "clock_profile_mismatch"
+        ):
+            return False
+        try:
+            start = float(attempt["window_start"])
+            end = float(attempt["window_end"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        if (
+            not math.isfinite(start)
+            or not math.isfinite(end)
+            or end <= start
+            or end - start
+            > OCR_CLOCK_READINESS_PROBE_SECONDS
+            + OCR_PROGRESSIVE_TAIL_EPSILON_SECONDS
+        ):
+            return False
+        detail_roots = [attempt.get("diagnostics")]
+        if isinstance(direct_fallback, dict):
+            detail_roots.append(direct_fallback.get("diagnostics"))
+        for detail in detail_roots:
+            if not isinstance(detail, dict):
+                continue
+            # These fields prove that the configured ROI itself is invalid.
+            # They are unrelated to having too few frames after a stream gap.
+            if any(
+                key in detail
+                for key in (
+                    "aspect_ratio_difference",
+                    "aspect_ratio_tolerance",
+                    "available_profile_ids",
+                    "reference_resolution",
+                )
+            ):
+                return False
+    return True
+
+
 def _tdeed_error_kind(error: BaseException) -> str:
     if isinstance(error, VisionConfigurationError):
         return "tdeed_model_unavailable"
@@ -6174,19 +6239,32 @@ def _process_ocr_window(
                     cancel_event=cancel_event,
                 )
             except VisualLocationFailed as exc:
-                _record_scoreboard_roi_failure(
-                    runtime,
-                    job,
-                    exc.kind,
-                    cached=cached_scoreboard_roi,
+                recoverable_profile_mismatch = bool(
+                    job.clock_only
+                    and progressive_scan
+                    and _ocr_recoverable_profile_mismatch(
+                        exc.kind,
+                        exc.diagnostics,
+                        clock_samples,
+                    )
                 )
+                if not recoverable_profile_mismatch:
+                    _record_scoreboard_roi_failure(
+                        runtime,
+                        job,
+                        exc.kind,
+                        cached=cached_scoreboard_roi,
+                    )
                 if _ocr_target_revision_is_stale(
                     runtime, job.event_key, worker_target_revision
                 ):
                     return False
                 if (
                     not progressive_scan
-                    or exc.kind not in OCR_PROGRESSIVE_SCAN_MISS_KINDS
+                    or (
+                        exc.kind not in OCR_PROGRESSIVE_SCAN_MISS_KINDS
+                        and not recoverable_profile_mismatch
+                    )
                 ):
                     raise
                 scanned_clock_samples = _ocr_progressive_merge_clock_samples(
@@ -6489,6 +6567,14 @@ def _process_ocr_window(
                     message=(
                         "上一轮 OCR 用时较长，正在重新扫描新增视频尾部"
                         if long_scan_tail_rescan
+                        else (
+                            "已读到 "
+                            f"{_clock_text_from_seconds(scanned_trusted) or '有效比赛时间'}，"
+                            "目标 "
+                            f"{_clock_text_from_seconds(target_clock_seconds) or '接口时间'}；"
+                            "直播中断后正在继续检查恢复画面"
+                        )
+                        if recoverable_profile_mismatch
                         else "latest trustworthy OCR clock has not reached the target"
                         if target_not_reached
                         else "target clock has not yet yielded a verified OCR anchor"
@@ -6505,6 +6591,9 @@ def _process_ocr_window(
                         "media_tail_after_scan": latest_end,
                         "media_tail_grew_during_scan": media_tail_grew_during_scan,
                         "long_scan_tail_rescan": long_scan_tail_rescan,
+                        "recoverable_profile_mismatch": (
+                            recoverable_profile_mismatch
+                        ),
                         "scoreboard_roi_cache": readiness_roi_cache,
                         "predicted_target_media_ready": predicted_target_media_ready,
                         "post_scan_target_window": post_scan_target_window,

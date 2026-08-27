@@ -732,11 +732,63 @@ class ArticlePublisher:
         archive_id: str | int | None = None,
     ) -> dict[str, Any]:
         """Create or update an OCR GIF draft without touching publish records."""
-        event_key = str(event.get("event_key") or "").strip()
-        if not event_key:
+        if not str(event.get("event_key") or "").strip():
             raise ArticlePublishError(
                 "事件缺少稳定标识，无法创建草稿",
                 code="draft_event_key_missing",
+                stage="request_validation",
+            )
+        return self.create_or_update_article(
+            match_id=match_id,
+            event=event,
+            match_detail=match_detail,
+            source_path=source_path,
+            delivery_mode="draft",
+            archive_id=archive_id,
+        )
+
+    def publish_draft(
+        self,
+        *,
+        match_id: str,
+        event: dict[str, Any],
+        match_detail: dict[str, Any],
+        source_path: Path,
+        archive_id: str | int,
+    ) -> dict[str, Any]:
+        """Update one existing OCR GIF draft and make it public."""
+        if archive_id is None or not str(archive_id).strip():
+            raise ArticlePublishError(
+                "发布草稿需要有效的数字文章 ID",
+                code="publish_archive_id_missing",
+                stage="request_validation",
+                status_code=400,
+            )
+        return self.create_or_update_article(
+            match_id=match_id,
+            event=event,
+            match_detail=match_detail,
+            source_path=source_path,
+            delivery_mode="publish",
+            archive_id=archive_id,
+        )
+
+    def create_or_update_article(
+        self,
+        *,
+        match_id: str,
+        event: dict[str, Any],
+        match_detail: dict[str, Any],
+        source_path: Path,
+        delivery_mode: str = "draft",
+        archive_id: str | int | None = None,
+    ) -> dict[str, Any]:
+        """Create or update an OCR GIF article as a draft or published article."""
+        event_key = str(event.get("event_key") or "").strip()
+        if not event_key:
+            raise ArticlePublishError(
+                "事件缺少稳定标识，无法创建或更新文章",
+                code="article_event_key_missing",
                 stage="request_validation",
             )
 
@@ -749,7 +801,7 @@ class ArticlePublisher:
                 event=event,
                 gif_url=str(gif["url"]),
                 title=title,
-                delivery_mode="draft",
+                delivery_mode=delivery_mode,
                 archive_id=archive_id,
             )
             try:
@@ -800,7 +852,7 @@ class ArticlePublisher:
                 "article_id": str(result["article_id"]),
                 "gif": gif,
                 "title": title,
-                "delivery_mode": "draft",
+                "delivery_mode": delivery_mode,
                 "updated": archive_id is not None,
                 "duplicate": bool(result.get("duplicate")),
                 "platform_code": result.get("code"),

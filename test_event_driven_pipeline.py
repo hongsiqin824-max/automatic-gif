@@ -175,6 +175,33 @@ class EventVisualLeaseTests(unittest.TestCase):
             self.assertEqual(called["source_path"], root / "ocr.gif")
             self.assertEqual(called["artifact_result"]["visual_resolution"], "ocr_second_exact")
             draft_queue.reset_mock()
+            self.assertTrue(
+                runtime.update_task_event(
+                    {
+                        "event_key": event_key,
+                        "code": "G",
+                        "event_type": "goal",
+                        "minute": "19",
+                        "team": "teamA",
+                        "person": "后来补齐的球员",
+                        "score": "1-0",
+                    }
+                )
+            )
+            self.assertTrue(
+                enqueue_encoded_ocr_draft(
+                    draft_queue,
+                    runtime,
+                    match_id="54478914",
+                    event_key=event_key,
+                    match_detail={},
+                )
+            )
+            self.assertEqual(
+                draft_queue.enqueue.call_args.kwargs["event"]["person"],
+                "后来补齐的球员",
+            )
+            draft_queue.reset_mock()
             runtime.store.suppress_task(event_key, "54478914:G:canonical")
             self.assertFalse(
                 enqueue_encoded_ocr_draft(
