@@ -142,6 +142,64 @@ class ArticlePublisherTests(unittest.TestCase):
             self.assertEqual(first["status"], "success")
             self.assertTrue(second["idempotent_replay"])
 
+    def test_automatic_article_uses_shared_remote_upload_and_reuses_mapping(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "ocr.gif"
+            source.write_bytes(animated_gif_bytes())
+            platform = FakePlatformClient()
+            remote = RemoteGifUploadClient("https://upload.example/api", "secret")
+            publisher = ArticlePublisher(
+                platform_client=platform,
+                gif_store=PublishedGifStore(
+                    root / "published", "https://matchgif.aisportsapp.com"
+                ),
+                database_path=root / "publish.sqlite3",
+                public_url_checker=lambda _url: None,
+                remote_upload_client=remote,
+            )
+            gif_id = __import__("hashlib").sha256(animated_gif_bytes()).hexdigest()
+            remote_result = {
+                "gif_id": gif_id,
+                "path": str(root / "published" / f"{gif_id}.gif"),
+                "url": f"https://matchgif.aisportsapp.com/publish-gifs/{gif_id}.gif",
+                "bytes": len(animated_gif_bytes()),
+                "animated": True,
+                "frame_count": 2,
+                "header": "GIF89a",
+            }
+            event = {
+                "event_key": "goal-19",
+                "code": "G",
+                "minute": "19",
+            }
+
+            with patch.object(remote, "upload", return_value=remote_result) as upload:
+                first = publisher.create_or_update_draft(
+                    match_id="54478914",
+                    event=event,
+                    match_detail={},
+                    source_path=source,
+                )
+                second = publisher.create_or_update_draft(
+                    match_id="54478914",
+                    event=event,
+                    match_detail={},
+                    source_path=source,
+                    archive_id=first["article_id"],
+                )
+
+            upload.assert_called_once()
+            self.assertEqual(upload.call_args.kwargs["artifact_kind"], "ocr_window")
+            self.assertEqual(first["gif"]["url"], remote_result["url"])
+            self.assertEqual(second["gif"]["url"], remote_result["url"])
+            self.assertIn(remote_result["url"], platform.calls[0]["body"])
+            self.assertIn(remote_result["url"], platform.calls[1]["body"])
+            uploaded = publisher.uploaded_gif_for(
+                "54478914", "goal-19", "ocr_window"
+            )
+            self.assertEqual(uploaded["gif_id"], gif_id)
+
     def test_upload_gif_persists_and_associates_with_event(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

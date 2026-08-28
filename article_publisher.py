@@ -579,6 +579,44 @@ class ArticlePublisher:
             "uploaded_at_unix": row["uploaded_at_unix"],
         }
 
+    def _prepare_public_gif(
+        self,
+        *,
+        source_path: Path,
+        match_id: str,
+        event_key: str,
+        artifact_kind: str,
+    ) -> dict[str, Any]:
+        """Persist a GIF locally and make it available at its public URL."""
+        local_gif = self.gif_store.create(source_path)
+        uploaded = self.uploaded_gif_for(match_id, event_key, artifact_kind)
+        if uploaded and uploaded.get("gif_id") == local_gif["gif_id"]:
+            return uploaded
+        if not self.remote_upload_client or not self.remote_upload_client.enabled:
+            return local_gif
+
+        gif = self.remote_upload_client.upload(
+            source_path=Path(local_gif["path"]),
+            match_id=match_id,
+            event_key=event_key,
+            artifact_kind=artifact_kind,
+            max_bytes=self.gif_store.max_bytes,
+        )
+        if gif["gif_id"] != local_gif["gif_id"]:
+            raise ArticlePublishError(
+                "服务器保存后的 GIF 与本地文件不一致，已停止发布",
+                code="remote_gif_upload_hash_mismatch",
+                stage="remote_gif_upload",
+                status_code=502,
+            )
+        self._save_uploaded_mapping(
+            match_id=match_id,
+            event_key=event_key,
+            artifact_kind=artifact_kind,
+            gif=gif,
+        )
+        return gif
+
     def publish(
         self,
         *,
@@ -612,36 +650,12 @@ class ArticlePublisher:
             )
 
         with self._lock:
-            # Keep a local content-addressed copy for retry/idempotency, then
-            # optionally upload that copy to the storage-only server.  The
-            # Open Platform request below always runs in this process.
-            local_gif = self.gif_store.create(source_path)
-            uploaded = self.uploaded_gif_for(match_id, event_key, artifact_kind)
-            if uploaded and uploaded.get("gif_id") == local_gif["gif_id"]:
-                gif = uploaded
-            elif self.remote_upload_client and self.remote_upload_client.enabled:
-                gif = self.remote_upload_client.upload(
-                    source_path=Path(local_gif["path"]),
-                    match_id=match_id,
-                    event_key=event_key,
-                    artifact_kind=artifact_kind,
-                    max_bytes=self.gif_store.max_bytes,
-                )
-                if gif["gif_id"] != local_gif["gif_id"]:
-                    raise ArticlePublishError(
-                        "服务器保存后的 GIF 与本地文件不一致，已停止发布",
-                        code="remote_gif_upload_hash_mismatch",
-                        stage="remote_gif_upload",
-                        status_code=502,
-                    )
-                self._save_uploaded_mapping(
-                    match_id=match_id,
-                    event_key=event_key,
-                    artifact_kind=artifact_kind,
-                    gif=gif,
-                )
-            else:
-                gif = local_gif
+            gif = self._prepare_public_gif(
+                source_path=source_path,
+                match_id=match_id,
+                event_key=event_key,
+                artifact_kind=artifact_kind,
+            )
             stable_id = hashlib.sha256(
                 f"{match_id}\n{event_key}\n{gif['gif_id']}".encode("utf-8")
             ).hexdigest()
@@ -794,7 +808,12 @@ class ArticlePublisher:
 
         with self._lock:
             started_at = time.monotonic()
-            gif = self.gif_store.create(source_path)
+            gif = self._prepare_public_gif(
+                source_path=source_path,
+                match_id=match_id,
+                event_key=event_key,
+                artifact_kind="ocr_window",
+            )
             title = build_article_title(event, match_detail)
             fields = build_article_fields(
                 match_id=match_id,
