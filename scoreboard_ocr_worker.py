@@ -61,6 +61,9 @@ AUTO_REACQUIRE_MISSING_FRAMES = 8
 AUTO_SEARCH_BATCH_FRAMES = 5
 AUTO_MAXIMUM_ANALYSIS_SECONDS = 360.0
 CLOCK_PREPROCESS_VARIANTS = ("gray_contrast_sharp", "binary_contrast")
+INDEPENDENT_STOPPAGE_BASE_MINUTES = (45, 90)
+INDEPENDENT_STOPPAGE_MAX_MINUTES = 15
+INDEPENDENT_STOPPAGE_MIN_OBSERVATIONS = 3
 
 _CLOCK_CHARACTER_TRANSLATION = str.maketrans(
     {
@@ -1730,6 +1733,7 @@ def _locate_goal_second(
     sample_interval_seconds: float,
     diagnostics: dict[str, Any],
     allow_nearby_observed_clock: bool = False,
+    minimum_confidence: float = 0.35,
 ) -> dict[str, Any]:
     target_clock = _clock_text(event_second)
     segments = _clock_segments(
@@ -1757,16 +1761,27 @@ def _locate_goal_second(
 
     observed_candidates: list[_ClockSecondCandidate] = []
     interpolated_candidates: list[_ClockSecondCandidate] = []
+    isolated_target_candidates: list[_ClockSecondCandidate] = []
     isolated_target_reading_count = 0
-    accepted_isolated_target_reading_count = 0
     for segment_index, segment in enumerate(segments):
         for reading in segment:
             if reading.clock_seconds == event_second:
                 if len(segment) < 2:
                     isolated_target_reading_count += 1
-                    # One isolated OCR value can be a false positive. Keep it
-                    # in diagnostics, but require an adjacent continuity
-                    # reading before authorizing an exact-second anchor.
+                    if (
+                        _direct_estimate_clock_reading(reading)
+                        and reading.mean_confidence is not None
+                        and reading.mean_confidence >= minimum_confidence
+                    ):
+                        isolated_target_candidates.append(
+                            _ClockSecondCandidate(
+                                reading.frame_seconds,
+                                "paddleocr_single_frame_target",
+                                "estimated_second",
+                                segment_index,
+                                reading,
+                            )
+                        )
                     continue
                 observed_candidates.append(
                     _ClockSecondCandidate(
@@ -1804,6 +1819,7 @@ def _locate_goal_second(
     # Preserve the established exact contract: a direct observation wins, then
     # a local two-sided interpolation. Wider nearby/mapping recovery comes later.
     candidates = observed_candidates or interpolated_candidates
+    accepted_isolated_target_reading_count = len(isolated_target_candidates)
     candidate_source = (
         "direct_observation"
         if observed_candidates
@@ -1835,6 +1851,79 @@ def _locate_goal_second(
                 ],
             },
         )
+    if not candidates and isolated_target_candidates:
+        isolated_occurrence_count = len(isolated_target_candidates)
+        if isolated_occurrence_count != 1:
+            raise WorkerError(
+                "ocr_ambiguous",
+                f"the isolated target match clock {target_clock} had conflicting OCR evidence",
+                diagnostics={
+                    **match_diagnostics,
+                    "accepted_isolated_target_reading_count": (
+                        accepted_isolated_target_reading_count
+                    ),
+                    "exact_second_failure_reason": (
+                        "conflicting_isolated_target_observations"
+                    ),
+                    "matching_occurrence_count": isolated_occurrence_count,
+                    "matching_frame_seconds": [
+                        round(candidate.frame_seconds, 3)
+                        for candidate in isolated_target_candidates
+                    ],
+                },
+            )
+        selected = isolated_target_candidates[0]
+        anchor = candidate_start_seconds + selected.frame_seconds
+        error_bound = round(max(0.5, sample_interval_seconds / 2.0), 3)
+        degradation_reason = {
+            "kind": "single_frame_target_observation",
+            "message": (
+                f"the target match clock {target_clock} was clearly read in one "
+                "frame, but no adjacent clock reading was available to confirm it"
+            ),
+            "target_clock_directly_observed": True,
+            "estimated_error_bound_seconds": error_bound,
+        }
+        diagnostics.update({
+            **match_diagnostics,
+            "accepted_isolated_target_reading_count": 1,
+            "matching_occurrence_count": 1,
+            "exact_second_candidate_source": (
+                "single_frame_target_observation"
+            ),
+            "exact_second_method": selected.method,
+            "exact_second_precision": selected.precision,
+            "target_frame_seconds": round(selected.frame_seconds, 3),
+            "target_clock_directly_observed": True,
+            "single_frame_mean_confidence": round(
+                float(selected.left.mean_confidence), 4
+            ),
+            "single_frame_minimum_confidence": minimum_confidence,
+            "estimated_error_bound_seconds": error_bound,
+            "interpolation_clock_bounds": None,
+            "interpolation_frame_bounds": None,
+        })
+        return {
+            "anchor_seconds": round(anchor, 3),
+            "method": selected.method,
+            "precision": selected.precision,
+            "location_kind": "match_clock_second",
+            "localization_quality": "estimated",
+            "degraded": True,
+            "degradation_mode": "single_frame_target_observation",
+            "degradation_reason": degradation_reason,
+            "target_clock_directly_observed": True,
+            "estimated_error_bound_seconds": error_bound,
+            "estimated_error_bound_label": f"+/-{error_bound:g}s",
+            "target_clock": target_clock,
+            "target_clock_seconds": event_second,
+            "observed_clock": target_clock,
+            "observed_clock_seconds": event_second,
+            "observed_clock_delta_seconds": 0,
+            "observed_clock_distance_seconds": 0,
+            "requires_tdeed": False,
+            "diagnostics": diagnostics,
+        }
     nearby_observations: list[_ClockSecondEstimate] = []
     if (
         not candidates
@@ -2179,6 +2268,7 @@ def _locate_minute_boundary(
     candidate_start_seconds: float,
     sample_interval_seconds: float,
     diagnostics: dict[str, Any],
+    minimum_confidence: float = 0.35,
 ) -> dict[str, Any]:
     """Locate the end boundary of the API event minute.
 
@@ -2194,6 +2284,7 @@ def _locate_minute_boundary(
             sample_interval_seconds=sample_interval_seconds,
             diagnostics=diagnostics,
             allow_nearby_observed_clock=True,
+            minimum_confidence=minimum_confidence,
         )
     except WorkerError as exc:
         if exc.kind == "ocr_invalid_request":
@@ -2644,7 +2735,12 @@ def locate_from_readings(
     clock_only = raw_clock_only
     sample_interval = float(request.get("sample_interval_seconds", 1.0))
     candidate_start = float(request.get("candidate_start_seconds", 0.0))
-    if sample_interval <= 0 or candidate_start < 0:
+    minimum_confidence = float(request.get("minimum_confidence", 0.35))
+    if (
+        sample_interval <= 0
+        or candidate_start < 0
+        or not 0 <= minimum_confidence <= 1
+    ):
         raise WorkerError("ocr_invalid_request", "invalid OCR timeline parameters")
     diagnostics = _base_diagnostics(
         ordered,
@@ -2684,6 +2780,7 @@ def locate_from_readings(
                 sample_interval_seconds=sample_interval,
                 diagnostics=dict(diagnostics),
                 allow_nearby_observed_clock=True,
+                minimum_confidence=minimum_confidence,
             )
             if clock_only:
                 exact["clock_only"] = True
@@ -2700,6 +2797,7 @@ def locate_from_readings(
                 candidate_start_seconds=candidate_start,
                 sample_interval_seconds=sample_interval,
                 diagnostics=diagnostics,
+                minimum_confidence=minimum_confidence,
             )
         except WorkerError as boundary_error:
             if exact_second_error is None:
@@ -3967,6 +4065,171 @@ def _integer_roi(bbox: BBox, frame_width: int, frame_height: int) -> tuple[int, 
     return x1, y1, x2, y2
 
 
+def _independent_stoppage_base_minute(
+    request: Mapping[str, Any],
+) -> int | None:
+    """Enable auxiliary stoppage-clock OCR only for an explicit 45+/90+ event."""
+    raw_minute = str(request.get("event_minute") or "").strip()
+    match = re.fullmatch(r"(\d{1,3})\s*\+\s*\d{1,2}", raw_minute)
+    if match is None:
+        return None
+    base_minute = int(match.group(1))
+    if base_minute not in INDEPENDENT_STOPPAGE_BASE_MINUTES:
+        return None
+    event_second = request.get("event_second")
+    if event_second is not None:
+        try:
+            if int(event_second) <= base_minute * 60:
+                return None
+        except (TypeError, ValueError):
+            return None
+    return base_minute
+
+
+def _independent_stoppage_candidate_rois(
+    clock_roi: BBox,
+    *,
+    frame_width: int,
+    frame_height: int,
+) -> tuple[tuple[str, BBox], ...]:
+    """Return narrow right/below crops without changing the primary clock ROI."""
+    x1, y1, x2, y2 = clock_roi
+    width = max(1.0, x2 - x1)
+    height = max(1.0, y2 - y1)
+    candidates = (
+        (
+            "right",
+            (
+                x2,
+                max(0.0, y1 - height * 0.5),
+                min(float(frame_width), x2 + width * 2.0),
+                min(float(frame_height), y2 + height * 0.5),
+            ),
+        ),
+        (
+            "below",
+            (
+                max(0.0, x1 - width * 0.5),
+                y2,
+                min(float(frame_width), x2 + width * 1.5),
+                min(float(frame_height), y2 + height * 2.0),
+            ),
+        ),
+    )
+    return tuple(
+        (label, roi)
+        for label, roi in candidates
+        if roi[2] - roi[0] >= 2.0 and roi[3] - roi[1] >= 2.0
+    )
+
+
+def extract_independent_stoppage_frames(
+    candidate_path: Path,
+    output_dir: Path,
+    *,
+    ffmpeg: str,
+    sample_interval_seconds: float,
+    frame_width: int,
+    frame_height: int,
+    clock_roi: BBox,
+    maximum_frames: int,
+    deadline_monotonic: float | None,
+    input_format: str | None = None,
+    input_seek_seconds: float = 0.0,
+    input_duration_seconds: float | None = None,
+) -> tuple[list[Path], list[str], dict[str, Any]]:
+    """Extract independent right/below timer candidates for stoppage events."""
+    candidates = [
+        (label, _integer_roi(roi, frame_width, frame_height))
+        for label, roi in _independent_stoppage_candidate_rois(
+            clock_roi,
+            frame_width=frame_width,
+            frame_height=frame_height,
+        )
+    ]
+    if not candidates:
+        return [], [], {"candidate_rois": {}, "frame_count": 0}
+    frame_rate = 1.0 / sample_interval_seconds
+    command = [ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error"]
+    if input_format == "ffconcat":
+        command.extend(["-f", "concat", "-safe", "0"])
+    command.extend(["-i", str(candidate_path)])
+    if input_seek_seconds > 0:
+        command.extend(["-ss", f"{input_seek_seconds:.6f}"])
+    if input_duration_seconds is not None:
+        command.extend(["-t", f"{input_duration_seconds:.6f}"])
+    labels = [label for label, _roi in candidates]
+    split_sources = [f"stoppage_source_{index}" for index in range(len(candidates))]
+    filter_graph = (
+        f"[0:v]fps={frame_rate:.8f},split={len(candidates)}"
+        + "".join(f"[{source}]" for source in split_sources)
+        + ";"
+    )
+    for index, ((_label, (x1, y1, x2, y2)), source) in enumerate(
+        zip(candidates, split_sources)
+    ):
+        filter_graph += (
+            f"[{source}]crop={x2 - x1}:{y2 - y1}:{x1}:{y1},"
+            f"scale=iw*3:ih*3:flags=lanczos[stoppage_{index}];"
+        )
+    command.extend(["-an", "-filter_complex", filter_graph.rstrip(";")])
+    for index, label in enumerate(labels):
+        pattern = output_dir / f"stoppage_{label}_%06d.png"
+        command.extend([
+            "-map",
+            f"[stoppage_{index}]",
+            "-frames:v",
+            str(maximum_frames),
+            str(pattern),
+        ])
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            text=True,
+            capture_output=True,
+            timeout=_remaining_seconds(
+                deadline_monotonic, stage="stoppage_frame_extraction"
+            ),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise WorkerError(
+            "inference_timeout",
+            "FFmpeg timed out while extracting independent stoppage timer crops",
+            diagnostics={"stage": "stoppage_frame_extraction"},
+        ) from exc
+    except OSError as exc:
+        raise WorkerError(
+            "ocr_model_unavailable",
+            f"cannot start FFmpeg for stoppage timer extraction: {exc}",
+        ) from exc
+    if completed.returncode != 0:
+        raise WorkerError(
+            "ocr_frame_extraction_failed",
+            "FFmpeg could not extract independent stoppage timer crops",
+            diagnostics={"ffmpeg_stderr": (completed.stderr or "")[-2000:]},
+        )
+    streams = {
+        label: sorted(output_dir.glob(f"stoppage_{label}_*.png"))
+        for label in labels
+    }
+    frame_count = min((len(paths) for paths in streams.values()), default=0)
+    paths: list[Path] = []
+    path_labels: list[str] = []
+    for frame_index in range(frame_count):
+        for label in labels:
+            paths.append(streams[label][frame_index])
+            path_labels.append(label)
+    return paths, path_labels, {
+        "candidate_rois": {
+            label: list(roi) for label, roi in candidates
+        },
+        "candidate_labels": labels,
+        "frame_count": frame_count,
+        "conditional": True,
+    }
+
+
 def extract_auto_roi_frames(
     candidate_path: Path,
     output_dir: Path,
@@ -4584,31 +4847,257 @@ def _request_period(request: Mapping[str, Any]) -> int | str | None:
         return None
 
 
+def _independent_stoppage_results_by_frame(
+    recognized: Sequence[tuple[list[str], list[float]]],
+    labels: Sequence[str],
+) -> list[dict[str, tuple[list[str], list[float]]]]:
+    if len(recognized) != len(labels):
+        raise ValueError("stoppage OCR results and labels must have equal lengths")
+    if not labels:
+        return []
+    first_label = labels[0]
+    frames: list[dict[str, tuple[list[str], list[float]]]] = []
+    current: dict[str, tuple[list[str], list[float]]] | None = None
+    for label, result in zip(labels, recognized):
+        if label == first_label:
+            current = {}
+            frames.append(current)
+        if current is None or label in current:
+            raise ValueError("stoppage OCR candidate streams are not frame aligned")
+        current[label] = result
+    return frames
+
+
+def _independent_stoppage_elapsed_seconds(texts: Sequence[str]) -> int | None:
+    parsed = parse_clock_texts(texts)
+    if (
+        parsed.clock_seconds is None
+        or parsed.ambiguous
+        or parsed.precision != "second"
+        or parsed.clock_format not in {"continuous", "compact"}
+    ):
+        return None
+    minute, _second = divmod(parsed.clock_seconds, 60)
+    if not 0 <= minute <= INDEPENDENT_STOPPAGE_MAX_MINUTES:
+        return None
+    return parsed.clock_seconds
+
+
+def _confirmed_independent_stoppage_overrides(
+    main_results: Sequence[tuple[list[str], list[float]]],
+    candidate_frames: Sequence[
+        Mapping[str, tuple[list[str], list[float]]]
+    ],
+    *,
+    base_minute: int | None,
+    sample_interval: float,
+) -> tuple[dict[int, tuple[list[str], list[float]]], dict[str, Any]]:
+    """Convert a separately running stoppage timer after three coherent frames."""
+    diagnostics: dict[str, Any] = {
+        "enabled": base_minute is not None,
+        "base_minute": base_minute,
+        "minimum_observations": INDEPENDENT_STOPPAGE_MIN_OBSERVATIONS,
+        "confirmed": False,
+        "confirmed_channels": [],
+        "static_candidate_rejected": False,
+    }
+    if base_minute is None or not candidate_frames:
+        return {}, diagnostics
+    frame_count = min(len(main_results), len(candidate_frames))
+    labels = sorted({label for frame in candidate_frames[:frame_count] for label in frame})
+    confirmed: dict[str, list[tuple[int, int, float]]] = {}
+    observed_by_label: dict[str, list[dict[str, Any]]] = {}
+    for label in labels:
+        observations: list[dict[str, Any]] = []
+        runs: list[list[tuple[int, int, float]]] = []
+        current_run: list[tuple[int, int, float]] = []
+        static_run: list[tuple[int, int]] = []
+        for frame_index in range(frame_count):
+            main_texts, _main_confidences = main_results[frame_index]
+            main_clock = parse_clock_texts(main_texts)
+            result = candidate_frames[frame_index].get(label, ([], []))
+            texts, confidences = result
+            elapsed = _independent_stoppage_elapsed_seconds(texts)
+            main_is_frozen_base = bool(
+                main_clock.clock_seconds == base_minute * 60
+                and not main_clock.ambiguous
+            )
+            observations.append({
+                "frame_index": frame_index,
+                "texts": list(texts),
+                "elapsed_seconds": elapsed,
+                "main_is_frozen_base": main_is_frozen_base,
+            })
+            confidence = min((float(value) for value in confidences), default=0.0)
+            if elapsed is None or not main_is_frozen_base:
+                if current_run:
+                    runs.append(current_run)
+                    current_run = []
+                static_run = []
+                continue
+            if (
+                static_run
+                and frame_index == static_run[-1][0] + 1
+                and elapsed == static_run[-1][1]
+            ):
+                static_run.append((frame_index, elapsed))
+            else:
+                static_run = [(frame_index, elapsed)]
+            if len(static_run) >= INDEPENDENT_STOPPAGE_MIN_OBSERVATIONS:
+                diagnostics["static_candidate_rejected"] = True
+            if current_run:
+                previous_index, previous_elapsed, _previous_confidence = current_run[-1]
+                video_delta = (frame_index - previous_index) * sample_interval
+                clock_delta = elapsed - previous_elapsed
+                allowed_deviation = max(1.0, video_delta * 0.35)
+                if (
+                    frame_index != previous_index + 1
+                    or clock_delta <= 0
+                    or abs(clock_delta - video_delta) > allowed_deviation
+                ):
+                    runs.append(current_run)
+                    current_run = []
+            current_run.append((frame_index, elapsed, confidence))
+        if current_run:
+            runs.append(current_run)
+        observed_by_label[label] = observations
+        qualified = [
+            run for run in runs
+            if len(run) >= INDEPENDENT_STOPPAGE_MIN_OBSERVATIONS
+        ]
+        if qualified:
+            confirmed[label] = max(qualified, key=len)
+    diagnostics["observations"] = observed_by_label
+    if not confirmed:
+        return {}, diagnostics
+
+    overrides: dict[int, tuple[list[str], list[float]]] = {}
+    conflicts: list[int] = []
+    for frame_index in range(frame_count):
+        candidates = [
+            (label, elapsed, confidence)
+            for label, run in confirmed.items()
+            for index, elapsed, confidence in run
+            if index == frame_index
+        ]
+        elapsed_values = {elapsed for _label, elapsed, _confidence in candidates}
+        if len(elapsed_values) != 1:
+            if len(elapsed_values) > 1:
+                conflicts.append(frame_index)
+            continue
+        elapsed = next(iter(elapsed_values))
+        added_minute, second = divmod(elapsed, 60)
+        confidence = max(confidence for _label, _elapsed, confidence in candidates)
+        overrides[frame_index] = (
+            [f"{base_minute}+{added_minute}:{second:02d}"],
+            [confidence],
+        )
+    diagnostics.update({
+        "confirmed": bool(overrides),
+        "confirmed_channels": sorted(confirmed),
+        "confirmed_frame_indices": sorted(overrides),
+        "conflicting_frame_indices": conflicts,
+        "method": (
+            "independent_stoppage_stopwatch" if overrides else None
+        ),
+    })
+    return overrides, diagnostics
+
+
+def _independent_stoppage_reading(
+    frame_index: int,
+    frame_seconds: float,
+    clock_texts: Iterable[str],
+    score_texts: Iterable[str] = (),
+    *,
+    clock_confidences: Iterable[float] = (),
+    score_confidences: Iterable[float] = (),
+) -> FrameReading:
+    """Build a confirmed independent-stopwatch reading without re-normalizing it."""
+    clock_values = tuple(str(text) for text in clock_texts if str(text).strip())
+    score_values = tuple(str(text) for text in score_texts if str(text).strip())
+    parsed_clock = parse_clock_texts(clock_values)
+    parsed_score = parse_score_texts(score_values)
+    if parsed_clock.clock_seconds is None or parsed_clock.ambiguous:
+        raise ValueError("confirmed stoppage override must contain one match clock")
+    confidence_values = [
+        *[float(value) for value in clock_confidences],
+        *[float(value) for value in score_confidences],
+    ]
+    return FrameReading(
+        frame_index=int(frame_index),
+        frame_seconds=float(frame_seconds),
+        texts=clock_values + score_values,
+        clock_seconds=parsed_clock.clock_seconds,
+        score=parsed_score.score,
+        mean_confidence=(
+            sum(confidence_values) / len(confidence_values)
+            if confidence_values else None
+        ),
+        ambiguous_clock=False,
+        ambiguous_score=parsed_score.ambiguous,
+        clock_texts=clock_values,
+        score_texts=score_values,
+        continuity_status="accepted",
+        continuity_reason="independent_stoppage_stopwatch",
+        scoreboard_visible=True,
+        observed_clock_seconds=parsed_clock.clock_seconds,
+    )
+
+
 def _profile_clock_readings(
     recognized: Sequence[tuple[list[str], list[float]]],
     *,
     profile: ScoreboardProfile,
     sample_interval: float,
     period: int | str | None,
+    independent_stoppage_frames: Sequence[
+        Mapping[str, tuple[list[str], list[float]]]
+    ] = (),
+    independent_stoppage_base_minute: int | None = None,
 ) -> tuple[list[FrameReading], list[dict[str, Any]]]:
     """Build one continuity-aware reading per clock crop, with no score OCR."""
     tracker = ClockContinuityStateMachine(profile)
+    stoppage_overrides, stoppage_diagnostics = (
+        _confirmed_independent_stoppage_overrides(
+            recognized,
+            independent_stoppage_frames,
+            base_minute=independent_stoppage_base_minute,
+            sample_interval=sample_interval,
+        )
+    )
     readings: list[FrameReading] = []
     continuity_diagnostics: list[dict[str, Any]] = []
     for frame_index, (clock_texts, clock_confidences) in enumerate(recognized):
-        reading = split_frame_reading(
-            frame_index,
-            frame_index * sample_interval,
-            clock_texts,
-            (),
-            clock_confidences=clock_confidences,
-            tracker=tracker,
-            period=period,
-            # The extracted crop exists even when OCR misses one frame. This
-            # lets the continuity state machine repair a bounded short gap.
-            clock_visible=True,
-            scoreboard_visible=bool(clock_texts),
-        )
+        raw_clock_texts = list(clock_texts)
+        if frame_index in stoppage_overrides:
+            tracker.update(
+                frame_index * sample_interval,
+                raw_clock_texts,
+                scoreboard_visible=True,
+                period=period,
+            )
+            override_texts, override_confidences = stoppage_overrides[frame_index]
+            reading = _independent_stoppage_reading(
+                frame_index,
+                frame_index * sample_interval,
+                override_texts,
+                clock_confidences=override_confidences,
+            )
+        else:
+            reading = split_frame_reading(
+                frame_index,
+                frame_index * sample_interval,
+                clock_texts,
+                (),
+                clock_confidences=clock_confidences,
+                tracker=tracker,
+                period=period,
+                # The extracted crop exists even when OCR misses one frame. This
+                # lets the continuity state machine repair a bounded short gap.
+                clock_visible=True,
+                scoreboard_visible=bool(clock_texts),
+            )
         readings.append(reading)
         continuity_diagnostics.append(
             {
@@ -4619,10 +5108,14 @@ def _profile_clock_readings(
                 "status": reading.continuity_status,
                 "reason": reading.continuity_reason,
                 "clock_texts": list(reading.clock_texts),
+                "raw_clock_texts": raw_clock_texts,
+                "independent_stoppage_applied": frame_index in stoppage_overrides,
                 "score_texts": [],
                 "scoreboard_visible": reading.scoreboard_visible,
             }
         )
+    if continuity_diagnostics:
+        continuity_diagnostics[0]["independent_stoppage"] = stoppage_diagnostics
     return readings, continuity_diagnostics
 
 
@@ -4674,29 +5167,60 @@ def _auto_readings(
     sample_interval: float,
     period: int | str | None,
     clock_only: bool = False,
+    independent_stoppage_frames: Sequence[
+        Mapping[str, tuple[list[str], list[float]]]
+    ] = (),
+    independent_stoppage_base_minute: int | None = None,
 ) -> tuple[list[FrameReading], list[dict[str, Any]]]:
     """Parse auto-discovered clock and score crops as independent streams."""
     if len(recognized) != len(kinds):
         raise ValueError("recognized results and crop kinds must have equal lengths")
     frames = _auto_results_by_frame(recognized, kinds)
+    main_results = [frame.get("clock", ([], [])) for frame in frames]
+    stoppage_overrides, stoppage_diagnostics = (
+        _confirmed_independent_stoppage_overrides(
+            main_results,
+            independent_stoppage_frames,
+            base_minute=independent_stoppage_base_minute,
+            sample_interval=sample_interval,
+        )
+    )
     tracker = ClockContinuityStateMachine(second_half_clock_mode="auto")
     readings: list[FrameReading] = []
     diagnostics: list[dict[str, Any]] = []
     for frame_index, frame in enumerate(frames):
         clock_texts, clock_confidences = frame.get("clock", ([], []))
+        raw_clock_texts = list(clock_texts)
         score_texts, score_confidences = frame.get("score", ([], []))
-        reading = split_frame_reading(
-            frame_index,
-            frame_index * sample_interval,
-            clock_texts,
-            score_texts,
-            clock_confidences=clock_confidences,
-            score_confidences=score_confidences,
-            tracker=tracker,
-            period=period,
-            clock_visible=(True if clock_only else bool(clock_texts)),
-            scoreboard_visible=bool(clock_texts or score_texts),
-        )
+        if frame_index in stoppage_overrides:
+            tracker.update(
+                frame_index * sample_interval,
+                raw_clock_texts,
+                scoreboard_visible=(True if clock_only else bool(raw_clock_texts)),
+                period=period,
+            )
+            override_texts, override_confidences = stoppage_overrides[frame_index]
+            reading = _independent_stoppage_reading(
+                frame_index,
+                frame_index * sample_interval,
+                override_texts,
+                score_texts,
+                clock_confidences=override_confidences,
+                score_confidences=score_confidences,
+            )
+        else:
+            reading = split_frame_reading(
+                frame_index,
+                frame_index * sample_interval,
+                clock_texts,
+                score_texts,
+                clock_confidences=clock_confidences,
+                score_confidences=score_confidences,
+                tracker=tracker,
+                period=period,
+                clock_visible=(True if clock_only else bool(clock_texts)),
+                scoreboard_visible=bool(clock_texts or score_texts),
+            )
         readings.append(reading)
         diagnostics.append(
             {
@@ -4707,10 +5231,14 @@ def _auto_readings(
                 "status": reading.continuity_status,
                 "reason": reading.continuity_reason,
                 "clock_texts": list(reading.clock_texts),
+                "raw_clock_texts": raw_clock_texts,
+                "independent_stoppage_applied": frame_index in stoppage_overrides,
                 "score_texts": list(reading.score_texts),
                 "scoreboard_visible": reading.scoreboard_visible,
             }
         )
+    if diagnostics:
+        diagnostics[0]["independent_stoppage"] = stoppage_diagnostics
     return readings, diagnostics
 
 
@@ -5054,6 +5582,9 @@ def run_request(
         )
     if request_timeout_seconds is not None and request_timeout_seconds <= 0:
         raise WorkerError("ocr_invalid_request", "request timeout must be positive")
+    independent_stoppage_base = (
+        _independent_stoppage_base_minute(request) if clock_only else None
+    )
     deadline_monotonic = (
         time.monotonic() + request_timeout_seconds
         if request_timeout_seconds is not None else None
@@ -5067,6 +5598,16 @@ def run_request(
         auto_diagnostics: dict[str, Any] | None = None
         auto_tracker: AutoClockTracker | None = None
         clock_preprocessing_diagnostics: dict[str, Any] | None = None
+        independent_stoppage_frames: list[
+            dict[str, tuple[list[str], list[float]]]
+        ] = []
+        independent_stoppage_diagnostics: dict[str, Any] = {
+            "enabled": independent_stoppage_base is not None,
+            "base_minute": independent_stoppage_base,
+            "status": (
+                "pending" if independent_stoppage_base is not None else "not_requested"
+            ),
+        }
         if profile_value is not None:
             profile = _resolve_worker_profile(profile_value)
             if not clock_only and profile.score_roi is None:
@@ -5284,6 +5825,84 @@ def run_request(
             auto_diagnostics["re_search_attempt_count"] = len(recovery_records)
             remaining_missing_start = _first_clock_missing_run(recognized, crop_kinds)
             auto_diagnostics["remaining_missing_start"] = remaining_missing_start
+        if independent_stoppage_base is not None:
+            try:
+                if profile is not None:
+                    assert profile_diagnostics is not None
+                    frame_width, frame_height = profile_diagnostics["frame_resolution"]
+                    stoppage_clock_roi = tuple(profile_diagnostics["clock_roi"])
+                else:
+                    assert auto_tracker is not None
+                    assert auto_tracker.clock_roi is not None
+                    frame_width, frame_height = (
+                        auto_tracker.frame_width,
+                        auto_tracker.frame_height,
+                    )
+                    stoppage_clock_roi = auto_tracker.clock_roi
+                stoppage_paths, stoppage_labels, extraction_diagnostics = (
+                    extract_independent_stoppage_frames(
+                        candidate_path,
+                        Path(directory),
+                        ffmpeg=ffmpeg,
+                        sample_interval_seconds=sample_interval,
+                        frame_width=int(frame_width),
+                        frame_height=int(frame_height),
+                        clock_roi=stoppage_clock_roi,
+                        maximum_frames=maximum_frames,
+                        deadline_monotonic=deadline_monotonic,
+                        input_format=candidate_input_format,
+                        input_seek_seconds=candidate_seek_seconds,
+                        input_duration_seconds=candidate_duration_seconds,
+                    )
+                )
+                stoppage_recognized, stoppage_failed_frames = (
+                    _recognize_request_paths(
+                        stoppage_paths,
+                        ["clock"] * len(stoppage_paths),
+                        engine=engine,
+                        batch_worker=batch_worker,
+                        request=request,
+                        profile_id=f"{profile_id}:independent_stoppage",
+                        sample_interval=sample_interval,
+                        minimum_confidence=minimum_confidence,
+                        inference_batch_size=inference_batch_size,
+                        deadline_monotonic=deadline_monotonic,
+                    )
+                )
+                stoppage_recognized, stoppage_repairs = (
+                    _normalize_clock_recognition_results(
+                        stoppage_recognized,
+                        ["clock"] * len(stoppage_recognized),
+                        source="independent_stoppage",
+                    )
+                )
+                independent_stoppage_frames = (
+                    _independent_stoppage_results_by_frame(
+                        stoppage_recognized,
+                        stoppage_labels,
+                    )
+                )
+                independent_stoppage_diagnostics.update({
+                    "status": "analyzed",
+                    "extraction": extraction_diagnostics,
+                    "failed_frame_count": len(stoppage_failed_frames),
+                    "character_repairs": stoppage_repairs,
+                })
+            except (OSError, ValueError, WorkerError) as exc:
+                error = (
+                    exc.as_dict()
+                    if isinstance(exc, WorkerError)
+                    else {
+                        "kind": "independent_stoppage_analysis_failed",
+                        "message": str(exc),
+                        "diagnostics": {},
+                    }
+                )
+                independent_stoppage_diagnostics.update({
+                    "status": "failed",
+                    "fallback": "primary_clock",
+                    "error": error,
+                })
         continuity_diagnostics: list[dict[str, Any]] | None = None
         profile_quality: dict[str, Any] | None = None
         if profile is not None:
@@ -5293,6 +5912,8 @@ def run_request(
                     profile=profile,
                     sample_interval=sample_interval,
                     period=request_period,
+                    independent_stoppage_frames=independent_stoppage_frames,
+                    independent_stoppage_base_minute=independent_stoppage_base,
                 )
             else:
                 readings, continuity_diagnostics = _profile_readings(
@@ -5301,10 +5922,6 @@ def run_request(
                     sample_interval=sample_interval,
                     period=request_period,
                 )
-            profile_quality = _validate_profile_content_quality(
-                readings,
-                profile_id=profile.profile_id,
-            )
         else:
             readings, continuity_diagnostics = _auto_readings(
                 recognized,
@@ -5312,6 +5929,8 @@ def run_request(
                 sample_interval=sample_interval,
                 period=request_period,
                 clock_only=clock_only,
+                independent_stoppage_frames=independent_stoppage_frames,
+                independent_stoppage_base_minute=independent_stoppage_base,
             )
             assert auto_diagnostics is not None
             auto_diagnostics["temporarily_hidden_frame_count"] = sum(
@@ -5322,6 +5941,31 @@ def run_request(
                 item["reason"] == "clock_discontinuity"
                 for item in continuity_diagnostics
             )
+        if independent_stoppage_base is not None and continuity_diagnostics:
+            confirmed = continuity_diagnostics[0].get("independent_stoppage")
+            if isinstance(confirmed, Mapping):
+                independent_stoppage_diagnostics["confirmation"] = dict(confirmed)
+                if confirmed.get("confirmed"):
+                    independent_stoppage_diagnostics["status"] = "confirmed"
+                elif independent_stoppage_diagnostics["status"] != "failed":
+                    independent_stoppage_diagnostics["status"] = "not_confirmed"
+        if profile is not None:
+            try:
+                profile_quality = _validate_profile_content_quality(
+                    readings,
+                    profile_id=profile.profile_id,
+                )
+            except WorkerError as exc:
+                if independent_stoppage_base is None:
+                    raise
+                raise WorkerError(
+                    exc.kind,
+                    exc.message,
+                    diagnostics={
+                        **exc.diagnostics,
+                        "independent_stoppage": independent_stoppage_diagnostics,
+                    },
+                ) from exc
         inference_seconds = time.perf_counter() - inference_started
         try:
             result = locate_from_readings(readings, request)
@@ -5332,6 +5976,10 @@ def run_request(
             if clock_preprocessing_diagnostics is not None:
                 extra_diagnostics["clock_preprocessing"] = (
                     clock_preprocessing_diagnostics
+                )
+            if independent_stoppage_base is not None:
+                extra_diagnostics["independent_stoppage"] = (
+                    independent_stoppage_diagnostics
                 )
             if not extra_diagnostics:
                 raise
@@ -5365,6 +6013,8 @@ def run_request(
         diagnostics["score_ocr_skipped"] = clock_only
         if clock_preprocessing_diagnostics is not None:
             diagnostics["clock_preprocessing"] = clock_preprocessing_diagnostics
+        if independent_stoppage_base is not None:
+            diagnostics["independent_stoppage"] = independent_stoppage_diagnostics
         return result
 
 

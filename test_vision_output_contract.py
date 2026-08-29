@@ -721,30 +721,38 @@ class VisionOutputContractTests(unittest.TestCase):
                 clock_only=True,
             )
 
-            completed = process_vision_artifact(
-                job,
-                runtime,
-                lambda: [
-                    Segment(before_gap, 70.0, 90.0),
-                    Segment(after_gap, 111.0, 130.0),
-                ],
-                "ffmpeg",
-                "ffprobe",
-                root,
-                artifact_kind="ocr_window",
-                search_before=120.0,
-                search_after=30.0,
-                refined_before=8.0,
-                refined_after=12.0,
-                width=768,
-                fps=16.0,
-                colors=256,
-                size_reference_bytes=10_000_000,
-                python=Path("python"),
-                timeout_seconds=3.0,
-                ocr_python=root / "ocr-python",
-                ocr_timeout_seconds=3.0,
-            )
+            # This test covers terminal lease cleanup, not the production gap
+            # tolerance. Keep the synthetic gap outside a deliberately narrow
+            # policy so later best-effort tolerance changes do not turn the
+            # fixture into an FFmpeg integration test.
+            with (
+                patch("vision_runtime.OCR_OUTPUT_MAX_ANCHOR_GAP_SECONDS", 10.0),
+                patch("vision_runtime.OCR_OUTPUT_MAX_ANCHOR_SHIFT_SECONDS", 5.0),
+            ):
+                completed = process_vision_artifact(
+                    job,
+                    runtime,
+                    lambda: [
+                        Segment(before_gap, 70.0, 90.0),
+                        Segment(after_gap, 111.0, 130.0),
+                    ],
+                    "ffmpeg",
+                    "ffprobe",
+                    root,
+                    artifact_kind="ocr_window",
+                    search_before=120.0,
+                    search_after=30.0,
+                    refined_before=8.0,
+                    refined_after=12.0,
+                    width=768,
+                    fps=16.0,
+                    colors=256,
+                    size_reference_bytes=10_000_000,
+                    python=Path("python"),
+                    timeout_seconds=3.0,
+                    ocr_python=root / "ocr-python",
+                    ocr_timeout_seconds=3.0,
+                )
 
             self.assertTrue(completed)
             failed = runtime.store.get_vision_task(event_key, "ocr_window")

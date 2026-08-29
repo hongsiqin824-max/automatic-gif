@@ -99,7 +99,10 @@ class DashboardPublishRoutesTests(unittest.TestCase):
                 )
             self.assertEqual(unauthorized.status_code, 401)
             self.assertEqual(response.status_code, 200)
-            self.assertTrue(response.get_json()["gif"]["url"].startswith("https://"))
+            uploaded_gif = response.get_json()["gif"]
+            self.assertTrue(uploaded_gif["url"].startswith("https://"))
+            self.assertTrue(uploaded_gif["cover_url"].startswith("https://"))
+            self.assertTrue(uploaded_gif["cover_url"].endswith(".jpg"))
             publisher.platform_client.create_article.assert_not_called()
 
     def test_publish_route_uses_uploaded_gif_id(self):
@@ -167,7 +170,9 @@ class DashboardPublishRoutesTests(unittest.TestCase):
         self.assertIn("等待自动创建文章", script)
         self.assertIn("文章任务尚未登记", script)
         self.assertIn("草稿已创建 · 等待球员信息", script)
+        self.assertIn("等待球员信息 · 尚未创建草稿", script)
         self.assertIn("等待接口补齐球员信息", script)
+        self.assertIn("未获取球员，已使用球队名发布", script)
         self.assertIn("错误码", script)
         self.assertIn("未自动发布", script)
         self.assertIn("publication_gate", script)
@@ -664,7 +669,6 @@ class DashboardPublishRoutesTests(unittest.TestCase):
             self.assertEqual(response.status_code, 200)
             self.assertTrue(response.content_type.startswith("image/gif"))
             self.assertEqual(invalid.status_code, 404)
-
 
 if __name__ == "__main__":
     unittest.main()

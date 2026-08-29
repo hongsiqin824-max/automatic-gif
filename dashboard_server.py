@@ -37,6 +37,11 @@ from article_publisher import (
     RemoteGifUploadClient,
     environment_boolean,
 )
+from publish_account_pool import (
+    PublishAccountPool,
+    PublishAccountPoolError,
+    PublishAccountPoolStorageError,
+)
 from article_draft_queue import ArticleDraftQueue, ocr_publication_eligibility
 from disk_lifecycle import DiskLifecycleManager, DiskLifecyclePolicy
 from event_api_response import EventApiResponseError, normalize_event_api_response
@@ -121,6 +126,7 @@ ORPHAN_CLEANUP_GRACE_SECONDS = _positive_environment_float(
 DEFAULT_OUTPUT = ROOT / "output_gifs" / "dashboard"
 DEFAULT_PUBLISHED_GIF_DIR = ROOT / "data" / "published_gifs"
 DEFAULT_ARTICLE_PUBLISH_DATABASE = ROOT / "data" / "article_publish.sqlite3"
+DEFAULT_PUBLISH_ACCOUNTS_PATH = ROOT / "data" / "publish_accounts.json"
 GIF_UPLOAD_TOKEN = os.environ.get("GIF_UPLOAD_TOKEN", "").strip()
 GIF_UPLOAD_ENDPOINT = os.environ.get("GIF_UPLOAD_ENDPOINT", "").strip()
 GIF_UPLOAD_TIMEOUT_SECONDS = _positive_environment_float(
@@ -3834,6 +3840,14 @@ article_publisher = ArticlePublisher(
         if GIF_UPLOAD_ENDPOINT
         else None
     ),
+    account_pool=PublishAccountPool(
+        Path(
+            os.environ.get(
+                "ARTICLE_PUBLISH_ACCOUNTS_PATH",
+                str(DEFAULT_PUBLISH_ACCOUNTS_PATH),
+            )
+        )
+    ),
 )
 article_draft_queue = ArticleDraftQueue(
     database_path=article_publisher.database_path,
@@ -3944,6 +3958,54 @@ def article_publish_status():
             },
         }
     )
+
+
+@app.get("/api/article-publish/accounts")
+def article_publish_accounts_get():
+    try:
+        accounts = article_publisher.account_pool.list_accounts()
+        return jsonify({
+            "ok": True,
+            "accounts": accounts,
+            "available_count": sum(
+                account.get("enabled") is True for account in accounts
+            ),
+        })
+    except (PublishAccountPoolError, AttributeError) as exc:
+        return jsonify({
+            "ok": False,
+            "error": f"读取发布账号池失败：{exc}",
+            "code": "publish_account_pool_unavailable",
+        }), 503
+
+
+@app.put("/api/article-publish/accounts")
+def article_publish_accounts_put():
+    body = request.get_json(silent=True) or {}
+    accounts = body.get("accounts")
+    try:
+        if not isinstance(accounts, list):
+            raise PublishAccountPoolError("accounts 必须是数组")
+        saved = article_publisher.account_pool.replace_accounts(accounts)
+        return jsonify({
+            "ok": True,
+            "accounts": saved,
+            "available_count": sum(
+                account.get("enabled") is True for account in saved
+            ),
+        })
+    except PublishAccountPoolStorageError as exc:
+        return jsonify({
+            "ok": False,
+            "error": str(exc),
+            "code": "publish_account_pool_unavailable",
+        }), 503
+    except PublishAccountPoolError as exc:
+        return jsonify({
+            "ok": False,
+            "error": str(exc),
+            "code": "publish_account_pool_invalid",
+        }), 400
 
 
 @app.get("/api/open-platform/oauth/start")
@@ -4444,6 +4506,23 @@ def published_gif_file(gif_id: str):
     if not path.is_file():
         abort(404)
     return send_from_directory(path.parent, path.name, mimetype="image/gif")
+
+
+@app.get("/publish-gif-covers/<gif_id>.jpg")
+def published_gif_cover_file(gif_id: str):
+    if not re.fullmatch(r"[a-f0-9]{64}", gif_id):
+        abort(404)
+    try:
+        cover = article_publisher.gif_store.ensure_cover(gif_id)
+    except ArticlePublishError as exc:
+        abort(exc.status_code)
+    path = Path(str(cover["cover_path"]))
+    if not path.is_file():
+        abort(404)
+    response = send_from_directory(path.parent, path.name, mimetype="image/jpeg")
+    response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
 
 
 @app.get("/api/gif/<match_id>/<path:filename>")

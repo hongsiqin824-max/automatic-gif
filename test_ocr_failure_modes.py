@@ -362,7 +362,9 @@ class OcrFailureModeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             runtime, job = self._create_progressive_ocr_job(
-                root, "profile-mismatch-after-ready-mapping"
+                root,
+                "profile-mismatch-after-ready-mapping",
+                event_second=100,
             )
             task = runtime.store.get_vision_task(job.event_key, "ocr_window")
             self.assertIsNotNone(task)

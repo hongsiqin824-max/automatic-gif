@@ -99,6 +99,16 @@
       <article class="panel events-panel"><div class="panel-head"><span>事件与 GIF</span><span id="event-count" class="muted">唯一事件 0</span></div><div class="event-legend"><span><i class="history-dot"></i>历史未生成</span><span><i class="task-dot"></i>处理中</span><span><i class="ready-dot"></i>已生成 GIF</span></div><div id="events" class="events-list"><div class="empty">输入比赛 ID 查询，或运行演示链路。</div></div></article>
       <aside class="side-stack">
         <article class="panel settings"><div class="panel-head"><span>运行配置</span><span class="muted">可调整</span></div><div class="settings-grid"><label>事件查询间隔<input id="event-poll" type="number" value="3" min="1" step="1"><small>秒</small></label><label>直播地址查询<input id="source-poll" type="number" value="10" min="1" step="1"><small>秒</small></label><label>比赛状态查询<input id="detail-poll" type="number" value="10" min="1" step="1"><small>秒</small></label><label>GIF 前置<input id="before" type="number" value="30" min="0" step="1"><small>秒</small></label><label>GIF 后置<input id="after" type="number" value="20" min="1" step="1"><small>秒</small></label><label>事件时间校准<input id="event-offset" type="number" value="-10" step="0.5"><small>秒</small></label><label>GIF 宽度<input id="width" type="number" value="768" min="160" step="16"><small>px</small></label><label class="vision-toggle">画面时间识别<input id="vision-enabled" type="checkbox" checked><small id="vision-state">默认开启</small></label><label class="vision-toggle">只识别比赛时间<input id="vision-clock-only" type="checkbox" checked><small id="vision-clock-only-state"></small></label><label>动作精剪前置<input id="vision-before" type="number" value="8" min="0" step="1" disabled><small>暂停</small></label><label>动作精剪后置<input id="vision-after" type="number" value="12" min="1" step="1" disabled><small>暂停</small></label></div><p class="config-note">默认 GIF：前置 30 秒 + 后置 20 秒 · 事件时间校准 -10 秒 · 画面时间识别开启 · 动作精剪当前暂停</p></article>
+        <article class="panel publish-accounts-panel" aria-labelledby="publish-accounts-title">
+          <div class="panel-head"><span id="publish-accounts-title">发布账号池</span><span id="publish-account-count" class="muted">正在读取</span></div>
+          <div id="publish-account-message" class="publish-account-message" role="status">正在读取发布账号。</div>
+          <div class="publish-account-columns" aria-hidden="true"><span>账号 ID</span><span>账号名称</span><span>启用</span><span></span></div>
+          <div id="publish-account-list" class="publish-account-list"><div class="publish-account-empty">正在读取账号池</div></div>
+          <div class="publish-account-toolbar">
+            <button id="publish-account-add" class="account-icon-button" type="button" aria-label="新增发布账号" title="新增发布账号">+</button>
+            <button id="publish-account-save" class="button secondary account-save-button" type="button">保存账号池</button>
+          </div>
+        </article>
         <article class="panel source-panel"><div class="panel-head"><span>直播地址</span><span id="source-change" class="warning hidden">地址有变化</span></div><code id="resource">尚未获取直播地址</code><div class="source-meta"><span>最近更新时间</span><b id="updated-at">--</b></div></article>
       </aside>
     </section>

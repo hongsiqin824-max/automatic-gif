@@ -7,7 +7,10 @@ import html
 import json
 import os
 import re
+import secrets
+import shutil
 import sqlite3
+import subprocess
 import threading
 import time
 import urllib.error
@@ -17,6 +20,11 @@ from pathlib import Path
 from typing import Any, Callable
 
 from open_platform_client import OpenPlatformClient, OpenPlatformError
+from publish_account_pool import (
+    MAX_USER_ID,
+    PublishAccountPool,
+    PublishAccountPoolError,
+)
 
 
 GIF_ID_PATTERN = re.compile(r"^[a-f0-9]{64}$")
@@ -29,6 +37,23 @@ EVENT_LABELS = {
     "RC": "红牌",
     "YC": "黄牌",
 }
+RELIABLE_PERSON_PLACEHOLDERS = frozenset(
+    {
+        "0",
+        "unknown",
+        "none",
+        "null",
+        "未提供球员",
+        "未知球员",
+    }
+)
+
+
+def has_reliable_person(event: dict[str, Any] | None) -> bool:
+    """Return whether an event has a usable display name, not only an ID."""
+    value = event if isinstance(event, dict) else {}
+    person = str(value.get("person") or "").strip()
+    return bool(person) and person.casefold() not in RELIABLE_PERSON_PLACEHOLDERS
 
 
 class ArticlePublishError(RuntimeError):
@@ -151,6 +176,7 @@ class PublishedGifStore:
         self.directory = directory.expanduser().resolve()
         self.public_origin = _normalize_public_origin(public_origin)
         self.max_bytes = max_bytes
+        self.cover_directory = self.directory / "covers"
 
     def path_for(self, gif_id: str) -> Path:
         if not GIF_ID_PATTERN.fullmatch(gif_id):
@@ -165,6 +191,175 @@ class PublishedGifStore:
     def url_for(self, gif_id: str) -> str:
         self.path_for(gif_id)
         return f"{self.public_origin}/publish-gifs/{gif_id}.gif"
+
+    def cover_path_for(self, gif_id: str) -> Path:
+        self.path_for(gif_id)
+        return self.cover_directory / f"{gif_id}.jpg"
+
+    def cover_url_for(self, gif_id: str) -> str:
+        self.cover_path_for(gif_id)
+        return f"{self.public_origin}/publish-gif-covers/{gif_id}.jpg"
+
+    def ensure_cover(self, gif_id: str) -> dict[str, Any]:
+        """Generate or reuse the immutable 960x540 first-frame JPEG."""
+        source = self.path_for(gif_id)
+        target = self.cover_path_for(gif_id)
+        if self._valid_jpeg_file(target):
+            return self._cover_result(gif_id, target, reused=True)
+        if not source.is_file():
+            raise ArticlePublishError(
+                "永久 GIF 文件不存在，无法生成封面",
+                code="publish_gif_not_found",
+                stage="gif_cover",
+                status_code=404,
+            )
+
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            raise ArticlePublishError(
+                "服务器未找到 FFmpeg，无法生成 GIF 首帧封面",
+                code="publish_gif_cover_ffmpeg_missing",
+                stage="gif_cover",
+                status_code=503,
+            )
+        temporary = target.with_name(
+            f".{target.name}.{os.getpid()}.{threading.get_ident()}."
+            f"{secrets.token_hex(6)}.tmp"
+        )
+        command = [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-y",
+            "-i",
+            str(source),
+            "-vf",
+            (
+                "scale=960:540:force_original_aspect_ratio=decrease,"
+                "pad=960:540:(ow-iw)/2:(oh-ih)/2:color=black"
+            ),
+            "-frames:v",
+            "1",
+            "-q:v",
+            "3",
+            "-f",
+            "image2",
+            "-vcodec",
+            "mjpeg",
+            "-update",
+            "1",
+            str(temporary),
+        ]
+        try:
+            self.cover_directory.mkdir(parents=True, exist_ok=True, mode=0o755)
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            if completed.returncode != 0:
+                detail = str(completed.stderr or "").strip()[-800:]
+                raise ArticlePublishError(
+                    f"FFmpeg 生成 GIF 首帧封面失败：{detail or '未知错误'}",
+                    code="publish_gif_cover_generation_failed",
+                    stage="gif_cover",
+                    status_code=503,
+                    retriable=True,
+                )
+            if not self._valid_jpeg_file(temporary):
+                raise ArticlePublishError(
+                    "FFmpeg 没有生成有效的 GIF 首帧封面",
+                    code="publish_gif_cover_generation_failed",
+                    stage="gif_cover",
+                    status_code=503,
+                    retriable=True,
+                )
+            os.chmod(temporary, 0o644)
+            os.replace(temporary, target)
+        except subprocess.TimeoutExpired as exc:
+            raise ArticlePublishError(
+                "生成 GIF 首帧封面超过 30 秒",
+                code="publish_gif_cover_timeout",
+                stage="gif_cover",
+                status_code=503,
+                retriable=True,
+            ) from exc
+        except ArticlePublishError:
+            raise
+        except OSError as exc:
+            raise ArticlePublishError(
+                f"GIF 首帧封面目录不可写：{exc}",
+                code="publish_gif_cover_storage_unavailable",
+                stage="gif_cover",
+                status_code=503,
+            ) from exc
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return self._cover_result(gif_id, target, reused=False)
+
+    @staticmethod
+    def _valid_jpeg_file(path: Path) -> bool:
+        try:
+            if not path.is_file() or path.stat().st_size <= 4:
+                return False
+            body = path.read_bytes()
+        except OSError:
+            return False
+        if not body.startswith(b"\xff\xd8") or not body.endswith(b"\xff\xd9"):
+            return False
+
+        offset = 2
+        start_of_frame_markers = {
+            0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+            0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF,
+        }
+        while offset + 4 <= len(body):
+            if body[offset] != 0xFF:
+                offset += 1
+                continue
+            while offset < len(body) and body[offset] == 0xFF:
+                offset += 1
+            if offset >= len(body):
+                return False
+            marker = body[offset]
+            offset += 1
+            if marker in {0x01, 0xD8} or 0xD0 <= marker <= 0xD7:
+                continue
+            if marker == 0xD9:
+                return False
+            if offset + 2 > len(body):
+                return False
+            length = int.from_bytes(body[offset : offset + 2], "big")
+            if length < 2 or offset + length > len(body):
+                return False
+            if marker in start_of_frame_markers:
+                if length < 7:
+                    return False
+                height = int.from_bytes(body[offset + 3 : offset + 5], "big")
+                width = int.from_bytes(body[offset + 5 : offset + 7], "big")
+                return (width, height) == (960, 540)
+            if marker == 0xDA:
+                return False
+            offset += length
+        return False
+
+    def _cover_result(
+        self, gif_id: str, target: Path, *, reused: bool
+    ) -> dict[str, Any]:
+        return {
+            "cover_path": str(target),
+            "cover_url": self.cover_url_for(gif_id),
+            "cover_width": 960,
+            "cover_height": 540,
+            "cover_reused": reused,
+        }
 
     def create(self, source_path: Path) -> dict[str, Any]:
         try:
@@ -214,11 +409,13 @@ class PublishedGifStore:
                 stage="gif_storage",
                 status_code=503,
             ) from exc
+        cover = self.ensure_cover(gif_id)
         return {
             "gif_id": gif_id,
             "path": str(target),
             "url": self.url_for(gif_id),
             "bytes": len(body),
+            **cover,
             **gif_info,
         }
 
@@ -371,9 +568,26 @@ class RemoteGifUploadClient:
             )
         gif_id = str(remote_gif.get("gif_id") or "").strip()
         gif_url = str(remote_gif.get("url") or "").strip()
+        cover_url = str(remote_gif.get("cover_url") or "").strip()
         if not GIF_ID_PATTERN.fullmatch(gif_id) or not gif_url.startswith("https://"):
             raise ArticlePublishError(
                 "GIF 上传成功但返回的文件标识或公网地址无效",
+                code="remote_gif_upload_invalid_response",
+                stage="remote_gif_upload",
+                status_code=502,
+            )
+        try:
+            cover_path_name = Path(
+                urllib.parse.urlsplit(cover_url).path
+            ).name.lower()
+        except ValueError:
+            cover_path_name = ""
+        if (
+            not _is_https_jpeg_url(cover_url)
+            or cover_path_name not in {f"{gif_id}.jpg", f"{gif_id}.jpeg"}
+        ):
+            raise ArticlePublishError(
+                "GIF 上传成功但返回的首帧封面公网地址无效",
                 code="remote_gif_upload_invalid_response",
                 stage="remote_gif_upload",
                 status_code=502,
@@ -382,6 +596,7 @@ class RemoteGifUploadClient:
             "gif_id": gif_id,
             "path": str(source_path.expanduser().resolve()),
             "url": gif_url,
+            "cover_url": cover_url,
             "bytes": len(body),
             **gif_info,
         }
@@ -396,27 +611,51 @@ class ArticlePublisher:
         database_path: Path,
         verify_public_url: bool = True,
         public_url_checker: Callable[[str], None] | None = None,
+        public_cover_url_checker: Callable[[str], None] | None = None,
         remote_upload_client: RemoteGifUploadClient | None = None,
+        account_pool: PublishAccountPool | None = None,
     ) -> None:
         self.platform_client = platform_client
         self.gif_store = gif_store
         self.database_path = database_path.expanduser().resolve()
         self.verify_public_url = verify_public_url
         self.public_url_checker = public_url_checker or _check_public_gif_url
+        self.public_cover_url_checker = (
+            public_cover_url_checker
+            or public_url_checker
+            or _check_public_cover_url
+        )
         self.remote_upload_client = remote_upload_client
+        self.account_pool = account_pool
         self._lock = threading.RLock()
 
     def status(self) -> dict[str, Any]:
+        try:
+            account_pool_status = (
+                self.account_pool.status()
+                if self.account_pool is not None
+                else {"enabled": False, "count": 0, "active_count": 0}
+            )
+        except PublishAccountPoolError as exc:
+            account_pool_status = {
+                "enabled": True,
+                "available": False,
+                "count": 0,
+                "active_count": 0,
+                "error": str(exc),
+            }
         return {
             "archive_level": "B",
             "add_to_tab": 1,
             "type": "article",
             "style": "gif",
-            "default_account": True,
+            "default_account": self.account_pool is None,
+            "account_pool": account_pool_status,
             "public_origin": self.gif_store.public_origin,
             "public_origin_https": self.gif_store.public_origin.startswith("https://"),
             "verify_public_url": self.verify_public_url,
             "gif_directory": str(self.gif_store.directory),
+            "gif_cover_directory": str(self.gif_store.cover_directory),
             "database_path": str(self.database_path),
             "oauth": self.platform_client.status(),
             "remote_upload": (
@@ -467,6 +706,94 @@ class ArticlePublisher:
         except sqlite3.Error:
             return None
         return _public_record(row) if row else None
+
+    def _account_for_assignment(self, assignment_key: str) -> dict[str, Any]:
+        """Bind one logical article to one account before its first request."""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                """
+                SELECT user_id, user_name
+                FROM article_publish_account_assignments
+                WHERE assignment_key=?
+                """,
+                (assignment_key,),
+            ).fetchone()
+            if existing is not None:
+                return {
+                    "user_id": int(existing["user_id"]),
+                    "user_name": str(existing["user_name"]),
+                }
+
+            try:
+                active_accounts = self.account_pool.active_accounts()
+            except PublishAccountPoolError as exc:
+                raise ArticlePublishError(
+                    f"发布账号池暂时不可用：{exc}",
+                    code="publish_account_pool_unavailable",
+                    stage="account_selection",
+                    status_code=503,
+                ) from exc
+            if not active_accounts:
+                raise ArticlePublishError(
+                    "发布账号池中没有启用的账号，请先添加或启用至少一个账号",
+                    code="publish_account_pool_empty",
+                    stage="account_selection",
+                    status_code=409,
+                )
+            usage_rows = connection.execute(
+                """
+                SELECT user_id, COUNT(*) AS assignment_count
+                FROM article_publish_account_assignments
+                GROUP BY user_id
+                """
+            ).fetchall()
+            usage = {
+                int(row["user_id"]): int(row["assignment_count"])
+                for row in usage_rows
+            }
+            minimum = min(
+                usage.get(int(account["user_id"]), 0)
+                for account in active_accounts
+            )
+            candidates = [
+                account
+                for account in active_accounts
+                if usage.get(int(account["user_id"]), 0) == minimum
+            ]
+            selected = secrets.choice(candidates)
+            connection.execute(
+                """
+                INSERT INTO article_publish_account_assignments (
+                    assignment_key, user_id, user_name, assigned_at_unix
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    assignment_key,
+                    int(selected["user_id"]),
+                    str(selected["user_name"]),
+                    time.time(),
+                ),
+            )
+            return {
+                "user_id": int(selected["user_id"]),
+                "user_name": str(selected["user_name"]),
+            }
+
+    def _existing_account_assignment(
+        self, assignment_key: str
+    ) -> dict[str, Any] | None:
+        if self.account_pool is None or not self.database_path.exists():
+            return None
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT user_id, user_name FROM article_publish_account_assignments "
+                "WHERE assignment_key=?",
+                (assignment_key,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {"user_id": int(row["user_id"]), "user_name": str(row["user_name"])}
 
     def upload_gif(
         self,
@@ -527,12 +854,13 @@ class ArticlePublisher:
                 """
                 INSERT INTO article_uploaded_gifs (
                     match_id, event_key, artifact_kind, gif_sha256,
-                    gif_path, gif_url, uploaded_at_unix
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    gif_path, gif_url, cover_url, uploaded_at_unix
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(match_id, event_key, artifact_kind) DO UPDATE SET
                     gif_sha256=excluded.gif_sha256,
                     gif_path=excluded.gif_path,
                     gif_url=excluded.gif_url,
+                    cover_url=excluded.cover_url,
                     uploaded_at_unix=excluded.uploaded_at_unix
                 """,
                 (
@@ -542,6 +870,7 @@ class ArticlePublisher:
                     str(gif["gif_id"]),
                     str(gif["path"]),
                     str(gif["url"]),
+                    str(gif["cover_url"]),
                     now,
                 ),
             )
@@ -576,6 +905,7 @@ class ArticlePublisher:
             "gif_id": str(row["gif_sha256"]),
             "path": str(path),
             "url": str(row["gif_url"]),
+            "cover_url": str(row["cover_url"] or ""),
             "uploaded_at_unix": row["uploaded_at_unix"],
         }
 
@@ -590,7 +920,11 @@ class ArticlePublisher:
         """Persist a GIF locally and make it available at its public URL."""
         local_gif = self.gif_store.create(source_path)
         uploaded = self.uploaded_gif_for(match_id, event_key, artifact_kind)
-        if uploaded and uploaded.get("gif_id") == local_gif["gif_id"]:
+        if (
+            uploaded
+            and uploaded.get("gif_id") == local_gif["gif_id"]
+            and _is_https_jpeg_url(uploaded.get("cover_url"))
+        ):
             return uploaded
         if not self.remote_upload_client or not self.remote_upload_client.enabled:
             return local_gif
@@ -664,12 +998,19 @@ class ArticlePublisher:
                 previous["idempotent_replay"] = True
                 return previous
 
+            publish_account = (
+                self._account_for_assignment(f"direct:{stable_id}")
+                if self.account_pool is not None
+                else None
+            )
             title = build_article_title(event, match_detail)
             fields = build_article_fields(
                 match_id=match_id,
                 event=event,
                 gif_url=str(gif["url"]),
+                cover_url=str(gif["cover_url"]),
                 title=title,
+                publish_account=publish_account,
             )
             self._save_record(
                 stable_id=stable_id,
@@ -680,10 +1021,12 @@ class ArticlePublisher:
                 title=title,
                 status="prepared",
                 stage="gif_prepared",
+                publish_account=publish_account,
             )
             try:
                 if self.verify_public_url:
                     self.public_url_checker(str(gif["url"]))
+                    self.public_cover_url_checker(str(gif["cover_url"]))
                 self._save_record(
                     stable_id=stable_id,
                     match_id=match_id,
@@ -693,6 +1036,7 @@ class ArticlePublisher:
                     title=title,
                     status="publishing",
                     stage="platform_publish",
+                    publish_account=publish_account,
                 )
                 result = self.platform_client.create_article(fields)
             except ArticlePublishError as exc:
@@ -725,6 +1069,7 @@ class ArticlePublisher:
                 platform_code=result.get("code"),
                 duplicate=bool(result.get("duplicate")),
                 published_at_unix=published_at,
+                publish_account=publish_account,
             )
             record = self._get_record(stable_id)
             if record is None:
@@ -814,18 +1159,31 @@ class ArticlePublisher:
                 event_key=event_key,
                 artifact_kind="ocr_window",
             )
+            assignment_key = f"ocr:{match_id}:{event_key}"
+            publish_account = self._existing_account_assignment(assignment_key)
+            # An archive_id without a prior assignment identifies a legacy
+            # draft. Never change its author while updating it.
+            if (
+                publish_account is None
+                and archive_id is None
+                and self.account_pool is not None
+            ):
+                publish_account = self._account_for_assignment(assignment_key)
             title = build_article_title(event, match_detail)
             fields = build_article_fields(
                 match_id=match_id,
                 event=event,
                 gif_url=str(gif["url"]),
+                cover_url=str(gif["cover_url"]),
                 title=title,
                 delivery_mode=delivery_mode,
                 archive_id=archive_id,
+                publish_account=publish_account,
             )
             try:
                 if self.verify_public_url:
                     self.public_url_checker(str(gif["url"]))
+                    self.public_cover_url_checker(str(gif["cover_url"]))
                 result = self.platform_client.create_article(fields)
             except ArticlePublishError as exc:
                 if not exc.diagnostics:
@@ -876,6 +1234,9 @@ class ArticlePublisher:
                 "duplicate": bool(result.get("duplicate")),
                 "platform_code": result.get("code"),
                 "diagnostics": diagnostics,
+                "publish_account": (
+                    dict(publish_account) if publish_account is not None else None
+                ),
             }
 
     def _connect(self) -> sqlite3.Connection:
@@ -891,11 +1252,14 @@ class ArticlePublisher:
                 source_path TEXT,
                 gif_sha256 TEXT NOT NULL,
                 gif_url TEXT NOT NULL,
+                cover_url TEXT,
                 gif_path TEXT NOT NULL,
                 title TEXT NOT NULL,
                 status TEXT NOT NULL,
                 stage TEXT NOT NULL,
                 article_id TEXT,
+                publish_user_id INTEGER,
+                publish_user_name TEXT,
                 platform_code TEXT,
                 duplicate INTEGER NOT NULL DEFAULT 0,
                 error TEXT,
@@ -914,6 +1278,7 @@ class ArticlePublisher:
                 gif_sha256 TEXT NOT NULL,
                 gif_path TEXT NOT NULL,
                 gif_url TEXT NOT NULL,
+                cover_url TEXT,
                 uploaded_at_unix REAL NOT NULL,
                 PRIMARY KEY(match_id, event_key, artifact_kind)
             )
@@ -929,6 +1294,38 @@ class ArticlePublisher:
             connection.execute(
                 "ALTER TABLE article_publish_records ADD COLUMN source_path TEXT"
             )
+        if "cover_url" not in columns:
+            connection.execute(
+                "ALTER TABLE article_publish_records ADD COLUMN cover_url TEXT"
+            )
+        if "publish_user_id" not in columns:
+            connection.execute(
+                "ALTER TABLE article_publish_records ADD COLUMN publish_user_id INTEGER"
+            )
+        if "publish_user_name" not in columns:
+            connection.execute(
+                "ALTER TABLE article_publish_records ADD COLUMN publish_user_name TEXT"
+            )
+        uploaded_columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(article_uploaded_gifs)"
+            )
+        }
+        if "cover_url" not in uploaded_columns:
+            connection.execute(
+                "ALTER TABLE article_uploaded_gifs ADD COLUMN cover_url TEXT"
+            )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS article_publish_account_assignments (
+                assignment_key TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                user_name TEXT NOT NULL,
+                assigned_at_unix REAL NOT NULL
+            )
+            """
+        )
         connection.execute(
             """
             CREATE INDEX IF NOT EXISTS article_publish_match_event
@@ -960,22 +1357,28 @@ class ArticlePublisher:
         platform_code: Any = None,
         duplicate: bool = False,
         published_at_unix: float | None = None,
+        publish_account: dict[str, Any] | None = None,
     ) -> None:
         now = time.time()
         with self._connect() as connection:
             connection.execute(
                 """
                 INSERT INTO article_publish_records (
-                    stable_id, match_id, event_key, source_path, gif_sha256, gif_url, gif_path,
+                    stable_id, match_id, event_key, source_path, gif_sha256,
+                    gif_url, cover_url, gif_path,
                     title, status, stage, article_id, platform_code, duplicate,
-                    error, created_at_unix, updated_at_unix, published_at_unix
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
+                    publish_user_id, publish_user_name, error,
+                    created_at_unix, updated_at_unix, published_at_unix
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
                 ON CONFLICT(stable_id) DO UPDATE SET
                     status=excluded.status,
                     stage=excluded.stage,
+                    cover_url=excluded.cover_url,
                     article_id=COALESCE(excluded.article_id, article_publish_records.article_id),
                     platform_code=COALESCE(excluded.platform_code, article_publish_records.platform_code),
                     duplicate=excluded.duplicate,
+                    publish_user_id=COALESCE(excluded.publish_user_id, article_publish_records.publish_user_id),
+                    publish_user_name=COALESCE(excluded.publish_user_name, article_publish_records.publish_user_name),
                     error=NULL,
                     updated_at_unix=excluded.updated_at_unix,
                     published_at_unix=COALESCE(excluded.published_at_unix, article_publish_records.published_at_unix)
@@ -987,6 +1390,7 @@ class ArticlePublisher:
                     str(source_path.expanduser().resolve()),
                     gif["gif_id"],
                     gif["url"],
+                    gif["cover_url"],
                     gif["path"],
                     title,
                     status,
@@ -994,6 +1398,16 @@ class ArticlePublisher:
                     article_id,
                     None if platform_code is None else str(platform_code),
                     int(duplicate),
+                    (
+                        int(publish_account["user_id"])
+                        if publish_account is not None
+                        else None
+                    ),
+                    (
+                        str(publish_account["user_name"])
+                        if publish_account is not None
+                        else None
+                    ),
                     now,
                     now,
                     published_at_unix,
@@ -1034,7 +1448,11 @@ def build_article_title(event: dict[str, Any], detail: dict[str, Any]) -> str:
     home = str(detail.get("team_A_name") or "主队").strip()
     away = str(detail.get("team_B_name") or "客队").strip()
     score = _match_score(event.get("score"))
-    actor = person or _event_team_name(event.get("team"), detail)
+    actor = (
+        person
+        if has_reliable_person(event)
+        else _event_team_name(event.get("team"), detail)
+    )
     action_text = f"{actor}{action}" if actor else action
     score_text = f"，{home} {score} {away}" if score else f"，{home}对阵{away}"
     return f"{minute_text}，{action_text}{score_text}"[:100]
@@ -1045,9 +1463,11 @@ def build_article_fields(
     match_id: str,
     event: dict[str, Any],
     gif_url: str,
+    cover_url: str,
     title: str,
     delivery_mode: str = "publish",
     archive_id: str | int | None = None,
+    publish_account: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if delivery_mode not in {"publish", "draft"}:
         raise ArticlePublishError(
@@ -1068,6 +1488,14 @@ def build_article_fields(
             "文章使用的 GIF 公网地址必须使用 HTTPS",
             code="publish_gif_https_required",
             stage="public_url_check",
+            status_code=503,
+        )
+    normalized_cover_url = str(cover_url or "").strip()
+    if not _is_https_jpeg_url(normalized_cover_url):
+        raise ArticlePublishError(
+            "文章封面必须是完整的 HTTPS JPG/JPEG 公网地址",
+            code="publish_cover_url_invalid",
+            stage="cover_public_url_check",
             status_code=503,
         )
     normalized_archive_id: int | None = None
@@ -1093,9 +1521,26 @@ def build_article_fields(
         "status": 0 if is_draft else 1,
         "type": "article",
         "style": "gif",
+        "litpic": normalized_cover_url,
         "match_id": match_id,
         "add_to_tab": 1,
     }
+    if publish_account is not None:
+        user_id_text = str(publish_account.get("user_id") or "").strip()
+        user_name = str(publish_account.get("user_name") or "").strip()
+        if (
+            not re.fullmatch(r"[1-9]\d{0,18}", user_id_text)
+            or int(user_id_text) > MAX_USER_ID
+            or not user_name
+        ):
+            raise ArticlePublishError(
+                "文章绑定的发布账号信息不完整",
+                code="publish_account_invalid",
+                stage="account_selection",
+                status_code=409,
+            )
+        fields["user_id"] = int(user_id_text)
+        fields["user_name"] = user_name
     if normalized_archive_id is not None:
         fields["archive_id"] = normalized_archive_id
     match_time = _match_time(event)
@@ -1130,6 +1575,9 @@ def _draft_diagnostics(
             "match_score",
             "add_to_tab",
             "archive_id",
+            "litpic",
+            "user_id",
+            "user_name",
         )
         if fields.get(key) is not None
     }
@@ -1188,11 +1636,56 @@ def _normalize_public_origin(value: str) -> str:
     return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
 
 
+def _is_https_jpeg_url(value: Any) -> bool:
+    try:
+        parsed = urllib.parse.urlsplit(str(value or "").strip())
+    except ValueError:
+        return False
+    return (
+        parsed.scheme.lower() == "https"
+        and bool(parsed.netloc)
+        and parsed.path.lower().endswith((".jpg", ".jpeg"))
+    )
+
+
 def _check_public_gif_url(url: str) -> None:
+    _check_public_media_url(
+        url,
+        expected_content_type="image/gif",
+        label="GIF",
+        unreachable_code="publish_gif_public_unreachable",
+        invalid_code="publish_gif_public_invalid",
+        stage="public_url_check",
+    )
+
+
+def _check_public_cover_url(url: str) -> None:
+    _check_public_media_url(
+        url,
+        expected_content_type="image/jpeg",
+        label="封面",
+        unreachable_code="publish_cover_public_unreachable",
+        invalid_code="publish_cover_public_invalid",
+        stage="cover_public_url_check",
+    )
+
+
+def _check_public_media_url(
+    url: str,
+    *,
+    expected_content_type: str,
+    label: str,
+    unreachable_code: str,
+    invalid_code: str,
+    stage: str,
+) -> None:
     request = urllib.request.Request(
         url,
         method="HEAD",
-        headers={"Accept": "image/gif", "User-Agent": "football-gif-publisher/1.0"},
+        headers={
+            "Accept": expected_content_type,
+            "User-Agent": "football-gif-publisher/1.0",
+        },
     )
     try:
         with urllib.request.urlopen(request, timeout=8.0) as response:
@@ -1200,29 +1693,37 @@ def _check_public_gif_url(url: str) -> None:
             status = int(getattr(response, "status", 200))
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         raise ArticlePublishError(
-            f"公网 GIF 地址不可访问：{exc}",
-            code="publish_gif_public_unreachable",
-            stage="public_url_check",
+            f"公网{label}地址不可访问：{exc}",
+            code=unreachable_code,
+            stage=stage,
             status_code=503,
             retriable=True,
         ) from exc
-    if status != 200 or not content_type.lower().startswith("image/gif"):
+    actual_content_type = content_type.split(";", 1)[0].strip().lower()
+    if status != 200 or actual_content_type != expected_content_type:
         raise ArticlePublishError(
-            f"公网 GIF 检查失败：HTTP {status}，Content-Type={content_type or '缺失'}",
-            code="publish_gif_public_invalid",
-            stage="public_url_check",
+            f"公网{label}检查失败：HTTP {status}，Content-Type={content_type or '缺失'}",
+            code=invalid_code,
+            stage=stage,
             status_code=503,
         )
 
 
 def _public_record(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
     value = dict(row)
+    account = None
+    if value.get("publish_user_id") is not None or value.get("publish_user_name"):
+        account = {
+            "user_id": value.get("publish_user_id"),
+            "user_name": value.get("publish_user_name"),
+        }
     return {
         "stable_id": value.get("stable_id"),
         "match_id": value.get("match_id"),
         "event_key": value.get("event_key"),
         "source_path": value.get("source_path"),
         "gif_url": value.get("gif_url"),
+        "cover_url": value.get("cover_url"),
         "title": value.get("title"),
         "status": value.get("status"),
         "stage": value.get("stage"),
@@ -1232,6 +1733,9 @@ def _public_record(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
         "error": value.get("error"),
         "updated_at_unix": value.get("updated_at_unix"),
         "published_at_unix": value.get("published_at_unix"),
+        "publish_account": account,
+        "account_user_id": value.get("publish_user_id"),
+        "account_user_name": value.get("publish_user_name"),
     }
 
 

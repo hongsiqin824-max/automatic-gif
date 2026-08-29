@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from article_draft_queue import (
     ArticleDraftQueue,
+    _event_with_team_fallback,
     draft_admin_url,
     has_reliable_person,
     ocr_publication_eligibility,
@@ -398,7 +399,7 @@ class ArticleDraftQueueTests(unittest.TestCase):
             self.assertEqual(replay["task_key"], first["task_key"])
             self.assertEqual(replay["status"], "queued")
 
-    def test_missing_person_creates_draft_then_publishes_when_name_arrives(self):
+    def test_missing_person_waits_locally_then_publishes_when_name_arrives(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = self.write_source(root)
@@ -416,7 +417,9 @@ class ArticleDraftQueueTests(unittest.TestCase):
             waiting = queue.records_for_match("54478914")[missing["event_key"]]
             self.assertEqual(waiting["status"], "waiting_person")
             self.assertEqual(waiting["person_deadline_at_unix"], 160.0)
-            self.assertEqual(platform.calls[0]["status"], 0)
+            self.assertIsNone(waiting["article_id"])
+            self.assertIsNone(waiting["draft_created_at_unix"])
+            self.assertEqual(platform.calls, [])
 
             refreshed = queue.refresh_event(
                 match_id="54478914",
@@ -431,9 +434,9 @@ class ArticleDraftQueueTests(unittest.TestCase):
             self.assertEqual(published["status"], "published")
             self.assertEqual(published["publish_reason"], "person_available")
             self.assertEqual(published["final_event"]["person"], "补齐球员")
-            self.assertEqual(platform.calls[1]["status"], 1)
-            self.assertEqual(platform.calls[1]["archive_id"], 6230049)
-            self.assertIn("补齐球员进球", platform.calls[1]["title"])
+            self.assertEqual(platform.calls[0]["status"], 1)
+            self.assertNotIn("archive_id", platform.calls[0])
+            self.assertIn("补齐球员进球", platform.calls[0]["title"])
 
     def test_missing_person_publishes_with_team_fallback_at_deadline(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -456,8 +459,12 @@ class ArticleDraftQueueTests(unittest.TestCase):
             published = queue.records_for_match("54478914")[missing["event_key"]]
             self.assertEqual(published["status"], "published")
             self.assertEqual(published["publish_reason"], "team_fallback")
-            self.assertEqual(platform.calls[1]["archive_id"], 6230049)
-            self.assertIn("主队进球", platform.calls[1]["title"])
+            self.assertEqual(len(platform.calls), 1)
+            self.assertEqual(platform.calls[0]["status"], 1)
+            self.assertNotIn("archive_id", platform.calls[0])
+            self.assertIn("主队进球", platform.calls[0]["title"])
+            self.assertEqual(published["final_event"]["person"], "主队")
+            self.assertTrue(published["final_event"]["person_fallback"])
 
     def test_waiting_person_deadline_recovers_after_restart(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -479,6 +486,8 @@ class ArticleDraftQueueTests(unittest.TestCase):
             self.assertTrue(reopened.run_once(now=160.0))
             record = reopened.records_for_match("54478914")[missing["event_key"]]
             self.assertEqual(record["status"], "published")
+            self.assertEqual(len(platform.calls), 1)
+            self.assertEqual(platform.calls[0]["status"], 1)
 
     def test_latest_event_loader_can_publish_before_deadline(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -512,6 +521,7 @@ class ArticleDraftQueueTests(unittest.TestCase):
             self.assertEqual(record["status"], "published")
             self.assertEqual(record["final_event"]["person"], "接口补齐球员")
             self.assertEqual(len(loader_calls), 1)
+            self.assertEqual(platform.calls[0]["status"], 1)
 
     def test_published_task_ignores_later_name_and_gif_revisions(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -552,6 +562,25 @@ class ArticleDraftQueueTests(unittest.TestCase):
                 self.assertFalse(has_reliable_person({"person": value, "person_id": "9"}))
         self.assertTrue(has_reliable_person({"person": "真实球员"}))
 
+    def test_team_fallback_resolves_symbolic_and_numeric_team_values(self):
+        detail = {
+            "team_A_id": "500001",
+            "team_A_name": "主队",
+            "team_B_id": "500002",
+            "team_B_name": "客队",
+        }
+        self.assertEqual(
+            _event_with_team_fallback({"team": "teamA", "person": ""}, detail)["person"],
+            "主队",
+        )
+        self.assertEqual(
+            _event_with_team_fallback(
+                {"team": "500002", "metadata": {"team_id": "500002"}, "person": ""},
+                detail,
+            )["person"],
+            "客队",
+        )
+
     def test_changed_ocr_gif_updates_existing_draft(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -579,10 +608,9 @@ class ArticleDraftQueueTests(unittest.TestCase):
             )
 
             self.assertEqual(changed["status"], "queued")
-            self.assertEqual(changed["article_id"], "6230049")
+            self.assertIsNone(changed["article_id"])
             queue.run_once()
-            self.assertEqual(len(platform.calls), 2)
-            self.assertEqual(platform.calls[1]["archive_id"], 6230049)
+            self.assertEqual(len(platform.calls), 0)
             record = queue.records_for_match("54478914")[self.event()["event_key"]]
             self.assertEqual(record["status"], "waiting_person")
             self.assertEqual(record["quality_label"], "精确到秒")

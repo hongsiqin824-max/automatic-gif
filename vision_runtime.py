@@ -78,8 +78,11 @@ OCR_PROGRESSIVE_TARGET_RESCAN_EXPANDED_MARGIN_SECONDS = 30.0
 OCR_PROGRESSIVE_TARGET_RESCAN_MAX_ATTEMPTS = 3
 OCR_OUTPUT_WINDOW_LEASE_OWNER = "ocr-output-window-retention"
 OCR_OUTPUT_MIN_DEGRADED_SECONDS = 10.0
-OCR_OUTPUT_MAX_ANCHOR_GAP_SECONDS = 10.0
-OCR_OUTPUT_MAX_ANCHOR_SHIFT_SECONDS = 5.0
+# The OCR artifact is a 60-second best-effort output. If its verified/projected
+# anchor falls inside a source outage, prefer the nearest retained boundary
+# anywhere in that window and mark the result approximate instead of failing.
+OCR_OUTPUT_MAX_ANCHOR_GAP_SECONDS = 60.0
+OCR_OUTPUT_MAX_ANCHOR_SHIFT_SECONDS = 30.0
 OCR_OUTPUT_WINDOW_LEASE_MIN_TTL_SECONDS = 180.0
 # Retain cumulative timing as diagnostics only. A slow-but-progressing event
 # must not lose its OCR upgrade merely because earlier passes used this much
@@ -92,10 +95,10 @@ OCR_ROI_CACHE_FAILURES_BEFORE_REDISCOVERY = 3
 # progressive pass is explicitly recorded as a refresh of the newly appended
 # tail instead of treating the old scan snapshot as final evidence.
 OCR_LONG_SCAN_TAIL_RESCAN_SECONDS = 5.0
-# A validated clock-to-video mapping is already a strong anchor. Keep its
-# focused scan at the original +/-15s; the wider windows above are reserved
-# for recovery after an OCR miss.
-OCR_PROGRESSIVE_MAPPED_TARGET_MARGIN_SECONDS = 15.0
+# A validated clock-to-video mapping is already a strong anchor. Scan a
+# target-centred +/-30s window as soon as its centre is retained; this avoids
+# waiting for a separate tail-growth signal and tolerates timestamp jitter.
+OCR_PROGRESSIVE_MAPPED_TARGET_MARGIN_SECONDS = 30.0
 # A clock-to-video mapping is only used after two trustworthy observations.
 # The ratio is normally close to 1.0, but a small tolerance covers broadcast
 # drift and timestamp jitter without accepting a paused/replayed stream.
@@ -106,7 +109,9 @@ OCR_CLOCK_MAPPING_MAX_SAMPLES = 32
 # Do not project a target arbitrarily far beyond the observed clock range.
 # Such a projection is useful for a short API/OCR lag, but unsafe after a
 # halftime break, stream seek, or a long missing segment.
-OCR_CLOCK_MAPPING_MAX_EXTRAPOLATION_SECONDS = 60.0
+# A validated clock-to-video mapping can safely navigate a longer live delay;
+# the actual scan still requires retained, readable TS components below.
+OCR_CLOCK_MAPPING_MAX_EXTRAPOLATION_SECONDS = 300.0
 # A second-half clock-to-video mapping omits the wall-clock halftime interval.
 # Add the normal 15-minute break only for availability diagnostics that project
 # back into the first half.  This is not used to accept an OCR anchor.
@@ -176,6 +181,58 @@ def _event_minute(job: "VisionJob") -> str:
     if minute and extra not in {"", "0"} and "+" not in minute:
         return f"{minute}+{extra}"
     return minute
+
+
+_OCR_CLOCK_PHASES = frozenset({
+    "first_half",
+    "first_half_stoppage",
+    "second_half",
+    "second_half_stoppage",
+})
+
+
+def _normalize_ocr_clock_phase(value: Any) -> str | None:
+    phase = str(value or "").strip().lower()
+    return phase if phase in _OCR_CLOCK_PHASES else None
+
+
+def _ocr_clock_period(phase: Any) -> str | None:
+    normalized = _normalize_ocr_clock_phase(phase)
+    if normalized is None:
+        return None
+    return "first_half" if normalized.startswith("first_half") else "second_half"
+
+
+def _ocr_clock_phases_compatible(left: Any, right: Any) -> bool:
+    left_period = _ocr_clock_period(left)
+    right_period = _ocr_clock_period(right)
+    return bool(left_period and left_period == right_period)
+
+
+def _ocr_job_clock_phase(job: "VisionJob") -> str | None:
+    """Classify the API target without confusing first-half stoppage with 48'."""
+    minute = _event_minute(job).rstrip("'").strip()
+    if minute:
+        base_text, separator, extra_text = minute.partition("+")
+        try:
+            base = int(base_text)
+            extra = int(extra_text) if separator else 0
+        except ValueError:
+            base = -1
+            extra = -1
+        if base == 45 and separator and extra > 0:
+            return "first_half_stoppage"
+        if base == 90 and separator and extra > 0:
+            return "second_half_stoppage"
+        if 0 <= base <= 45:
+            return "first_half"
+        if 45 < base <= 90:
+            return "second_half"
+
+    target = _ocr_progressive_target_seconds(job)
+    if target is None:
+        return None
+    return "first_half" if int(target) <= 45 * 60 else "second_half"
 
 
 def _v1_clock_scope_error(job: "VisionJob") -> tuple[str, str] | None:
@@ -2457,7 +2514,7 @@ def _ocr_match_clock_readiness(
     runtime: Any,
     job: VisionJob,
     state: dict[str, Any],
-) -> tuple[list[dict[str, float | int]], dict[str, Any]]:
+) -> tuple[list[dict[str, float | int | str]], dict[str, Any]]:
     """Return this task's clock samples or a ready mapping from the match.
 
     Vision task metadata is already durable and indexed by match, so sharing a
@@ -2465,12 +2522,26 @@ def _ocr_match_clock_readiness(
     backed by two plausible progressing observations is shared; isolated OCR
     readings remain local to their event.
     """
+    clock_phase = _ocr_job_clock_phase(job)
+    clock_period = _ocr_clock_period(clock_phase)
     local_samples = _ocr_progressive_merge_clock_samples(
-        [], state.get("clock_samples")
+        [],
+        state.get("clock_samples"),
+        default_phase=clock_phase,
     )
-    local_mapping = _ocr_progressive_clock_mapping(local_samples)
+    local_mapping = _ocr_progressive_clock_mapping(
+        local_samples,
+        clock_phase=clock_phase,
+    )
     previous = state.get("clock_readiness")
     readiness = dict(previous) if isinstance(previous, dict) else {}
+    previous_period = (
+        _ocr_clock_period(readiness.get("clock_phase"))
+        or str(readiness.get("clock_period") or "").strip()
+        or None
+    )
+    if previous_period is not None and previous_period != clock_period:
+        readiness = {}
     if local_mapping.get("status") == "ready":
         readiness.update({
             "status": "ready",
@@ -2482,12 +2553,14 @@ def _ocr_match_clock_readiness(
                 local_mapping.get("accepted_sample_count") or 0
             ),
             "clock_mapping": local_mapping,
+            "clock_phase": clock_phase,
+            "clock_period": clock_period,
         })
         return local_samples, readiness
 
     list_tasks = getattr(runtime.store, "list_vision_tasks", None)
     if callable(list_tasks):
-        candidates: list[tuple[float, str, list[dict[str, float | int]], dict[str, Any]]] = []
+        candidates: list[tuple[float, str, list[dict[str, Any]], dict[str, Any]]] = []
         waiting_candidates: list[tuple[float, float, str, dict[str, Any]]] = []
         try:
             tasks = list_tasks(job.match_id, "ocr_window")
@@ -2499,6 +2572,11 @@ def _ocr_match_clock_readiness(
             candidate_state = _ocr_progressive_state(task)
             candidate_readiness = candidate_state.get("clock_readiness")
             if isinstance(candidate_readiness, dict):
+                candidate_readiness_period = (
+                    _ocr_clock_period(candidate_readiness.get("clock_phase"))
+                    or str(candidate_readiness.get("clock_period") or "").strip()
+                    or None
+                )
                 try:
                     candidate_probe_tail = float(
                         candidate_readiness.get(
@@ -2509,6 +2587,8 @@ def _ocr_match_clock_readiness(
                     candidate_probe_tail = math.nan
                 if (
                     candidate_readiness.get("status") == "waiting"
+                    and candidate_readiness_period is not None
+                    and candidate_readiness_period == clock_period
                     and math.isfinite(candidate_probe_tail)
                 ):
                     waiting_candidates.append((
@@ -2520,7 +2600,23 @@ def _ocr_match_clock_readiness(
             candidate_samples = _ocr_progressive_merge_clock_samples(
                 [], candidate_state.get("clock_samples")
             )
-            candidate_mapping = _ocr_progressive_clock_mapping(candidate_samples)
+            candidate_sample_periods = [
+                _ocr_clock_period(sample.get("clock_phase"))
+                for sample in candidate_samples
+            ]
+            # Phase-less legacy samples are valid only inside their original
+            # event. Cross-event reuse requires every source sample to prove
+            # that it belongs to the target event's match period.
+            if (
+                not candidate_sample_periods
+                or any(period is None for period in candidate_sample_periods)
+                or any(period != clock_period for period in candidate_sample_periods)
+            ):
+                continue
+            candidate_mapping = _ocr_progressive_clock_mapping(
+                candidate_samples,
+                clock_phase=clock_phase,
+            )
             if candidate_mapping.get("status") != "ready":
                 continue
             candidate_source_event_key = str(
@@ -2547,6 +2643,8 @@ def _ocr_match_clock_readiness(
                     shared_mapping.get("accepted_sample_count") or 0
                 ),
                 "clock_mapping": shared_mapping,
+                "clock_phase": clock_phase,
+                "clock_period": clock_period,
                 "reused_from_match": True,
             })
             return shared_samples, readiness
@@ -2568,6 +2666,8 @@ def _ocr_match_clock_readiness(
                 readiness.update({
                     "source_event_key": source_event_key,
                     "last_probe_media_end_stream_time": round(probe_tail, 3),
+                    "clock_phase": clock_phase,
+                    "clock_period": clock_period,
                     "reused_from_match": True,
                 })
 
@@ -2581,6 +2681,8 @@ def _ocr_match_clock_readiness(
             local_mapping.get("accepted_sample_count") or 0
         ),
         "clock_mapping": local_mapping,
+        "clock_phase": clock_phase,
+        "clock_period": clock_period,
     })
     return local_samples, readiness
 
@@ -2689,15 +2791,29 @@ def _ocr_structured_diagnostic_roots(value: Any) -> list[dict[str, Any]]:
     return roots
 
 
-def _ocr_progressive_clock_readings(value: Any) -> list[tuple[float, int]]:
-    """Extract unique ``(video_seconds, match_clock_seconds)`` observations.
+def _ocr_progressive_clock_sample_records(
+    value: Any,
+    *,
+    default_phase: str | None = None,
+) -> list[dict[str, Any]]:
+    """Extract unique trusted clock observations while preserving their phase.
 
     Worker failures preserve diagnostics at different nesting levels (for
     example ``readings`` and ``clock_raw_observations``).  Keeping this parser
     local to the progressive state avoids coupling the runtime to one worker
     response shape while still allowing a safe target-window retry.
     """
-    found: set[tuple[float, int]] = set()
+    normalized_default_phase = _normalize_ocr_clock_phase(default_phase)
+    found: dict[tuple[float, int], str | None] = {}
+
+    def add(stream: float, clock: int, phase: Any) -> None:
+        normalized_phase = (
+            _normalize_ocr_clock_phase(phase) or normalized_default_phase
+        )
+        key = (round(stream, 3), int(clock))
+        existing = found.get(key)
+        if existing is None or normalized_phase is not None:
+            found[key] = normalized_phase
 
     # Durable samples have an absolute stream time and were already filtered
     # before persistence. They are still range-checked below and later passed
@@ -2717,10 +2833,18 @@ def _ocr_progressive_clock_readings(value: Any) -> list[tuple[float, int]]:
                 and clock >= 0
                 and not isinstance(sample.get("match_clock_seconds"), bool)
             ):
-                found.add((round(stream, 3), clock))
-        return sorted(found)
+                add(stream, clock, sample.get("clock_phase"))
+        return [
+            {
+                "stream_time": stream,
+                "match_clock_seconds": clock,
+                **({"clock_phase": phase} if phase is not None else {}),
+            }
+            for (stream, clock), phase in sorted(found.items())
+        ]
 
     for root in _ocr_structured_diagnostic_roots(value):
+        root_phase = _normalize_ocr_clock_phase(root.get("clock_phase"))
         try:
             candidate_start = float(root.get("candidate_start_seconds") or 0.0)
         except (TypeError, ValueError):
@@ -2775,7 +2899,11 @@ def _ocr_progressive_clock_readings(value: Any) -> list[tuple[float, int]]:
                     clock = None
                 if clock is None or clock < 0:
                     continue
-                found.add((round(candidate_start + frame, 3), int(clock)))
+                add(
+                    candidate_start + frame,
+                    int(clock),
+                    reading.get("clock_phase") or root_phase,
+                )
 
     # Conflicting clocks at the same stream time are ambiguous even when both
     # records claim acceptance. Drop the whole timestamp rather than picking a
@@ -2783,11 +2911,24 @@ def _ocr_progressive_clock_readings(value: Any) -> list[tuple[float, int]]:
     clocks_by_stream: dict[float, set[int]] = {}
     for stream, clock in found:
         clocks_by_stream.setdefault(stream, set()).add(clock)
-    return sorted(
-        (stream, next(iter(clocks)))
-        for stream, clocks in clocks_by_stream.items()
-        if len(clocks) == 1
-    )
+    records: list[dict[str, Any]] = []
+    for (stream, clock), phase in sorted(found.items()):
+        if len(clocks_by_stream.get(stream, ())) != 1:
+            continue
+        records.append({
+            "stream_time": stream,
+            "match_clock_seconds": clock,
+            **({"clock_phase": phase} if phase is not None else {}),
+        })
+    return records
+
+
+def _ocr_progressive_clock_readings(value: Any) -> list[tuple[float, int]]:
+    """Return the legacy pair view of trusted clock sample records."""
+    return [
+        (float(sample["stream_time"]), int(sample["match_clock_seconds"]))
+        for sample in _ocr_progressive_clock_sample_records(value)
+    ]
 
 
 def _ocr_latest_unpositioned_clock_seconds(value: Any) -> int | None:
@@ -3049,11 +3190,14 @@ def _ocr_progressive_merge_clock_samples(
     diagnostics: Any,
     *,
     limit: int = OCR_CLOCK_MAPPING_MAX_SAMPLES,
-) -> list[dict[str, float | int]]:
+    default_phase: str | None = None,
+) -> list[dict[str, float | int | str]]:
     """Merge trusted OCR clock readings into durable stream-time samples."""
-    merged: dict[tuple[float, int], dict[str, float | int]] = {}
+    normalized_default_phase = _normalize_ocr_clock_phase(default_phase)
+    target_period = _ocr_clock_period(normalized_default_phase)
+    merged: dict[tuple[float, int], dict[str, float | int | str]] = {}
 
-    def add(stream_time: Any, clock_seconds: Any) -> None:
+    def add(stream_time: Any, clock_seconds: Any, phase: Any = None) -> None:
         try:
             stream = float(stream_time)
             clock = int(clock_seconds)
@@ -3061,37 +3205,89 @@ def _ocr_progressive_merge_clock_samples(
             return
         if not math.isfinite(stream) or stream < 0 or clock < 0:
             return
-        merged[(round(stream, 3), clock)] = {
+        normalized_phase = (
+            _normalize_ocr_clock_phase(phase) or normalized_default_phase
+        )
+        if (
+            target_period is not None
+            and _ocr_clock_period(normalized_phase) != target_period
+        ):
+            return
+        key = (round(stream, 3), clock)
+        existing = merged.get(key)
+        if (
+            existing is not None
+            and existing.get("clock_phase") is not None
+            and normalized_phase is None
+        ):
+            return
+        merged[key] = {
             "stream_time": round(stream, 3),
             "match_clock_seconds": clock,
+            **(
+                {"clock_phase": normalized_phase}
+                if normalized_phase is not None
+                else {}
+            ),
         }
 
-    for stream, clock in _ocr_progressive_clock_readings(previous):
-        add(stream, clock)
-    for stream, clock in _ocr_progressive_clock_readings(diagnostics):
-        add(stream, clock)
+    for sample in _ocr_progressive_clock_sample_records(
+        previous,
+        default_phase=normalized_default_phase,
+    ):
+        add(
+            sample.get("stream_time"),
+            sample.get("match_clock_seconds"),
+            sample.get("clock_phase"),
+        )
+    for sample in _ocr_progressive_clock_sample_records(
+        diagnostics,
+        default_phase=normalized_default_phase,
+    ):
+        add(
+            sample.get("stream_time"),
+            sample.get("match_clock_seconds"),
+            sample.get("clock_phase"),
+        )
     ordered = sorted(merged)
-    validated = _ocr_latest_continuous_clock_run(ordered)
+    known_periods = {
+        period
+        for sample in merged.values()
+        if (period := _ocr_clock_period(sample.get("clock_phase"))) is not None
+    }
+    continuity_candidates = [
+        key
+        for key in ordered
+        if (
+            not known_periods
+            or len(known_periods) > 1
+            or _ocr_clock_period(merged[key].get("clock_phase"))
+            in known_periods
+        )
+    ]
+    validated = (
+        []
+        if len(known_periods) > 1
+        else _ocr_latest_continuous_clock_run(continuity_candidates)
+    )
     # Keep an entirely inconsistent short set long enough for the mapping
     # diagnostics to explain pause/jump. Once a continuous run exists, discard
     # isolated outliers so they cannot poison subsequent state.
     durable = validated if validated else ordered
     bounded = durable[-max(1, min(int(limit), OCR_CLOCK_MAPPING_MAX_SAMPLES)) :]
-    return [
-        {"stream_time": stream, "match_clock_seconds": clock}
-        for stream, clock in bounded
-    ]
+    return [dict(merged[key]) for key in bounded]
 
 
 def _ocr_target_passed_with_continuous_evidence(
     samples: Any,
     *,
     target_clock_seconds: int | None,
+    clock_phase: str | None = None,
 ) -> bool:
     """Require a validated progressing run before declaring a target passed."""
     if target_clock_seconds is None:
         return False
-    mapping = _ocr_progressive_clock_mapping(samples)
+    mapping = _ocr_progressive_clock_mapping(samples, clock_phase=clock_phase)
     return bool(
         mapping.get("status") == "ready"
         and int(mapping.get("right_match_clock_seconds", -1))
@@ -3099,7 +3295,11 @@ def _ocr_target_passed_with_continuous_evidence(
     )
 
 
-def _ocr_progressive_clock_mapping(samples: Any) -> dict[str, Any]:
+def _ocr_progressive_clock_mapping(
+    samples: Any,
+    *,
+    clock_phase: str | None = None,
+) -> dict[str, Any]:
     """Build a validated linear mapping from match-clock to stream time.
 
     At least two observations and one positive, sensible interval are
@@ -3115,10 +3315,64 @@ def _ocr_progressive_clock_mapping(samples: Any) -> dict[str, Any]:
             "rejected_samples": [],
             "updated_at_unix": time.time(),
         }
+    requested_phase = _normalize_ocr_clock_phase(clock_phase)
+    requested_period = _ocr_clock_period(requested_phase)
+    records = _ocr_progressive_clock_sample_records(samples)
+    known_periods = {
+        period
+        for item in records
+        if (period := _ocr_clock_period(item.get("clock_phase"))) is not None
+    }
+    if requested_period is not None:
+        known_records = [
+            item
+            for item in records
+            if _ocr_clock_period(item.get("clock_phase")) == requested_period
+        ]
+        # Legacy phase-less rows remain usable inside their own event. The
+        # caller stamps those rows during local merge; never mix them with
+        # explicitly phased samples here.
+        if known_periods and not known_records:
+            return {
+                "status": "clock_phase_mismatch",
+                "reason": "clock_samples_do_not_match_target_period",
+                "sample_count": len(records),
+                "accepted_sample_count": 0,
+                "rejected_samples": [],
+                "clock_periods": sorted(known_periods),
+                "clock_phase": requested_phase,
+                "clock_period": requested_period,
+                "updated_at_unix": time.time(),
+            }
+        records = known_records if known_periods else records
+    elif len(known_periods) > 1:
+        return {
+            "status": "clock_phase_mismatch",
+            "reason": "clock_samples_span_multiple_match_periods",
+            "sample_count": len(records),
+            "accepted_sample_count": 0,
+            "rejected_samples": [],
+            "clock_periods": sorted(known_periods),
+            "updated_at_unix": time.time(),
+        }
+    elif known_periods:
+        records = [
+            item
+            for item in records
+            if _ocr_clock_period(item.get("clock_phase")) in known_periods
+        ]
+
+    mapping_phase = requested_phase or next(
+        (
+            _normalize_ocr_clock_phase(item.get("clock_phase"))
+            for item in reversed(records)
+            if _normalize_ocr_clock_phase(item.get("clock_phase")) is not None
+        ),
+        None,
+    )
+    mapping_period = _ocr_clock_period(mapping_phase)
     parsed: list[tuple[float, int]] = []
-    for item in samples:
-        if not isinstance(item, dict):
-            continue
+    for item in records:
         try:
             stream = float(item.get("stream_time"))
             clock = int(item.get("match_clock_seconds"))
@@ -3127,6 +3381,12 @@ def _ocr_progressive_clock_mapping(samples: Any) -> dict[str, Any]:
         if math.isfinite(stream) and stream >= 0 and clock >= 0:
             parsed.append((stream, clock))
     parsed = sorted(set(parsed))[-OCR_CLOCK_MAPPING_MAX_SAMPLES:]
+
+    def phase_fields() -> dict[str, str]:
+        return {
+            **({"clock_phase": mapping_phase} if mapping_phase else {}),
+            **({"clock_period": mapping_period} if mapping_period else {}),
+        }
     # Keep this initialized before the short-input guard; a one-sample history
     # should report insufficient data rather than raising an implementation
     # error while inspecting pause diagnostics.
@@ -3164,6 +3424,7 @@ def _ocr_progressive_clock_mapping(samples: Any) -> dict[str, Any]:
                 "sample_count": len(parsed),
                 "accepted_sample_count": 0,
                 "rejected_samples": pause_runs[-8:],
+                **phase_fields(),
                 "updated_at_unix": time.time(),
             }
         return {
@@ -3172,6 +3433,7 @@ def _ocr_progressive_clock_mapping(samples: Any) -> dict[str, Any]:
             "sample_count": len(parsed),
             "accepted_sample_count": len(parsed),
             "rejected_samples": pause_runs[-8:],
+            **phase_fields(),
             "updated_at_unix": time.time(),
         }
     valid: list[tuple[float, int, float, int, float]] = []
@@ -3228,6 +3490,7 @@ def _ocr_progressive_clock_mapping(samples: Any) -> dict[str, Any]:
             "sample_count": len(parsed),
             "accepted_sample_count": len(parsed) - len(rejected),
             "rejected_samples": rejected[-8:],
+            **phase_fields(),
             "updated_at_unix": time.time(),
         }
     if not valid:
@@ -3237,6 +3500,7 @@ def _ocr_progressive_clock_mapping(samples: Any) -> dict[str, Any]:
             "sample_count": len(parsed),
             "accepted_sample_count": 0,
             "rejected_samples": [],
+            **phase_fields(),
             "updated_at_unix": time.time(),
         }
     # Fit all trusted monotonic samples (rather than only the last pair) so
@@ -3261,6 +3525,7 @@ def _ocr_progressive_clock_mapping(samples: Any) -> dict[str, Any]:
             "sample_count": len(parsed),
             "accepted_sample_count": len(parsed),
             "rejected_samples": [],
+            **phase_fields(),
             "updated_at_unix": time.time(),
         }
     intercept = mean_stream - slope * mean_clock
@@ -3278,6 +3543,7 @@ def _ocr_progressive_clock_mapping(samples: Any) -> dict[str, Any]:
         "left_match_clock_seconds": left_clock,
         "right_stream_time": round(right_stream, 3),
         "right_match_clock_seconds": right_clock,
+        **phase_fields(),
         "updated_at_unix": time.time(),
     }
 
@@ -3287,11 +3553,12 @@ def _ocr_progressive_mapped_target_window(
     *,
     target_clock_seconds: int | None,
     margin_seconds: float = OCR_PROGRESSIVE_MAPPED_TARGET_MARGIN_SECONDS,
+    clock_phase: str | None = None,
 ) -> dict[str, Any] | None:
     """Estimate the retained-video window corresponding to a target clock."""
     if target_clock_seconds is None:
         return None
-    mapping = _ocr_progressive_clock_mapping(samples)
+    mapping = _ocr_progressive_clock_mapping(samples, clock_phase=clock_phase)
     if mapping.get("status") != "ready":
         return None
     rate = float(mapping.get("slope") or mapping["stream_time_per_match_second"])
@@ -3299,6 +3566,14 @@ def _ocr_progressive_mapped_target_window(
     target = int(target_clock_seconds)
     left_clock = int(mapping["left_match_clock_seconds"])
     right_clock = int(mapping["right_match_clock_seconds"])
+    halftime_boundary = 45 * 60
+    if (
+        right_clock <= halftime_boundary < target
+        or target < halftime_boundary <= left_clock
+    ):
+        # A linear in-play clock mapping does not contain the wall-clock
+        # halftime break. Wait for a trusted sample from the target half.
+        return None
     outside_distance = max(left_clock - target, target - right_clock, 0)
     if outside_distance > OCR_CLOCK_MAPPING_MAX_EXTRAPOLATION_SECONDS:
         return None
@@ -3321,11 +3596,84 @@ def _ocr_progressive_mapped_target_window(
     }
 
 
+def _ocr_readable_mapped_target_scan_window(
+    segments: list[Segment],
+    target_window: Any,
+    *,
+    minimum_component_seconds: float = 3.0,
+) -> tuple[float, float] | None:
+    """Return the retained part of a mapped target window once its centre arrives."""
+    if not isinstance(target_window, dict):
+        return None
+    try:
+        mapped_start = float(target_window["start_stream_time"])
+        mapped_end = float(target_window["end_stream_time"])
+        estimated = float(target_window["estimated_stream_time"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not all(math.isfinite(value) for value in (mapped_start, mapped_end, estimated)):
+        return None
+    if mapped_end <= mapped_start:
+        return None
+    components, _ = _continuous_search_components(
+        segments,
+        window_start=mapped_start,
+        window_end=mapped_end,
+        minimum_seconds=max(3.0, float(minimum_component_seconds)),
+    )
+    containing = next(
+        (
+            component
+            for component in components
+            if component.start <= estimated
+            and component.end
+            > estimated + OCR_PROGRESSIVE_TAIL_EPSILON_SECONDS
+        ),
+        None,
+    )
+    if containing is None:
+        return None
+    return (
+        max(mapped_start, containing.start),
+        min(mapped_end, containing.end),
+    )
+
+
+def _ocr_has_scannable_media_after_cursor(
+    segments: list[Segment],
+    cursor_stream_time: Any,
+    *,
+    minimum_component_seconds: float = 3.0,
+) -> bool:
+    """Whether retained, readable video remains beyond the OCR cursor."""
+    try:
+        cursor = float(cursor_stream_time)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(cursor):
+        return False
+    retained_ends = [
+        float(segment.end)
+        for segment in segments
+        if Path(segment.path).is_file() and float(segment.end) > cursor
+    ]
+    if not retained_ends:
+        return False
+    components, _ = _continuous_search_components(
+        segments,
+        window_start=max(0.0, cursor),
+        window_end=max(retained_ends),
+        minimum_seconds=max(3.0, float(minimum_component_seconds)),
+    )
+    return bool(components)
+
+
 def _ocr_target_media_availability(
     samples: Any,
     *,
     target_clock_seconds: int | None,
     earliest_retained_stream_time: float | None,
+    clock_phase: str | None = None,
 ) -> dict[str, Any]:
     """Classify whether a far historical target could exist in this recording.
 
@@ -3335,7 +3683,7 @@ def _ocr_target_media_availability(
     target window still fall before stream time zero?  Only that case is
     labelled as never recorded.
     """
-    mapping = _ocr_progressive_clock_mapping(samples)
+    mapping = _ocr_progressive_clock_mapping(samples, clock_phase=clock_phase)
     if target_clock_seconds is None or mapping.get("status") != "ready":
         return {"status": "unknown", "reason": "clock_mapping_not_ready"}
     try:
@@ -3394,6 +3742,7 @@ def _ocr_deadline_policy(
     latest_trusted_clock_seconds: int | None,
     latest_media_end_stream_time: float | None = None,
     clock_samples: Any = None,
+    has_scannable_media_after_cursor: bool | None = None,
 ) -> dict[str, Any]:
     """Return the persisted target-wait budget, excluding visual queue time."""
     state = _ocr_progressive_state(task)
@@ -3588,7 +3937,37 @@ def _ocr_deadline_policy(
         # The first observation is a baseline.  Subsequent unchanged tails
         # are measured from the last observed growth, not from task creation.
         policy.setdefault("last_media_progress_at_unix", float(now_unix))
+    if has_scannable_media_after_cursor is None:
+        has_scannable_media_after_cursor = bool(
+            policy.get("has_scannable_media_after_cursor")
+        )
+    else:
+        has_scannable_media_after_cursor = bool(
+            has_scannable_media_after_cursor
+        )
+    policy["has_scannable_media_after_cursor"] = (
+        has_scannable_media_after_cursor
+    )
     terminal_wait_reason = policy.get("target_wait_terminal_reason")
+    if (
+        has_scannable_media_after_cursor
+        and terminal_wait_reason in {
+            "ocr_clock_paused_timeout",
+            "ocr_target_media_stalled",
+        }
+    ):
+        recovered_terminal_reason = str(terminal_wait_reason)
+        policy.pop("target_wait_terminal_reason", None)
+        terminal_wait_reason = None
+        policy["terminal_wait_recovered_reason"] = recovered_terminal_reason
+        policy["terminal_wait_recovered_at_unix"] = float(now_unix)
+        policy["target_deadline_at_unix"] = min(
+            float(policy["hard_deadline_at_unix"]),
+            max(
+                float(policy["target_deadline_at_unix"]),
+                float(now_unix) + OCR_TARGET_WAIT_MARGIN_SECONDS,
+            ),
+        )
     if media_progress and latest_trusted_clock_seconds is None and not terminal_wait_reason:
         previous_deadline = float(policy["target_deadline_at_unix"])
         proposed_deadline = float(now_unix) + OCR_MEDIA_PROGRESS_EXTENSION_SECONDS
@@ -3722,12 +4101,13 @@ def _ocr_deadline_policy(
         target_still_future
         and math.isfinite(current_media_end)
         and media_stall_elapsed >= OCR_MEDIA_STALL_TIMEOUT_SECONDS
+        and not has_scannable_media_after_cursor
     )
     previous_clock = state.get("latest_trusted_clock_seconds")
     clock_changed = bool(
         isinstance(previous_clock, int)
         and isinstance(latest_trusted_clock_seconds, int)
-        and latest_trusted_clock_seconds != previous_clock
+        and latest_trusted_clock_seconds > previous_clock
     )
     if clock_changed:
         policy["last_clock_progress_at_unix"] = float(now_unix)
@@ -3748,6 +4128,7 @@ def _ocr_deadline_policy(
         and latest_trusted_clock_seconds < int(target_clock_seconds)
         and len(state.get("clock_samples") or []) >= 2
         and clock_pause_elapsed >= OCR_CLOCK_PAUSE_TIMEOUT_SECONDS
+        and not has_scannable_media_after_cursor
     )
     policy["media_stall_elapsed_seconds"] = round(media_stall_elapsed, 3)
     policy["clock_pause_elapsed_seconds"] = round(clock_pause_elapsed, 3)
@@ -4270,9 +4651,12 @@ def _ocr_progressive_wait(
     target_rescan_attempted: bool = False,
     suppress_target_rescan: bool = False,
     next_scan_cursor_stream_time: float | None = None,
+    has_scannable_media_after_cursor: bool | None = None,
+    retry_immediately: bool = False,
     now_unix: float | None = None,
 ) -> None:
     timestamp = time.time() if now_unix is None else float(now_unix)
+    clock_phase = _ocr_job_clock_phase(job)
     previous = _ocr_progressive_state(task)
     try:
         prior_rescan_attempt_count = max(
@@ -4281,12 +4665,15 @@ def _ocr_progressive_wait(
     except (TypeError, ValueError):
         prior_rescan_attempt_count = 0
     clock_samples = _ocr_progressive_merge_clock_samples(
-        previous.get("clock_samples"), diagnostics
+        previous.get("clock_samples"),
+        diagnostics,
+        default_phase=clock_phase,
     )
     if isinstance(diagnostics, dict):
         clock_samples = _ocr_progressive_merge_clock_samples(
             clock_samples,
             diagnostics.get("clock_samples"),
+            default_phase=clock_phase,
         )
     previous_readiness = previous.get("clock_readiness")
     readiness = (
@@ -4311,7 +4698,10 @@ def _ocr_progressive_wait(
                 "clock_readiness": readiness,
             },
         )
-    clock_mapping = _ocr_progressive_clock_mapping(clock_samples)
+    clock_mapping = _ocr_progressive_clock_mapping(
+        clock_samples,
+        clock_phase=clock_phase,
+    )
     # Derive state from the newest validated stream-time sample. Never retain
     # a numerically larger old clock merely because it was persisted first.
     validated_latest = _latest_trusted_clock_seconds(clock_samples)
@@ -4326,6 +4716,7 @@ def _ocr_progressive_wait(
     target_passed = _ocr_target_passed_with_continuous_evidence(
         clock_samples,
         target_clock_seconds=target_clock_seconds,
+        clock_phase=clock_phase,
     )
     deadline_policy = _ocr_deadline_policy(
         task,
@@ -4334,6 +4725,7 @@ def _ocr_progressive_wait(
         latest_trusted_clock_seconds=latest_trusted_clock_seconds,
         latest_media_end_stream_time=latest_media_end_stream_time,
         clock_samples=clock_samples,
+        has_scannable_media_after_cursor=has_scannable_media_after_cursor,
     )
     target_deadline = float(deadline_policy["target_deadline_at_unix"])
     next_attempt_at = _ocr_far_target_retry_at(
@@ -4342,6 +4734,8 @@ def _ocr_progressive_wait(
         latest_trusted_clock_seconds=latest_trusted_clock_seconds,
         target_deadline_at_unix=target_deadline,
     )
+    if retry_immediately:
+        next_attempt_at = timestamp
     active_processing_budget = _ocr_active_processing_budget(
         previous,
         now_unix=timestamp,
@@ -5511,6 +5905,7 @@ def _process_ocr_window(
             runtime,
             job,
         )
+        clock_phase = _ocr_job_clock_phase(job)
         scope_error = _v1_clock_scope_error(job)
         if scope_error is not None:
             kind, message = scope_error
@@ -5580,7 +5975,8 @@ def _process_ocr_window(
                         _latest_trusted_clock_seconds(readiness_samples)
                     ),
                     "clock_mapping": _ocr_progressive_clock_mapping(
-                        readiness_samples
+                        readiness_samples,
+                        clock_phase=clock_phase,
                     ),
                     "clock_readiness": clock_readiness,
                 }
@@ -5634,10 +6030,12 @@ def _process_ocr_window(
             target_passed = _ocr_target_passed_with_continuous_evidence(
                 clock_samples,
                 target_clock_seconds=target_clock_seconds,
+                clock_phase=clock_phase,
             )
             mapped_target_window = _ocr_progressive_mapped_target_window(
                 clock_samples,
                 target_clock_seconds=target_clock_seconds,
+                clock_phase=clock_phase,
             )
             target_rescan_window = state.get("target_rescan_window")
             try:
@@ -5657,6 +6055,13 @@ def _process_ocr_window(
                 previous_media_end = float(previous_media_end_raw)
             except (TypeError, ValueError):
                 previous_media_end = None
+            has_scannable_media_after_cursor = (
+                _ocr_has_scannable_media_after_cursor(
+                    retained,
+                    cursor,
+                    minimum_component_seconds=max(3.0, min_degraded_seconds),
+                )
+            )
             deadline_policy = _ocr_deadline_policy(
                 current,
                 now_unix=now_unix,
@@ -5664,6 +6069,9 @@ def _process_ocr_window(
                 latest_trusted_clock_seconds=latest_trusted,
                 latest_media_end_stream_time=latest_end,
                 clock_samples=clock_samples,
+                has_scannable_media_after_cursor=(
+                    has_scannable_media_after_cursor
+                ),
             )
             target_deadline = float(deadline_policy["target_deadline_at_unix"])
             deadline_reached = now_unix >= target_deadline
@@ -5675,7 +6083,10 @@ def _process_ocr_window(
             readiness_probe = bool(
                 job.clock_only
                 and progressive_scan
-                and _ocr_progressive_clock_mapping(clock_samples).get("status")
+                and _ocr_progressive_clock_mapping(
+                    clock_samples,
+                    clock_phase=clock_phase,
+                ).get("status")
                 != "ready"
                 and latest_end is not None
             )
@@ -5728,6 +6139,7 @@ def _process_ocr_window(
                 clock_samples,
                 target_clock_seconds=target_clock_seconds,
                 earliest_retained_stream_time=earliest_start,
+                clock_phase=clock_phase,
             )
             coverage_diagnostics["target_media_availability"] = (
                 target_media_availability
@@ -5796,6 +6208,9 @@ def _process_ocr_window(
                         "coverage_diagnostics": coverage_diagnostics,
                     },
                     next_scan_cursor_stream_time=last_probe_tail,
+                    has_scannable_media_after_cursor=(
+                        has_scannable_media_after_cursor
+                    ),
                     now_unix=now_unix,
                 )
                 return False
@@ -5807,7 +6222,59 @@ def _process_ocr_window(
             if mapped_target_window is not None and not target_rescan_pending:
                 mapped_start = float(mapped_target_window["start_stream_time"])
                 mapped_end = float(mapped_target_window["end_stream_time"])
-                if latest_end is None or latest_end <= mapped_start + OCR_PROGRESSIVE_TAIL_EPSILON_SECONDS:
+                readable_mapped_window = _ocr_readable_mapped_target_scan_window(
+                    retained,
+                    mapped_target_window,
+                    minimum_component_seconds=max(3.0, min_degraded_seconds),
+                )
+                if readable_mapped_window is None:
+                    mapped_estimate = float(
+                        mapped_target_window["estimated_stream_time"]
+                    )
+                    if deadline_reached:
+                        if (
+                            latest_end is None
+                            or float(latest_end)
+                            <= mapped_estimate
+                            + OCR_PROGRESSIVE_TAIL_EPSILON_SECONDS
+                        ):
+                            raise VisualLocationFailed(
+                                "ocr_target_media_not_arrived",
+                                "the predicted match-clock centre did not enter the retained live buffer before the deadline",
+                                {
+                                    "stage": "ocr_target_window_mapping",
+                                    "mapped_target_window": mapped_target_window,
+                                    "latest_media_end_stream_time": latest_end,
+                                    "deadline_policy": deadline_policy,
+                                },
+                            )
+                        if (
+                            earliest_start is not None
+                            and float(earliest_start)
+                            > mapped_estimate
+                            + OCR_PROGRESSIVE_TAIL_EPSILON_SECONDS
+                        ):
+                            raise VisualLocationFailed(
+                                "ocr_search_history_evicted",
+                                "the predicted match-clock centre is older than the retained video",
+                                {
+                                    "stage": "ocr_target_window_mapping",
+                                    "mapped_target_window": mapped_target_window,
+                                    "earliest_retained_stream_time": earliest_start,
+                                    "deadline_policy": deadline_policy,
+                                },
+                            )
+                        raise VisualLocationFailed(
+                            "buffer_gap",
+                            "the predicted match-clock centre falls in a retained-video gap",
+                            {
+                                "stage": "ocr_target_window_mapping",
+                                "mapped_target_window": mapped_target_window,
+                                "earliest_retained_stream_time": earliest_start,
+                                "latest_media_end_stream_time": latest_end,
+                                "deadline_policy": deadline_policy,
+                            },
+                        )
                     _ocr_progressive_wait(
                         runtime,
                         job,
@@ -5819,10 +6286,16 @@ def _process_ocr_window(
                         latest_trusted_clock_seconds=latest_trusted,
                         latest_media_end_stream_time=latest_end,
                         history_evicted=history_evicted,
+                        has_scannable_media_after_cursor=(
+                            has_scannable_media_after_cursor
+                        ),
                         diagnostics={
                             "stage": "ocr_target_window_mapping",
                             "mapped_target_window": mapped_target_window,
-                            "clock_mapping": _ocr_progressive_clock_mapping(clock_samples),
+                            "clock_mapping": _ocr_progressive_clock_mapping(
+                                clock_samples,
+                                clock_phase=clock_phase,
+                            ),
                             "coverage_diagnostics": _ocr_progressive_coverage_diagnostics(
                                 retained,
                                 intended_initial_start=intended_initial_start,
@@ -5840,15 +6313,12 @@ def _process_ocr_window(
                         now_unix=now_unix,
                     )
                     return False
-                if latest_end > mapped_start + OCR_PROGRESSIVE_TAIL_EPSILON_SECONDS:
-                    focused_start = max(mapped_start, float(earliest_start or 0.0))
-                    focused_end = min(mapped_end, float(latest_end))
-                    if focused_end - focused_start >= 3.0:
-                        window_start = focused_start
-                        window_end = focused_end
-                        mapped_target_ready = True
-                        force_final_scan = True
-                        target_rescan_pending = False
+                focused_start, focused_end = readable_mapped_window
+                window_start = focused_start
+                window_end = focused_end
+                mapped_target_ready = True
+                force_final_scan = True
+                target_rescan_pending = False
 
             if latest_end is None:
                 if deadline_reached:
@@ -5874,6 +6344,9 @@ def _process_ocr_window(
                     latest_media_end_stream_time=latest_end,
                     history_evicted=history_evicted,
                     diagnostics={"coverage_diagnostics": coverage_diagnostics},
+                    has_scannable_media_after_cursor=(
+                        has_scannable_media_after_cursor
+                    ),
                     now_unix=now_unix,
                 )
                 return False
@@ -6000,6 +6473,9 @@ def _process_ocr_window(
                                 ),
                             },
                             target_rescan_attempted=False,
+                            has_scannable_media_after_cursor=(
+                                has_scannable_media_after_cursor
+                            ),
                             now_unix=now_unix,
                         )
                         return False
@@ -6012,9 +6488,6 @@ def _process_ocr_window(
                     elif latest_trusted is None:
                         error_kind = "ocr_no_trustworthy_clock_before_deadline"
                         message = "OCR never produced a trustworthy match-clock reading before the deadline"
-                    elif history_evicted and coverage_diagnostics.get("target_history_fully_missing"):
-                        error_kind = "ocr_search_history_evicted"
-                        message = "required OCR search history was evicted before the target clock was located"
                     elif (
                         target_clock_seconds is not None
                         and latest_trusted < target_clock_seconds
@@ -6070,6 +6543,9 @@ def _process_ocr_window(
                     latest_media_end_stream_time=latest_end,
                     history_evicted=history_evicted,
                     diagnostics={"coverage_diagnostics": coverage_diagnostics},
+                    has_scannable_media_after_cursor=(
+                        has_scannable_media_after_cursor
+                    ),
                     now_unix=now_unix,
                 )
                 return False
@@ -6099,6 +6575,9 @@ def _process_ocr_window(
                     latest_media_end_stream_time=latest_end,
                     history_evicted=history_evicted,
                     diagnostics={"coverage_diagnostics": coverage_diagnostics},
+                    has_scannable_media_after_cursor=(
+                        has_scannable_media_after_cursor
+                    ),
                     now_unix=now_unix,
                 )
                 return False
@@ -6169,6 +6648,8 @@ def _process_ocr_window(
                     **readiness,
                     "status": "waiting",
                     "scope": "match",
+                    "clock_phase": clock_phase,
+                    "clock_period": _ocr_clock_period(clock_phase),
                     "probe_count": readiness_probe_count + 1,
                     "last_probe_media_end_stream_time": round(
                         float(latest_end), 3
@@ -6270,6 +6751,7 @@ def _process_ocr_window(
                 scanned_clock_samples = _ocr_progressive_merge_clock_samples(
                     clock_samples,
                     exc.diagnostics,
+                    default_phase=clock_phase,
                 )
                 scanned_trusted = _latest_trusted_clock_seconds(
                     scanned_clock_samples
@@ -6282,6 +6764,7 @@ def _process_ocr_window(
                     _ocr_target_passed_with_continuous_evidence(
                         scanned_clock_samples,
                         target_clock_seconds=target_clock_seconds,
+                        clock_phase=clock_phase,
                     )
                 )
                 target_not_reached = bool(
@@ -6301,10 +6784,9 @@ def _process_ocr_window(
                 ]
                 refreshed_latest_end = max(
                     (float(segment.end) for segment in refreshed_retained),
-                    default=latest_end,
+                    default=None,
                 )
-                if refreshed_latest_end is not None:
-                    latest_end = refreshed_latest_end
+                latest_end = refreshed_latest_end
                 media_tail_grew_during_scan = bool(
                     latest_end is not None
                     and (
@@ -6314,11 +6796,6 @@ def _process_ocr_window(
                         + OCR_PROGRESSIVE_TAIL_EPSILON_SECONDS
                     )
                 )
-                long_scan_tail_rescan = bool(
-                    media_tail_grew_during_scan
-                    and after_scan_unix - now_unix
-                    >= OCR_LONG_SCAN_TAIL_RESCAN_SECONDS
-                )
                 # Re-read the transition persisted immediately before OCR.
                 # It contains the execution start timestamp needed to exclude
                 # this expensive scan from the live-media wait budget.
@@ -6326,6 +6803,26 @@ def _process_ocr_window(
                 if refreshed is not None:
                     current = refreshed
                     state = _ocr_progressive_state(current)
+                post_scan_cursor = (
+                    float(cursor)
+                    if target_rescan_pending and isinstance(cursor, (int, float))
+                    else float(window_end)
+                )
+                post_scan_has_scannable_media = (
+                    _ocr_has_scannable_media_after_cursor(
+                        refreshed_retained,
+                        post_scan_cursor,
+                        minimum_component_seconds=max(
+                            3.0, min_degraded_seconds
+                        ),
+                    )
+                )
+                long_scan_tail_rescan = bool(
+                    media_tail_grew_during_scan
+                    and post_scan_has_scannable_media
+                    and after_scan_unix - now_unix
+                    >= OCR_LONG_SCAN_TAIL_RESCAN_SECONDS
+                )
                 updated_deadline_policy = _ocr_deadline_policy(
                     current,
                     now_unix=after_scan_unix,
@@ -6333,26 +6830,34 @@ def _process_ocr_window(
                     latest_trusted_clock_seconds=scanned_trusted,
                     latest_media_end_stream_time=latest_end,
                     clock_samples=scanned_clock_samples,
+                    has_scannable_media_after_cursor=(
+                        post_scan_has_scannable_media
+                    ),
                 )
                 effective_deadline_reached = (
                     after_scan_unix
                     >= float(updated_deadline_policy["target_deadline_at_unix"])
                 )
                 post_scan_clock_samples = _ocr_progressive_merge_clock_samples(
-                    state.get("clock_samples"), scanned_clock_samples
+                    state.get("clock_samples"),
+                    scanned_clock_samples,
+                    default_phase=clock_phase,
                 )
                 scanned_target_passed = (
                     _ocr_target_passed_with_continuous_evidence(
                         post_scan_clock_samples,
                         target_clock_seconds=target_clock_seconds,
+                        clock_phase=clock_phase,
                     )
                 )
                 post_scan_target_window = _ocr_progressive_mapped_target_window(
                     post_scan_clock_samples,
                     target_clock_seconds=target_clock_seconds,
+                    clock_phase=clock_phase,
                 )
                 post_scan_mapping = _ocr_progressive_clock_mapping(
-                    post_scan_clock_samples
+                    post_scan_clock_samples,
+                    clock_phase=clock_phase,
                 )
                 readiness_roi_cache = None
                 if (
@@ -6373,12 +6878,21 @@ def _process_ocr_window(
                         exc.diagnostics,
                         cached=cached_scoreboard_roi,
                     )
+                predicted_target_scan_window = (
+                    _ocr_readable_mapped_target_scan_window(
+                        refreshed_retained,
+                        post_scan_target_window,
+                        minimum_component_seconds=max(
+                            3.0, min_degraded_seconds
+                        ),
+                    )
+                )
                 predicted_target_media_ready = bool(
-                    media_tail_grew_during_scan
-                    and latest_end is not None
-                    and isinstance(post_scan_target_window, dict)
-                    and float(latest_end)
-                    >= float(post_scan_target_window["estimated_stream_time"])
+                    predicted_target_scan_window is not None
+                    and not scanned_target_passed
+                    and not mapped_target_ready
+                    and not target_rescan_pending
+                    and not force_final_scan
                 )
                 post_scan_coverage = _ocr_progressive_coverage_diagnostics(
                     refreshed_retained,
@@ -6393,10 +6907,7 @@ def _process_ocr_window(
                     previous_media_end_stream_time=media_tail_before_scan,
                     target_window=post_scan_target_window,
                 )
-                if (
-                    history_evicted
-                    and post_scan_coverage.get("target_history_fully_missing")
-                ):
+                if post_scan_coverage.get("target_history_fully_missing"):
                     raise VisualLocationFailed(
                         "ocr_search_history_evicted",
                         "required OCR search history was evicted before the target clock was located",
@@ -6467,6 +6978,9 @@ def _process_ocr_window(
                             and isinstance(cursor, (int, float))
                             else None
                         ),
+                        has_scannable_media_after_cursor=(
+                            post_scan_has_scannable_media
+                        ),
                         now_unix=after_scan_unix,
                     )
                     return False
@@ -6501,6 +7015,9 @@ def _process_ocr_window(
                                 if target_rescan_pending
                                 and isinstance(cursor, (int, float))
                                 else None
+                            ),
+                            has_scannable_media_after_cursor=(
+                                post_scan_has_scannable_media
                             ),
                             now_unix=after_scan_unix,
                         )
@@ -6596,6 +7113,18 @@ def _process_ocr_window(
                         ),
                         "scoreboard_roi_cache": readiness_roi_cache,
                         "predicted_target_media_ready": predicted_target_media_ready,
+                        "predicted_target_scan_window": (
+                            {
+                                "start_stream_time": round(
+                                    predicted_target_scan_window[0], 3
+                                ),
+                                "end_stream_time": round(
+                                    predicted_target_scan_window[1], 3
+                                ),
+                            }
+                            if predicted_target_scan_window is not None
+                            else None
+                        ),
                         "post_scan_target_window": post_scan_target_window,
                         "coverage_diagnostics": post_scan_coverage,
                         **exc.diagnostics,
@@ -6608,6 +7137,10 @@ def _process_ocr_window(
                         and isinstance(cursor, (int, float))
                         else None
                     ),
+                    has_scannable_media_after_cursor=(
+                        post_scan_has_scannable_media
+                    ),
+                    retry_immediately=predicted_target_media_ready,
                     now_unix=after_scan_unix,
                 )
                 return False
@@ -6691,7 +7224,9 @@ def _process_ocr_window(
             locate_result["clip_before_seconds"] = before
             locate_result["clip_after_seconds"] = after
             merged_clock_samples = _ocr_progressive_merge_clock_samples(
-                state.get("clock_samples"), located.get("diagnostics") or located
+                state.get("clock_samples"),
+                located.get("diagnostics") or located,
+                default_phase=clock_phase,
             )
             effective_latest_trusted = _latest_trusted_clock_seconds(
                 merged_clock_samples
@@ -6728,7 +7263,10 @@ def _process_ocr_window(
                 "last_execution_completed_at_unix": execution_completed_at,
                 "last_execution_result": "target_located",
                 "clock_samples": merged_clock_samples,
-                "clock_mapping": _ocr_progressive_clock_mapping(merged_clock_samples),
+                "clock_mapping": _ocr_progressive_clock_mapping(
+                    merged_clock_samples,
+                    clock_phase=clock_phase,
+                ),
             }
             if force_final_scan:
                 progress["final_scan_completed_at_unix"] = time.time()

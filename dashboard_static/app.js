@@ -16,6 +16,10 @@ const state = {
   lastRenderedRefreshSerial: 0,
   actionPending: false,
   ocrAutomaticPublishing: true,
+  publishAccounts: [],
+  publishAccountsLoading: false,
+  publishAccountsSaving: false,
+  publishAccountsDirty: false,
   openTechnicalDetails: new Set(),
 };
 
@@ -95,6 +99,16 @@ function articleAdminUrl(articleId) {
     ? `https://dadmin.dongqiudi.com/admin/archives/articlePublish?articleId=${encodeURIComponent(value)}`
     : '';
 }
+function publicationAccountText(record) {
+  if (!record || typeof record !== 'object') return '';
+  const nested = record.publish_account && typeof record.publish_account === 'object'
+    ? record.publish_account
+    : {};
+  const userId = String(record.account_user_id ?? nested.user_id ?? '').trim();
+  const userName = String(record.account_user_name ?? nested.user_name ?? '').trim();
+  if (!userId && !userName) return '';
+  return `发布账号：${userName || '未提供名称'}${userId ? `（${userId}）` : ''}`;
+}
 function automaticArticleStatus(event, artifact) {
   const uploaded = artifact && artifact.uploaded_gif;
   const ready = artifact && (artifact.status === 'encoded' || (uploaded && uploaded.gif_id));
@@ -118,14 +132,18 @@ function automaticArticleStatus(event, artifact) {
   const publicationHeld = status === 'held'
     || publication.stage === 'publication_gate'
     || (eligibility && eligibility.eligible === false && !['published', 'success'].includes(status));
+  const articleId = publication.article_id ? String(publication.article_id) : '';
+  // New no-player tasks wait only in local SQLite and do not have an
+  // article_id.  Keep the old wording for legacy platform drafts, but do not
+  // tell the operator that a remote draft exists when it does not.
+  const draftCreated = Boolean(articleId || Number(publication.draft_created_at_unix) > 0);
   const labels = {
     queued:'等待自动创建文章', creating:'正在创建文章草稿', creating_draft:'正在创建文章草稿',
-    waiting_person:'草稿已创建 · 等待球员信息', publishing:'正在自动发布',
+    waiting_person: draftCreated ? '草稿已创建 · 等待球员信息' : '等待球员信息 · 尚未创建草稿', publishing:'正在自动发布',
     retry_wait:'自动发布暂时失败 · 系统将重试',
     published:'已自动发布', success:'草稿已创建', failed:'自动发布失败',
     held:'未自动发布'
   };
-  const articleId = publication.article_id ? String(publication.article_id) : '';
   const articleUrl = articleAdminUrl(articleId);
   const error = publicationHeld || !publication.error ? '' : `：${escapeHtml(publication.error)}`;
   const holdReason = eligibility && eligibility.reason
@@ -138,21 +156,126 @@ function automaticArticleStatus(event, artifact) {
     ? ` · 原因：${escapeHtml(holdReason)} · 错误码 ${escapeHtml(holdCode)}`
     : status === 'waiting_person'
     ? (publication.person_deadline_at_unix
-      ? ` · 等待球员信息至 ${new Date(Number(publication.person_deadline_at_unix) * 1000).toLocaleTimeString('zh-CN', {hour12:false})}`
-      : ' · 等待接口补齐球员信息')
+      ? ` · ${draftCreated ? '等待球员信息至' : '本地等待球员信息至'} ${new Date(Number(publication.person_deadline_at_unix) * 1000).toLocaleTimeString('zh-CN', {hour12:false})}`
+      : (draftCreated ? ' · 等待接口补齐球员信息' : ' · 本地等待球员信息'))
     : status === 'retry_wait'
       ? ' · 平台或网络暂时不可用，系统会自动重试'
       : status === 'failed'
         ? ` · ${publication.error_code ? `错误码 ${escapeHtml(publication.error_code)}` : '任务未完成'}`
         : status === 'success'
           ? ' · 旧任务仅创建了草稿，等待后续处理'
+          : status === 'published' && publication.publish_reason === 'team_fallback'
+            ? ' · 未获取球员，已使用球队名发布'
           : '';
   const link = articleId
     ? ` · ${articleUrl ? `<a href="${articleUrl}" target="_blank" rel="noopener noreferrer">查看文章 ${escapeHtml(articleId)}</a>` : `文章 ${escapeHtml(articleId)}`}`
     : '';
   const style = status === 'published' ? 'success' : publicationHeld ? 'retry' : status === 'failed' ? 'failed' : 'pending';
   const label = publicationHeld ? '未自动发布' : (labels[status] || '自动文章处理中');
-  return `<small class="publish-result ${style}">${escapeHtml(label)}${reason}${error}${link}</small>`;
+  const account = publicationAccountText(publication);
+  return `<small class="publish-result ${style}">${escapeHtml(label)}${reason}${error}${account ? ` · ${escapeHtml(account)}` : ''}${link}</small>`;
+}
+
+function setPublishAccountMessage(message, kind = '') {
+  const element = $('publish-account-message');
+  element.textContent = message;
+  element.className = `publish-account-message${kind ? ` ${kind}` : ''}`;
+}
+
+function updatePublishAccountSummary() {
+  const enabled = state.publishAccounts.filter(account => account.enabled !== false).length;
+  const total = state.publishAccounts.length;
+  $('publish-account-count').textContent = `${enabled} 个可用 · 共 ${total} 个${state.publishAccountsDirty ? ' · 未保存' : ''}`;
+  $('publish-account-save').disabled = state.publishAccountsLoading || state.publishAccountsSaving || !state.publishAccountsDirty;
+  $('publish-account-add').disabled = state.publishAccountsLoading || state.publishAccountsSaving;
+}
+
+function renderPublishAccounts() {
+  const list = $('publish-account-list');
+  if (!state.publishAccounts.length) {
+    list.innerHTML = '<div class="publish-account-empty">账号池为空，新增账号后保存。</div>';
+  } else {
+    list.innerHTML = state.publishAccounts.map((account, index) => `
+      <div class="publish-account-row" data-account-index="${index}">
+        <input class="publish-account-id" inputmode="numeric" autocomplete="off" maxlength="20" value="${escapeHtml(account.user_id)}" aria-label="账号 ${index + 1} 的用户 ID" placeholder="user_id">
+        <input class="publish-account-name" autocomplete="off" maxlength="64" value="${escapeHtml(account.user_name)}" aria-label="账号 ${index + 1} 的用户名称" placeholder="user_name">
+        <label class="publish-account-enabled" title="启用或停用此账号"><input type="checkbox" ${account.enabled !== false ? 'checked' : ''} aria-label="启用账号 ${index + 1}"><span></span></label>
+        <button class="account-icon-button publish-account-remove" type="button" aria-label="删除账号 ${index + 1}" title="删除账号">×</button>
+      </div>
+    `).join('');
+  }
+  updatePublishAccountSummary();
+}
+
+function accountRowsFromForm() {
+  const accounts = [];
+  const seen = new Set();
+  for (const [index, row] of [...document.querySelectorAll('.publish-account-row')].entries()) {
+    const userId = row.querySelector('.publish-account-id').value.trim();
+    const userName = row.querySelector('.publish-account-name').value.trim();
+    if (!/^[1-9]\d{0,18}$/.test(userId) || BigInt(userId) > 9223372036854775807n) {
+      throw new Error(`第 ${index + 1} 个账号的 user_id 必须是有效的正整数。`);
+    }
+    if (!userName) throw new Error(`第 ${index + 1} 个账号缺少 user_name。`);
+    if (userName.length > 64) throw new Error(`第 ${index + 1} 个账号名称不能超过 64 个字符。`);
+    if (seen.has(userId)) throw new Error(`user_id ${userId} 重复，请只保留一条。`);
+    seen.add(userId);
+    accounts.push({user_id:userId, user_name:userName, enabled:row.querySelector('.publish-account-enabled input').checked});
+  }
+  return accounts;
+}
+
+async function loadPublishAccounts() {
+  if (state.publishAccountsLoading || state.publishAccountsSaving) return;
+  state.publishAccountsLoading = true;
+  updatePublishAccountSummary();
+  setPublishAccountMessage('正在读取发布账号。');
+  try {
+    const data = await requestJson('/api/article-publish/accounts');
+    state.publishAccounts = (Array.isArray(data.accounts) ? data.accounts : []).map(account => ({
+      user_id:String(account && account.user_id != null ? account.user_id : ''),
+      user_name:String(account && account.user_name != null ? account.user_name : ''),
+      enabled:!account || account.enabled !== false,
+    }));
+    state.publishAccountsDirty = false;
+    renderPublishAccounts();
+    const available = Number.isInteger(Number(data.available_count)) ? Number(data.available_count) : state.publishAccounts.filter(account => account.enabled).length;
+    setPublishAccountMessage(available > 0 ? `发布时会从 ${available} 个启用账号中随机选择。` : '当前没有启用账号，发布会被阻止。', available > 0 ? 'success' : 'warning');
+  } catch (error) {
+    setPublishAccountMessage(`账号池读取失败：${friendlyErrorMessage(error.message)}`, 'error');
+  } finally {
+    state.publishAccountsLoading = false;
+    updatePublishAccountSummary();
+  }
+}
+
+async function savePublishAccounts() {
+  if (state.publishAccountsSaving) return;
+  let accounts;
+  try {
+    accounts = accountRowsFromForm();
+  } catch (error) {
+    setPublishAccountMessage(error.message, 'error');
+    return;
+  }
+  state.publishAccountsSaving = true;
+  updatePublishAccountSummary();
+  setPublishAccountMessage('正在保存账号池。');
+  try {
+    const data = await requestJson('/api/article-publish/accounts', {method:'PUT', body:JSON.stringify({accounts})});
+    state.publishAccounts = (Array.isArray(data.accounts) ? data.accounts : accounts).map(account => ({
+      user_id:String(account.user_id), user_name:String(account.user_name), enabled:account.enabled !== false,
+    }));
+    state.publishAccountsDirty = false;
+    renderPublishAccounts();
+    const available = Number.isInteger(Number(data.available_count)) ? Number(data.available_count) : state.publishAccounts.filter(account => account.enabled).length;
+    setPublishAccountMessage(available > 0 ? `已保存，发布时会从 ${available} 个启用账号中随机选择。` : '已保存；当前没有启用账号，发布会被阻止。', available > 0 ? 'success' : 'warning');
+  } catch (error) {
+    setPublishAccountMessage(`保存失败：${friendlyErrorMessage(error.message)}`, 'error');
+  } finally {
+    state.publishAccountsSaving = false;
+    updatePublishAccountSummary();
+  }
 }
 function setDiscoveryCollapsed(collapsed) {
   state.discoveryCollapsed = Boolean(collapsed);
@@ -1135,7 +1258,8 @@ function render(data) {
     const ocrArtifactLabel = ocrWindow && ocrWindow.output_kind === 'api_time_range_fallback' ? '接口时间范围兜底' : '画面时间 60秒';
     const defaultUploaded = e.uploaded_gif && e.uploaded_gif.url ? e.uploaded_gif : null;
     const defaultPreview = e.output ? `<a class="gif-link" href="/api/gif/${encodeURIComponent(data.match_id)}/${encodeURIComponent(e.output.split('/').pop())}" target="_blank">预览</a>` : defaultUploaded ? `<a class="gif-link" href="${escapeHtml(defaultUploaded.url)}" target="_blank" rel="noopener">预览</a>` : '';
-    const defaultActions = e.output || defaultUploaded ? `<div class="default-artifact-actions">${defaultPreview}</div>` : '';
+    const defaultAccount = publicationAccountText(e.publish);
+    const defaultActions = e.output || defaultUploaded || defaultAccount ? `<div class="default-artifact-actions">${defaultPreview}${defaultAccount ? `<small class="publish-account-used">${escapeHtml(defaultAccount)}</small>` : ''}</div>` : '';
     const ocrPreview = gifLink(ocrWindow);
     const ocrArtifact = ocrWindow
       ? {...ocrWindow, ...(e.ocr_uploaded_gif ? {uploaded_gif:e.ocr_uploaded_gif} : {})}
@@ -1266,6 +1390,48 @@ $('demo-btn').addEventListener('click', () => {
 });
 $('start-btn').addEventListener('click', () => startSelectedMatch());
 $('stop-btn').addEventListener('click', stopCurrentMatch);
+$('publish-account-add').addEventListener('click', () => {
+  state.publishAccounts.push({user_id:'', user_name:'', enabled:true});
+  state.publishAccountsDirty = true;
+  renderPublishAccounts();
+  const rows = document.querySelectorAll('.publish-account-row');
+  const input = rows.length ? rows[rows.length - 1].querySelector('.publish-account-id') : null;
+  if (input) input.focus();
+  setPublishAccountMessage('新增账号尚未保存。', 'warning');
+});
+$('publish-account-save').addEventListener('click', savePublishAccounts);
+$('publish-account-list').addEventListener('input', event => {
+  const row = event.target.closest('.publish-account-row');
+  if (!row) return;
+  const index = Number(row.dataset.accountIndex);
+  const account = state.publishAccounts[index];
+  if (!account) return;
+  if (event.target.classList.contains('publish-account-id')) account.user_id = event.target.value;
+  if (event.target.classList.contains('publish-account-name')) account.user_name = event.target.value;
+  state.publishAccountsDirty = true;
+  updatePublishAccountSummary();
+  setPublishAccountMessage('账号池有未保存的修改。', 'warning');
+});
+$('publish-account-list').addEventListener('change', event => {
+  if (!event.target.matches('.publish-account-enabled input')) return;
+  const row = event.target.closest('.publish-account-row');
+  const account = row ? state.publishAccounts[Number(row.dataset.accountIndex)] : null;
+  if (!account) return;
+  account.enabled = event.target.checked;
+  state.publishAccountsDirty = true;
+  updatePublishAccountSummary();
+  setPublishAccountMessage('账号启用状态尚未保存。', 'warning');
+});
+$('publish-account-list').addEventListener('click', event => {
+  const button = event.target.closest('.publish-account-remove');
+  if (!button) return;
+  const row = button.closest('.publish-account-row');
+  if (!row) return;
+  state.publishAccounts.splice(Number(row.dataset.accountIndex), 1);
+  state.publishAccountsDirty = true;
+  renderPublishAccounts();
+  setPublishAccountMessage('账号已从列表移除，保存后生效。', 'warning');
+});
 $('events').addEventListener('toggle', event => {
   const details = event.target.closest('details[data-details-key]');
   if (!details) return;
@@ -1276,5 +1442,6 @@ $('events').addEventListener('toggle', event => {
 }, true);
 refresh();
 refreshMatches();
+loadPublishAccounts();
 state.timer = setInterval(refresh, 1000);
 state.matchesTimer = setInterval(refreshMatches, MATCH_DIRECTORY_INTERVAL_MS);

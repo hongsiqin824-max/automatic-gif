@@ -509,7 +509,7 @@ class ClockContinuityStateMachine:
         *,
         maximum_repair_gap_seconds: float = 5.0,
         maximum_consecutive_repairs: int = 3,
-        resync_observations: int = 3,
+        resync_observations: int = 2,
         second_half_clock_mode: str | None = None,
     ) -> None:
         if maximum_repair_gap_seconds <= 0:

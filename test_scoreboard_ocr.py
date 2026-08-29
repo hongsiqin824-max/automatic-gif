@@ -335,7 +335,7 @@ class ClockContinuityTests(unittest.TestCase):
         self.assertEqual(results[2].status, "accepted")
         self.assertEqual(results[2].reason, "coarse_stoppage_advanced")
 
-    def test_resynchronizes_after_three_continuous_observations_follow_bad_first_frame(self):
+    def test_resynchronizes_after_two_continuous_observations_follow_bad_first_frame(self):
         tracker = ClockContinuityStateMachine()
         tracker.update(0.0, "8:55", period=2)
 
@@ -347,11 +347,13 @@ class ClockContinuityTests(unittest.TestCase):
         ]
         following = tracker.update(4.0, "68:59", period=2)
 
-        self.assertEqual(candidates[-1].clock_seconds, 68 * 60 + 58)
-        self.assertEqual(candidates[-1].status, "resynchronized")
+        self.assertEqual(candidates[1].clock_seconds, 68 * 60 + 57)
+        self.assertEqual(candidates[1].status, "resynchronized")
         self.assertEqual(
-            candidates[-1].reason, "continuous_observations_resynchronized"
+            candidates[1].reason, "continuous_observations_resynchronized"
         )
+        self.assertEqual(candidates[-1].status, "accepted")
+        self.assertEqual(candidates[-1].clock_seconds, 68 * 60 + 58)
         self.assertEqual(following.status, "accepted")
         self.assertEqual(following.clock_seconds, 68 * 60 + 59)
 
@@ -365,14 +367,44 @@ class ClockContinuityTests(unittest.TestCase):
         following = tracker.update(5.0, "44:41")
 
         self.assertEqual(first.status, "repaired")
-        self.assertEqual(second.status, "repaired")
-        self.assertEqual(relocked.status, "resynchronized")
+        self.assertEqual(second.status, "resynchronized")
+        self.assertEqual(relocked.status, "accepted")
         self.assertEqual(relocked.clock_seconds, 44 * 60 + 40)
         self.assertEqual(
-            relocked.reason, "continuous_observations_resynchronized"
+            second.reason, "continuous_observations_resynchronized"
         )
         self.assertEqual(following.status, "accepted")
         self.assertEqual(following.clock_seconds, 44 * 60 + 41)
+
+    def test_confirmed_clock_regression_starts_a_new_segment_after_two_readings(self):
+        tracker = ClockContinuityStateMachine()
+        tracker.update(0.0, "53:40")
+
+        first = tracker.update(1.0, "46:07")
+        second = tracker.update(2.0, "46:08")
+        following = tracker.update(3.0, "46:09")
+
+        self.assertEqual(first.status, "repaired")
+        self.assertEqual(first.clock_seconds, 53 * 60 + 41)
+        self.assertEqual(second.status, "resynchronized")
+        self.assertEqual(second.clock_seconds, 46 * 60 + 8)
+        self.assertEqual(
+            second.reason, "continuous_observations_resynchronized"
+        )
+        self.assertEqual(following.status, "accepted")
+        self.assertEqual(following.clock_seconds, 46 * 60 + 9)
+
+    def test_single_clock_regression_is_ignored_when_original_track_returns(self):
+        tracker = ClockContinuityStateMachine()
+        tracker.update(0.0, "53:40")
+
+        outlier = tracker.update(1.0, "46:07")
+        recovered = tracker.update(2.0, "53:42")
+
+        self.assertEqual(outlier.status, "repaired")
+        self.assertEqual(outlier.clock_seconds, 53 * 60 + 41)
+        self.assertEqual(recovered.status, "accepted")
+        self.assertEqual(recovered.clock_seconds, 53 * 60 + 42)
 
     def test_isolated_clock_jump_does_not_replace_the_existing_track(self):
         tracker = ClockContinuityStateMachine()
@@ -614,27 +646,31 @@ class ScoreboardLocationTests(unittest.TestCase):
         self.assertEqual(result["anchor_seconds"], 101.0)
         self.assertEqual(result["method"], "paddleocr_exact_clock")
 
-    def test_goal_second_rejects_one_isolated_clock_reading(self):
+    def test_goal_second_accepts_one_isolated_clock_reading_as_estimated(self):
         readings = [self._reading(0, 7.0, "69:37")]
 
-        with self.assertRaises(WorkerError) as raised:
-            locate_from_readings(
-                readings,
-                {
-                    "event_code": "G",
-                    "event_second": 4177,
-                },
-            )
+        result = locate_from_readings(
+            readings,
+            {
+                "event_code": "G",
+                "event_second": 4177,
+            },
+        )
 
-        self.assertEqual(raised.exception.kind, "ocr_exact_second_not_found")
+        self.assertEqual(result["anchor_seconds"], 7.0)
+        self.assertEqual(result["method"], "paddleocr_single_frame_target")
+        self.assertEqual(result["precision"], "estimated_second")
+        self.assertEqual(result["localization_quality"], "estimated")
+        self.assertTrue(result["degraded"])
         self.assertEqual(
-            raised.exception.diagnostics["isolated_target_reading_count"], 1
+            result["degradation_mode"], "single_frame_target_observation"
         )
         self.assertEqual(
-            raised.exception.diagnostics[
-                "accepted_isolated_target_reading_count"
-            ],
-            0,
+            result["diagnostics"]["isolated_target_reading_count"], 1
+        )
+        self.assertEqual(
+            result["diagnostics"]["accepted_isolated_target_reading_count"],
+            1,
         )
 
     def test_goal_second_failure_downgrades_to_score_transition(self):

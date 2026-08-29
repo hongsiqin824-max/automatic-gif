@@ -635,6 +635,361 @@ class ShotmapSecondEnrichmentTests(unittest.TestCase):
             self.assertTrue(restored.initialized)
             reopened.close()
 
+    def test_shotmap_metadata_revision_does_not_emit_a_second_goal(self):
+        from pipeline_runtime import PipelineRuntime
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = PipelineRuntime(root / "state.sqlite3", root / "events.jsonl")
+            source = HttpShotmapGoalSource(
+                "https://example.test/shotmap",
+                "match-shotmap-revision",
+                None,
+                runtime.store,
+                timeout=1.0,
+            )
+            source.start = lambda: None
+            source._responses.put(({"shots": []}, {"http_status": 200}, 1000.0))
+            self.assertEqual(source.poll(0.0, 0.0), [])
+
+            original = {
+                "outcome": "goal",
+                "person_id": 384728,
+                "team_id": 137665,
+                "minute": 85,
+                "minute_extra": 0,
+                "second": 5079,
+                "situation": "fast-break",
+                "start_x": 0.31,
+                "start_y": 0.47,
+            }
+            source._responses.put(
+                ({"shots": [original]}, {"http_status": 200}, 1005.0)
+            )
+            emitted = source.poll(0.0, 0.0)
+            self.assertEqual(len(emitted), 1)
+            source.acknowledge(emitted)
+
+            revised = {
+                **original,
+                "situation": "assisted",
+                "shot_type": "right-foot",
+                "start_x": 0.312,
+                "start_y": 0.468,
+            }
+            source._responses.put(
+                ({"shots": [revised]}, {"http_status": 200}, 1010.0)
+            )
+
+            self.assertEqual(source.poll(0.0, 0.0), [])
+            self.assertEqual(source.report()["pending_candidate_count"], 0)
+            self.assertNotEqual(
+                normalize_shotmap_goal(original)["fingerprint"],
+                normalize_shotmap_goal(revised)["fingerprint"],
+            )
+            runtime.close()
+
+    def test_shotmap_same_player_at_a_different_second_is_a_new_goal(self):
+        from pipeline_runtime import PipelineRuntime
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = PipelineRuntime(root / "state.sqlite3", root / "events.jsonl")
+            source = HttpShotmapGoalSource(
+                "https://example.test/shotmap",
+                "match-two-goals",
+                None,
+                runtime.store,
+                timeout=1.0,
+            )
+            source.start = lambda: None
+            source._responses.put(({"shots": []}, {"http_status": 200}, 1000.0))
+            self.assertEqual(source.poll(0.0, 0.0), [])
+
+            first = {
+                "outcome": "goal",
+                "person_id": 9,
+                "team_id": 2,
+                "minute": 8,
+                "minute_extra": 0,
+                "second": 455,
+                "situation": "open_play",
+            }
+            source._responses.put(
+                ({"shots": [first]}, {"http_status": 200}, 1005.0)
+            )
+            first_events = source.poll(0.0, 0.0)
+            self.assertEqual([event.second for event in first_events], [455])
+            source.acknowledge(first_events)
+
+            second = {
+                **first,
+                "minute": 12,
+                "second": 701,
+                "situation": "assisted",
+            }
+            source._responses.put(
+                ({"shots": [first, second]}, {"http_status": 200}, 1010.0)
+            )
+            second_events = source.poll(0.0, 0.0)
+
+            self.assertEqual([event.second for event in second_events], [701])
+            self.assertNotEqual(first_events[0].event_key, second_events[0].event_key)
+            runtime.close()
+
+    def test_same_poll_shotmap_revisions_emit_only_one_goal(self):
+        from pipeline_runtime import PipelineRuntime
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = PipelineRuntime(root / "state.sqlite3", root / "events.jsonl")
+            source = HttpShotmapGoalSource(
+                "https://example.test/shotmap",
+                "match-same-poll-revisions",
+                None,
+                runtime.store,
+                timeout=1.0,
+            )
+            source.start = lambda: None
+            source._responses.put(({"shots": []}, {"http_status": 200}, 1000.0))
+            self.assertEqual(source.poll(0.0, 0.0), [])
+
+            original = {
+                "outcome": "goal",
+                "person_id": 9,
+                "team_id": 2,
+                "minute": 8,
+                "minute_extra": 0,
+                "second": 455,
+                "situation": "fast-break",
+                "start_x": 0.31,
+            }
+            revised = {
+                **original,
+                "situation": "assisted",
+                "start_x": 0.312,
+            }
+            source._responses.put(
+                ({"shots": [original, revised]}, {"http_status": 200}, 1005.0)
+            )
+
+            emitted = source.poll(0.0, 0.0)
+            self.assertEqual(len(emitted), 1)
+            self.assertEqual(source.report()["pending_candidate_count"], 1)
+            self.assertEqual(
+                len(
+                    runtime.store.load_shotmap_state(
+                        "match-same-poll-revisions"
+                    ).seen_fingerprints
+                ),
+                2,
+            )
+            runtime.close()
+
+    def test_incomplete_shotmap_identity_is_not_force_merged(self):
+        from pipeline_runtime import PipelineRuntime
+
+        for missing_field in ("person_id", "team_id", "second"):
+            with self.subTest(missing_field=missing_field):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    runtime = PipelineRuntime(
+                        root / "state.sqlite3", root / "events.jsonl"
+                    )
+                    source = HttpShotmapGoalSource(
+                        "https://example.test/shotmap",
+                        f"match-incomplete-{missing_field}",
+                        None,
+                        runtime.store,
+                        timeout=1.0,
+                    )
+                    source.start = lambda: None
+                    source._responses.put(
+                        ({"shots": []}, {"http_status": 200}, 1000.0)
+                    )
+                    self.assertEqual(source.poll(0.0, 0.0), [])
+
+                    incomplete = {
+                        "outcome": "goal",
+                        "person_id": 9,
+                        "team_id": 2,
+                        "minute": 8,
+                        "minute_extra": 0,
+                        "second": 455,
+                        "situation": "fast-break",
+                        missing_field: None,
+                    }
+                    source._responses.put(
+                        ({"shots": [incomplete]}, {"http_status": 200}, 1005.0)
+                    )
+                    first_events = source.poll(0.0, 0.0)
+                    self.assertEqual(len(first_events), 1)
+                    source.acknowledge(first_events)
+
+                    revised = {**incomplete, "situation": "assisted"}
+                    source._responses.put(
+                        ({"shots": [revised]}, {"http_status": 200}, 1010.0)
+                    )
+                    second_events = source.poll(0.0, 0.0)
+
+                    self.assertEqual(len(second_events), 1)
+                    self.assertNotEqual(
+                        first_events[0].event_key, second_events[0].event_key
+                    )
+                    runtime.close()
+
+    def test_shotmap_revision_stays_suppressed_after_restart(self):
+        from pipeline_runtime import PipelineRuntime
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "state.sqlite3"
+            log = root / "events.jsonl"
+            runtime = PipelineRuntime(database, log)
+            source = HttpShotmapGoalSource(
+                "https://example.test/shotmap",
+                "match-restarted-revision",
+                None,
+                runtime.store,
+                timeout=1.0,
+            )
+            source.start = lambda: None
+            source._responses.put(({"shots": []}, {"http_status": 200}, 1000.0))
+            self.assertEqual(source.poll(0.0, 0.0), [])
+
+            original = {
+                "outcome": "goal",
+                "person_id": 9,
+                "team_id": 2,
+                "minute": 8,
+                "minute_extra": 0,
+                "second": 455,
+                "situation": "fast-break",
+                "start_x": 0.31,
+            }
+            source._responses.put(
+                ({"shots": [original]}, {"http_status": 200}, 1005.0)
+            )
+            emitted = source.poll(0.0, 0.0)
+            self.assertEqual(len(emitted), 1)
+            source.acknowledge(emitted)
+            runtime.close()
+
+            reopened = PipelineRuntime(database, log)
+            restarted = HttpShotmapGoalSource(
+                "https://example.test/shotmap",
+                "match-restarted-revision",
+                None,
+                reopened.store,
+                timeout=1.0,
+            )
+            restarted.start = lambda: None
+            restarted._responses.put(
+                ({"shots": [original]}, {"http_status": 200}, 1010.0)
+            )
+            self.assertEqual(restarted.poll(0.0, 0.0), [])
+
+            first_revision = {
+                **original,
+                "situation": "assisted",
+                "start_x": 0.312,
+            }
+            restarted._responses.put(
+                ({"shots": [first_revision]}, {"http_status": 200}, 1015.0)
+            )
+            self.assertEqual(restarted.poll(0.0, 0.0), [])
+            self.assertEqual(restarted.report()["pending_candidate_count"], 0)
+            self.assertEqual(
+                reopened.store.load_shotmap_state(
+                    "match-restarted-revision"
+                ).last_snapshot,
+                {"shots": [first_revision]},
+            )
+            reopened.close()
+
+    def test_overview_then_shotmap_revision_keeps_one_canonical_task(self):
+        from pipeline_runtime import PipelineRuntime
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = PipelineRuntime(root / "state.sqlite3", root / "events.jsonl")
+            overview = self.goal(
+                event_key="match-one-canonical:G:overview",
+                minute="85",
+                person="Scorer",
+                person_id="50384728",
+                score="4-1",
+                metadata={"team_id": "137665", "source": "overview"},
+            )
+            self.assertTrue(
+                runtime.discover_task(
+                    match_id="match-one-canonical",
+                    event_data=overview.__dict__,
+                    observed_stream_time=100.0,
+                    observed_source_time=None,
+                    clip_anchor_stream_time=100.0,
+                    clip_anchor_source_time=None,
+                    output_due_stream_time=130.0,
+                    detected_at_unix=1000.0,
+                )
+            )
+
+            source = HttpShotmapGoalSource(
+                "https://example.test/shotmap",
+                "match-one-canonical",
+                None,
+                runtime.store,
+                timeout=1.0,
+            )
+            source.start = lambda: None
+            source._responses.put(({"shots": []}, {"http_status": 200}, 1000.0))
+            self.assertEqual(source.poll(0.0, 0.0), [])
+
+            original = {
+                "outcome": "goal",
+                "person_id": 384728,
+                "team_id": 137665,
+                "minute": 85,
+                "minute_extra": 0,
+                "second": 5079,
+                "situation": "fast-break",
+            }
+            source._responses.put(
+                ({"shots": [original]}, {"http_status": 200}, 1005.0)
+            )
+            shotmap_events = source.poll(0.0, 0.0)
+            self.assertEqual(len(shotmap_events), 1)
+            selected, method, count = select_cross_source_goal_incident(
+                runtime.store.list_for_match("match-one-canonical"),
+                shotmap_events[0],
+            )
+            self.assertIsNotNone(selected)
+            self.assertEqual((method, count), ("strong", 1))
+            merged = merge_cross_source_goal(selected.event_data, shotmap_events[0])
+            self.assertTrue(
+                runtime.update_task_event(
+                    merged.__dict__,
+                    replace_fields={"second", "metadata"},
+                )
+            )
+            source.acknowledge(shotmap_events)
+
+            revised = {**original, "situation": "assisted", "start_x": 0.312}
+            source._responses.put(
+                ({"shots": [revised]}, {"http_status": 200}, 1010.0)
+            )
+            self.assertEqual(source.poll(0.0, 0.0), [])
+
+            tasks = runtime.store.list_for_match("match-one-canonical")
+            self.assertEqual(len(tasks), 1)
+            self.assertEqual(tasks[0].event_key, overview.event_key)
+            self.assertEqual(tasks[0].event_data["second"], 5079)
+            self.assertEqual(
+                tasks[0].event_data["metadata"]["event_source"]["primary"],
+                "shotmap",
+            )
+            runtime.close()
+
     def test_restart_first_response_is_always_a_fresh_process_baseline(self):
         from pipeline_runtime import PipelineRuntime
 

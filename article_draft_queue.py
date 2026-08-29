@@ -17,6 +17,7 @@ from typing import Any, Callable, Iterable
 from article_publisher import (
     ArticlePublisher,
     ArticlePublishError,
+    has_reliable_person,
     inspect_animated_gif,
 )
 from match_event_identity import merge_event_metadata
@@ -34,21 +35,55 @@ AUTO_PUBLISH_ANCHOR_TOLERANCE_SECONDS = 1.0
 AUTO_PUBLISH_MIN_CENTERED_SIDE_SECONDS = 25.0
 
 
-def has_reliable_person(event: dict[str, Any] | None) -> bool:
-    """Return whether an event has a usable display name, not only a person ID."""
-    value = event if isinstance(event, dict) else {}
-    person = str(value.get("person") or "").strip()
-    if not person:
-        return False
-    normalized = person.casefold()
-    return normalized not in {
-        "0",
-        "unknown",
-        "none",
-        "null",
-        "未提供球员",
-        "未知球员",
+def _event_with_team_fallback(
+    event: dict[str, Any], match_detail: dict[str, Any]
+) -> dict[str, Any]:
+    """Return a publishable event using the scoring team's name as actor."""
+    fallback = dict(event)
+    team = str(event.get("team") or "").strip()
+    normalized = team.casefold().replace("-", "_")
+
+    # Overview events normally use ``teamA``/``teamB`` while shotmap events
+    # can carry a numeric team ID.  Resolve both forms against the match
+    # detail before falling back to a human-readable value.
+    metadata = event.get("metadata")
+    metadata_team_id = (
+        metadata.get("team_id") if isinstance(metadata, dict) else None
+    )
+    team_ids = {
+        str(value).strip()
+        for value in (team, event.get("team_id"), metadata_team_id)
+        if str(value or "").strip()
     }
+    home_ids = {
+        str(match_detail.get(key) or "").strip()
+        for key in ("team_A_id", "team_a_id")
+        if str(match_detail.get(key) or "").strip()
+    }
+    away_ids = {
+        str(match_detail.get(key) or "").strip()
+        for key in ("team_B_id", "team_b_id")
+        if str(match_detail.get(key) or "").strip()
+    }
+    if normalized in {"a", "teama", "team_a", "home"} or team_ids & home_ids:
+        person = str(
+            match_detail.get("team_A_name")
+            or match_detail.get("team_a_name")
+            or "主队"
+        ).strip()
+    elif normalized in {"b", "teamb", "team_b", "away"} or team_ids & away_ids:
+        person = str(
+            match_detail.get("team_B_name")
+            or match_detail.get("team_b_name")
+            or "客队"
+        ).strip()
+    else:
+        person = str(event.get("team_name") or team).strip()
+        if re.fullmatch(r"\d{1,20}", person):
+            person = ""
+    fallback["person"] = person or "球队"
+    fallback["person_fallback"] = True
+    return fallback
 
 
 def draft_admin_url(article_id: Any) -> str | None:
@@ -920,6 +955,46 @@ class ArticleDraftQueue:
             if article_id:
                 event = self._load_latest_event(task, event)
             person_available = has_reliable_person(event)
+            # New events without a player stay local until the event API fills
+            # the name.  Do not create a platform draft (status=0) just to
+            # reserve an article ID; only legacy rows with article_id keep the
+            # old draft-update path below.
+            if (
+                not article_id
+                and not person_available
+                and deadline is not None
+                and self.latest_event_loader is not None
+            ):
+                # Once the local wait has started, use the optional loader on
+                # each due check so a newly enriched API event can publish
+                # immediately, including at the deadline boundary.
+                event = self._load_latest_event(task, event)
+                person_available = has_reliable_person(event)
+            if not article_id and not person_available:
+                if deadline is None:
+                    deadline = claimed_at + self.person_wait_seconds
+                if claimed_at < deadline:
+                    self._return_to_person_wait(task, deadline=deadline, now=claimed_at)
+                    return True
+                final_event = _event_with_team_fallback(event, detail)
+                operation = "publish"
+                publish_reason = "team_fallback"
+                self._set_claim_phase(task, "publishing", now=claimed_at)
+                result = self.publisher.create_or_update_article(
+                    match_id=str(task["match_id"]),
+                    event=final_event,
+                    match_detail=detail,
+                    source_path=source_path,
+                    delivery_mode="publish",
+                )
+                self._record_published(
+                    task,
+                    result,
+                    event=final_event,
+                    publish_reason=str(publish_reason),
+                    now=claimed_at,
+                )
+                return True
             if article_id and draft_created_at is None and not person_available:
                 self._set_claim_phase(task, "creating_draft", now=claimed_at)
                 result = self.publisher.create_or_update_draft(
@@ -937,7 +1012,11 @@ class ArticleDraftQueue:
                 publish_reason = (
                     "person_available" if person_available else "team_fallback"
                 )
-                final_event = dict(event)
+                final_event = (
+                    dict(event)
+                    if person_available
+                    else _event_with_team_fallback(event, detail)
+                )
                 self._set_claim_phase(task, "publishing", now=claimed_at)
                 result = self.publisher.publish_draft(
                     match_id=str(task["match_id"]),
@@ -959,13 +1038,12 @@ class ArticleDraftQueue:
                     delivery_mode="publish",
                 )
             else:
-                self._set_claim_phase(task, "creating_draft", now=claimed_at)
-                result = self.publisher.create_or_update_draft(
-                    match_id=str(task["match_id"]),
-                    event=event,
-                    match_detail=detail,
-                    source_path=source_path,
-                )
+                # Defensive fallback for a task whose state changed while it
+                # was being claimed. New no-player tasks must never create a
+                # status=0 platform draft.
+                deadline = deadline or claimed_at + self.person_wait_seconds
+                self._return_to_person_wait(task, deadline=deadline, now=claimed_at)
+                return True
         except ArticlePublishError as exc:
             self._record_failure(
                 task, exc, now=time.time() if now is None else claimed_at
@@ -1301,17 +1379,25 @@ class ArticleDraftQueue:
     def _return_to_person_wait(
         self, task: dict[str, Any], *, deadline: float, now: float
     ) -> None:
+        previous_staged_path = task.get("previous_staged_path")
         with self._connect() as connection:
-            connection.execute(
+            updated = connection.execute(
                 """
                 UPDATE article_delivery_tasks
                 SET status='waiting_person', stage='waiting_person',
                     next_attempt_at_unix=?, lease_until_unix=NULL, lease_token=NULL,
+                    previous_staged_path=NULL,
+                    person_deadline_at_unix=COALESCE(person_deadline_at_unix, ?),
                     updated_at_unix=?
                 WHERE task_key=? AND generation=? AND lease_token=?
                   AND status IN ('creating', 'creating_draft', 'publishing')
                 """,
                 (
+                    (
+                        min(deadline, now + self.person_wait_seconds / 2.0)
+                        if self.latest_event_loader is not None and now < deadline
+                        else deadline
+                    ),
                     deadline,
                     now,
                     task["task_key"],
@@ -1319,6 +1405,8 @@ class ArticleDraftQueue:
                     task["lease_token"],
                 ),
             )
+        if updated.rowcount == 1:
+            self._delete_previous_staged_if_unused(previous_staged_path)
 
     def _stage_source(self, task: dict[str, Any]) -> Path:
         staged_path = str(task.get("staged_path") or "").strip()
@@ -1739,6 +1827,18 @@ def _public_task(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
     value = dict(row)
     article_id = value.get("article_id")
     publication_eligibility = _json_object(value.get("eligibility_json"))
+    diagnostics = _json_object(value.get("diagnostics_json"))
+    request_summary = (
+        diagnostics.get("request_summary")
+        if isinstance(diagnostics, dict)
+        else None
+    )
+    publish_account = None
+    if isinstance(request_summary, dict):
+        user_id = request_summary.get("user_id")
+        user_name = str(request_summary.get("user_name") or "").strip()
+        if user_id is not None or user_name:
+            publish_account = {"user_id": user_id, "user_name": user_name}
     return {
         "task_key": value.get("task_key"),
         "match_id": value.get("match_id"),
@@ -1762,7 +1862,8 @@ def _public_task(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
         "error": value.get("error"),
         "platform_code": value.get("platform_code"),
         "platform_status_code": value.get("platform_status_code"),
-        "diagnostics": _json_object(value.get("diagnostics_json")),
+        "diagnostics": diagnostics,
+        "publish_account": publish_account,
         "gif_url": value.get("gif_url"),
         "draft_created_at_unix": value.get("draft_created_at_unix"),
         "person_deadline_at_unix": value.get("person_deadline_at_unix"),

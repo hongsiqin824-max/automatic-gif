@@ -111,6 +111,38 @@ class ArticlePublisherDeliveryTests(unittest.TestCase):
         self.assertEqual(result["delivery_mode"], "publish")
         self.assertFalse(result["updated"])
 
+    def test_updating_draft_with_new_gif_updates_litpic(self):
+        event = {
+            "event_key": "goal-22",
+            "code": "G",
+            "minute": "22",
+            "score": "1-0",
+        }
+        created = self.publisher.create_or_update_draft(
+            match_id="54478914",
+            event=event,
+            match_detail=self.match_detail,
+            source_path=self.source,
+        )
+        second_source = self.source.with_name("ocr-updated.gif")
+        second_source.write_bytes(
+            animated_gif_bytes().replace(b"\xff\xff\xff", b"\xff\x00\x00", 1)
+        )
+
+        updated = self.publisher.create_or_update_draft(
+            match_id="54478914",
+            event=event,
+            match_detail=self.match_detail,
+            source_path=second_source,
+            archive_id=created["article_id"],
+        )
+
+        first_fields, second_fields = self.platform.calls
+        self.assertEqual(second_fields["archive_id"], 3801234)
+        self.assertNotEqual(first_fields["litpic"], second_fields["litpic"])
+        self.assertEqual(second_fields["litpic"], updated["gif"]["cover_url"])
+        self.assertNotIn(second_fields["litpic"], second_fields["body"])
+
     def test_publish_draft_requires_archive_id(self):
         with self.assertRaises(ArticlePublishError) as caught:
             self.publisher.publish_draft(

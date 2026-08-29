@@ -20,6 +20,7 @@ from scoreboard_ocr_worker import (
     _SocketOcrRuntime,
     _auto_results_by_frame,
     _auto_readings,
+    _confirmed_independent_stoppage_overrides,
     _extract_detected_texts,
     _first_clock_missing_run,
     _merge_auto_results,
@@ -31,6 +32,7 @@ from scoreboard_ocr_worker import (
     _restartable_backend_generation,
     _validate_profile_content_quality,
     extract_auto_roi_frames,
+    extract_independent_stoppage_frames,
     extract_profile_clock_frames,
     extract_profile_frames,
     extract_scoreboard_frames,
@@ -578,6 +580,69 @@ class ProfileCropTests(unittest.TestCase):
         self.assertEqual(ffmpeg_command[ffmpeg_command.index("-t") + 1], "15.000000")
         self.assertIn("crop=", ffmpeg_command[ffmpeg_command.index("-vf") + 1])
 
+    def test_independent_stoppage_extraction_uses_separate_right_and_below_rois(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory)
+            candidate = output_dir / "candidate.mp4"
+            candidate.write_bytes(b"video")
+            commands = []
+
+            def runner(command, **_kwargs):
+                commands.append(command)
+                (output_dir / "stoppage_right_000001.png").write_bytes(b"right")
+                (output_dir / "stoppage_below_000001.png").write_bytes(b"below")
+                return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+            with patch("scoreboard_ocr_worker.subprocess.run", side_effect=runner):
+                frames, labels, diagnostics = extract_independent_stoppage_frames(
+                    candidate,
+                    output_dir,
+                    ffmpeg="ffmpeg",
+                    sample_interval_seconds=1,
+                    frame_width=1280,
+                    frame_height=720,
+                    clock_roi=(100, 20, 180, 60),
+                    maximum_frames=10,
+                    deadline_monotonic=None,
+                )
+
+        self.assertEqual(labels, ["right", "below"])
+        self.assertEqual(
+            [frame.name for frame in frames],
+            ["stoppage_right_000001.png", "stoppage_below_000001.png"],
+        )
+        self.assertEqual(set(diagnostics["candidate_rois"]), {"right", "below"})
+        filter_graph = commands[0][commands[0].index("-filter_complex") + 1]
+        self.assertIn("split=2", filter_graph)
+        self.assertIn("crop=160:80:180:0", filter_graph)
+        self.assertIn("crop=240:80:60:60", filter_graph)
+
+    def test_independent_stoppage_extraction_clamps_edge_rois(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory)
+            candidate = output_dir / "candidate.mp4"
+            candidate.write_bytes(b"video")
+
+            def runner(command, **_kwargs):
+                (output_dir / "stoppage_below_000001.png").write_bytes(b"below")
+                return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+            with patch("scoreboard_ocr_worker.subprocess.run", side_effect=runner):
+                _frames, labels, diagnostics = extract_independent_stoppage_frames(
+                    candidate,
+                    output_dir,
+                    ffmpeg="ffmpeg",
+                    sample_interval_seconds=1,
+                    frame_width=1280,
+                    frame_height=720,
+                    clock_roi=(1220, 650, 1280, 690),
+                    maximum_frames=10,
+                    deadline_monotonic=None,
+                )
+
+        self.assertEqual(labels, ["below"])
+        self.assertEqual(diagnostics["candidate_rois"]["below"], [1190, 690, 1280, 720])
+
     def test_profile_aspect_mismatch_fails_closed_before_extraction(self):
         probe = subprocess.CompletedProcess(
             ["ffprobe"],
@@ -678,6 +743,113 @@ class ProfileCropTests(unittest.TestCase):
             [2, 3],
         )
 
+    def test_independent_first_half_stoppage_stopwatch_maps_to_match_clock(self):
+        main = [(["45:00"], [0.9])] * 3
+        auxiliary = [
+            {"right": ([clock], [0.92])}
+            for clock in ("2:16", "2:17", "2:18")
+        ]
+
+        readings, continuity = _profile_clock_readings(
+            main,
+            profile=self._profile(),
+            sample_interval=1,
+            period=1,
+            independent_stoppage_frames=auxiliary,
+            independent_stoppage_base_minute=45,
+        )
+
+        self.assertEqual(
+            [reading.clock_seconds for reading in readings],
+            [47 * 60 + 16, 47 * 60 + 17, 47 * 60 + 18],
+        )
+        self.assertTrue(
+            all(reading.continuity_status == "accepted" for reading in readings)
+        )
+        self.assertTrue(
+            all(
+                reading.continuity_reason == "independent_stoppage_stopwatch"
+                for reading in readings
+            )
+        )
+        self.assertTrue(continuity[0]["independent_stoppage"]["confirmed"])
+
+    def test_independent_second_half_stoppage_does_not_double_apply_period(self):
+        main = [(["90:00"], [0.9])] * 3
+        auxiliary = [
+            {"below": ([clock], [0.93])}
+            for clock in ("5:08", "5:09", "5:10")
+        ]
+
+        readings, _continuity = _profile_clock_readings(
+            main,
+            profile=self._profile(second_half_clock_mode="reset"),
+            sample_interval=1,
+            period=2,
+            independent_stoppage_frames=auxiliary,
+            independent_stoppage_base_minute=90,
+        )
+
+        self.assertEqual(
+            [reading.clock_seconds for reading in readings],
+            [95 * 60 + 8, 95 * 60 + 9, 95 * 60 + 10],
+        )
+
+    def test_static_or_insufficient_stoppage_candidate_is_rejected(self):
+        main = [(["45:00"], [0.9])] * 3
+        cases = {
+            "static_minute": [
+                {"right": (["+2"], [0.9])},
+                {"right": (["+2"], [0.9])},
+                {"right": (["+2"], [0.9])},
+            ],
+            "static_stopwatch": [
+                {"right": (["2:17"], [0.9])},
+                {"right": (["2:17"], [0.9])},
+                {"right": (["2:17"], [0.9])},
+            ],
+            "two_advancing_frames": [
+                {"right": (["2:17"], [0.9])},
+                {"right": (["2:18"], [0.9])},
+            ],
+        }
+
+        for name, auxiliary in cases.items():
+            with self.subTest(name=name):
+                overrides, diagnostics = _confirmed_independent_stoppage_overrides(
+                    main,
+                    auxiliary,
+                    base_minute=45,
+                    sample_interval=1,
+                )
+                self.assertEqual(overrides, {})
+                self.assertFalse(diagnostics["confirmed"])
+                if name == "static_stopwatch":
+                    self.assertTrue(diagnostics["static_candidate_rejected"])
+
+    def test_existing_combined_stoppage_formats_are_not_overridden(self):
+        auxiliary = [
+            {"right": ([clock], [0.9])}
+            for clock in ("9:01", "9:02", "9:03")
+        ]
+        for main_texts, expected in (
+            (("45+2:16", "45+2:17", "45+2:18"), 47 * 60 + 16),
+            (("45:00+02:16", "45:00+02:17", "45:00+02:18"), 47 * 60 + 16),
+        ):
+            with self.subTest(main_texts=main_texts):
+                readings, continuity = _profile_clock_readings(
+                    [([text], [0.9]) for text in main_texts],
+                    profile=self._profile(),
+                    sample_interval=1,
+                    period=1,
+                    independent_stoppage_frames=auxiliary,
+                    independent_stoppage_base_minute=45,
+                )
+                self.assertEqual(readings[0].clock_seconds, expected)
+                self.assertFalse(
+                    continuity[0]["independent_stoppage"]["confirmed"]
+                )
+
     def test_clock_only_locates_exact_second_after_stream_gap_resynchronization(self):
         readings, _continuity = _profile_clock_readings(
             [
@@ -704,7 +876,8 @@ class ProfileCropTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(readings[3].continuity_status, "resynchronized")
+        self.assertEqual(readings[2].continuity_status, "resynchronized")
+        self.assertEqual(readings[3].continuity_status, "accepted")
         self.assertEqual(readings[3].clock_seconds, 44 * 60 + 40)
         self.assertEqual(result["method"], "paddleocr_exact_clock")
         self.assertEqual(result["anchor_seconds"], 103)
@@ -909,23 +1082,136 @@ class ProfileCropTests(unittest.TestCase):
         self.assertEqual(result["precision"], "observed_second")
         self.assertEqual(result["localization_quality"], "exact")
 
-    def test_goal_second_rejects_isolated_exact_target_reading(self):
+    def test_goal_second_accepts_clear_isolated_target_as_estimated(self):
         readings = [frame_reading(0, 7.0, ["69:37"], [0.95])]
+
+        result = locate_from_readings(
+            readings,
+            {
+                "event_code": "G",
+                "event_second": 69 * 60 + 37,
+                "candidate_start_seconds": 100.0,
+                "sample_interval_seconds": 1.0,
+                "minimum_confidence": 0.35,
+            },
+        )
+
+        self.assertEqual(result["anchor_seconds"], 107.0)
+        self.assertEqual(result["method"], "paddleocr_single_frame_target")
+        self.assertEqual(result["precision"], "estimated_second")
+        self.assertEqual(result["localization_quality"], "estimated")
+        self.assertTrue(result["degraded"])
+        self.assertEqual(
+            result["degradation_mode"], "single_frame_target_observation"
+        )
+        self.assertTrue(result["target_clock_directly_observed"])
+        self.assertEqual(result["estimated_error_bound_seconds"], 0.5)
+        diagnostics = result["diagnostics"]
+        self.assertEqual(diagnostics["isolated_target_reading_count"], 1)
+        self.assertEqual(diagnostics["accepted_isolated_target_reading_count"], 1)
+        self.assertEqual(diagnostics["direct_observation_candidate_count"], 0)
+        self.assertEqual(
+            diagnostics["exact_second_candidate_source"],
+            "single_frame_target_observation",
+        )
+
+    def test_goal_second_rejects_two_isolated_target_positions_as_ambiguous(self):
+        readings = [
+            frame_reading(0, 7.0, ["69:37"], [0.95]),
+            frame_reading(10, 17.0, ["69:37"], [0.96]),
+        ]
 
         with self.assertRaises(WorkerError) as raised:
             locate_from_readings(
                 readings,
-                {"event_code": "G", "event_second": 69 * 60 + 37},
+                {
+                    "event_code": "G",
+                    "event_second": 69 * 60 + 37,
+                    "sample_interval_seconds": 1.0,
+                },
             )
 
-        self.assertEqual(raised.exception.kind, "ocr_exact_second_not_found")
+        self.assertEqual(raised.exception.kind, "ocr_ambiguous")
         diagnostics = raised.exception.diagnostics
-        self.assertEqual(diagnostics["isolated_target_reading_count"], 1)
         self.assertEqual(
-            diagnostics["accepted_isolated_target_reading_count"], 0
+            diagnostics["exact_second_failure_reason"],
+            "conflicting_isolated_target_observations",
         )
-        self.assertEqual(diagnostics["direct_observation_candidate_count"], 0)
-        self.assertEqual(diagnostics["exact_second_failure_cause"], "isolated")
+        self.assertEqual(diagnostics["matching_occurrence_count"], 2)
+        self.assertEqual(diagnostics["matching_frame_seconds"], [7.0, 17.0])
+
+    def test_goal_second_ignores_unrelated_ambiguous_frame_for_single_target(self):
+        readings = [
+            frame_reading(0, 7.0, ["69:37"], [0.95]),
+            frame_reading(10, 17.0, ["69:52", "68:52"], [0.95, 0.95]),
+        ]
+
+        result = locate_from_readings(
+            readings,
+            {"event_code": "G", "event_second": 69 * 60 + 37},
+        )
+
+        self.assertEqual(result["anchor_seconds"], 7.0)
+        self.assertEqual(result["method"], "paddleocr_single_frame_target")
+        self.assertEqual(result["localization_quality"], "estimated")
+
+    def test_goal_second_exact_candidate_precedes_isolated_estimate(self):
+        readings = [
+            frame_reading(0, 7.0, ["69:37"], [0.95]),
+            frame_reading(10, 17.0, ["69:37"], [0.96]),
+            frame_reading(11, 18.0, ["69:38"], [0.96]),
+        ]
+
+        result = locate_from_readings(
+            readings,
+            {"event_code": "G", "event_second": 69 * 60 + 37},
+        )
+
+        self.assertEqual(result["anchor_seconds"], 17.0)
+        self.assertEqual(result["method"], "paddleocr_exact_clock")
+        self.assertEqual(result["localization_quality"], "exact")
+
+    def test_goal_second_rejects_unsafe_isolated_readings(self):
+        target = 69 * 60 + 37
+        cases = {
+            "below_existing_confidence_threshold": (
+                [frame_reading(0, 7.0, ["69:37"], [0.34])],
+                {"minimum_confidence": 0.35},
+            ),
+            "ambiguous_clock": (
+                [frame_reading(0, 7.0, ["69:37", "68:37"], [0.95, 0.95])],
+                {},
+            ),
+            "non_target_clock": (
+                [frame_reading(0, 7.0, ["69:36"], [0.95])],
+                {},
+            ),
+            "resynchronized_target": (
+                [
+                    replace(
+                        frame_reading(0, 7.0, ["69:37"], [0.95]),
+                        continuity_status="resynchronized",
+                    )
+                ],
+                {},
+            ),
+        }
+
+        for name, (readings, options) in cases.items():
+            with self.subTest(name=name):
+                with self.assertRaises(WorkerError) as raised:
+                    locate_from_readings(
+                        readings,
+                        {
+                            "event_code": "G",
+                            "event_second": target,
+                            **options,
+                        },
+                    )
+                self.assertIn(
+                    raised.exception.kind,
+                    {"ocr_clock_unreadable", "ocr_exact_second_not_found"},
+                )
 
     def test_goal_second_accepts_target_with_adjacent_continuity_reading(self):
         readings = [
@@ -1326,6 +1612,12 @@ class ProfileCropTests(unittest.TestCase):
                     side_effect=AssertionError("score crops must not be extracted"),
                 ),
                 patch(
+                    "scoreboard_ocr_worker.extract_independent_stoppage_frames",
+                    side_effect=AssertionError(
+                        "ordinary events must not extract stoppage crops"
+                    ),
+                ),
+                patch(
                     "scoreboard_ocr_worker._recognize_request_paths",
                     side_effect=recognize,
                 ),
@@ -1345,6 +1637,131 @@ class ProfileCropTests(unittest.TestCase):
         self.assertEqual(captured["crop_kinds"], ["clock"] * 4)
         self.assertTrue(result["clock_only"])
         self.assertTrue(result["diagnostics"]["score_ocr_skipped"])
+
+    def test_profile_run_analyzes_independent_stopwatch_for_explicit_stoppage(self):
+        profile = ProfileCropTests._profile()
+        with tempfile.TemporaryDirectory() as directory:
+            candidate = Path(directory) / "candidate.mp4"
+            candidate.write_bytes(b"video")
+            main_paths = [Path(f"clock-{index}.png") for index in range(3)]
+            auxiliary_paths = [Path(f"stoppage-{index}.png") for index in range(3)]
+
+            def recognize(frames, _crop_kinds, **_kwargs):
+                if list(frames) == main_paths:
+                    return [(["45:00"], [0.9])] * 3, []
+                if list(frames) == auxiliary_paths:
+                    return (
+                        [([clock], [0.92]) for clock in ("2:16", "2:17", "2:18")],
+                        [],
+                    )
+                raise AssertionError(f"unexpected OCR paths: {frames!r}")
+
+            with (
+                patch(
+                    "scoreboard_ocr_worker.extract_profile_clock_frames",
+                    return_value=(
+                        main_paths,
+                        {
+                            "profile_id": profile.profile_id,
+                            "clock_only": True,
+                            "frame_resolution": [1920, 1080],
+                            "clock_roi": [100, 40, 220, 90],
+                            "score_roi": None,
+                        },
+                    ),
+                ),
+                patch(
+                    "scoreboard_ocr_worker.extract_independent_stoppage_frames",
+                    return_value=(
+                        auxiliary_paths,
+                        ["right"] * 3,
+                        {"candidate_labels": ["right"], "frame_count": 3},
+                    ),
+                ) as auxiliary_extraction,
+                patch(
+                    "scoreboard_ocr_worker._recognize_request_paths",
+                    side_effect=recognize,
+                ),
+            ):
+                result = run_request(
+                    {
+                        "candidate_path": str(candidate),
+                        "event_code": "G",
+                        "event_minute": "45+2",
+                        "event_second": 47 * 60 + 17,
+                        "clock_only": True,
+                        "scoreboard_profile": profile,
+                    },
+                    engine=object(),
+                )
+
+        auxiliary_extraction.assert_called_once()
+        self.assertEqual(result["anchor_seconds"], 1.0)
+        self.assertEqual(result["method"], "paddleocr_exact_clock")
+        independent = result["diagnostics"]["independent_stoppage"]
+        self.assertEqual(independent["status"], "confirmed")
+        self.assertEqual(
+            independent["confirmation"]["method"],
+            "independent_stoppage_stopwatch",
+        )
+
+    def test_stoppage_analysis_failure_falls_back_to_primary_clock(self):
+        profile = ProfileCropTests._profile()
+        with tempfile.TemporaryDirectory() as directory:
+            candidate = Path(directory) / "candidate.mp4"
+            candidate.write_bytes(b"video")
+            main_paths = [Path(f"clock-{index}.png") for index in range(3)]
+            with (
+                patch(
+                    "scoreboard_ocr_worker.extract_profile_clock_frames",
+                    return_value=(
+                        main_paths,
+                        {
+                            "profile_id": profile.profile_id,
+                            "clock_only": True,
+                            "frame_resolution": [1920, 1080],
+                            "clock_roi": [100, 40, 220, 90],
+                            "score_roi": None,
+                        },
+                    ),
+                ),
+                patch(
+                    "scoreboard_ocr_worker.extract_independent_stoppage_frames",
+                    side_effect=WorkerError(
+                        "ocr_frame_extraction_failed", "auxiliary crop failed"
+                    ),
+                ),
+                patch(
+                    "scoreboard_ocr_worker._recognize_request_paths",
+                    return_value=(
+                        [
+                            (["47:16"], [0.9]),
+                            (["47:17"], [0.9]),
+                            (["47:18"], [0.9]),
+                        ],
+                        [],
+                    ),
+                ),
+            ):
+                result = run_request(
+                    {
+                        "candidate_path": str(candidate),
+                        "event_code": "G",
+                        "event_minute": "45+2",
+                        "event_second": 47 * 60 + 17,
+                        "clock_only": True,
+                        "scoreboard_profile": profile,
+                    },
+                    engine=object(),
+                )
+
+        self.assertEqual(result["anchor_seconds"], 1.0)
+        independent = result["diagnostics"]["independent_stoppage"]
+        self.assertEqual(independent["status"], "failed")
+        self.assertEqual(independent["fallback"], "primary_clock")
+        self.assertEqual(
+            independent["error"]["kind"], "ocr_frame_extraction_failed"
+        )
 
     def test_auto_run_disables_discovered_score_rois(self):
         tracker = AutoClockTracker(1280, 720)

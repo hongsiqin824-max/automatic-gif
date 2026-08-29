@@ -1746,14 +1746,18 @@ def normalize_shotmap_goal(shot: Any) -> dict[str, Any] | None:
 
 
 def _shotmap_goal_core(goal: dict[str, Any]) -> tuple[str, str, int, str] | None:
+    """Return a conservative incident identity without mutable shot metadata."""
+    person_id = meaningful_id(goal.get("person_id"))
+    team_id = meaningful_id(goal.get("team_id"))
     second = parse_cumulative_match_second(goal.get("second"))
-    if second is None:
+    outcome = str(goal.get("outcome") or "").strip().lower()
+    if not person_id or not team_id or second is None or outcome != "goal":
         return None
     return (
-        meaningful_id(goal.get("person_id")),
-        meaningful_id(goal.get("team_id")),
+        person_id,
+        team_id,
         second,
-        str(goal.get("situation") or "").strip().lower(),
+        outcome,
     )
 
 
@@ -2913,11 +2917,14 @@ class HttpShotmapGoalSource:
                     self._known_cores.add(core)
             if not was_initialized:
                 continue
+            emitted_cores = set(known_before)
             for fingerprint in sorted(inserted):
                 goal = events_by_fingerprint[fingerprint]
                 core = _shotmap_goal_core(goal)
-                if core is not None and core in known_before:
-                    continue
+                if core is not None:
+                    if core in emitted_cores:
+                        continue
+                    emitted_cores.add(core)
                 self._pending_events[fingerprint] = shotmap_goal_match_event(
                     self.match_id,
                     goal,
