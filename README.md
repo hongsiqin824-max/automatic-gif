@@ -321,11 +321,11 @@ python3 live_goal_pipeline.py \
 ```
 
 The default event window is 12 seconds before score confirmation and 18 seconds
-after it. GIF encoding uses one fixed profile, currently 768 pixels wide, 16 FPS,
-and 256 palette colors. The 10 MB setting is a reporting reference only: the
-encoder does not reduce colors, FPS, or resolution, and a larger GIF still
-succeeds. The fixed profile can be selected explicitly with `--gif-width`,
-`--gif-fps`, and `--gif-colors`.
+after it. Default GIF encoding uses a fixed 640-pixel, 12 FPS, 128-color profile
+that is independent from the OCR GIF profile. The 10 MB setting is a reporting
+reference only: the encoder does not reduce colors, FPS, or resolution, and a
+larger GIF still succeeds. The fixed profile can be selected explicitly with
+`--gif-width`, `--gif-fps`, and `--gif-colors`.
 
 For comparison, a 30-second clip from the supplied match encoded at the source
 size (`1280x720`, `30 FPS`, `256 GIF colors`) was 334.57 MB and took 92.63
@@ -415,7 +415,8 @@ session field; this skips discovery and remains the fastest path. For example:
 ```
 
 Unknown or mismatched layouts never publish a false precise result. The OCR GIF
-uses 384px / 6 FPS / 160 colors and is encoded directly from the original TS.
+keeps its separate 384px / 6 FPS / 160-color profile and is encoded directly
+from the original TS; lowering the default GIF profile does not change it.
 T-DEED analyzes only that OCR 60-second window and, when successful, publishes
 the short `-8/+12` second `_ai_` GIF. OCR and T-DEED persist separate status,
 window metadata, output path, failure stage, and failure reason. A failure in

@@ -1237,9 +1237,9 @@ def main() -> None:
     parser.add_argument("--before", type=float, default=12.0)
     parser.add_argument("--after", type=float, default=18.0)
     parser.add_argument("--segment-slack", type=float, default=7.0)
-    parser.add_argument("--gif-width", type=int, default=768)
-    parser.add_argument("--gif-fps", type=float, default=16.0)
-    parser.add_argument("--gif-colors", type=int, default=256)
+    parser.add_argument("--gif-width", type=int, default=640)
+    parser.add_argument("--gif-fps", type=float, default=12.0)
+    parser.add_argument("--gif-colors", type=int, default=128)
     parser.add_argument(
         "--gif-size-reference-mb",
         "--gif-max-mb",

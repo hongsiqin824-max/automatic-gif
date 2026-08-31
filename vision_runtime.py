@@ -159,6 +159,11 @@ OCR_TDEED_MINUTE_AFTER_SECONDS = 0.0
 # T-DEED cannot select an action candidate.
 OCR_MINUTE_FALLBACK_BEFORE_SECONDS = 30.0
 OCR_MINUTE_FALLBACK_AFTER_SECONDS = 30.0
+# Keep the user-facing OCR GIF at its existing profile.  The default event GIF
+# has a separate lower profile, so changing that path cannot alter OCR output.
+OCR_GIF_WIDTH = 384
+OCR_GIF_FPS = 6.0
+OCR_GIF_COLORS = 160
 OCR_MINUTE_FALLBACK_WIDTH = 384
 OCR_MINUTE_FALLBACK_FPS = 6.0
 OCR_MINUTE_FALLBACK_COLORS = 160
@@ -5873,6 +5878,9 @@ def _process_ocr_window(
     colors: int,
     min_degraded_seconds: float,
     cancel_event: Any,
+    fallback_width: int = OCR_MINUTE_FALLBACK_WIDTH,
+    fallback_fps: float = OCR_MINUTE_FALLBACK_FPS,
+    fallback_colors: int = OCR_MINUTE_FALLBACK_COLORS,
     progressive_scan: bool = True,
 ) -> bool:
     artifact_kind = "ocr_window"
@@ -7629,9 +7637,9 @@ def _process_ocr_window(
                     ffprobe,
                     output_dir,
                     failure=exc,
-                    width=width,
-                    fps=fps,
-                    colors=colors,
+                    width=fallback_width,
+                    fps=fallback_fps,
+                    colors=fallback_colors,
                     size_reference_bytes=size_reference_bytes,
                     timeout_seconds=max(ocr_timeout_seconds * 3.0, 180.0),
                     min_degraded_seconds=min_degraded_seconds,
@@ -8444,6 +8452,9 @@ def process_vision_artifact(
     fallback_width: int = OCR_MINUTE_FALLBACK_WIDTH,
     fallback_fps: float = OCR_MINUTE_FALLBACK_FPS,
     fallback_colors: int = OCR_MINUTE_FALLBACK_COLORS,
+    ocr_width: int = OCR_GIF_WIDTH,
+    ocr_fps: float = OCR_GIF_FPS,
+    ocr_colors: int = OCR_GIF_COLORS,
     min_degraded_seconds: float = MIN_DEGRADED_CLIP_SECONDS,
     cancel_event: Any = None,
     progressive_ocr: bool = True,
@@ -8462,9 +8473,12 @@ def process_vision_artifact(
             size_reference_bytes=size_reference_bytes,
             ocr_python=ocr_python,
             ocr_timeout_seconds=ocr_timeout_seconds,
-            width=fallback_width,
-            fps=fallback_fps,
-            colors=fallback_colors,
+            width=ocr_width,
+            fps=ocr_fps,
+            colors=ocr_colors,
+            fallback_width=fallback_width,
+            fallback_fps=fallback_fps,
+            fallback_colors=fallback_colors,
             min_degraded_seconds=min_degraded_seconds,
             cancel_event=cancel_event,
             progressive_scan=progressive_ocr,

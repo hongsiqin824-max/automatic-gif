@@ -1381,18 +1381,18 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(session.before_seconds, 30.0)
         self.assertEqual(session.after_seconds, 20.0)
         self.assertEqual(session.event_to_video_offset_seconds, -10.0)
-        self.assertEqual(session.gif_width, 768)
-        self.assertEqual(session.gif_fps, 16.0)
-        self.assertEqual(session.gif_colors, 256)
+        self.assertEqual(session.gif_width, 640)
+        self.assertEqual(session.gif_fps, 12.0)
+        self.assertEqual(session.gif_colors, 128)
         self.assertTrue(session.vision_enabled)
         self.assertFalse(session.tdeed_enabled)
         payload = dashboard_server._session_json(session)
         self.assertEqual(payload["gif"]["before_seconds"], 30.0)
         self.assertEqual(payload["gif"]["after_seconds"], 20.0)
         self.assertEqual(payload["gif"]["event_to_video_offset_seconds"], -10.0)
-        self.assertEqual(payload["gif"]["width"], 768)
-        self.assertEqual(payload["gif"]["fps"], 16.0)
-        self.assertEqual(payload["gif"]["colors"], 256)
+        self.assertEqual(payload["gif"]["width"], 640)
+        self.assertEqual(payload["gif"]["fps"], 12.0)
+        self.assertEqual(payload["gif"]["colors"], 128)
         self.assertTrue(payload["vision"]["enabled"])
         self.assertFalse(payload["vision"]["worker_enabled"])
         self.assertFalse(payload["vision"]["tdeed_enabled"])
@@ -1708,7 +1708,7 @@ class DashboardTests(unittest.TestCase):
         self.assertIn('id="before" type="number" value="30"', html)
         self.assertIn('id="after" type="number" value="20"', html)
         self.assertIn('id="event-offset" type="number" value="-10"', html)
-        self.assertIn('id="width" type="number" value="768"', html)
+        self.assertIn('id="width" type="number" value="640"', html)
         self.assertIn('id="vision-enabled" type="checkbox" checked', html)
         self.assertIn('id="vision-state">默认开启', html)
         self.assertIn('id="runtime-issues"', html)
@@ -1774,9 +1774,9 @@ class DashboardTests(unittest.TestCase):
             command[command.index("--buffer-seconds") + 1],
             "900.0",
         )
-        self.assertEqual(command[command.index("--gif-width") + 1], "768")
-        self.assertEqual(command[command.index("--gif-fps") + 1], "16.0")
-        self.assertEqual(command[command.index("--gif-colors") + 1], "256")
+        self.assertEqual(command[command.index("--gif-width") + 1], "640")
+        self.assertEqual(command[command.index("--gif-fps") + 1], "12.0")
+        self.assertEqual(command[command.index("--gif-colors") + 1], "128")
         self.assertEqual(
             float(command[command.index("--graceful-stop-grace-seconds") + 1]),
             dashboard_server.WORKER_FINISH_GRACE_SECONDS,
@@ -1883,9 +1883,9 @@ class DashboardTests(unittest.TestCase):
             command[command.index("--buffer-seconds") + 1],
             "900.0",
         )
-        self.assertEqual(command[command.index("--gif-width") + 1], "768")
-        self.assertEqual(command[command.index("--gif-fps") + 1], "16.0")
-        self.assertEqual(command[command.index("--gif-colors") + 1], "256")
+        self.assertEqual(command[command.index("--gif-width") + 1], "640")
+        self.assertEqual(command[command.index("--gif-fps") + 1], "12.0")
+        self.assertEqual(command[command.index("--gif-colors") + 1], "128")
         self.assertEqual(command[command.index("--fallback-gif-width") + 1], "384")
         self.assertEqual(command[command.index("--fallback-gif-fps") + 1], "6.0")
 

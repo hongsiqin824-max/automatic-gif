@@ -4314,7 +4314,7 @@ class VisionRuntimeTests(unittest.TestCase):
                     "ffmpeg", "ffprobe", root,
                     search_before=120.0, search_after=30.0,
                     refined_before=8.0, refined_after=12.0,
-                    width=768, fps=16.0, colors=256,
+                    width=640, fps=12.0, colors=128,
                     size_reference_bytes=10_000_000,
                     python=Path("python"), timeout_seconds=3.0,
                 ))
@@ -4332,6 +4332,14 @@ class VisionRuntimeTests(unittest.TestCase):
             self.assertEqual(
                 (refined_call.kwargs["before"], refined_call.kwargs["after"]),
                 (8.0, 12.0),
+            )
+            self.assertEqual(
+                (
+                    refined_call.kwargs["width"],
+                    refined_call.kwargs["fps"],
+                    refined_call.kwargs["colors"],
+                ),
+                (640, 12.0, 128),
             )
             self.assertEqual(tdeed.call_args.kwargs["candidate_window_start_seconds"], 70.0)
             self.assertEqual(tdeed.call_args.kwargs["candidate_window_end_seconds"], 130.0)

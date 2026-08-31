@@ -265,9 +265,9 @@ class MatchSession:
     after_seconds: float = 20.0
     event_to_video_offset_seconds: float = -10.0
     shotmap_offset_seconds: float = 0.0
-    gif_width: int = 768
-    gif_fps: float = 16.0
-    gif_colors: int = 256
+    gif_width: int = 640
+    gif_fps: float = 12.0
+    gif_colors: int = 128
     vision_enabled: bool = True
     tdeed_enabled: bool = False
     vision_clock_only: bool = True
