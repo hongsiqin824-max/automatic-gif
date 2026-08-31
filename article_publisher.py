@@ -37,6 +37,7 @@ EVENT_LABELS = {
     "RC": "红牌",
     "YC": "黄牌",
 }
+GOAL_EVENT_CODES = frozenset({"G", "PG", "OG"})
 RELIABLE_PERSON_PLACEHOLDERS = frozenset(
     {
         "0",
@@ -999,7 +1000,7 @@ class ArticlePublisher:
                 return previous
 
             publish_account = (
-                self._account_for_assignment(f"direct:{stable_id}")
+                self._account_for_assignment(f"match:{match_id}")
                 if self.account_pool is not None
                 else None
             )
@@ -1159,7 +1160,7 @@ class ArticlePublisher:
                 event_key=event_key,
                 artifact_kind="ocr_window",
             )
-            assignment_key = f"ocr:{match_id}:{event_key}"
+            assignment_key = f"match:{match_id}"
             publish_account = self._existing_account_assignment(assignment_key)
             # An archive_id without a prior assignment identifies a legacy
             # draft. Never change its author while updating it.
@@ -1454,7 +1455,17 @@ def build_article_title(event: dict[str, Any], detail: dict[str, Any]) -> str:
         else _event_team_name(event.get("team"), detail)
     )
     action_text = f"{actor}{action}" if actor else action
-    score_text = f"，{home} {score} {away}" if score else f"，{home}对阵{away}"
+    if code in GOAL_EVENT_CODES:
+        # Goal events change the score, so include the score when the API
+        # provides one. Keep the matchup fallback for incomplete event data.
+        score_text = f"，{home} {score} {away}" if score else f"，{home}对阵{away}"
+    elif code in {"YC", "RC"}:
+        # Cards do not change the score; their concise title is easier to scan.
+        score_text = ""
+    else:
+        # Preserve the existing format for event types outside the supported
+        # football event set until they receive an explicit title rule.
+        score_text = f"，{home} {score} {away}" if score else f"，{home}对阵{away}"
     return f"{minute_text}，{action_text}{score_text}"[:100]
 
 

@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,6 +16,7 @@ from article_publisher import (
     inspect_animated_gif,
 )
 from open_platform_client import OpenPlatformError
+from publish_account_pool import PublishAccountPool
 
 
 def animated_gif_bytes():
@@ -466,8 +468,107 @@ class ArticlePublisherTests(unittest.TestCase):
             },
             {"team_A_name": "主队", "team_B_name": "客队"},
         )
-        self.assertEqual(title, "30分钟，主队黄牌，主队对阵客队")
+        self.assertEqual(title, "30分钟，主队黄牌")
         self.assertNotIn("未提供球员", title)
+
+    def test_goal_event_titles_include_score_but_card_titles_omit_matchup(self):
+        detail = {"team_A_name": "主队", "team_B_name": "客队"}
+        for code, action in (("G", "进球"), ("PG", "点球破门"), ("OG", "乌龙球")):
+            with self.subTest(code=code):
+                title = build_article_title(
+                    {
+                        "code": code,
+                        "minute": "45",
+                        "person": "球员甲",
+                        "score": "2:1",
+                    },
+                    detail,
+                )
+                self.assertEqual(title, f"45分钟，球员甲{action}，主队 2-1 客队")
+
+        for code, action in (("YC", "黄牌"), ("RC", "红牌")):
+            with self.subTest(code=code):
+                title = build_article_title(
+                    {
+                        "code": code,
+                        "minute": "71",
+                        "person": "球员乙",
+                        "score": "2:1",
+                    },
+                    detail,
+                )
+                self.assertEqual(title, f"71分钟，球员乙{action}")
+
+    def test_match_account_is_shared_by_default_ocr_and_all_events(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "event.gif"
+            source.write_bytes(animated_gif_bytes())
+            platform = FakePlatformClient()
+            pool = PublishAccountPool(
+                root / "publish_accounts.json",
+                initial_accounts=[
+                    {"user_id": 1001, "user_name": "账号甲", "enabled": True},
+                    {"user_id": 1002, "user_name": "账号乙", "enabled": True},
+                ],
+            )
+            publisher = ArticlePublisher(
+                platform_client=platform,
+                gif_store=PublishedGifStore(
+                    root / "published", "https://matchgif.aisportsapp.com"
+                ),
+                database_path=root / "publish.sqlite3",
+                public_url_checker=lambda _url: None,
+                account_pool=pool,
+            )
+            detail = {"team_A_name": "主队", "team_B_name": "客队"}
+            publisher.publish(
+                match_id="54478914",
+                event={
+                    "event_key": "goal-default",
+                    "status": "encoded",
+                    "code": "G",
+                    "minute": "19",
+                    "score": "1-0",
+                },
+                match_detail=detail,
+                source_path=source,
+            )
+            publisher.create_or_update_article(
+                match_id="54478914",
+                event={
+                    "event_key": "card-30",
+                    "code": "YC",
+                    "minute": "30",
+                },
+                match_detail=detail,
+                source_path=source,
+                delivery_mode="publish",
+            )
+            publisher.create_or_update_draft(
+                match_id="54478914",
+                event={
+                    "event_key": "goal-draft",
+                    "code": "OG",
+                    "minute": "45",
+                    "score": "2-0",
+                },
+                match_detail=detail,
+                source_path=source,
+            )
+
+            assigned_ids = [call["user_id"] for call in platform.calls]
+            assigned_names = [call["user_name"] for call in platform.calls]
+            self.assertEqual(len(set(assigned_ids)), 1)
+            self.assertEqual(len(set(assigned_names)), 1)
+            with sqlite3.connect(root / "publish.sqlite3") as connection:
+                keys = [
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT assignment_key FROM article_publish_account_assignments"
+                    )
+                ]
+            self.assertEqual(keys, ["match:54478914"])
 
     def test_publish_is_idempotent_and_persists_success(self):
         with tempfile.TemporaryDirectory() as directory:

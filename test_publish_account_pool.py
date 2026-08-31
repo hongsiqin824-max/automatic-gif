@@ -238,7 +238,10 @@ class PublishAccountIntegrationTests(unittest.TestCase):
 
             for index in range(9):
                 publisher.create_or_update_article(
-                    match_id="54478914",
+                    # Account assignments are now scoped to a match. Use a
+                    # different match for each event here so this test keeps
+                    # exercising cross-match load balancing.
+                    match_id=f"544789{14 + index:02d}",
                     event=self.event(f"goal-{index}"),
                     match_detail={},
                     source_path=source,
@@ -364,6 +367,47 @@ class PublishAccountIntegrationTests(unittest.TestCase):
             self.assertEqual([call["user_name"] for call in platform.calls], [
                 "账号甲", "账号甲", "账号甲"
             ])
+
+    def test_legacy_draft_update_preserves_platform_author_without_migrating_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            platform = SequencePlatformClient()
+            publisher, _pool = self.make_publisher(
+                root,
+                platform,
+                [{"user_id": 1002, "user_name": "新账号", "enabled": True}],
+            )
+            source = self.write_source(root)
+            legacy_key = "ocr:54478914:goal-19"
+            with publisher._connect() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO article_publish_account_assignments (
+                        assignment_key, user_id, user_name, assigned_at_unix
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (legacy_key, 1001, "旧账号", 1.0),
+                )
+
+            result = publisher.create_or_update_draft(
+                match_id="54478914",
+                event=self.event(),
+                match_detail={},
+                source_path=source,
+                archive_id="3801234",
+            )
+
+            self.assertIsNone(result["publish_account"])
+            self.assertNotIn("user_id", platform.calls[0])
+            self.assertNotIn("user_name", platform.calls[0])
+            with publisher._connect() as connection:
+                keys = [
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT assignment_key FROM article_publish_account_assignments"
+                    )
+                ]
+            self.assertEqual(keys, [legacy_key])
 
     def test_empty_pool_blocks_default_and_ocr_without_platform_calls(self):
         with tempfile.TemporaryDirectory() as directory:
