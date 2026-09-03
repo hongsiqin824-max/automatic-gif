@@ -15,7 +15,7 @@ from article_publisher import (
     build_article_title,
     inspect_animated_gif,
 )
-from open_platform_client import OpenPlatformError
+from open_platform_client import ImageUploadResults, OpenPlatformError
 from publish_account_pool import PublishAccountPool
 
 
@@ -46,7 +46,235 @@ class FakePlatformClient:
         return {"article_id": "3801234", "duplicate": False, "code": 0}
 
 
+class FakeOfficialImageClient:
+    def __init__(self):
+        self.calls = []
+
+    def status(self):
+        return {"configured": True, "authorized": True, "api_name": "image-uploadimage-ai"}
+
+    def upload_images(self, gif_path, cover_path, *, max_bytes):
+        self.calls.append((Path(gif_path), Path(cover_path), max_bytes))
+        return ImageUploadResults(
+            [
+                {
+                    "image_id": "gif-image",
+                    "mime": "image/gif",
+                    "url": "/fastdfs8/M00/gif-event.gif",
+                    "img1_url": "https://img1.qunliao.info/fastdfs8/M00/gif-event.gif",
+                    "file_name": "event.gif",
+                },
+                {
+                    "image_id": "cover-image",
+                    "mime": "image/jpeg",
+                    "url": "/fastdfs8/M00/cover-event.jpg",
+                    "img1_url": "https://img1.qunliao.info/fastdfs8/M00/cover-event.jpg",
+                    "file_name": "event.jpg",
+                },
+            ],
+            diagnostics={
+                "lifecycle": [
+                    {"event": "upload_started"},
+                    {"event": "upload_succeeded"},
+                ],
+            },
+        )
+
+
+class FailingOfficialImageClient(FakeOfficialImageClient):
+    def upload_images(self, gif_path, cover_path, *, max_bytes):
+        raise OpenPlatformError(
+            "Not login",
+            code=300002,
+            status_code=401,
+            auth_required=True,
+            diagnostics={
+                "http_status": 200,
+                "platform_code": 300002,
+                "lifecycle": [
+                    {"event": "upload_started", "at_ms": 0.1},
+                    {"event": "token_acquired", "at_ms": 4.2},
+                    {
+                        "event": "platform_response_received",
+                        "http_status": 200,
+                        "platform_code": 300002,
+                    },
+                ],
+            },
+        )
+
+
 class ArticlePublisherTests(unittest.TestCase):
+    def test_ocr_uses_official_image_urls_and_reuses_upload_for_archive_update(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "ocr.gif"
+            source.write_bytes(animated_gif_bytes())
+            platform = FakePlatformClient()
+            official = FakeOfficialImageClient()
+            publisher = ArticlePublisher(
+                platform_client=platform,
+                gif_store=PublishedGifStore(
+                    root / "published", "https://matchgif.aisportsapp.com"
+                ),
+                database_path=root / "publish.sqlite3",
+                verify_public_url=False,
+                ocr_image_upload_client=official,
+            )
+            event = {"event_key": "goal-19", "code": "G", "minute": "19"}
+
+            created = publisher.create_or_update_draft(
+                match_id="54478914",
+                event=event,
+                match_detail={},
+                source_path=source,
+            )
+            updated = publisher.create_or_update_draft(
+                match_id="54478914",
+                event=event,
+                match_detail={},
+                source_path=source,
+                archive_id=created["article_id"],
+            )
+
+            self.assertEqual(len(official.calls), 1)
+            self.assertEqual(official.calls[0][2], 20 * 1024 * 1024)
+            self.assertEqual(
+                created["gif"]["url"],
+                "https://img1.qunliao.info/fastdfs8/M00/gif-event.gif",
+            )
+            self.assertEqual(created["gif"]["cover_url"], "/fastdfs8/M00/cover-event.jpg")
+            self.assertIn(
+                "https://img1.qunliao.info/fastdfs8/M00/gif-event.gif",
+                platform.calls[0]["body"],
+            )
+            self.assertEqual(platform.calls[0]["litpic"], "/fastdfs8/M00/cover-event.jpg")
+            self.assertEqual(platform.calls[1]["archive_id"], 3801234)
+            self.assertEqual(updated["gif"]["url"], created["gif"]["url"])
+            self.assertEqual(
+                updated["diagnostics"]["image_upload"]["lifecycle"][-1]["event"],
+                "upload_succeeded",
+            )
+            uploaded = publisher.uploaded_gif_for(
+                "54478914", "goal-19", "ocr_window"
+            )
+            self.assertEqual(
+                uploaded["upload_diagnostics"]["lifecycle"][-1]["event"],
+                "upload_succeeded",
+            )
+
+    def test_ocr_upload_failure_keeps_official_lifecycle_diagnostics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "ocr.gif"
+            source.write_bytes(animated_gif_bytes())
+            publisher = ArticlePublisher(
+                platform_client=FakePlatformClient(),
+                gif_store=PublishedGifStore(
+                    root / "published", "https://matchgif.aisportsapp.com"
+                ),
+                database_path=root / "publish.sqlite3",
+                public_url_checker=lambda _url: None,
+                ocr_image_upload_client=FailingOfficialImageClient(),
+            )
+            with self.assertRaises(ArticlePublishError) as context:
+                publisher.create_or_update_draft(
+                    match_id="54478914",
+                    event={"event_key": "goal-19", "code": "G", "minute": "19"},
+                    match_detail={},
+                    source_path=source,
+                )
+            self.assertEqual(context.exception.code, "official_image_upload_failed")
+            self.assertEqual(context.exception.platform_code, 300002)
+            self.assertEqual(
+                context.exception.diagnostics["lifecycle"][-1]["event"],
+                "platform_response_received",
+            )
+
+    def test_ocr_upload_requires_complete_img1_urls(self):
+        class MissingPublicUrlClient(FakeOfficialImageClient):
+            def upload_images(self, gif_path, cover_path, *, max_bytes):
+                return ImageUploadResults(
+                    [
+                        {
+                            "image_id": "gif-image",
+                            "mime": "image/gif",
+                            "url": "/fastdfs8/M00/gif-event.gif",
+                        },
+                        {
+                            "image_id": "cover-image",
+                            "mime": "image/jpeg",
+                            "url": "/fastdfs8/M00/cover-event.jpg",
+                        },
+                    ]
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "ocr.gif"
+            source.write_bytes(animated_gif_bytes())
+            publisher = ArticlePublisher(
+                platform_client=FakePlatformClient(),
+                gif_store=PublishedGifStore(
+                    root / "published", "https://matchgif.aisportsapp.com"
+                ),
+                database_path=root / "publish.sqlite3",
+                verify_public_url=False,
+                ocr_image_upload_client=MissingPublicUrlClient(),
+            )
+            with self.assertRaises(ArticlePublishError) as context:
+                publisher.create_or_update_draft(
+                    match_id="54478914",
+                    event={"event_key": "goal-19", "code": "G", "minute": "19"},
+                    match_detail={},
+                    source_path=source,
+                )
+            self.assertEqual(context.exception.code, "official_image_upload_invalid_response")
+            self.assertIn("img1_url", str(context.exception))
+
+    def test_self_hosted_does_not_reuse_official_upload_mapping(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "ocr.gif"
+            source.write_bytes(animated_gif_bytes())
+            remote = RemoteGifUploadClient("https://upload.example/api", "secret")
+            publisher = ArticlePublisher(
+                platform_client=FakePlatformClient(),
+                gif_store=PublishedGifStore(
+                    root / "published", "https://matchgif.aisportsapp.com"
+                ),
+                database_path=root / "publish.sqlite3",
+                verify_public_url=False,
+                remote_upload_client=remote,
+            )
+            local = publisher.gif_store.create(source)
+            publisher._save_uploaded_mapping(
+                match_id="54478914",
+                event_key="goal-19",
+                artifact_kind="ocr_window",
+                gif={
+                    **local,
+                    "url": "https://official.example/gif.gif",
+                    "cover_url": "https://official.example/cover.jpg",
+                    "upload_source": "official",
+                },
+            )
+            remote_result = {
+                **local,
+                "url": "https://matchgif.aisportsapp.com/publish-gifs/event.gif",
+                "cover_url": "https://matchgif.aisportsapp.com/publish-gif-covers/event.jpg",
+            }
+            with patch.object(remote, "upload", return_value=remote_result) as upload:
+                result = publisher._prepare_public_gif(
+                    source_path=source,
+                    match_id="54478914",
+                    event_key="goal-19",
+                    artifact_kind="ocr_window",
+                )
+
+            upload.assert_called_once()
+            self.assertEqual(result["url"], remote_result["url"])
+
     def test_remote_upload_client_returns_server_public_url(self):
         class Response:
             status = 200

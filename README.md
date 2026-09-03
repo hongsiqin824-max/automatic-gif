@@ -115,6 +115,34 @@ HTTP 409 response until one active match has completely stopped. GIF encoding
 has queue priority over optional vision refinement, and the activity panel
 shows current heavy-task occupancy and queue depth.
 
+Automatic admission is enabled by default for the Dashboard process. Every 30
+seconds it refreshes the complete soccer `Playing` directory (independent of
+the browser's 20-row/competition filter), probes each newly discovered match's
+live-source endpoint, and starts the existing Worker only after a non-empty
+`resource` is confirmed. A first confirmed empty `data` object enters the
+temporary `source_waiting` state instead of being discarded immediately. By
+default, the coordinator waits 60 seconds and requires three empty
+confirmations before recording the terminal `skipped_no_source` state. If a
+source appears during this grace window, the match follows the normal
+`waiting_capacity`/`running` path. Transport, authentication, and malformed
+responses remain retryable with backoff and are never counted as empty-source
+confirmations. Matches that have a source but arrive after the eight-worker
+limit are recorded as `waiting_capacity` and start automatically when a slot
+is released. Manual `POST /api/session/start` behavior is unchanged, including
+its 409 response when the limit is full. The read-only `GET /api/auto-admission`
+endpoint exposes discovery, queue, source waiting, retry, and final state
+without returning source URLs. Automatically started Workers opt into
+processing events already present in the first successful API snapshot, which
+reduces the event gap caused by source discovery; manual starts retain their
+existing baseline behavior.
+
+The admission queue intentionally does not create a Worker or rolling video
+buffer before a slot is available. Consequently, an event that occurs while a
+match is waiting for capacity cannot be reconstructed by the current Worker;
+this is a known boundary of the eight-slot policy, not a false success. The
+Dashboard keeps automatic records in memory and retains terminal records for
+24 hours by default, so a Dashboard restart starts a fresh discovery cycle.
+
 When the API reports that a match has ended, the worker stops ingesting only
 after pending OCR work drains. It waits up to `GIF_WORKER_FINISH_TIMEOUT_SECONDS`;
 anything still running at that point is recorded as “OCR incomplete” while the
@@ -126,10 +154,10 @@ default GIF covers `[T-60, T-10]` and can be encoded immediately from history.
 Optional refinement uses the unshifted API time `T`, scans `[T-120, T]`, and is
 not submitted until the corresponding default GIF has succeeded.
 
-For a real match, "启动实时处理" is enabled by behavior only after the source
-query has returned a non-empty `resource`. A source `resource` or `updated_at`
-change is logged and causes the worker to restart against the new source while
-retaining SQLite event deduplication state.
+For a real match, the manual "启动实时处理" action and automatic admission
+both require a non-empty `resource` from the source query. A source `resource`
+or `updated_at` change is logged and causes the worker to restart against the
+new source while retaining SQLite event deduplication state.
 
 ## What is proven
 

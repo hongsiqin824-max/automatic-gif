@@ -20,6 +20,7 @@ from typing import Any
 
 PLATFORM_ORIGIN = "https://platform.dongqiudi.com"
 DEFAULT_API_NAME = "admin-archive-createarticle"
+IMAGE_UPLOAD_API_NAME = "image-uploadimage-ai"
 TOKEN_REFRESH_LEEWAY_SECONDS = 5 * 60
 OAUTH_STATE_TTL_SECONDS = 10 * 60
 
@@ -34,6 +35,7 @@ class OpenPlatformError(RuntimeError):
         auth_required: bool = False,
         retriable: bool = False,
         http_status: int | None = None,
+        diagnostics: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
@@ -41,6 +43,20 @@ class OpenPlatformError(RuntimeError):
         self.auth_required = auth_required
         self.retriable = retriable
         self.http_status = http_status
+        self.diagnostics = dict(diagnostics or {})
+
+
+class ImageUploadResults(list[dict[str, Any]]):
+    """List-compatible image results carrying a safe upload lifecycle trace."""
+
+    def __init__(
+        self,
+        items: list[dict[str, Any]] | None = None,
+        *,
+        diagnostics: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(items or [])
+        self.diagnostics = dict(diagnostics or {})
 
 
 @dataclass(frozen=True)
@@ -51,6 +67,7 @@ class OpenPlatformConfig:
     redirect_uri: str
     token_path: Path
     token_service_url: str = ""
+    image_upload_token: str = ""
 
     @classmethod
     def from_environment(cls, root: Path) -> "OpenPlatformConfig":
@@ -69,6 +86,9 @@ class OpenPlatformConfig:
                 )
             ).expanduser(),
             token_service_url=os.environ.get("TOKEN_SERVICE_URL", "").strip().rstrip("/"),
+            image_upload_token=os.environ.get(
+                "OPEN_PLATFORM_IMAGE_UPLOAD_TOKEN", ""
+            ).strip(),
         )
 
 
@@ -107,6 +127,10 @@ class OpenPlatformClient:
         self._lock = threading.RLock()
         self._oauth_states: dict[str, float] = {}
         self._token_cache: dict[str, Any] | None | object = _UNSET
+        # The most recent image-upload trace is intentionally kept in memory
+        # only long enough for ArticlePublisher to persist a safe summary.
+        # Tokens, signatures, and multipart bodies are never included.
+        self.last_upload_diagnostics: dict[str, Any] = {}
 
     def status(self) -> dict[str, Any]:
         if self.config.token_service_url:
@@ -148,6 +172,23 @@ class OpenPlatformClient:
             "token_path": str(self.config.token_path),
             "token_service_url": None,
             "token_storage": "local_file",
+        }
+
+    def image_upload_status(self) -> dict[str, Any]:
+        """Return image-upload readiness without exposing either credential."""
+        gateway_configured = bool(self.config.appid and self.config.app_secret)
+        token_configured = bool(self.config.image_upload_token)
+        return {
+            "enabled": bool(gateway_configured and token_configured),
+            "configured": bool(gateway_configured and token_configured),
+            "gateway_configured": gateway_configured,
+            "authorization_configured": token_configured,
+            "api_name": IMAGE_UPLOAD_API_NAME,
+            "endpoint": f"{PLATFORM_ORIGIN}/open/v1/do",
+            "type": "archive",
+            "multipart_fields": ["file1", "file2"],
+            "max_file_bytes": 20 * 1024 * 1024,
+            "animated_gif_supported": True,
         }
 
     def _token_service_status(self) -> dict[str, Any]:
@@ -357,6 +398,259 @@ class OpenPlatformClient:
             "http_status": payload.get("__http_status"),
         }
 
+    def upload_images(
+        self,
+        gif_path: Path,
+        cover_path: Path,
+        *,
+        max_bytes: int = 20 * 1024 * 1024,
+    ) -> list[dict[str, Any]]:
+        """Upload a GIF and JPG through the Open Platform image endpoint.
+
+        The image endpoint expects its business parameters in the query string
+        and the files as multipart fields named ``file1`` and ``file2``.  The
+        returned records are kept intact while normalizing common metadata so
+        callers can rely on ``mime``, ``file_name``, ``size``, ``url`` and
+        ``img1_url`` being present.
+        """
+        started_at = time.monotonic()
+        lifecycle: list[dict[str, Any]] = []
+
+        def mark(name: str, **details: Any) -> None:
+            lifecycle.append(
+                {
+                    "event": name,
+                    "at_ms": round((time.monotonic() - started_at) * 1000, 1),
+                    **details,
+                }
+            )
+
+        def traced_error(exc: OpenPlatformError) -> OpenPlatformError:
+            diagnostics = {
+                **getattr(exc, "diagnostics", {}),
+                "http_status": exc.http_status or exc.status_code,
+                "platform_code": exc.code,
+                "lifecycle": list(lifecycle),
+                "elapsed_ms": round((time.monotonic() - started_at) * 1000, 1),
+            }
+            exc.diagnostics = diagnostics
+            self.last_upload_diagnostics = dict(diagnostics)
+            return exc
+
+        def trace_success() -> dict[str, Any]:
+            response_events = [
+                item
+                for item in lifecycle
+                if item.get("event") == "platform_response_received"
+            ]
+            response = response_events[-1] if response_events else {}
+            return {
+                "http_status": response.get("http_status"),
+                "platform_code": response.get("platform_code", 0),
+                "lifecycle": list(lifecycle),
+                "elapsed_ms": round((time.monotonic() - started_at) * 1000, 1),
+            }
+
+        self.last_upload_diagnostics = {}
+        mark("upload_started")
+        try:
+            self._require_configuration()
+        except OpenPlatformError as exc:
+            mark("upload_failed", stage="configuration", error=str(exc))
+            raise traced_error(exc)
+        configured_image_token = self.config.image_upload_token.strip()
+        if not configured_image_token:
+            exc = OpenPlatformError(
+                "图片上传需要配置 OPEN_PLATFORM_IMAGE_UPLOAD_TOKEN（原始登录 token）",
+                code="image_upload_token_missing",
+                status_code=503,
+                auth_required=True,
+            )
+            mark("upload_failed", stage="configuration", error=str(exc))
+            raise traced_error(exc)
+        if not isinstance(gif_path, Path) or not isinstance(cover_path, Path):
+            raise traced_error(OpenPlatformError(
+                "图片上传仅支持本地 Path 文件",
+                status_code=400,
+            ))
+        if (
+            not isinstance(max_bytes, int)
+            or isinstance(max_bytes, bool)
+            or max_bytes <= 0
+        ):
+            raise traced_error(OpenPlatformError("图片大小限制必须是正整数", status_code=400))
+
+        files = (
+            ("file1", gif_path, "image/gif"),
+            ("file2", cover_path, "image/jpeg"),
+        )
+        file_metadata: list[tuple[str, Path, str, bytes]] = []
+        for field_name, path, mime in files:
+            try:
+                if not path.is_file():
+                    raise OSError("不是文件")
+                size = path.stat().st_size
+                if size <= 0 or size > max_bytes:
+                    raise OpenPlatformError(
+                        f"图片文件 {path.name} 大小非法（上限 {max_bytes} 字节）",
+                        code=300007,
+                        status_code=400,
+                    )
+                content = path.read_bytes()
+            except OpenPlatformError as exc:
+                raise traced_error(exc)
+            except (OSError, ValueError) as exc:
+                raise traced_error(OpenPlatformError(
+                    f"无法读取图片文件 {path}",
+                    status_code=400,
+                )) from exc
+            if len(content) == 0 or len(content) > max_bytes:
+                raise traced_error(OpenPlatformError(
+                    f"图片文件 {path.name} 大小非法（上限 {max_bytes} 字节）",
+                    code=300007,
+                    status_code=400,
+                ))
+            file_metadata.append((field_name, path, mime, content))
+
+        boundary = f"----football-gif-{secrets.token_hex(16)}"
+        body = _multipart_body(boundary, file_metadata)
+
+        def send(access_token: str) -> dict[str, Any]:
+            query = {
+                "api_name": IMAGE_UPLOAD_API_NAME,
+                "appid": self.config.appid,
+                "nonce": secrets.token_hex(16),
+                "timestamp": int(time.time()),
+                "type": "archive",
+            }
+            query["sign"] = sign_query(query, self.config.app_secret)
+            url = f"{PLATFORM_ORIGIN}/open/v1/do?{urllib.parse.urlencode(query)}"
+            return self._request_json(
+                "POST",
+                url,
+                body=body,
+                content_type=f"multipart/form-data; boundary={boundary}",
+                # This image endpoint expects the original token value, not
+                # the OAuth `Bearer <token>` scheme used by article creation.
+                authorization=access_token,
+            )
+
+        # The app image endpoint uses a raw login token. Keep this credential
+        # separate from the OAuth token used by article APIs; an OAuth access
+        # token cannot identify the logged-in upload user for this endpoint.
+        access_token = configured_image_token
+        mark(
+            "token_acquired",
+            gif_bytes=len(file_metadata[0][3]),
+            cover_bytes=len(file_metadata[1][3]),
+        )
+        try:
+            mark(
+                "platform_request_sent",
+                attempt=1,
+                body_bytes=len(body),
+                field_names=[item[0] for item in file_metadata],
+            )
+            payload = send(access_token)
+            mark(
+                "platform_response_received",
+                attempt=1,
+                http_status=payload.get("__http_status"),
+                platform_code=(
+                    _image_upload_result(payload) or {}
+                ).get("code"),
+            )
+        except OpenPlatformError as exc:
+            mark(
+                "platform_response_received",
+                attempt=1,
+                http_status=exc.http_status or exc.status_code,
+                platform_code=exc.code,
+                error=str(exc),
+            )
+            raise traced_error(exc)
+        result = _image_upload_result(payload)
+        if not result:
+            raise traced_error(OpenPlatformError(
+                "开放平台图片上传返回了无法解析的结果",
+                http_status=payload.get("__http_status"),
+            ))
+        code = result.get("code")
+        if not _code_matches(code, 0):
+            auth_required = any(
+                _code_matches(code, auth_code)
+                for auth_code in (10007, 10008, 300002)
+            )
+            message = (
+                result.get("messgae")
+                or result.get("message")
+                or payload.get("messgae")
+                or payload.get("message")
+                or "图片上传失败"
+            )
+            raise traced_error(OpenPlatformError(
+                str(message),
+                code=code,
+                status_code=401 if auth_required else 502,
+                auth_required=auth_required,
+                retriable=any(
+                    _code_matches(code, retry_code)
+                    for retry_code in (4, 5, 10006, 300009, 50001, 50002)
+                ),
+                http_status=payload.get("__http_status"),
+                diagnostics={
+                    "lifecycle": lifecycle,
+                    "elapsed_ms": round((time.monotonic() - started_at) * 1000, 1),
+                },
+            ))
+        data = result.get("data")
+        if not isinstance(data, list):
+            raise traced_error(OpenPlatformError(
+                "开放平台图片上传成功，但返回的 data 不是数组",
+                code=code,
+                http_status=payload.get("__http_status"),
+                diagnostics={
+                    "lifecycle": lifecycle,
+                    "elapsed_ms": round((time.monotonic() - started_at) * 1000, 1),
+                },
+            ))
+        normalized: list[dict[str, Any]] = []
+        for index, item in enumerate(data):
+            if not isinstance(item, dict):
+                raise traced_error(OpenPlatformError(
+                    "开放平台图片上传返回了无效的图片记录",
+                    code=code,
+                    http_status=payload.get("__http_status"),
+                    diagnostics={
+                        "lifecycle": lifecycle,
+                        "elapsed_ms": round((time.monotonic() - started_at) * 1000, 1),
+                    },
+                ))
+            _field_name, path, expected_mime, content = file_metadata[
+                min(index, len(file_metadata) - 1)
+            ]
+            record = dict(item)
+            record["image_id"] = item.get("image_id") or item.get("id")
+            record["mime"] = str(item.get("mime") or expected_mime)
+            record["file_name"] = str(item.get("file_name") or path.name)
+            record["size"] = (
+                item.get("size")
+                if item.get("size") not in (None, "")
+                else len(content)
+            )
+            record["url"] = str(item.get("url") or "")
+            record["img1_url"] = str(item.get("img1_url") or "")
+            normalized.append(record)
+        mark(
+            "upload_succeeded",
+            image_count=len(normalized),
+            http_status=payload.get("__http_status"),
+            platform_code=code,
+        )
+        diagnostics = trace_success()
+        self.last_upload_diagnostics = dict(diagnostics)
+        return ImageUploadResults(normalized, diagnostics=diagnostics)
+
     def _require_configuration(self, *, require_redirect_uri: bool = False) -> None:
         if not self.config.appid or not self.config.app_secret:
             raise OpenPlatformError(
@@ -531,11 +825,16 @@ class OpenPlatformClient:
             payload = _parse_json(raw)
             result = _business_result(payload)
             code = result.get("code") if result else None
-            auth_required = exc.code == 401 or code in (10007, 10008)
+            auth_required = exc.code == 401 or any(
+                _code_matches(code, auth_code)
+                for auth_code in (10007, 10008, 300002)
+            )
             raise OpenPlatformError(
                 str(
                     (result or {}).get("message")
+                    or (result or {}).get("messgae")
                     or payload.get("message")
+                    or payload.get("messgae")
                     or f"开放平台 HTTP {exc.code}"
                 ),
                 code=code,
@@ -649,6 +948,66 @@ def _article_id(result: dict[str, Any]) -> str:
         return str(value)
     match = re.search(r"id\s*[:：]\s*(\d+)", str(result.get("message") or ""), re.I)
     return match.group(1) if match else ""
+
+
+def _code_matches(value: Any, expected: int) -> bool:
+    """Compare API codes consistently when a service serializes them as strings."""
+    if isinstance(value, bool):
+        return False
+    try:
+        return int(value) == expected
+    except (TypeError, ValueError):
+        return False
+
+
+def _image_upload_result(payload: Any) -> dict[str, Any] | None:
+    """Extract the image endpoint result from direct or wrapped responses."""
+    if not isinstance(payload, dict):
+        return None
+    response = payload.get("response")
+    if isinstance(response, dict):
+        nested = response.get("data")
+        if isinstance(nested, dict) and "code" in nested:
+            return nested
+        if "code" in response and (
+            "data" in response or "messgae" in response or "message" in response
+        ):
+            return response
+    nested = payload.get("data")
+    if isinstance(nested, dict) and "code" in nested:
+        return nested
+    if "code" in payload:
+        return payload
+    return None
+
+
+def _multipart_body(
+    boundary: str,
+    files: list[tuple[str, Path, str, bytes]],
+) -> bytes:
+    """Build a deterministic multipart body for the two image fields."""
+    chunks: list[bytes] = []
+    boundary_bytes = boundary.encode("ascii")
+    for field_name, path, mime, content in files:
+        filename = (
+            path.name.replace("\"", "_")
+            .replace("\r", "")
+            .replace("\n", "")
+        )
+        chunks.extend(
+            (
+                b"--" + boundary_bytes + b"\r\n",
+                (
+                    f'Content-Disposition: form-data; name="{field_name}"; '
+                    f'filename="{filename}"\r\n'
+                ).encode("utf-8"),
+                f"Content-Type: {mime}\r\n\r\n".encode("ascii"),
+                content,
+                b"\r\n",
+            )
+        )
+    chunks.append(b"--" + boundary_bytes + b"--\r\n")
+    return b"".join(chunks)
 
 
 def _number_or_none(value: Any) -> float | None:

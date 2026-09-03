@@ -33,6 +33,8 @@ PUBLICATION_HOLD_STATUS = "held"
 AUTO_PUBLISH_MIN_PLAYABLE_SECONDS = 55.0
 AUTO_PUBLISH_ANCHOR_TOLERANCE_SECONDS = 1.0
 AUTO_PUBLISH_MIN_CENTERED_SIDE_SECONDS = 25.0
+AUTO_PUBLISH_MAX_INTERNAL_GAP_SECONDS = 8.0
+AUTO_PUBLISH_MIN_INTERNAL_GAP_PLAYABLE_SECONDS = 52.0
 
 
 def _event_with_team_fallback(
@@ -212,14 +214,6 @@ def ocr_publication_eligibility(result: dict[str, Any] | None) -> dict[str, Any]
             "anchor_adjusted",
             "OCR 锚点被移动到相邻视频片段，事件时间与画面位置不再严格对应。",
         )
-    gap_count = _optional_float(value.get("video_gap_count"))
-    if value.get("stitched_across_gap") is True or (gap_count is not None and gap_count > 0):
-        return hold(
-            "internal_gap",
-            "片段包含内部直播断口，虽然可以拼接播放，但事件附近的连续性无法保证。",
-            video_gap_count=gap_count,
-        )
-
     requested = value.get("requested_media_window")
     if not isinstance(requested, dict):
         requested = {
@@ -258,11 +252,45 @@ def ocr_publication_eligibility(result: dict[str, Any] | None) -> dict[str, Any]
             requested_duration_seconds=requested_duration,
             actual_duration_seconds=actual_duration,
         )
+    # A short source interruption can leave a playable stitched clip. The
+    # publication rule is based on the measured playable duration, so a clip
+    # with at least 52 seconds and no more than 8 seconds missing is usable.
+    # Keep rejecting a larger or unmeasured gap instead of inferring it from
+    # the final GIF duration alone.
+    gap_count = _optional_float(value.get("video_gap_count"))
+    skipped_gap = _optional_float(value.get("skipped_gap_seconds"))
+    has_internal_gap = (
+        value.get("stitched_across_gap") is True
+        or (gap_count is not None and gap_count > 0)
+        or (skipped_gap is not None and skipped_gap != 0)
+    )
+    if has_internal_gap and (
+        skipped_gap is None
+        or skipped_gap <= 0
+        or skipped_gap > AUTO_PUBLISH_MAX_INTERNAL_GAP_SECONDS
+    ):
+        return hold(
+            "internal_gap",
+            "片段中间有直播中断，但缺口时长没有正确记录；暂不自动发布。"
+            if skipped_gap is None or skipped_gap <= 0
+            else f"片段中间缺少约 {skipped_gap:.1f} 秒直播画面，超过自动发布允许的 8.0 秒。",
+            video_gap_count=gap_count,
+            skipped_gap_seconds=skipped_gap,
+        )
     minimum_duration = min(
-        AUTO_PUBLISH_MIN_PLAYABLE_SECONDS,
+        (
+            AUTO_PUBLISH_MIN_INTERNAL_GAP_PLAYABLE_SECONDS
+            if has_internal_gap
+            else AUTO_PUBLISH_MIN_PLAYABLE_SECONDS
+        ),
         max(0.0, requested_duration),
     )
-    if actual_duration + AUTO_PUBLISH_ANCHOR_TOLERANCE_SECONDS < minimum_duration:
+    below_minimum = (
+        actual_duration < minimum_duration
+        if has_internal_gap
+        else actual_duration + AUTO_PUBLISH_ANCHOR_TOLERANCE_SECONDS < minimum_duration
+    )
+    if below_minimum:
         return hold(
             "insufficient_coverage",
             f"实际可播放时长约 {actual_duration:.1f} 秒，低于自动发布要求的 {minimum_duration:.1f} 秒。",
@@ -306,6 +334,15 @@ def ocr_publication_eligibility(result: dict[str, Any] | None) -> dict[str, Any]
                 f"事件后连续画面约 {max(0.0, after_available):.1f} 秒，低于自动发布要求。",
             )
 
+    if has_internal_gap:
+        return allow(
+            "trusted_ocr_small_internal_gap",
+            f"OCR 锚点可信，直播中间缺少约 {skipped_gap:.1f} 秒，但 GIF 实际可播放约 {actual_duration:.1f} 秒，允许自动发布。",
+            requested_duration_seconds=round(requested_duration, 3),
+            actual_duration_seconds=round(actual_duration, 3),
+            video_gap_count=gap_count,
+            skipped_gap_seconds=round(skipped_gap, 3),
+        )
     if actual_duration + AUTO_PUBLISH_ANCHOR_TOLERANCE_SECONDS < requested_duration:
         return allow(
             "trusted_ocr_edge_truncated",
@@ -721,22 +758,60 @@ class ArticleDraftQueue:
                 next_status, next_stage = "queued", "queued"
             elif next_status in {"queued", "waiting_person"} and not eligible:
                 next_status, next_stage = PUBLICATION_HOLD_STATUS, "publication_gate"
+            # Re-registering an unchanged encoded GIF is common during worker
+            # shutdown/reconciliation. It must not erase the original upload
+            # failure that explains why the task is currently failed or waiting
+            # for retry. A new artifact is handled by the branch above and is
+            # intentionally allowed to reset its diagnostics.
+            preserve_failure = str(existing["status"] or "") in {
+                "failed",
+                "retry_wait",
+            }
+            if preserve_failure:
+                error_assignments: list[str] = []
+                error_values: list[Any] = []
+            else:
+                error_assignments = ["error_code=?", "error=?"]
+                error_values = [
+                    None
+                    if eligible
+                    else str(eligibility.get("reason_code") or "auto_publish_not_eligible"),
+                    None
+                    if eligible
+                    else str(eligibility.get("reason") or "OCR GIF 不符合自动发布条件"),
+                ]
+            if preserve_failure:
+                next_attempt_assignment = "next_attempt_at_unix=next_attempt_at_unix"
+                next_attempt_values: list[Any] = []
+            else:
+                next_attempt_assignment = (
+                    "next_attempt_at_unix=CASE "
+                    "WHEN ? THEN CASE "
+                    "WHEN status='waiting_person' AND ? THEN ? "
+                    "ELSE next_attempt_at_unix END "
+                    "ELSE NULL END"
+                )
+                next_attempt_values = [
+                    int(eligible),
+                    int(person_available),
+                    now,
+                ]
+            assignments = [
+                "source_path=?",
+                "event_json=?",
+                "match_detail_json=?",
+                "quality_label=?",
+                "eligibility_json=?",
+                "status=?",
+                "stage=?",
+                *error_assignments,
+                next_attempt_assignment,
+                "updated_at_unix=?",
+            ]
             updated = connection.execute(
-                """
-                UPDATE article_delivery_tasks
-                SET source_path=?, event_json=?, match_detail_json=?,
-                    quality_label=?, eligibility_json=?,
-                    status=?, stage=?, error_code=?, error=?,
-                    next_attempt_at_unix=CASE
-                        WHEN ? THEN CASE
-                            WHEN status='waiting_person' AND ? THEN ?
-                            ELSE next_attempt_at_unix
-                        END
-                        ELSE NULL
-                    END,
-                    updated_at_unix=?
-                WHERE task_key=? AND generation=? AND source_signature=?
-                """,
+                "UPDATE article_delivery_tasks SET "
+                + ", ".join(assignments)
+                + " WHERE task_key=? AND generation=? AND source_signature=?",
                 (
                     str(source_path),
                     event_json,
@@ -745,11 +820,8 @@ class ArticleDraftQueue:
                     eligibility_json,
                     next_status,
                     next_stage,
-                    None if eligible else str(eligibility.get("reason_code") or "auto_publish_not_eligible"),
-                    None if eligible else str(eligibility.get("reason") or "OCR GIF 不符合自动发布条件"),
-                    int(eligible),
-                    int(person_available),
-                    now,
+                    *error_values,
+                    *next_attempt_values,
                     now,
                     task_key,
                     existing["generation"],

@@ -29,6 +29,7 @@ from publish_account_pool import (
 
 GIF_ID_PATTERN = re.compile(r"^[a-f0-9]{64}$")
 GIF_HEADERS = {b"GIF87a", b"GIF89a"}
+OFFICIAL_IMAGE_MAX_BYTES = 20 * 1024 * 1024
 EVENT_TYPES = {"G": 1, "PG": 2, "RC": 4, "OG": 5}
 EVENT_LABELS = {
     "G": "进球",
@@ -614,6 +615,7 @@ class ArticlePublisher:
         public_url_checker: Callable[[str], None] | None = None,
         public_cover_url_checker: Callable[[str], None] | None = None,
         remote_upload_client: RemoteGifUploadClient | None = None,
+        ocr_image_upload_client: OpenPlatformClient | None = None,
         account_pool: PublishAccountPool | None = None,
     ) -> None:
         self.platform_client = platform_client
@@ -627,6 +629,10 @@ class ArticlePublisher:
             or _check_public_cover_url
         )
         self.remote_upload_client = remote_upload_client
+        # The official image API is deliberately opt-in and only used by the
+        # OCR article path. Keeping it separate preserves the default GIF
+        # uploader and its existing configuration.
+        self.ocr_image_upload_client = ocr_image_upload_client
         self.account_pool = account_pool
         self._lock = threading.RLock()
 
@@ -645,6 +651,21 @@ class ArticlePublisher:
                 "active_count": 0,
                 "error": str(exc),
             }
+        oauth_status = self.platform_client.status()
+        if self.ocr_image_upload_client is not None:
+            # Image upload has its own token and readiness requirements. Do
+            # not mirror OAuth status, otherwise a valid image token can look
+            # unauthorized when the article OAuth token is absent or expired.
+            image_status = getattr(
+                self.ocr_image_upload_client, "image_upload_status", None
+            )
+            ocr_upload_status = (
+                image_status()
+                if callable(image_status)
+                else self.ocr_image_upload_client.status()
+            )
+        else:
+            ocr_upload_status = {"enabled": False, "configured": False}
         return {
             "archive_level": "B",
             "add_to_tab": 1,
@@ -658,12 +679,13 @@ class ArticlePublisher:
             "gif_directory": str(self.gif_store.directory),
             "gif_cover_directory": str(self.gif_store.cover_directory),
             "database_path": str(self.database_path),
-            "oauth": self.platform_client.status(),
+            "oauth": oauth_status,
             "remote_upload": (
                 self.remote_upload_client.status()
                 if self.remote_upload_client
                 else {"enabled": False, "configured": False}
             ),
+            "ocr_image_upload": ocr_upload_status,
         }
 
     def records_for_match(self, match_id: str) -> dict[str, dict[str, Any]]:
@@ -855,13 +877,19 @@ class ArticlePublisher:
                 """
                 INSERT INTO article_uploaded_gifs (
                     match_id, event_key, artifact_kind, gif_sha256,
-                    gif_path, gif_url, cover_url, uploaded_at_unix
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    gif_path, gif_url, cover_url, upload_source,
+                    upload_diagnostics_json, uploaded_at_unix
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(match_id, event_key, artifact_kind) DO UPDATE SET
                     gif_sha256=excluded.gif_sha256,
                     gif_path=excluded.gif_path,
                     gif_url=excluded.gif_url,
                     cover_url=excluded.cover_url,
+                    upload_source=excluded.upload_source,
+                    upload_diagnostics_json=COALESCE(
+                        excluded.upload_diagnostics_json,
+                        article_uploaded_gifs.upload_diagnostics_json
+                    ),
                     uploaded_at_unix=excluded.uploaded_at_unix
                 """,
                 (
@@ -872,6 +900,11 @@ class ArticlePublisher:
                     str(gif["path"]),
                     str(gif["url"]),
                     str(gif["cover_url"]),
+                    str(
+                        gif.get("upload_source")
+                        or ("official" if gif.get("official_upload") else "remote")
+                    ),
+                    _diagnostics_json(gif.get("upload_diagnostics")),
                     now,
                 ),
             )
@@ -902,13 +935,18 @@ class ArticlePublisher:
         path = Path(str(row["gif_path"])).expanduser()
         if not path.is_file():
             return None
-        return {
+        result = {
             "gif_id": str(row["gif_sha256"]),
             "path": str(path),
             "url": str(row["gif_url"]),
             "cover_url": str(row["cover_url"] or ""),
+            "upload_source": str(row["upload_source"] or "remote"),
             "uploaded_at_unix": row["uploaded_at_unix"],
         }
+        upload_diagnostics = _json_object(row["upload_diagnostics_json"])
+        if upload_diagnostics:
+            result["upload_diagnostics"] = upload_diagnostics
+        return result
 
     def _prepare_public_gif(
         self,
@@ -921,12 +959,44 @@ class ArticlePublisher:
         """Persist a GIF locally and make it available at its public URL."""
         local_gif = self.gif_store.create(source_path)
         uploaded = self.uploaded_gif_for(match_id, event_key, artifact_kind)
-        if (
-            uploaded
-            and uploaded.get("gif_id") == local_gif["gif_id"]
-            and _is_https_jpeg_url(uploaded.get("cover_url"))
-        ):
+        if artifact_kind == "ocr_window" and self.ocr_image_upload_client is not None:
+            # Once the official OCR client is enabled, a legacy remote mapping
+            # must not block migration to FastDFS. The persisted upload_source
+            # marker identifies an upload made through the official endpoint.
+            can_reuse_uploaded = bool(
+                uploaded
+                and uploaded.get("gif_id") == local_gif["gif_id"]
+                and uploaded.get("upload_source") == "official"
+                and _is_media_reference(uploaded.get("url"))
+                and _is_media_reference(uploaded.get("cover_url"), allow_relative=True)
+            )
+        else:
+            # Preserve the legacy/default uploader's validation exactly.
+            can_reuse_uploaded = bool(
+                uploaded
+                and uploaded.get("gif_id") == local_gif["gif_id"]
+                and uploaded.get("upload_source") == "remote"
+                and _is_https_jpeg_url(uploaded.get("cover_url"))
+            )
+        if can_reuse_uploaded:
             return uploaded
+
+        # OCR GIFs use the official image endpoint when it is configured. The
+        # endpoint receives both files in one request and returns a FastDFS
+        # `url` plus a complete `img1_url` for each file.
+        if artifact_kind == "ocr_window" and self.ocr_image_upload_client is not None:
+            gif = self._upload_ocr_images(local_gif, match_id=match_id, event_key=event_key)
+            self._save_uploaded_mapping(
+                match_id=match_id,
+                event_key=event_key,
+                artifact_kind=artifact_kind,
+                gif=gif,
+            )
+            return gif
+
+        # Keep the previous uploader as a compatibility fallback when the
+        # official OCR client has not been injected yet. The normal/default
+        # GIF path remains exactly the same.
         if not self.remote_upload_client or not self.remote_upload_client.enabled:
             return local_gif
 
@@ -951,6 +1021,140 @@ class ArticlePublisher:
             gif=gif,
         )
         return gif
+
+    def _upload_ocr_images(
+        self,
+        local_gif: dict[str, Any],
+        *,
+        match_id: str,
+        event_key: str,
+    ) -> dict[str, Any]:
+        """Upload an OCR GIF and its generated JPEG cover to the platform."""
+        gif_path = Path(str(local_gif["path"])).expanduser()
+        cover_path = Path(str(local_gif.get("cover_path") or "")).expanduser()
+        if not cover_path.is_file():
+            raise ArticlePublishError(
+                "官方图片上传缺少 GIF 封面文件",
+                code="official_image_cover_missing",
+                stage="official_image_upload",
+                status_code=500,
+            )
+        try:
+            gif_size = gif_path.stat().st_size
+            cover_size = cover_path.stat().st_size
+        except OSError as exc:
+            raise ArticlePublishError(
+                f"读取官方图片上传文件大小失败：{exc}",
+                code="official_image_source_unreadable",
+                stage="official_image_upload",
+                status_code=404,
+            ) from exc
+        if gif_size > OFFICIAL_IMAGE_MAX_BYTES or cover_size > OFFICIAL_IMAGE_MAX_BYTES:
+            raise ArticlePublishError(
+                "GIF 或封面超过懂球帝官方图片接口的 20MB 单文件上限",
+                code="official_image_too_large",
+                stage="official_image_upload",
+                status_code=413,
+            )
+        try:
+            results = self.ocr_image_upload_client.upload_images(
+                gif_path,
+                cover_path,
+                max_bytes=OFFICIAL_IMAGE_MAX_BYTES,
+            )
+        except ArticlePublishError:
+            raise
+        except OpenPlatformError as exc:
+            raise ArticlePublishError(
+                f"懂球帝官方图片上传失败：{exc}",
+                code="official_image_upload_failed",
+                stage="official_image_upload",
+                status_code=exc.status_code,
+                auth_required=exc.auth_required,
+                retriable=exc.retriable,
+                platform_code=exc.code,
+                diagnostics=getattr(exc, "diagnostics", None),
+            ) from exc
+        except (OSError, TimeoutError) as exc:
+            raise ArticlePublishError(
+                f"懂球帝官方图片上传连接失败：{exc}",
+                code="official_image_upload_unreachable",
+                stage="official_image_upload",
+                status_code=503,
+                retriable=True,
+            ) from exc
+
+        if isinstance(results, dict):
+            results = results.get("images") or results.get("data") or []
+        if not isinstance(results, (list, tuple)) or len(results) < 2:
+            raise ArticlePublishError(
+                "官方图片接口返回结果不完整，GIF 和封面地址均未确认",
+                code="official_image_upload_invalid_response",
+                stage="official_image_upload",
+                status_code=502,
+            )
+        gif_item = _find_official_image_result(results, kind="gif")
+        cover_item = _find_official_image_result(results, kind="cover")
+        if gif_item is None or cover_item is None or gif_item is cover_item:
+            # The documented file1/file2 order is the final fallback when the
+            # service omits MIME/file-name metadata.
+            gif_item, cover_item = results[0], results[1]
+        if not isinstance(gif_item, dict) or not isinstance(cover_item, dict):
+            raise ArticlePublishError(
+                "官方图片接口返回了无法识别的图片项目",
+                code="official_image_upload_invalid_response",
+                stage="official_image_upload",
+                status_code=502,
+            )
+        gif_path_url = str(gif_item.get("url") or "").strip()
+        gif_url = str(gif_item.get("img1_url") or "").strip()
+        cover_url = str(cover_item.get("url") or "").strip()
+        cover_public_url = str(cover_item.get("img1_url") or "").strip()
+        if not _is_media_reference(gif_path_url, allow_relative=True):
+            raise ArticlePublishError(
+                "官方图片接口未返回有效的 GIF url 路径",
+                code="official_image_upload_invalid_response",
+                stage="official_image_upload",
+                status_code=502,
+            )
+        if not _is_media_reference(gif_url):
+            raise ArticlePublishError(
+                "官方图片接口未返回有效的 GIF 完整访问地址 img1_url",
+                code="official_image_upload_invalid_response",
+                stage="official_image_upload",
+                status_code=502,
+            )
+        if not _is_media_reference(cover_url, allow_relative=True):
+            raise ArticlePublishError(
+                "官方图片接口未返回有效的封面 url 路径",
+                code="official_image_upload_invalid_response",
+                stage="official_image_upload",
+                status_code=502,
+            )
+        if not _is_media_reference(cover_public_url):
+            raise ArticlePublishError(
+                "官方图片接口未返回有效的封面完整访问地址 img1_url",
+                code="official_image_upload_invalid_response",
+                stage="official_image_upload",
+                status_code=502,
+            )
+        return {
+            **local_gif,
+            "url": gif_url,
+            "cover_url": cover_url,
+            "official_upload": True,
+            "official_gif_path": gif_path_url,
+            "official_gif_url": gif_url,
+            "official_cover_path": cover_url,
+            "official_cover_url": cover_public_url,
+            "upload_diagnostics": dict(
+                getattr(results, "diagnostics", {}) or {}
+            ),
+            "official_gif_image_id": gif_item.get("image_id"),
+            "official_cover_image_id": cover_item.get("image_id"),
+            "official_upload_match_id": str(match_id),
+            "official_upload_event_key": str(event_key),
+        }
 
     def publish(
         self,
@@ -1012,6 +1216,13 @@ class ArticlePublisher:
                 cover_url=str(gif["cover_url"]),
                 title=title,
                 publish_account=publish_account,
+                allow_relative_media=bool(
+                    artifact_kind == "ocr_window"
+                    and (
+                        gif.get("official_upload")
+                        or gif.get("upload_source") == "official"
+                    )
+                ),
             )
             self._save_record(
                 stable_id=stable_id,
@@ -1026,8 +1237,10 @@ class ArticlePublisher:
             )
             try:
                 if self.verify_public_url:
-                    self.public_url_checker(str(gif["url"]))
-                    self.public_cover_url_checker(str(gif["cover_url"]))
+                    if _is_absolute_http_url(gif.get("url")):
+                        self.public_url_checker(str(gif["url"]))
+                    if _is_absolute_http_url(gif.get("cover_url")):
+                        self.public_cover_url_checker(str(gif["cover_url"]))
                 self._save_record(
                     stable_id=stable_id,
                     match_id=match_id,
@@ -1180,20 +1393,38 @@ class ArticlePublisher:
                 delivery_mode=delivery_mode,
                 archive_id=archive_id,
                 publish_account=publish_account,
+                # A reused DB mapping predates the in-memory marker, so infer
+                # official mode from its persisted upload source marker.
+                allow_relative_media=bool(
+                    gif.get("official_upload")
+                    or gif.get("upload_source") == "official"
+                ),
             )
             try:
                 if self.verify_public_url:
-                    self.public_url_checker(str(gif["url"]))
-                    self.public_cover_url_checker(str(gif["cover_url"]))
+                    # FastDFS `url` values from the official image API are
+                    # relative paths and cannot be probed with HTTP HEAD.
+                    if _is_absolute_http_url(gif.get("url")):
+                        self.public_url_checker(str(gif["url"]))
+                    if _is_absolute_http_url(gif.get("cover_url")):
+                        self.public_cover_url_checker(str(gif["cover_url"]))
                 result = self.platform_client.create_article(fields)
             except ArticlePublishError as exc:
-                if not exc.diagnostics:
-                    exc.diagnostics = _draft_diagnostics(
-                        fields=fields,
-                        gif=gif,
-                        elapsed_ms=(time.monotonic() - started_at) * 1000,
-                        platform_message=str(exc),
-                    )
+                base_diagnostics = _draft_diagnostics(
+                    fields=fields,
+                    gif=gif,
+                    elapsed_ms=(time.monotonic() - started_at) * 1000,
+                    platform_message=str(exc),
+                )
+                if exc.diagnostics:
+                    # Keep the upload trace under its own key while retaining
+                    # the safe request summary used by the Dashboard.
+                    exc.diagnostics = {
+                        **base_diagnostics,
+                        "image_upload": dict(exc.diagnostics),
+                    }
+                else:
+                    exc.diagnostics = base_diagnostics
                 raise
             except OpenPlatformError as exc:
                 stage = "authorization" if exc.auth_required else "platform_publish"
@@ -1280,6 +1511,8 @@ class ArticlePublisher:
                 gif_path TEXT NOT NULL,
                 gif_url TEXT NOT NULL,
                 cover_url TEXT,
+                upload_source TEXT NOT NULL DEFAULT 'remote',
+                upload_diagnostics_json TEXT,
                 uploaded_at_unix REAL NOT NULL,
                 PRIMARY KEY(match_id, event_key, artifact_kind)
             )
@@ -1316,6 +1549,14 @@ class ArticlePublisher:
         if "cover_url" not in uploaded_columns:
             connection.execute(
                 "ALTER TABLE article_uploaded_gifs ADD COLUMN cover_url TEXT"
+            )
+        if "upload_source" not in uploaded_columns:
+            connection.execute(
+                "ALTER TABLE article_uploaded_gifs ADD COLUMN upload_source TEXT NOT NULL DEFAULT 'remote'"
+            )
+        if "upload_diagnostics_json" not in uploaded_columns:
+            connection.execute(
+                "ALTER TABLE article_uploaded_gifs ADD COLUMN upload_diagnostics_json TEXT"
             )
         connection.execute(
             """
@@ -1479,6 +1720,7 @@ def build_article_fields(
     delivery_mode: str = "publish",
     archive_id: str | int | None = None,
     publish_account: dict[str, Any] | None = None,
+    allow_relative_media: bool = False,
 ) -> dict[str, Any]:
     if delivery_mode not in {"publish", "draft"}:
         raise ArticlePublishError(
@@ -1494,17 +1736,26 @@ def build_article_fields(
             stage="request_validation",
             status_code=400,
         )
-    if not gif_url.startswith("https://"):
+    if (
+        not (
+            allow_relative_media
+            and _is_relative_media_reference(gif_url)
+        )
+        and not gif_url.startswith("https://")
+    ):
         raise ArticlePublishError(
-            "文章使用的 GIF 公网地址必须使用 HTTPS",
+            "文章使用的 GIF 地址必须是 HTTPS 公网地址或官方 FastDFS url 路径",
             code="publish_gif_https_required",
             stage="public_url_check",
             status_code=503,
         )
     normalized_cover_url = str(cover_url or "").strip()
-    if not _is_https_jpeg_url(normalized_cover_url):
+    if not (
+        (allow_relative_media and _is_relative_media_reference(normalized_cover_url))
+        or _is_https_jpeg_url(normalized_cover_url)
+    ):
         raise ArticlePublishError(
-            "文章封面必须是完整的 HTTPS JPG/JPEG 公网地址",
+            "文章封面必须是完整 HTTPS JPG/JPEG 地址或官方 FastDFS url 路径",
             code="publish_cover_url_invalid",
             stage="cover_public_url_check",
             status_code=503,
@@ -1592,13 +1843,38 @@ def _draft_diagnostics(
         )
         if fields.get(key) is not None
     }
-    return {
+    diagnostics = {
         "http_status": http_status,
         "gif_bytes": int(gif.get("bytes") or 0),
         "elapsed_ms": round(max(float(elapsed_ms), 0.0), 1),
         "request_summary": summary,
         "platform_message": str(platform_message or ""),
     }
+    upload_diagnostics = gif.get("upload_diagnostics")
+    if isinstance(upload_diagnostics, dict) and upload_diagnostics:
+        diagnostics["image_upload"] = dict(upload_diagnostics)
+    return diagnostics
+
+
+def _json_object(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    if not isinstance(value, str) or not value.strip():
+        return {}
+    try:
+        decoded = json.loads(value)
+    except json.JSONDecodeError:
+        return {}
+    return dict(decoded) if isinstance(decoded, dict) else {}
+
+
+def _diagnostics_json(value: Any) -> str | None:
+    if not isinstance(value, dict) or not value:
+        return None
+    try:
+        return json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return None
 
 
 def _remote_error_message(raw: str) -> str:
@@ -1657,6 +1933,55 @@ def _is_https_jpeg_url(value: Any) -> bool:
         and bool(parsed.netloc)
         and parsed.path.lower().endswith((".jpg", ".jpeg"))
     )
+
+
+def _is_absolute_http_url(value: Any) -> bool:
+    try:
+        parsed = urllib.parse.urlsplit(str(value or "").strip())
+    except ValueError:
+        return False
+    return parsed.scheme.lower() in {"http", "https"} and bool(parsed.netloc)
+
+
+def _is_media_reference(value: Any, *, allow_relative: bool = False) -> bool:
+    """Validate a returned image reference without assuming a file suffix."""
+    text = str(value or "").strip()
+    if not text:
+        return False
+    if _is_absolute_http_url(text):
+        return text.lower().startswith("https://")
+    if not allow_relative:
+        return False
+    parsed = urllib.parse.urlsplit(text)
+    return (
+        not parsed.scheme
+        and not parsed.netloc
+        and parsed.path.startswith("/")
+        and ".." not in Path(parsed.path).parts
+    )
+
+
+def _is_relative_media_reference(value: Any) -> bool:
+    text = str(value or "").strip()
+    return bool(text) and _is_media_reference(text, allow_relative=True) and not _is_absolute_http_url(text)
+
+
+def _find_official_image_result(results: list[Any] | tuple[Any, ...], *, kind: str) -> dict[str, Any] | None:
+    expected_mimes = {
+        "gif": {"image/gif", "image/gif; charset=binary"},
+        "cover": {"image/jpeg", "image/jpg", "image/jpg; charset=binary"},
+    }
+    expected_suffixes = {"gif": (".gif",), "cover": (".jpg", ".jpeg")}
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        mime = str(item.get("mime") or item.get("content_type") or "").split(";", 1)[0].strip().lower()
+        if mime in expected_mimes[kind]:
+            return item
+        name = str(item.get("file_name") or item.get("filename") or "").lower()
+        if name.endswith(expected_suffixes[kind]):
+            return item
+    return None
 
 
 def _check_public_gif_url(url: str) -> None:

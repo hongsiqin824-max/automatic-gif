@@ -15,6 +15,7 @@ import json
 import math
 import os
 import re
+import shlex
 import signal
 import sqlite3
 import subprocess
@@ -23,6 +24,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -108,6 +110,56 @@ def _positive_environment_float(name: str, default: float) -> float:
     return value
 
 
+def _environment_choice(name: str, default: str, choices: set[str]) -> str:
+    """Read a case-insensitive environment setting from a fixed allow-list."""
+    value = os.environ.get(name)
+    value = (value.strip().lower() if value is not None else "") or default.strip().lower()
+    if value not in choices:
+        allowed = ", ".join(sorted(choices))
+        raise RuntimeError(f"{name} 必须是以下值之一：{allowed}")
+    return value
+
+
+def _ocr_image_upload_client_for_backend(
+    backend: str, client: OpenPlatformClient
+) -> OpenPlatformClient | None:
+    """Inject the official OCR uploader only when explicitly selected."""
+    if backend == "official":
+        return client
+    if backend == "self_hosted":
+        return None
+    raise RuntimeError(f"不支持的 OCR 图片上传后端：{backend}")
+
+
+def _ocr_image_upload_backend_status(
+    backend: str, publisher: ArticlePublisher
+) -> dict[str, Any]:
+    """Describe the selected OCR upload route without exposing credentials."""
+    if backend == "official":
+        client = publisher.ocr_image_upload_client
+        status_loader = getattr(client, "image_upload_status", None)
+        status = status_loader() if callable(status_loader) else {}
+        return {
+            "backend": backend,
+            "transport": "official_api",
+            "configured": bool(status.get("configured")),
+        }
+    if backend == "self_hosted":
+        remote = publisher.remote_upload_client
+        if remote is not None and remote.enabled:
+            return {
+                "backend": backend,
+                "transport": "remote_server",
+                "configured": bool(remote.status().get("configured")),
+            }
+        return {
+            "backend": backend,
+            "transport": "local_store",
+            "configured": publisher.gif_store.public_origin.startswith("https://"),
+        }
+    raise RuntimeError(f"不支持的 OCR 图片上传后端：{backend}")
+
+
 MAX_CONCURRENT_MATCHES = _positive_environment_integer(
     "GIF_MAX_CONCURRENT_MATCHES", 8
 )
@@ -131,6 +183,9 @@ GIF_UPLOAD_TOKEN = os.environ.get("GIF_UPLOAD_TOKEN", "").strip()
 GIF_UPLOAD_ENDPOINT = os.environ.get("GIF_UPLOAD_ENDPOINT", "").strip()
 GIF_UPLOAD_TIMEOUT_SECONDS = _positive_environment_float(
     "GIF_UPLOAD_TIMEOUT_SECONDS", 120.0
+)
+OCR_IMAGE_UPLOAD_BACKEND = _environment_choice(
+    "OCR_IMAGE_UPLOAD_BACKEND", "self_hosted", {"official", "self_hosted"}
 )
 ARTICLE_PUBLISH_ENABLED = environment_boolean("ARTICLE_PUBLISH_ENABLED", True)
 # OCR GIF article delivery is automatic. The environment switch remains so an
@@ -163,6 +218,39 @@ MATCH_CATALOG_REFRESH_SECONDS = 120.0
 MATCH_CATALOG_BACKOFF_SECONDS = (5.0, 10.0, 20.0, 30.0)
 MATCH_CATALOG_LIMIT = 20
 MATCH_CATALOG_UPCOMING_SECONDS = 15 * 60
+# Automatic admission has its own refresh clock.  The UI cache remains on its
+# existing contract while the background coordinator can discover new Playing
+# matches without waiting for a browser request.
+AUTO_ADMISSION_ENABLED = environment_boolean("GIF_AUTO_ADMISSION_ENABLED", True)
+AUTO_ADMISSION_POLL_SECONDS = _positive_environment_float(
+    "GIF_AUTO_ADMISSION_POLL_SECONDS", 30.0
+)
+AUTO_ADMISSION_SOURCE_POLL_SECONDS = _positive_environment_float(
+    "GIF_AUTO_ADMISSION_SOURCE_POLL_SECONDS", 10.0
+)
+AUTO_ADMISSION_SOURCE_WAIT_SECONDS = _positive_environment_float(
+    "GIF_AUTO_ADMISSION_SOURCE_WAIT_SECONDS", 60.0
+)
+AUTO_ADMISSION_SOURCE_EMPTY_CONFIRMATIONS = _positive_environment_integer(
+    "GIF_AUTO_ADMISSION_SOURCE_EMPTY_CONFIRMATIONS", 3
+)
+AUTO_ADMISSION_MAX_BACKOFF_SECONDS = _positive_environment_float(
+    "GIF_AUTO_ADMISSION_MAX_BACKOFF_SECONDS", 60.0
+)
+AUTO_ADMISSION_SOURCE_WORKERS = _positive_environment_integer(
+    "GIF_AUTO_ADMISSION_SOURCE_WORKERS", 4
+)
+AUTO_ADMISSION_RECORD_RETENTION_SECONDS = _positive_environment_float(
+    "GIF_AUTO_ADMISSION_RECORD_RETENTION_SECONDS", 24 * 60 * 60
+)
+AUTO_ADMISSION_MISSING_CONFIRMATIONS = _positive_environment_integer(
+    "GIF_AUTO_ADMISSION_MISSING_CONFIRMATIONS", 2
+)
+# These competitions are hidden from the browser's discovery list. Automatic
+# admission uses the complete soccer Playing set; manual entry is unchanged.
+MATCH_CATALOG_EXCLUDED_COMPETITION_NAMES = frozenset(
+    {"英超", "西甲", "意甲", "德甲", "法甲", "中超"}
+)
 MATCH_CATALOG_CARD_FIELDS = (
     "match_id", "team_A_name", "team_A_logo", "team_B_name", "team_B_logo",
     "competition_name", "round_name", "status", "start_play", "sort_timestamp",
@@ -398,6 +486,80 @@ def query_source(match_id: str) -> dict[str, Any]:
     )
 
 
+@dataclass(frozen=True)
+class SourceCheckResult:
+    """Classified result for automatic admission's source probe."""
+
+    state: str
+    data: dict[str, Any]
+    error: str | None = None
+    error_kind: str | None = None
+    retryable: bool = False
+
+
+def classify_source_response(response: Any) -> SourceCheckResult:
+    """Separate a confirmed empty source from a failed source request.
+
+    The source API documents ``errno=0`` plus an empty ``data`` object as a
+    valid "no source" result.  Authentication, transport, and malformed
+  responses must remain retryable so an outage cannot permanently discard a
+  match.  Missing ``errno`` is treated as a protocol error so an incomplete
+  proxy response cannot be mistaken for a confirmed empty source.
+    """
+    if not isinstance(response, dict):
+        return SourceCheckResult(
+            "error", {}, "直播源接口返回不是 JSON 对象", "source_protocol_error", True
+        )
+    errno_value = response.get("errno")
+    # ``bool`` is a subclass of ``int`` in Python; reject it explicitly so a
+    # malformed ``errno=false`` response cannot be treated as success.
+    errno_success = (
+        not isinstance(errno_value, bool)
+        and errno_value in (0, "0")
+    )
+    if not errno_success:
+        if errno_value is None:
+            return SourceCheckResult(
+                "error",
+                {},
+                "直播源接口响应缺少 errno",
+                "source_protocol_error",
+                True,
+            )
+        message = str(response.get("message") or f"errno={errno_value}").strip()
+        kind = (
+            "source_auth_error"
+            if any(token in message for token in ("secret", "user", "校验", "鉴权"))
+            else "source_api_error"
+        )
+        # Even configuration errors are not classified as no-source. Retrying
+        # lets an operator correct a secret/user without losing the match.
+        return SourceCheckResult("error", {}, message, kind, True)
+    if "data" not in response:
+        return SourceCheckResult(
+            "error", {}, "直播源接口响应缺少 data", "source_protocol_error", True
+        )
+    data = response.get("data")
+    if not isinstance(data, dict):
+        return SourceCheckResult(
+            "error", {}, "直播源接口 data 不是对象", "source_protocol_error", True
+        )
+    resource = data.get("resource")
+    if isinstance(resource, str) and resource.strip():
+        normalized = dict(data)
+        normalized["resource"] = resource.strip()
+        return SourceCheckResult("available", normalized)
+    if not data:
+        return SourceCheckResult("no_source", {})
+    return SourceCheckResult(
+        "error",
+        data,
+        "直播源接口返回了记录，但缺少有效 resource",
+        "source_protocol_error",
+        True,
+    )
+
+
 def _catalog_match_timestamp(item: dict[str, Any]) -> float:
     raw_timestamp = item.get("sort_timestamp")
     try:
@@ -432,6 +594,9 @@ class MatchCatalog:
     def __init__(self) -> None:
         self.lock = threading.RLock()
         self.playing: list[dict[str, Any]] = []
+        # The browser intentionally receives only MATCH_CATALOG_LIMIT rows.
+        # Keep the complete Playing set for the background coordinator.
+        self.all_playing: list[dict[str, Any]] = []
         self.upcoming: list[dict[str, Any]] = []
         self.last_success_at: float | None = None
         self.last_attempt_at: float | None = None
@@ -442,6 +607,11 @@ class MatchCatalog:
         self.consecutive_failures = 0
         self.source_count = 0
         self.soccer_count = 0
+        self._pending_all_playing: list[dict[str, Any]] = []
+        self.automation_next_attempt_at = 0.0
+        self.automation_last_success_at: float | None = None
+        self.automation_last_error: str | None = None
+        self.automation_consecutive_failures = 0
 
     @staticmethod
     def _iso_beijing(timestamp: float | None) -> str | None:
@@ -466,6 +636,7 @@ class MatchCatalog:
             raise ValueError("赛事目录响应缺少有效的 list 数组")
 
         candidates: dict[str, tuple[dict[str, Any], float]] = {}
+        all_candidates: dict[str, tuple[dict[str, Any], float]] = {}
         soccer_count = 0
         for index, raw_item in enumerate(rows):
             if not isinstance(raw_item, dict):
@@ -473,12 +644,23 @@ class MatchCatalog:
             if str(raw_item.get("cmp_type") or "").strip() != "soccer":
                 continue
             soccer_count += 1
-            match_id = validate_match_id(
-                _catalog_required_text(raw_item, "match_id", index)
+            competition_name = raw_item.get("competition_name")
+            excluded = (
+                isinstance(competition_name, str)
+                and competition_name.strip()
+                in MATCH_CATALOG_EXCLUDED_COMPETITION_NAMES
             )
-            _catalog_required_text(raw_item, "team_A_name", index)
-            _catalog_required_text(raw_item, "team_B_name", index)
-            status = _catalog_required_text(raw_item, "status", index)
+            try:
+                match_id = validate_match_id(
+                    _catalog_required_text(raw_item, "match_id", index)
+                )
+                _catalog_required_text(raw_item, "team_A_name", index)
+                _catalog_required_text(raw_item, "team_B_name", index)
+                status = _catalog_required_text(raw_item, "status", index)
+            except ValueError:
+                if excluded:
+                    continue
+                raise
             if status not in {"Playing", "Fixture"}:
                 continue
             item = {
@@ -486,20 +668,40 @@ class MatchCatalog:
                 for field_name in MATCH_CATALOG_CARD_FIELDS
             }
             item["match_id"] = match_id
-            match_timestamp = _catalog_match_timestamp(item)
-            existing = candidates.get(match_id)
-            if existing is None:
-                candidates[match_id] = (item, match_timestamp)
+            try:
+                match_timestamp = _catalog_match_timestamp(item)
+            except ValueError:
+                # One malformed directory row must not hide every other live
+                # match from automatic admission. It is safe to omit this row
+                # because it has no usable ordering/start-time information.
                 continue
-            existing_status = str(existing[0].get("status") or "")
-            if (
-                status == "Playing" and existing_status != "Playing"
-            ) or (
-                status == existing_status and match_timestamp < existing[1]
-            ):
-                candidates[match_id] = (item, match_timestamp)
+            for target in (all_candidates,):
+                existing = target.get(match_id)
+                if existing is None:
+                    target[match_id] = (item, match_timestamp)
+                    continue
+                existing_status = str(existing[0].get("status") or "")
+                if (
+                    status == "Playing" and existing_status != "Playing"
+                ) or (
+                    status == existing_status and match_timestamp < existing[1]
+                ):
+                    target[match_id] = (item, match_timestamp)
+            if not excluded:
+                existing = candidates.get(match_id)
+                if existing is None:
+                    candidates[match_id] = (item, match_timestamp)
+                else:
+                    existing_status = str(existing[0].get("status") or "")
+                    if (
+                        status == "Playing" and existing_status != "Playing"
+                    ) or (
+                        status == existing_status and match_timestamp < existing[1]
+                    ):
+                        candidates[match_id] = (item, match_timestamp)
 
         playing_rows: list[tuple[dict[str, Any], float]] = []
+        all_playing_rows: list[tuple[dict[str, Any], float]] = []
         upcoming_rows: list[tuple[dict[str, Any], float]] = []
         upcoming_deadline = now_unix + MATCH_CATALOG_UPCOMING_SECONDS
         for item, match_timestamp in candidates.values():
@@ -507,9 +709,14 @@ class MatchCatalog:
                 playing_rows.append((item, match_timestamp))
             elif now_unix <= match_timestamp <= upcoming_deadline:
                 upcoming_rows.append((item, match_timestamp))
+        for item, match_timestamp in all_candidates.values():
+            if item.get("status") == "Playing":
+                all_playing_rows.append((item, match_timestamp))
 
         playing_rows.sort(key=lambda entry: (entry[1], entry[0]["match_id"]))
+        all_playing_rows.sort(key=lambda entry: (entry[1], entry[0]["match_id"]))
         upcoming_rows.sort(key=lambda entry: (entry[1], entry[0]["match_id"]))
+        self._pending_all_playing = [item for item, _ in all_playing_rows]
         return (
             [item for item, _ in playing_rows[:MATCH_CATALOG_LIMIT]],
             [item for item, _ in upcoming_rows[:MATCH_CATALOG_LIMIT]],
@@ -546,6 +753,7 @@ class MatchCatalog:
 
         completed_at = time.time()
         self.playing = playing
+        self.all_playing = list(self._pending_all_playing or playing)
         self.upcoming = upcoming
         self.source_count = source_count
         self.soccer_count = soccer_count
@@ -570,6 +778,7 @@ class MatchCatalog:
                 if self.last_success_at is not None
                 else None
             )
+
             has_cache = self.last_success_at is not None
             if self.last_error and has_cache:
                 state, status = "stale", "degraded"
@@ -597,25 +806,677 @@ class MatchCatalog:
                     "last_attempt_at_unix": self.last_attempt_at,
                     "last_attempt_at": self._iso_beijing(self.last_attempt_at),
                     "latency_ms": self.last_latency_ms,
-                    "cache_age_seconds": (
-                        round(cache_age, 1) if cache_age is not None else None
-                    ),
+                    "cache_age_seconds": round(cache_age, 1) if cache_age is not None else None,
                     "consecutive_failures": self.consecutive_failures,
                     "source_count": self.source_count,
                     "soccer_count": self.soccer_count,
                     "total_count": total_count,
                     "error": self.last_error,
-                    "next_retry_at_unix": (
-                        self.next_attempt_at if self.next_attempt_at > 0 else None
-                    ),
-                    "next_retry_at": (
-                        self._iso_beijing(self.next_attempt_at)
-                        if self.next_attempt_at > 0
-                        else None
-                    ),
+                    "next_retry_at_unix": self.next_attempt_at if self.next_attempt_at > 0 else None,
+                    "next_retry_at": self._iso_beijing(self.next_attempt_at) if self.next_attempt_at > 0 else None,
                     "refresh_interval_seconds": MATCH_CATALOG_REFRESH_SECONDS,
                     "query_start": self.last_query_start,
                 },
+            }
+
+    def refresh_for_automation(self, now_unix: float | None = None) -> dict[str, Any]:
+        """Refresh the full Playing set on an independent background clock.
+
+        This deliberately does not use ``snapshot``'s 120-second UI cache.  A
+        stale catalog is reported to the caller and is never treated as a new
+        authoritative discovery result.
+        """
+        now = time.time() if now_unix is None else float(now_unix)
+        with self.lock:
+            if now < self.automation_next_attempt_at:
+                return {
+                    "playing": [dict(item) for item in self.all_playing],
+                    "fresh": False,
+                    "error": self.automation_last_error,
+                    "last_success_at_unix": self.automation_last_success_at,
+                }
+            started_monotonic = time.monotonic()
+            try:
+                playing, upcoming, source_count, soccer_count, query_start = self._fetch(now)
+            except Exception as exc:
+                self.automation_consecutive_failures += 1
+                backoff = min(
+                    AUTO_ADMISSION_MAX_BACKOFF_SECONDS,
+                    max(
+                        AUTO_ADMISSION_POLL_SECONDS,
+                        2 ** min(self.automation_consecutive_failures - 1, 6),
+                    ),
+                )
+                self.automation_next_attempt_at = time.time() + backoff
+                self.automation_last_error = str(exc)
+                return {
+                    "playing": [],
+                    "fresh": False,
+                    "error": str(exc),
+                    "last_success_at_unix": self.automation_last_success_at,
+                }
+
+            completed_at = time.time()
+            self.playing = playing
+            self.all_playing = list(self._pending_all_playing or playing)
+            self.upcoming = upcoming
+            self.source_count = source_count
+            self.soccer_count = soccer_count
+            self.last_query_start = query_start
+            self.last_success_at = completed_at
+            self.last_latency_ms = round(
+                (time.monotonic() - started_monotonic) * 1000, 1
+            )
+            self.consecutive_failures = 0
+            self.last_error = None
+            self.automation_last_success_at = completed_at
+            self.automation_last_error = None
+            self.automation_consecutive_failures = 0
+            self.automation_next_attempt_at = completed_at + AUTO_ADMISSION_POLL_SECONDS
+            self.next_attempt_at = max(
+                self.next_attempt_at,
+                completed_at + MATCH_CATALOG_REFRESH_SECONDS,
+            )
+            return {
+                "playing": [dict(item) for item in self.all_playing],
+                "fresh": True,
+                "error": None,
+                "last_success_at_unix": completed_at,
+            }
+
+
+@dataclass
+class AutoAdmissionRecord:
+    match_id: str
+    state: str = "discovered"
+    first_seen_at_unix: float = field(default_factory=time.time)
+    last_seen_at_unix: float = field(default_factory=time.time)
+    last_state_at_unix: float = field(default_factory=time.time)
+    next_source_check_at_unix: float = 0.0
+    source_attempts: int = 0
+    no_source_first_seen_at_unix: float | None = None
+    no_source_confirmations: int = 0
+    catalog_missing_confirmations: int = 0
+    source: dict[str, Any] = field(default_factory=dict)
+    last_error: str | None = None
+    last_error_kind: str | None = None
+    reason: str | None = None
+
+
+class AutoAdmissionCoordinator:
+    """Discover Playing matches and feed eligible ones into Dashboard.start()."""
+
+    TERMINAL_STATES = {
+        "skipped_no_source",
+        "expired_not_started",
+        "completed",
+        "failed",
+        "stopped",
+    }
+    PRE_START_STATES = {
+        "discovered",
+        "source_checking",
+        "source_waiting",
+        "retrying",
+        "waiting_capacity",
+        "start_retrying",
+    }
+
+    def __init__(
+        self,
+        dashboard: "Dashboard",
+        catalog: MatchCatalog,
+        *,
+        poll_seconds: float = AUTO_ADMISSION_POLL_SECONDS,
+        source_poll_seconds: float = AUTO_ADMISSION_SOURCE_POLL_SECONDS,
+        source_wait_seconds: float = AUTO_ADMISSION_SOURCE_WAIT_SECONDS,
+        source_empty_confirmations: int = AUTO_ADMISSION_SOURCE_EMPTY_CONFIRMATIONS,
+    ) -> None:
+        if poll_seconds <= 0 or source_poll_seconds <= 0 or source_wait_seconds <= 0:
+            raise ValueError("自动接纳轮询时间必须是正数")
+        if source_empty_confirmations < 1:
+            raise ValueError("直播源空结果确认次数必须是正整数")
+        self.dashboard = dashboard
+        self.catalog = catalog
+        self.poll_seconds = float(poll_seconds)
+        self.source_poll_seconds = float(source_poll_seconds)
+        self.source_wait_seconds = float(source_wait_seconds)
+        self.source_empty_confirmations = int(source_empty_confirmations)
+        self.lock = threading.RLock()
+        self.records: dict[str, AutoAdmissionRecord] = {}
+        self.last_run_at_unix: float | None = None
+        self.last_catalog_error: str | None = None
+        self._stop = threading.Event()
+        self.thread: threading.Thread | None = None
+        self._start_lock = threading.Lock()
+
+    def start(self) -> None:
+        with self.lock:
+            if self.thread is not None and self.thread.is_alive():
+                return
+            self._stop.clear()
+            self.thread = threading.Thread(
+                target=self._run_loop,
+                name="auto-match-admission",
+                daemon=True,
+            )
+            self.thread.start()
+
+    def stop(self, timeout: float = 2.0) -> None:
+        self._stop.set()
+        thread = self.thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=max(0.0, timeout))
+
+    @staticmethod
+    def _record_state(
+        record: AutoAdmissionRecord,
+        state: str,
+        *,
+        reason: str | None = None,
+        error: str | None = None,
+        error_kind: str | None = None,
+        now: float,
+    ) -> bool:
+        changed = record.state != state or record.reason != reason or record.last_error != error
+        record.state = state
+        record.last_state_at_unix = now
+        record.reason = reason
+        record.last_error = error
+        record.last_error_kind = error_kind
+        return changed
+
+    @staticmethod
+    def _log(record: AutoAdmissionRecord, event: str, **fields: Any) -> None:
+        DEFAULT_OUTPUT.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "timestamp_unix": time.time(),
+            "event": event,
+            "match_id": record.match_id,
+            "admission_state": record.state,
+            **fields,
+        }
+        try:
+            with (DEFAULT_OUTPUT / "auto_admission.jsonl").open(
+                "a", encoding="utf-8"
+            ) as handle:
+                handle.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
+        except OSError:
+            pass
+
+    def _transition(
+        self,
+        record: AutoAdmissionRecord,
+        state: str,
+        *,
+        now: float,
+        reason: str | None = None,
+        error: str | None = None,
+        error_kind: str | None = None,
+    ) -> None:
+        with self.lock:
+            previous = record.state
+            changed = self._record_state(
+                record,
+                state,
+                reason=reason,
+                error=error,
+                error_kind=error_kind,
+                now=now,
+            )
+            if changed:
+                self._log(
+                    record,
+                    "auto_admission_state_changed",
+                    previous_state=previous,
+                    reason=reason,
+                    error=error,
+                    error_kind=error_kind,
+                )
+
+    def _schedule_source_retry(
+        self,
+        record: AutoAdmissionRecord,
+        result: SourceCheckResult,
+        now: float,
+    ) -> None:
+        with self.lock:
+            record.source_attempts += 1
+            # A transport/auth/protocol error means we no longer have a
+            # continuous sequence of authoritative empty-source responses.
+            # Start a fresh grace window after the next confirmed empty result
+            # instead of allowing failures to contribute to a no-source skip.
+            record.no_source_first_seen_at_unix = None
+            record.no_source_confirmations = 0
+            delay = min(
+                AUTO_ADMISSION_MAX_BACKOFF_SECONDS,
+                max(
+                    self.source_poll_seconds,
+                    2 ** min(record.source_attempts - 1, 6),
+                ),
+            )
+            record.next_source_check_at_unix = now + delay
+        self._transition(
+            record,
+            "retrying",
+            now=now,
+            reason="直播源接口异常，等待重试",
+            error=result.error,
+            error_kind=result.error_kind,
+        )
+        self._log(
+            record,
+            "auto_admission_source_retry_scheduled",
+            retry_at_unix=record.next_source_check_at_unix,
+            source_attempts=record.source_attempts,
+        )
+
+    def _probe_source(self, record: AutoAdmissionRecord, now: float) -> None:
+        with self.lock:
+            if now < record.next_source_check_at_unix:
+                return
+            # Once a source has been confirmed, keep it while the match waits
+            # for a Worker slot. A transient empty response must not turn a
+            # queued match into a permanent no-source skip.
+            if record.state == "waiting_capacity" and str(
+                record.source.get("resource") or ""
+            ).strip():
+                return
+        self._transition(record, "source_checking", now=now)
+        try:
+            result = classify_source_response(query_source(record.match_id))
+        except Exception as exc:
+            result = SourceCheckResult(
+                "error", {}, str(exc), "source_request_error", True
+            )
+        if result.state == "available":
+            with self.lock:
+                record.source = dict(result.data)
+                record.source_attempts = 0
+                record.no_source_first_seen_at_unix = None
+                record.no_source_confirmations = 0
+                record.next_source_check_at_unix = now + self.source_poll_seconds
+            self._transition(record, "waiting_capacity", now=now, reason="已找到直播源")
+            return
+        if result.state == "no_source":
+            with self.lock:
+                record.source = {}
+                record.source_attempts = 0
+                if record.no_source_first_seen_at_unix is None:
+                    record.no_source_first_seen_at_unix = now
+                record.no_source_confirmations += 1
+                first_seen = record.no_source_first_seen_at_unix
+                elapsed = max(0.0, now - first_seen)
+                confirmations = record.no_source_confirmations
+                should_skip = (
+                    confirmations >= self.source_empty_confirmations
+                    and elapsed >= self.source_wait_seconds
+                )
+                if not should_skip:
+                    record.next_source_check_at_unix = now + self.source_poll_seconds
+            if should_skip:
+                self._transition(
+                    record,
+                    "skipped_no_source",
+                    now=now,
+                    reason=(
+                        f"直播源连续确认 {confirmations} 次为空，"
+                        f"等待 {elapsed:.0f} 秒后仍无直播源"
+                    ),
+                )
+                self._log(
+                    record,
+                    "auto_admission_source_absent_after_grace",
+                    no_source_confirmations=confirmations,
+                    no_source_wait_seconds=round(elapsed, 1),
+                    required_confirmations=self.source_empty_confirmations,
+                    wait_window_seconds=self.source_wait_seconds,
+                )
+            else:
+                self._transition(
+                    record,
+                    "source_waiting",
+                    now=now,
+                    reason=(
+                        f"直播源暂未返回，已确认空结果 {confirmations}/"
+                        f"{self.source_empty_confirmations}，已等待 {elapsed:.0f}/"
+                        f"{self.source_wait_seconds:.0f} 秒"
+                    ),
+                )
+                self._log(
+                    record,
+                    "auto_admission_source_empty_waiting",
+                    no_source_confirmations=confirmations,
+                    no_source_wait_seconds=round(elapsed, 1),
+                    required_confirmations=self.source_empty_confirmations,
+                    wait_window_seconds=self.source_wait_seconds,
+                    next_check_at_unix=record.next_source_check_at_unix,
+                )
+            return
+        self._schedule_source_retry(record, result, now)
+
+    def _start_waiting(self, record: AutoAdmissionRecord, match: dict[str, Any], now: float) -> None:
+        if not self.dashboard.worker_slot_status(include_external=True)["available_worker_slots"]:
+            return
+        # Serializing coordinator starts closes the race between its own
+        # candidates; Dashboard.start still performs the final capacity and
+        # duplicate checks used by manual starts.
+        with self._start_lock:
+            if not self.dashboard.worker_slot_status(include_external=True)["available_worker_slots"]:
+                return
+            external_pid = self.dashboard.external_worker_pid(record.match_id)
+            if isinstance(external_pid, int) and external_pid > 0:
+                self._transition(
+                    record,
+                    "running",
+                    now=now,
+                    reason=f"检测到重启前仍存活的 Worker（PID {external_pid}）",
+                )
+                return
+            session: MatchSession | None = None
+            try:
+                session = self.dashboard.get(record.match_id, start_monitor=False)
+                external_pid = self.dashboard.external_worker_pid(record.match_id)
+                if isinstance(external_pid, int) and external_pid > 0:
+                    self._transition(
+                        record,
+                        "running",
+                        now=now,
+                        reason=f"检测到重启前仍存活的 Worker（PID {external_pid}）",
+                    )
+                    return
+                if (
+                    session.lifecycle_state == "stopped"
+                    and session.exit_reason == "manual_stop"
+                ):
+                    self._transition(
+                        record,
+                        "stopped",
+                        now=now,
+                        reason="已手动停止，自动接纳不会重新启动",
+                        error_kind="manual_stop",
+                    )
+                    return
+                session.detail = dict(match)
+                session.source = dict(record.source)
+                session.last_source_poll = now
+                self.dashboard.start(
+                    session,
+                    emit_existing_events=True,
+                    include_external_workers=True,
+                )
+            except RuntimeError as exc:
+                message = str(exc)
+                if "已在运行" in message or (
+                    session is not None
+                    and (session.worker_running() or session.desired_running)
+                    and "已处于" in message
+                ):
+                    self._transition(record, "running", now=now, reason="已有 Worker 正在处理")
+                    return
+                if "上限" in message:
+                    self._transition(record, "waiting_capacity", now=now, reason="等待 Worker 并发名额")
+                    return
+                if "已结束" in message:
+                    self._transition(record, "expired_not_started", now=now, reason=message, error=message, error_kind="match_finished")
+                    return
+                record.next_source_check_at_unix = now + self.source_poll_seconds
+                self._transition(record, "start_retrying", now=now, reason="Worker 启动失败，等待重试", error=message, error_kind="worker_start_error")
+                return
+            except Exception as exc:
+                record.next_source_check_at_unix = now + self.source_poll_seconds
+                self._transition(record, "start_retrying", now=now, reason="Worker 启动失败，等待重试", error=str(exc), error_kind="worker_start_error")
+                return
+        self._transition(record, "running", now=now, reason="已自动启动 Worker")
+
+    def run_once(self, now: float | None = None) -> dict[str, Any]:
+        timestamp = time.time() if now is None else float(now)
+        catalog_result = self.catalog.refresh_for_automation(timestamp)
+        if not catalog_result.get("fresh"):
+            with self.lock:
+                self.last_catalog_error = catalog_result.get("error")
+            return self.snapshot()
+        with self.lock:
+            self.last_catalog_error = None
+        playing = catalog_result.get("playing") or []
+        current_ids: set[str] = set()
+        probe_records: list[AutoAdmissionRecord] = []
+        with self.lock:
+            self.last_run_at_unix = timestamp
+            for item in playing:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    match_id = validate_match_id(str(item.get("match_id") or ""))
+                except ValueError:
+                    continue
+                current_ids.add(match_id)
+                record = self.records.get(match_id)
+                if record is None:
+                    record = AutoAdmissionRecord(match_id=match_id)
+                    self.records[match_id] = record
+                    self._log(record, "auto_admission_discovered")
+                record.last_seen_at_unix = timestamp
+                record.catalog_missing_confirmations = 0
+                if record.state == "discovered":
+                    external_pid = self.dashboard.external_worker_pid(match_id)
+                    if isinstance(external_pid, int) and external_pid > 0:
+                        self._transition(
+                            record,
+                            "running",
+                            now=timestamp,
+                            reason=f"检测到重启前仍存活的 Worker（PID {external_pid}）",
+                        )
+                if record.state == "discovered":
+                    with self.dashboard.lock:
+                        session = self.dashboard.sessions.get(match_id)
+                    if session is not None and session.lifecycle_state == "stopped" and session.exit_reason == "manual_stop":
+                        self._transition(
+                            record,
+                            "stopped",
+                            now=timestamp,
+                            reason="已手动停止，自动接纳不会重新启动",
+                            error_kind="manual_stop",
+                        )
+                if record.state in self.TERMINAL_STATES or record.state == "running":
+                    if record.state in {"running", "stopped"}:
+                        with self.dashboard.lock:
+                            session = self.dashboard.sessions.get(match_id)
+                        if session is not None and session.worker_running():
+                            self._transition(
+                                record,
+                                "running",
+                                now=timestamp,
+                                reason="检测到已有 Worker 正在处理",
+                            )
+                        elif session is not None and session.lifecycle_state in {
+                            "completed",
+                            "completed_with_warnings",
+                            "failed",
+                            "stopped",
+                        } and not session.worker_running():
+                            terminal_state = (
+                                "failed"
+                                if session.lifecycle_state == "failed"
+                                else "stopped"
+                                if session.lifecycle_state == "stopped"
+                                else "completed"
+                            )
+                            self._transition(
+                                record,
+                                terminal_state,
+                                now=timestamp,
+                                reason=session.exit_reason or "Worker 已完成",
+                            )
+                        elif session is None:
+                            # The previous Dashboard may have been restarted
+                            # while its Worker was still alive. If that
+                            # external Worker has since exited, return the
+                            # record to the normal admission path so a
+                            # currently Playing match can be recovered.
+                            external_pid = self.dashboard.external_worker_pid(match_id)
+                            if external_pid is None:
+                                self._transition(
+                                    record,
+                                    "start_retrying",
+                                    now=timestamp,
+                                    reason="重启前 Worker 已退出，准备重新接纳",
+                                    error_kind="external_worker_exited",
+                                )
+                                probe_records.append(record)
+                    continue
+                if record.state in {
+                    "discovered",
+                    "retrying",
+                    "waiting_capacity",
+                    "start_retrying",
+                    "source_checking",
+                    "source_waiting",
+                }:
+                    probe_records.append(record)
+
+        # Source probes are network-bound. Run a small bounded batch without
+        # holding the coordinator lock, keeping status requests responsive.
+        if probe_records:
+            with ThreadPoolExecutor(max_workers=AUTO_ADMISSION_SOURCE_WORKERS) as executor:
+                futures = [
+                    executor.submit(self._probe_source, record, timestamp)
+                    for record in probe_records
+                ]
+                for future in futures:
+                    try:
+                        future.result()
+                    except Exception as exc:
+                        self.last_catalog_error = str(exc)
+
+        waiting_records: list[tuple[AutoAdmissionRecord, dict[str, Any]]] = []
+        with self.lock:
+            for item in playing:
+                if not isinstance(item, dict):
+                    continue
+                match_id = str(item.get("match_id") or "")
+                record = self.records.get(match_id)
+                if record is not None and record.state == "waiting_capacity":
+                    waiting_records.append((record, item))
+
+        for record, item in waiting_records:
+            self._start_waiting(record, item, timestamp)
+
+        with self.lock:
+            # A fresh authoritative directory is the only safe time to infer
+            # that an unstarted match is no longer Playing. Running sessions are
+            # left to Dashboard's existing detail/lifecycle monitor.
+            for match_id, record in self.records.items():
+                if match_id in current_ids:
+                    continue
+                if record.state == "running":
+                    record.catalog_missing_confirmations += 1
+                    with self.dashboard.lock:
+                        session = self.dashboard.sessions.get(match_id)
+                    if record.catalog_missing_confirmations >= AUTO_ADMISSION_MISSING_CONFIRMATIONS:
+                        if session is None:
+                            self._transition(
+                                record,
+                                "completed",
+                                now=timestamp,
+                                reason="赛事目录已确认比赛结束，Worker 会话已不存在",
+                            )
+                        elif (
+                            not session.worker_running()
+                            and session.lifecycle_state in {
+                                "completed",
+                                "completed_with_warnings",
+                                "failed",
+                                "stopped",
+                            }
+                        ):
+                            terminal_state = (
+                                "failed"
+                                if session.lifecycle_state == "failed"
+                                else "stopped"
+                                if session.lifecycle_state == "stopped"
+                                else "completed"
+                            )
+                            self._transition(
+                                record,
+                                terminal_state,
+                                now=timestamp,
+                                reason=session.exit_reason or "Worker 已完成",
+                            )
+                    continue
+                if record.state not in self.PRE_START_STATES:
+                    continue
+                record.catalog_missing_confirmations += 1
+                if record.catalog_missing_confirmations < AUTO_ADMISSION_MISSING_CONFIRMATIONS:
+                    continue
+                self._transition(
+                    record,
+                    "expired_not_started",
+                    now=timestamp,
+                    reason="赛事目录已确认该比赛不再进行中，未启动 Worker",
+                    error_kind="match_no_longer_playing",
+                )
+        return self.snapshot()
+
+    def _run_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self.run_once()
+            except Exception as exc:
+                with self.lock:
+                    self.last_catalog_error = str(exc)
+            self._stop.wait(self.poll_seconds)
+
+    def _prune_terminal_records_locked(self, now: float) -> None:
+        cutoff = now - AUTO_ADMISSION_RECORD_RETENTION_SECONDS
+        for match_id, record in list(self.records.items()):
+            if record.state not in self.TERMINAL_STATES:
+                continue
+            if max(record.last_seen_at_unix, record.last_state_at_unix) < cutoff:
+                self.records.pop(match_id, None)
+
+    def snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            self._prune_terminal_records_locked(time.time())
+            records = []
+            for record in sorted(self.records.values(), key=lambda item: item.first_seen_at_unix):
+                records.append(
+                    {
+                        "match_id": record.match_id,
+                        "state": record.state,
+                        "first_seen_at_unix": record.first_seen_at_unix,
+                        "last_seen_at_unix": record.last_seen_at_unix,
+                        "last_state_at_unix": record.last_state_at_unix,
+                        "next_source_check_at_unix": record.next_source_check_at_unix,
+                        "source_attempts": record.source_attempts,
+                        "no_source_first_seen_at_unix": record.no_source_first_seen_at_unix,
+                        "no_source_confirmations": record.no_source_confirmations,
+                        "source_wait_deadline_at_unix": (
+                            record.no_source_first_seen_at_unix + self.source_wait_seconds
+                            if record.no_source_first_seen_at_unix is not None
+                            else None
+                        ),
+                        "catalog_missing_confirmations": record.catalog_missing_confirmations,
+                        "has_source": bool(record.source.get("resource")),
+                        "last_error": record.last_error,
+                        "last_error_kind": record.last_error_kind,
+                        "reason": record.reason,
+                    }
+                )
+            counts: dict[str, int] = {}
+            for record in self.records.values():
+                counts[record.state] = counts.get(record.state, 0) + 1
+            return {
+                "enabled": AUTO_ADMISSION_ENABLED,
+                "running": self.thread is not None and self.thread.is_alive(),
+                "poll_seconds": self.poll_seconds,
+                "source_poll_seconds": self.source_poll_seconds,
+                "source_wait_seconds": self.source_wait_seconds,
+                "source_empty_confirmations": self.source_empty_confirmations,
+                "last_run_at_unix": self.last_run_at_unix,
+                "last_catalog_error": self.last_catalog_error,
+                "counts": counts,
+                "records": records,
             }
 
 
@@ -1067,6 +1928,7 @@ def _tasks_from_database(
             "ocr_minute_fallback",
             "ocr_range_fallback",
             "ocr_no_clock_detected",
+            "ocr_clock_target_not_located",
             "ocr_target_timeout",
             "ocr_target_media_not_arrived",
             "ocr_target_media_stalled",
@@ -1232,7 +2094,6 @@ def _tasks_from_database(
                 "ocr_target_media_not_arrived": "ocr_target_media_not_arrived",
                 "ocr_target_media_stalled": "ocr_target_media_stalled",
                 "ocr_clock_paused_timeout": "ocr_clock_paused_timeout",
-                "ocr_clock_target_not_located": "ocr_target_timeout",
                 "ocr_postroll_timeout": "ocr_target_timeout",
                 "ocr_output_window_timeout": "ocr_target_timeout",
                 "ocr_target_before_recording": "ocr_target_before_recording",
@@ -2165,12 +3026,17 @@ def _session_json(session: MatchSession) -> dict[str, Any]:
         "failed": sum(item.get("status") == "failed" for item in tasks),
     }
     telemetry = _runtime_evidence(session, report, tasks)
+    upload_backend_status = _ocr_image_upload_backend_status(
+        OCR_IMAGE_UPLOAD_BACKEND, article_publisher
+    )
     return {
         "match_id": session.match_id,
         "publishing": {
             "enabled": ARTICLE_PUBLISH_ENABLED,
             "remote_upload_enabled": bool(GIF_UPLOAD_ENDPOINT),
             "ocr_automatic": OCR_DRAFT_AUTO_CREATE,
+            "ocr_image_upload_backend": OCR_IMAGE_UPLOAD_BACKEND,
+            "ocr_image_upload_ready": upload_backend_status["configured"],
         },
         "status": session.status(),
         "status_label": MATCH_STATUS_LABELS.get(session.status(), "未知"),
@@ -2334,7 +3200,9 @@ class Dashboard:
             or session.worker_cleanup_process_group is not None
         )
 
-    def _active_match_summaries_locked(self) -> list[dict[str, Any]]:
+    def _active_match_summaries_locked(
+        self, *, include_external: bool = False
+    ) -> list[dict[str, Any]]:
         summaries = []
         for match_id, session in self.sessions.items():
             worker_running = session.worker_running()
@@ -2372,11 +3240,34 @@ class Dashboard:
                     "finish_reason": session.finish_reason,
                 }
             )
+        if include_external:
+            # A Worker started by a previous Dashboard instance can survive a
+            # restart because it runs in its own process group. Count it as an
+            # occupied slot and expose it as an external summary until it exits.
+            for match_id, pid in self._external_worker_pids_locked().items():
+                summaries.append(
+                    {
+                        "match_id": match_id,
+                        "state": "running",
+                        "match_status": "Playing",
+                        "lifecycle_state": "playing",
+                        "worker_running": True,
+                        "desired_running": True,
+                        "worker_mode": "live",
+                        "worker_pid": pid,
+                        "restart_due_at_unix": None,
+                        "cleanup_process_group": None,
+                        "finish_reason": None,
+                        "external": True,
+                    }
+                )
         return sorted(summaries, key=lambda item: item["match_id"])
 
-    def worker_slot_status(self) -> dict[str, Any]:
+    def worker_slot_status(self, *, include_external: bool = False) -> dict[str, Any]:
         with self.lock:
-            active_matches = self._active_match_summaries_locked()
+            active_matches = self._active_match_summaries_locked(
+                include_external=include_external
+            )
             active_match_ids = [item["match_id"] for item in active_matches]
             active_match_count = len(active_match_ids)
             available_slots = max(
@@ -2399,10 +3290,15 @@ class Dashboard:
                 "locked": at_capacity,
             }
 
-    def _assert_worker_slot_available(self, session: MatchSession) -> None:
+    def _assert_worker_slot_available(
+        self, session: MatchSession, *, include_external: bool = False
+    ) -> None:
         with self.lock:
             active_match_ids = {
-                item["match_id"] for item in self._active_match_summaries_locked()
+                item["match_id"]
+                for item in self._active_match_summaries_locked(
+                    include_external=include_external
+                )
             }
             if session.match_id in active_match_ids:
                 return
@@ -2412,12 +3308,17 @@ class Dashboard:
                     "请先停止一场比赛并等待其 Worker 完全退出"
                 )
 
-    def _claim_worker_slot(self, session: MatchSession) -> None:
+    def _claim_worker_slot(
+        self, session: MatchSession, *, include_external: bool = False
+    ) -> None:
         with self.lock:
             if self.sessions.get(session.match_id) is not session:
                 raise RuntimeError("比赛会话已过期，请重新打开该比赛")
             active_match_ids = {
-                item["match_id"] for item in self._active_match_summaries_locked()
+                item["match_id"]
+                for item in self._active_match_summaries_locked(
+                    include_external=include_external
+                )
             }
             if (
                 session.match_id not in active_match_ids
@@ -2441,7 +3342,7 @@ class Dashboard:
         if self._session_holds_worker_slot(session):
             return
 
-    def get(self, match_id: str) -> MatchSession:
+    def get(self, match_id: str, *, start_monitor: bool = True) -> MatchSession:
         match_id = validate_match_id(match_id)
         now = time.time()
         with self.lock:
@@ -2452,7 +3353,8 @@ class Dashboard:
                 MatchSession(match_id=match_id, output_dir=DEFAULT_OUTPUT / match_id),
             )
             session.last_access_at = now
-        self._ensure_monitor(session)
+        if start_monitor:
+            self._ensure_monitor(session)
         if match_id.startswith("demo-") and not session.detail:
             session.detail = _demo_detail(match_id)
             session.source = {
@@ -2704,6 +3606,120 @@ class Dashboard:
         # window above; a fresh heartbeat never reaches this method.
         return False if saw_runtime_signal else None
 
+    @classmethod
+    def _live_worker_pid_from_log(
+        cls, log_path: Path, match_id: str
+    ) -> int | None:
+        """Return a live Dashboard Worker PID recorded in an output log.
+
+        Workers are placed in their own process groups, so they can outlive a
+        Dashboard restart. This conservative probe is used only to avoid
+        launching a duplicate Worker for the same match; it does not adopt or
+        signal the process.
+        """
+        try:
+            records = _read_log(log_path, limit=600)
+        except (OSError, UnicodeError):
+            return None
+        for record in records:
+            event = record.get("event")
+            if event in {"worker_exited", "worker_stopped", "pipeline_stopped"}:
+                return None
+            if event != "worker_started" or str(record.get("mode") or "") != "live":
+                continue
+            try:
+                pid = int(record.get("pid"))
+            except (TypeError, ValueError):
+                return None
+            if pid <= 0:
+                return None
+            permission_denied = False
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return None
+            except PermissionError:
+                # The PID exists, but this user cannot signal it.  Continue
+                # with command-line identity verification instead of treating
+                # every inaccessible system process as our Worker.
+                permission_denied = True
+            except OSError:
+                return None
+            try:
+                # ``subprocess.Popen`` is also used to start Workers and is
+                # frequently mocked by tests; use the platform ``ps`` command
+                # through a numeric-only PID to verify process identity
+                # without coupling this probe to Worker startup.
+                process_listing = os.popen(f"ps -p {pid} -o args=", "r")
+                command = process_listing.read().strip()
+                process_listing.close()
+            except OSError:
+                command = ""
+            if command:
+                try:
+                    command_args = shlex.split(command)
+                except ValueError:
+                    return None
+                has_worker_script = any(
+                    Path(argument).name == "event_driven_pipeline.py"
+                    for argument in command_args
+                )
+                observed_match_id: str | None = None
+                for index, argument in enumerate(command_args):
+                    if argument == "--match-id" and index + 1 < len(command_args):
+                        observed_match_id = command_args[index + 1]
+                        break
+                    if argument.startswith("--match-id="):
+                        observed_match_id = argument.partition("=")[2]
+                        break
+                if not has_worker_script or observed_match_id != match_id:
+                    return None
+            if permission_denied and not command:
+                # Without a process listing there is no safe way to
+                # distinguish an inaccessible Worker from a reused PID.
+                return None
+            # If command-line inspection is unavailable (for example on a
+            # restricted host), a successful PID existence check plus the
+            # recent structured worker_started record is still safer than
+            # launching a second Worker into the same SQLite/output directory.
+            return pid
+        return None
+
+    def _external_worker_pids_locked(self) -> dict[str, int]:
+        """Find live Workers whose Dashboard session was lost on restart."""
+        try:
+            entries = list(os.scandir(DEFAULT_OUTPUT))
+        except (FileNotFoundError, OSError):
+            return {}
+        external: dict[str, int] = {}
+        for entry in entries:
+            if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
+                continue
+            try:
+                match_id = validate_match_id(entry.name)
+            except (OSError, ValueError):
+                continue
+            session = self.sessions.get(match_id)
+            if session is not None and session.worker_running():
+                # This is the Worker already owned by the current Dashboard;
+                # do not count it a second time.
+                continue
+            pid = self._live_worker_pid_from_log(
+                Path(entry.path) / "pipeline_events.jsonl", match_id
+            )
+            if pid is not None:
+                external[match_id] = pid
+        return external
+
+    def external_worker_pid(self, match_id: str) -> int | None:
+        """Return a surviving Worker PID for a match without creating a session."""
+        match_id = validate_match_id(match_id)
+        with self.lock:
+            session = self.sessions.get(match_id)
+            if session is not None and session.worker_running():
+                return None
+            return self._external_worker_pids_locked().get(match_id)
+
     def _prune_orphan_outputs(self, now: float) -> list[str]:
         """Clean stale match directories left after a dashboard/process crash.
 
@@ -2930,6 +3946,9 @@ class Dashboard:
 
     def close(self) -> None:
         self._maintenance_stop.set()
+        coordinator = globals().get("auto_admission")
+        if coordinator is not None and getattr(coordinator, "dashboard", None) is self:
+            coordinator.stop()
 
     @staticmethod
     def _process_group_exists(process_group: int) -> bool:
@@ -3550,6 +4569,8 @@ class Dashboard:
         *,
         demo: bool = False,
         recovery: bool = False,
+        emit_existing_events: bool = False,
+        include_external_workers: bool = False,
     ) -> None:
         with session.lock:
             if session.worker_running():
@@ -3566,7 +4587,9 @@ class Dashboard:
                     f"比赛 {session.match_id} 已处于 {session.lifecycle_state} 状态，"
                     "不能重复启动"
                 )
-            self._assert_worker_slot_available(session)
+            self._assert_worker_slot_available(
+                session, include_external=include_external_workers
+            )
             if session.worker_process_group is not None:
                 if not self._cleanup_worker_group_blocking(
                     session,
@@ -3625,6 +4648,12 @@ class Dashboard:
                     "--graceful-stop-grace-seconds", str(WORKER_FINISH_GRACE_SECONDS),
                     "--graceful-stop-timeout-seconds", str(WORKER_FINISH_TIMEOUT_SECONDS),
                 ]
+                if emit_existing_events:
+                    # Automatic admission may start after the first event was
+                    # already exposed by the API. Opt in only for that path;
+                    # manual/recovery starts retain their historical seeding
+                    # behavior.
+                    command.append("--emit-existing-events")
             match_start_play = _usable_match_start_play(session.detail)
             if match_start_play is not None:
                 command.extend([
@@ -3678,7 +4707,9 @@ class Dashboard:
             previous_lifecycle_state = session.lifecycle_state
             session.lifecycle_state = "starting"
             try:
-                self._claim_worker_slot(session)
+                self._claim_worker_slot(
+                    session, include_external=include_external_workers
+                )
                 session.worker = subprocess.Popen(
                     command,
                     cwd=ROOT,
@@ -3804,12 +4835,20 @@ class Dashboard:
 
 dashboard = Dashboard()
 match_catalog = MatchCatalog()
+auto_admission = AutoAdmissionCoordinator(dashboard, match_catalog)
 heavy_task_monitor = HeavyTaskCoordinator.from_environment()
 open_platform_client = OpenPlatformClient(
     OpenPlatformConfig.from_environment(ROOT)
 )
 article_publisher = ArticlePublisher(
     platform_client=open_platform_client,
+    # The official image API is opt-in. Missing official credentials are
+    # reported by the existing client instead of silently falling back.
+    ocr_image_upload_client=(
+        _ocr_image_upload_client_for_backend(
+            OCR_IMAGE_UPLOAD_BACKEND, open_platform_client
+        )
+    ),
     gif_store=PublishedGifStore(
         Path(
             os.environ.get(
@@ -3943,11 +4982,16 @@ def health():
 
 @app.get("/api/article-publish/status")
 def article_publish_status():
+    upload_backend_status = _ocr_image_upload_backend_status(
+        OCR_IMAGE_UPLOAD_BACKEND, article_publisher
+    )
     return jsonify(
         {
             "ok": True,
             "publish_enabled": ARTICLE_PUBLISH_ENABLED,
+            "ocr_image_upload_backend": OCR_IMAGE_UPLOAD_BACKEND,
             **article_publisher.status(),
+            "ocr_image_upload_route": upload_backend_status,
             "ocr_drafts": {
                 "automatic": OCR_DRAFT_AUTO_CREATE,
                 **article_draft_queue.status(),
@@ -4053,6 +5097,12 @@ def matches_catalog():
     # Compatibility name consumed by the current dashboard UI.
     payload["selection_locked"] = worker_slot["locked"]
     return jsonify(payload)
+
+
+@app.get("/api/auto-admission")
+def auto_admission_status():
+    """Expose automatic discovery state without exposing live-source URLs."""
+    return jsonify(auto_admission.snapshot())
 
 
 @app.get("/api/session")
@@ -4547,5 +5597,7 @@ def start_ocr_draft_delivery() -> int:
 
 if __name__ == "__main__":
     start_ocr_draft_delivery()
+    if AUTO_ADMISSION_ENABLED:
+        auto_admission.start()
     print(f"Football GIF dashboard: http://{HOST}:{PORT}")
     app.run(host=HOST, port=PORT, threaded=True, debug=False)

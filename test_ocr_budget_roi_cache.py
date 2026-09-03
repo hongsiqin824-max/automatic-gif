@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import tempfile
 import subprocess
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from live_goal_pipeline import Segment
@@ -11,7 +13,9 @@ from pipeline_runtime import PipelineRuntime
 from vision_runtime import (
     OCR_FFMPEG_WATCHDOG_SECONDS,
     VisionJob,
+    VisualLocationFailed,
     _job_with_cached_scoreboard_profile,
+    _locate_ocr_window_with_cached_profile_recovery,
     _ocr_active_processing_budget,
     _ocr_budget_after_elapsed,
     _record_scoreboard_roi_failure,
@@ -436,6 +440,143 @@ class ScoreboardRoiCacheTests(unittest.TestCase):
                     ).failure_streak,
                     3,
                 )
+            finally:
+                runtime.close()
+
+    def test_persisted_short_probe_mismatch_bypasses_cache_on_next_attempt(self):
+        job = self._job("match-roi-short-probe")
+        cache_reads: list[str] = []
+
+        class Store:
+            @staticmethod
+            def get_vision_task(event_key, *, artifact_kind):
+                self.assertEqual(event_key, job.event_key)
+                self.assertEqual(artifact_kind, "ocr_window")
+                return SimpleNamespace(
+                    window_metadata={
+                        "progressive_scan": {
+                            "scoreboard_roi_cache_bypass": True,
+                        }
+                    }
+                )
+
+            @staticmethod
+            def get_scoreboard_roi_cache(match_id):
+                cache_reads.append(match_id)
+                return object()
+
+        effective_job, cached = _job_with_cached_scoreboard_profile(
+            SimpleNamespace(store=Store()),
+            job,
+        )
+
+        self.assertIs(effective_job, job)
+        self.assertIsNone(cached)
+        self.assertEqual(cache_reads, [])
+
+    def test_explicit_profile_is_preserved_even_when_cache_bypass_is_persisted(self):
+        profile = self._profile()
+        job = replace(
+            self._job("match-explicit-profile"),
+            scoreboard_profile=profile,
+        )
+
+        class Store:
+            @staticmethod
+            def get_vision_task(*_args, **_kwargs):
+                raise AssertionError("explicit profiles must not inspect cache state")
+
+        effective_job, cached = _job_with_cached_scoreboard_profile(
+            SimpleNamespace(store=Store()),
+            job,
+        )
+
+        self.assertIs(effective_job, job)
+        self.assertEqual(effective_job.scoreboard_profile, profile)
+        self.assertIsNone(cached)
+
+    def test_profile_mismatch_rediscovery_retries_current_event_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = PipelineRuntime(root / "state.sqlite3", root / "events.jsonl")
+            job = self._job("match-roi-recovery")
+            runtime.store.save_scoreboard_roi_cache(job.match_id, self._profile())
+            cached_job, cached = _job_with_cached_scoreboard_profile(runtime, job)
+            calls: list[dict | None] = []
+
+            def locate(candidate: VisionJob):
+                calls.append(candidate.scoreboard_profile)
+                if len(calls) == 1:
+                    raise VisualLocationFailed(
+                        "clock_profile_mismatch",
+                        "cached ROI does not match this video",
+                        {"stage": "ocr_clock_discovery"},
+                    )
+                return (
+                    {
+                        "anchor_stream_time": 101.0,
+                        "diagnostics": {"auto_clock": {"clock_roi": [40, 30, 180, 82]}},
+                    },
+                    {"path": "candidate.mp4"},
+                    ["segment.ts"],
+                )
+
+            try:
+                effective_job, located, _materialized, _paths, retried = (
+                    _locate_ocr_window_with_cached_profile_recovery(
+                        cached_job,
+                        runtime,
+                        cached,
+                        locate,
+                    )
+                )
+                self.assertTrue(retried)
+                self.assertIsNone(effective_job.scoreboard_profile)
+                self.assertEqual(len(calls), 2)
+                self.assertIsNotNone(calls[0])
+                self.assertIsNone(calls[1])
+                self.assertEqual(
+                    located["scoreboard_roi_cache_recovery"]["status"],
+                    "rediscovered",
+                )
+                self.assertEqual(
+                    runtime.store.get_scoreboard_roi_cache(job.match_id).failure_streak,
+                    3,
+                )
+            finally:
+                runtime.close()
+
+    def test_profile_mismatch_rediscovery_failure_is_reported_without_retry_loop(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = PipelineRuntime(root / "state.sqlite3", root / "events.jsonl")
+            job = self._job("match-roi-recovery-failed")
+            runtime.store.save_scoreboard_roi_cache(job.match_id, self._profile())
+            cached_job, cached = _job_with_cached_scoreboard_profile(runtime, job)
+            calls: list[dict | None] = []
+
+            def locate(candidate: VisionJob):
+                calls.append(candidate.scoreboard_profile)
+                raise VisualLocationFailed(
+                    "clock_profile_mismatch" if len(calls) == 1 else "scoreboard_missing",
+                    "OCR could not use this layout",
+                    {"stage": "ocr_clock_discovery"},
+                )
+
+            try:
+                with self.assertRaises(VisualLocationFailed) as raised:
+                    _locate_ocr_window_with_cached_profile_recovery(
+                        cached_job,
+                        runtime,
+                        cached,
+                        locate,
+                    )
+                self.assertEqual(calls, [self._profile(), None])
+                recovery = raised.exception.diagnostics[
+                    "scoreboard_roi_cache_recovery"
+                ]
+                self.assertEqual(recovery["status"], "rediscovery_failed")
+                self.assertEqual(recovery["rediscovery_error_kind"], "scoreboard_missing")
             finally:
                 runtime.close()
 

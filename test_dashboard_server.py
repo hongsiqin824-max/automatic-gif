@@ -73,6 +73,94 @@ class DashboardTests(unittest.TestCase):
                     "GIF_MAX_CONCURRENT_MATCHES", 8
                 )
 
+    def test_ocr_image_upload_backend_is_explicit_and_validated(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                dashboard_server._environment_choice(
+                    "OCR_IMAGE_UPLOAD_BACKEND",
+                    "self_hosted",
+                    {"official", "self_hosted"},
+                ),
+                "self_hosted",
+            )
+        with patch.dict(
+            os.environ, {"OCR_IMAGE_UPLOAD_BACKEND": " OFFICIAL "}, clear=True
+        ):
+            self.assertEqual(
+                dashboard_server._environment_choice(
+                    "OCR_IMAGE_UPLOAD_BACKEND",
+                    "self_hosted",
+                    {"official", "self_hosted"},
+                ),
+                "official",
+            )
+        with patch.dict(
+            os.environ, {"OCR_IMAGE_UPLOAD_BACKEND": ""}, clear=True
+        ):
+            self.assertEqual(
+                dashboard_server._environment_choice(
+                    "OCR_IMAGE_UPLOAD_BACKEND",
+                    "self_hosted",
+                    {"official", "self_hosted"},
+                ),
+                "self_hosted",
+            )
+        with patch.dict(
+            os.environ, {"OCR_IMAGE_UPLOAD_BACKEND": "platform"}, clear=True
+        ):
+            with self.assertRaisesRegex(RuntimeError, "以下值之一"):
+                dashboard_server._environment_choice(
+                    "OCR_IMAGE_UPLOAD_BACKEND",
+                    "self_hosted",
+                    {"official", "self_hosted"},
+                )
+
+    def test_ocr_image_upload_client_is_injected_only_for_official_backend(self):
+        client = Mock()
+        self.assertIsNone(
+            dashboard_server._ocr_image_upload_client_for_backend(
+                "self_hosted", client
+            )
+        )
+        self.assertIs(
+            dashboard_server._ocr_image_upload_client_for_backend(
+                "official", client
+            ),
+            client,
+        )
+        with self.assertRaisesRegex(RuntimeError, "不支持"):
+            dashboard_server._ocr_image_upload_client_for_backend("invalid", client)
+
+    def test_ocr_image_upload_backend_status_reports_selected_route_readiness(self):
+        publisher = Mock()
+        publisher.remote_upload_client = Mock(enabled=True)
+        publisher.remote_upload_client.status.return_value = {"configured": True}
+        self.assertEqual(
+            dashboard_server._ocr_image_upload_backend_status(
+                "self_hosted", publisher
+            ),
+            {
+                "backend": "self_hosted",
+                "transport": "remote_server",
+                "configured": True,
+            },
+        )
+
+        publisher.ocr_image_upload_client = Mock()
+        publisher.ocr_image_upload_client.image_upload_status.return_value = {
+            "configured": False
+        }
+        self.assertEqual(
+            dashboard_server._ocr_image_upload_backend_status(
+                "official", publisher
+            ),
+            {
+                "backend": "official",
+                "transport": "official_api",
+                "configured": False,
+            },
+        )
+
     def test_flatten_events_keeps_only_supported_codes(self):
         payload = {
             "events": {
@@ -197,6 +285,22 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(payload["health"]["source_count"], 2)
         self.assertEqual(payload["health"]["soccer_count"], 1)
 
+    def test_match_catalog_skips_malformed_row_without_hiding_valid_playing_matches(self):
+        now = 1_800_000_000.0
+        valid = self._catalog_match("valid-live", "Playing", now - 30)
+        malformed = self._catalog_match("malformed-live", "Playing", now - 20)
+        malformed["sort_timestamp"] = None
+        malformed["start_play"] = "not-a-date"
+        catalog = dashboard_server.MatchCatalog()
+
+        with patch("dashboard_server._json_request", return_value={"list": [malformed, valid]}), patch(
+            "dashboard_server.time.time", return_value=now
+        ):
+            payload = catalog.snapshot()
+
+        self.assertEqual([item["match_id"] for item in payload["playing"]], ["valid-live"])
+        self.assertEqual(payload["health"]["state"], "healthy")
+
     def test_match_catalog_sorts_and_limits_playing_and_upcoming(self):
         now = 1_800_000_000.0
         playing = [
@@ -229,6 +333,611 @@ class DashboardTests(unittest.TestCase):
             [item["sort_timestamp"] for item in payload["upcoming"]],
             sorted(item["sort_timestamp"] for item in upcoming)[:20],
         )
+
+    def test_match_catalog_keeps_full_playing_set_for_automatic_admission(self):
+        now = 1_800_000_000.0
+        rows = [
+            self._catalog_match(f"playing-{index:02d}", "Playing", now - index)
+            for index in range(25)
+        ]
+        rows.append(
+            {
+                **self._catalog_match("excluded-live", "Playing", now - 100),
+                "competition_name": "英超",
+            }
+        )
+        catalog = dashboard_server.MatchCatalog()
+
+        with patch("dashboard_server._json_request", return_value={"list": rows}), patch(
+            "dashboard_server.time.time", return_value=now
+        ):
+            payload = catalog.snapshot()
+
+        self.assertEqual(len(payload["playing"]), 20)
+        self.assertEqual(len(catalog.all_playing), 26)
+        self.assertIn("excluded-live", {item["match_id"] for item in catalog.all_playing})
+
+    def test_source_response_classification_does_not_confuse_errors_with_no_source(self):
+        available = dashboard_server.classify_source_response(
+            {"errno": 0, "data": {"resource": " rtmp://example/live "}}
+        )
+        self.assertEqual(available.state, "available")
+        self.assertEqual(available.data["resource"], "rtmp://example/live")
+
+        no_source = dashboard_server.classify_source_response(
+            {"errno": 0, "message": "无数据", "data": {}}
+        )
+        self.assertEqual(no_source.state, "no_source")
+
+        auth_error = dashboard_server.classify_source_response(
+            {"errno": 1, "message": "secret错误", "data": {}}
+        )
+        self.assertEqual(auth_error.state, "error")
+        self.assertEqual(auth_error.error_kind, "source_auth_error")
+        self.assertTrue(auth_error.retryable)
+
+        malformed = dashboard_server.classify_source_response(
+            {"errno": 0, "data": {"id": 10}}
+        )
+        self.assertEqual(malformed.state, "error")
+        self.assertEqual(malformed.error_kind, "source_protocol_error")
+
+        malformed_bool = dashboard_server.classify_source_response(
+            {"errno": False, "data": {}}
+        )
+        self.assertEqual(malformed_bool.state, "error")
+        self.assertEqual(malformed_bool.error_kind, "source_api_error")
+
+    def test_auto_admission_waits_before_skipping_empty_source(self):
+        manager = dashboard_server.Dashboard(background_monitors=False)
+        catalog = Mock()
+        catalog.refresh_for_automation.return_value = {
+            "fresh": True,
+            "playing": [self._catalog_match("auto-no-source", "Playing", 90.0)],
+        }
+        coordinator = dashboard_server.AutoAdmissionCoordinator(
+            manager,
+            catalog,
+            poll_seconds=1,
+            source_poll_seconds=1,
+            source_wait_seconds=60,
+            source_empty_confirmations=3,
+        )
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            dashboard_server, "DEFAULT_OUTPUT", Path(directory)
+        ), patch(
+            "dashboard_server.query_source",
+            return_value={"errno": 0, "message": "无数据", "data": {}},
+        ), patch("dashboard_server.subprocess.Popen") as popen:
+            coordinator.run_once(now=100.0)
+            record = coordinator.records["auto-no-source"]
+            self.assertEqual(record.state, "source_waiting")
+            self.assertEqual(record.no_source_confirmations, 1)
+            self.assertEqual(record.no_source_first_seen_at_unix, 100.0)
+            popen.assert_not_called()
+
+            coordinator.run_once(now=130.0)
+            self.assertEqual(record.state, "source_waiting")
+            self.assertEqual(record.no_source_confirmations, 2)
+            popen.assert_not_called()
+
+            coordinator.run_once(now=160.0)
+
+        self.assertEqual(record.state, "skipped_no_source")
+        popen.assert_not_called()
+        self.assertEqual(manager.sessions, {})
+        self.assertEqual(record.no_source_confirmations, 3)
+        self.assertEqual(record.reason, "直播源连续确认 3 次为空，等待 60 秒后仍无直播源")
+
+        missing_errno = dashboard_server.classify_source_response(
+            {"message": "secret错误", "data": {}}
+        )
+        self.assertEqual(missing_errno.state, "error")
+        self.assertEqual(missing_errno.error_kind, "source_protocol_error")
+
+    def test_auto_admission_starts_when_source_appears_during_empty_grace_window(self):
+        manager = dashboard_server.Dashboard(background_monitors=False)
+        catalog = Mock()
+        catalog.refresh_for_automation.return_value = {
+            "fresh": True,
+            "playing": [self._catalog_match("auto-source-delayed", "Playing", 90.0)],
+        }
+        coordinator = dashboard_server.AutoAdmissionCoordinator(
+            manager,
+            catalog,
+            poll_seconds=1,
+            source_poll_seconds=1,
+            source_wait_seconds=60,
+            source_empty_confirmations=3,
+        )
+        worker = Mock(pid=997, returncode=None)
+        worker.poll.return_value = None
+        source_responses = iter(
+            [
+                {"errno": 0, "message": "无数据", "data": {}},
+                {"errno": 0, "data": {"resource": "rtmp://example/delayed"}},
+            ]
+        )
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            dashboard_server, "DEFAULT_OUTPUT", Path(directory)
+        ), patch(
+            "dashboard_server.query_source",
+            side_effect=lambda _match_id: next(source_responses),
+        ), patch("dashboard_server.subprocess.Popen", return_value=worker) as popen:
+            coordinator.run_once(now=100.0)
+            self.assertEqual(
+                coordinator.records["auto-source-delayed"].state,
+                "source_waiting",
+            )
+            coordinator.run_once(now=130.0)
+
+        record = coordinator.records["auto-source-delayed"]
+        self.assertEqual(record.state, "running")
+        self.assertEqual(record.source["resource"], "rtmp://example/delayed")
+        self.assertEqual(record.no_source_confirmations, 0)
+        popen.assert_called_once()
+
+    def test_auto_admission_retries_source_errors_without_skipping(self):
+        manager = dashboard_server.Dashboard(background_monitors=False)
+        catalog = Mock()
+        catalog.refresh_for_automation.return_value = {
+            "fresh": True,
+            "playing": [self._catalog_match("auto-source-error", "Playing", 90.0)],
+        }
+        coordinator = dashboard_server.AutoAdmissionCoordinator(
+            manager, catalog, poll_seconds=1, source_poll_seconds=10
+        )
+        now = time.time()
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            dashboard_server, "DEFAULT_OUTPUT", Path(directory)
+        ), patch(
+            "dashboard_server.query_source",
+            return_value={"errno": 1, "message": "secret错误", "data": {}},
+        ):
+            coordinator.run_once(now=now)
+
+        record = coordinator.records["auto-source-error"]
+        self.assertEqual(record.state, "retrying")
+        self.assertEqual(record.last_error_kind, "source_auth_error")
+        self.assertNotIn(record.state, coordinator.TERMINAL_STATES)
+        self.assertEqual(manager.sessions, {})
+
+    def test_auto_admission_source_error_breaks_empty_confirmation_sequence(self):
+        manager = dashboard_server.Dashboard(background_monitors=False)
+        catalog = Mock()
+        match = self._catalog_match("auto-source-interrupted", "Playing", 90.0)
+        catalog.refresh_for_automation.return_value = {
+            "fresh": True,
+            "playing": [match],
+        }
+        coordinator = dashboard_server.AutoAdmissionCoordinator(
+            manager,
+            catalog,
+            poll_seconds=1,
+            source_poll_seconds=1,
+            source_wait_seconds=60,
+            source_empty_confirmations=3,
+        )
+        source_responses = iter(
+            [
+                {"errno": 0, "data": {}},
+                {"errno": 1, "message": "secret错误", "data": {}},
+                {"errno": 0, "data": {}},
+            ]
+        )
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            dashboard_server, "DEFAULT_OUTPUT", Path(directory)
+        ), patch(
+            "dashboard_server.query_source",
+            side_effect=lambda _match_id: next(source_responses),
+        ):
+            coordinator.run_once(now=100.0)
+            record = coordinator.records[match["match_id"]]
+            self.assertEqual(record.no_source_confirmations, 1)
+            coordinator.run_once(now=101.0)
+            self.assertEqual(record.state, "retrying")
+            self.assertEqual(record.no_source_confirmations, 0)
+            self.assertIsNone(record.no_source_first_seen_at_unix)
+            coordinator.run_once(now=102.0)
+
+        self.assertEqual(record.state, "source_waiting")
+        self.assertEqual(record.no_source_confirmations, 1)
+        self.assertEqual(record.no_source_first_seen_at_unix, 102.0)
+
+    def test_auto_admission_starts_available_source_and_is_idempotent(self):
+        manager = dashboard_server.Dashboard(background_monitors=False)
+        catalog = Mock()
+        catalog.refresh_for_automation.return_value = {
+            "fresh": True,
+            "playing": [self._catalog_match("auto-start", "Playing", 90.0)],
+        }
+        coordinator = dashboard_server.AutoAdmissionCoordinator(
+            manager, catalog, poll_seconds=1, source_poll_seconds=10
+        )
+        base = time.time()
+        worker = Mock(pid=991, returncode=None)
+        worker.poll.return_value = None
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            dashboard_server, "DEFAULT_OUTPUT", Path(directory)
+        ), patch(
+            "dashboard_server.query_source",
+            return_value={"errno": 0, "data": {"resource": "rtmp://example/live"}},
+        ), patch("dashboard_server.subprocess.Popen", return_value=worker) as popen:
+            coordinator.run_once(now=base)
+            coordinator.run_once(now=base + 1)
+
+        self.assertEqual(coordinator.records["auto-start"].state, "running")
+        self.assertEqual(popen.call_count, 1)
+        self.assertTrue(manager.get("auto-start", start_monitor=False).worker_running())
+
+    def test_auto_admission_waits_for_capacity_then_starts(self):
+        manager = dashboard_server.Dashboard(
+            background_monitors=False, max_concurrent_matches=1
+        )
+        occupied = manager.get("occupied", start_monitor=False)
+        occupied.desired_running = True
+        occupied.worker_mode = "live"
+        occupied.lifecycle_state = "playing"
+        catalog = Mock()
+        catalog.refresh_for_automation.return_value = {
+            "fresh": True,
+            "playing": [self._catalog_match("auto-queued", "Playing", 90.0)],
+        }
+        coordinator = dashboard_server.AutoAdmissionCoordinator(
+            manager, catalog, poll_seconds=1, source_poll_seconds=10
+        )
+        worker = Mock(pid=992, returncode=None)
+        worker.poll.return_value = None
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            dashboard_server, "DEFAULT_OUTPUT", Path(directory)
+        ), patch(
+            "dashboard_server.query_source",
+            return_value={"errno": 0, "data": {"resource": "rtmp://example/live"}},
+        ), patch("dashboard_server.subprocess.Popen", return_value=worker) as popen:
+            coordinator.run_once(now=time.time())
+            self.assertEqual(coordinator.records["auto-queued"].state, "waiting_capacity")
+            occupied.desired_running = False
+            occupied.lifecycle_state = "idle"
+            coordinator.run_once(now=111.0)
+
+        self.assertEqual(coordinator.records["auto-queued"].state, "running")
+        popen.assert_called_once()
+
+    def test_auto_admission_keeps_confirmed_source_while_waiting_for_capacity(self):
+        manager = dashboard_server.Dashboard(
+            background_monitors=False, max_concurrent_matches=1
+        )
+        occupied = manager.get("occupied-source", start_monitor=False)
+        occupied.desired_running = True
+        occupied.worker_mode = "live"
+        occupied.lifecycle_state = "playing"
+        catalog = Mock()
+        match = self._catalog_match("auto-source-queued", "Playing", 90.0)
+        catalog.refresh_for_automation.side_effect = [
+            {"fresh": True, "playing": [match]},
+            {"fresh": True, "playing": [match]},
+        ]
+        coordinator = dashboard_server.AutoAdmissionCoordinator(
+            manager, catalog, poll_seconds=1, source_poll_seconds=1
+        )
+        worker = Mock(pid=993, returncode=None)
+        worker.poll.return_value = None
+        source_responses = iter(
+            [
+                {"errno": 0, "data": {"resource": "rtmp://example/live"}},
+                {"errno": 0, "data": {}},
+            ]
+        )
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            dashboard_server, "DEFAULT_OUTPUT", Path(directory)
+        ), patch(
+            "dashboard_server.query_source", side_effect=lambda _match_id: next(source_responses)
+        ), patch("dashboard_server.subprocess.Popen", return_value=worker):
+            coordinator.run_once(now=100.0)
+            self.assertEqual(
+                coordinator.records["auto-source-queued"].state,
+                "waiting_capacity",
+            )
+            coordinator.run_once(now=101.0)
+
+        record = coordinator.records["auto-source-queued"]
+        self.assertEqual(record.state, "waiting_capacity")
+        self.assertEqual(record.source["resource"], "rtmp://example/live")
+
+    def test_auto_admission_does_not_mark_absent_matches_on_catalog_failure(self):
+        manager = dashboard_server.Dashboard(background_monitors=False)
+        catalog = Mock()
+        catalog.refresh_for_automation.side_effect = [
+            {"fresh": True, "playing": [self._catalog_match("auto-stale", "Playing", 90.0)]},
+            {"fresh": False, "playing": [], "error": "catalog offline"},
+        ]
+        coordinator = dashboard_server.AutoAdmissionCoordinator(
+            manager, catalog, poll_seconds=1, source_poll_seconds=1
+        )
+        base = time.time()
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            dashboard_server, "DEFAULT_OUTPUT", Path(directory)
+        ), patch(
+            "dashboard_server.query_source",
+            return_value={"errno": 0, "data": {"resource": "rtmp://example/live"}},
+        ), patch("dashboard_server.subprocess.Popen") as popen:
+            coordinator.run_once(now=base)
+            coordinator.run_once(now=base + 1)
+
+        self.assertNotEqual(
+            coordinator.records["auto-stale"].state, "expired_not_started"
+        )
+        popen.assert_called_once()
+
+    def test_auto_admission_requires_two_authoritative_missing_catalogs(self):
+        manager = dashboard_server.Dashboard(background_monitors=False)
+        catalog = Mock()
+        match = self._catalog_match("auto-missing", "Playing", 90.0)
+        catalog.refresh_for_automation.side_effect = [
+            {"fresh": True, "playing": [match]},
+            {"fresh": True, "playing": []},
+            {"fresh": True, "playing": []},
+        ]
+        coordinator = dashboard_server.AutoAdmissionCoordinator(
+            manager, catalog, poll_seconds=1, source_poll_seconds=1
+        )
+        base = time.time()
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            dashboard_server, "DEFAULT_OUTPUT", Path(directory)
+        ), patch(
+            "dashboard_server.query_source",
+            return_value={"errno": 1, "message": "查询失败: database offline", "data": {}},
+        ):
+            coordinator.run_once(now=base)
+            # The first empty authoritative response is retained as a grace
+            # observation; the second one is allowed to expire the record.
+            coordinator.run_once(now=base + 1)
+            self.assertNotEqual(
+                coordinator.records["auto-missing"].state, "expired_not_started"
+            )
+            coordinator.run_once(now=base + 2)
+
+        self.assertEqual(
+            coordinator.records["auto-missing"].state, "expired_not_started"
+        )
+
+    def test_auto_admission_marks_completed_session_after_catalog_disappearance(self):
+        manager = dashboard_server.Dashboard(background_monitors=False)
+        session = manager.get("auto-completed", start_monitor=False)
+        session.lifecycle_state = "completed_with_warnings"
+        session.exit_reason = "match_played_stream_incomplete"
+        catalog = Mock()
+        catalog.refresh_for_automation.side_effect = [
+            {"fresh": True, "playing": []},
+            {"fresh": True, "playing": []},
+        ]
+        coordinator = dashboard_server.AutoAdmissionCoordinator(
+            manager, catalog, poll_seconds=1, source_poll_seconds=1
+        )
+        record = dashboard_server.AutoAdmissionRecord("auto-completed")
+        record.state = "running"
+        coordinator.records[record.match_id] = record
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            dashboard_server, "DEFAULT_OUTPUT", Path(directory)
+        ):
+            coordinator.run_once(now=100.0)
+            self.assertEqual(record.state, "running")
+            coordinator.run_once(now=101.0)
+
+        self.assertEqual(record.state, "completed")
+        self.assertEqual(record.reason, "match_played_stream_incomplete")
+
+    def test_auto_admission_does_not_hide_starting_state_as_running(self):
+        session = dashboard_server.MatchSession("auto-starting")
+        session.lifecycle_state = "stopping"
+        fake_dashboard = Mock()
+        fake_dashboard.worker_slot_status.return_value = {
+            "available_worker_slots": 1
+        }
+        fake_dashboard.get.return_value = session
+        fake_dashboard.start.side_effect = RuntimeError(
+            "比赛 auto-starting 已处于 stopping 状态，不能重复启动"
+        )
+        coordinator = dashboard_server.AutoAdmissionCoordinator(
+            fake_dashboard, Mock(), poll_seconds=1, source_poll_seconds=1
+        )
+        record = dashboard_server.AutoAdmissionRecord("auto-starting")
+        record.source = {"resource": "rtmp://example/live"}
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            dashboard_server, "DEFAULT_OUTPUT", Path(directory)
+        ):
+            coordinator._start_waiting(record, {}, time.time())
+
+        self.assertEqual(record.state, "start_retrying")
+
+    def test_auto_admission_does_not_restart_a_manually_stopped_session(self):
+        manager = dashboard_server.Dashboard(background_monitors=False)
+        session = manager.get("auto-manual-stop", start_monitor=False)
+        session.lifecycle_state = "stopped"
+        session.exit_reason = "manual_stop"
+        catalog = Mock()
+        match = self._catalog_match("auto-manual-stop", "Playing", 90.0)
+        catalog.refresh_for_automation.return_value = {
+            "fresh": True,
+            "playing": [match],
+        }
+        coordinator = dashboard_server.AutoAdmissionCoordinator(
+            manager, catalog, poll_seconds=1, source_poll_seconds=1
+        )
+        worker = Mock(pid=995, returncode=None)
+        worker.poll.return_value = None
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            dashboard_server, "DEFAULT_OUTPUT", Path(directory)
+        ), patch(
+            "dashboard_server.query_source",
+            return_value={"errno": 0, "data": {"resource": "rtmp://example/live"}},
+        ), patch("dashboard_server.subprocess.Popen", return_value=worker) as popen:
+            coordinator.run_once(now=time.time())
+
+        self.assertEqual(coordinator.records["auto-manual-stop"].state, "stopped")
+        popen.assert_not_called()
+
+    def test_automatic_start_opts_into_existing_event_emission(self):
+        manager = dashboard_server.Dashboard(background_monitors=False)
+        session = manager.get("auto-emit-existing", start_monitor=False)
+        session.detail = self._catalog_match("auto-emit-existing", "Playing", 90.0)
+        session.source = {"resource": "rtmp://example/live"}
+        worker = Mock(pid=996, returncode=None)
+        worker.poll.return_value = None
+        with patch("dashboard_server.subprocess.Popen", return_value=worker) as popen:
+            manager.start(session, emit_existing_events=True)
+
+        command = popen.call_args.args[0]
+        self.assertIn("--emit-existing-events", command)
+
+    def test_auto_admission_does_not_duplicate_worker_surviving_dashboard_restart(self):
+        manager = dashboard_server.Dashboard(background_monitors=False)
+        catalog = Mock()
+        catalog.refresh_for_automation.return_value = {
+            "fresh": True,
+            "playing": [self._catalog_match("auto-survivor", "Playing", 90.0)],
+        }
+        coordinator = dashboard_server.AutoAdmissionCoordinator(
+            manager, catalog, poll_seconds=1, source_poll_seconds=1
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            output_root = Path(directory)
+            match_dir = output_root / "auto-survivor"
+            match_dir.mkdir()
+            (match_dir / "pipeline_events.jsonl").write_text(
+                json.dumps(
+                    {
+                        "event": "worker_started",
+                        "mode": "live",
+                        "pid": 994,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with patch.object(dashboard_server, "DEFAULT_OUTPUT", output_root), patch(
+                "dashboard_server.os.kill"
+            ) as kill, patch(
+                "dashboard_server.os.popen",
+                return_value=Mock(
+                    read=Mock(return_value="python event_driven_pipeline.py --match-id auto-survivor"),
+                    close=Mock(return_value=None),
+                ),
+            ), patch("dashboard_server.query_source") as query, patch(
+                "dashboard_server.subprocess.Popen"
+            ) as popen:
+                coordinator.run_once(now=100.0)
+
+        self.assertEqual(coordinator.records["auto-survivor"].state, "running")
+        query.assert_not_called()
+        popen.assert_not_called()
+        kill.assert_any_call(994, 0)
+
+    def test_external_worker_permission_error_accepts_matching_process_command(self):
+        manager = dashboard_server.Dashboard(background_monitors=False)
+        with tempfile.TemporaryDirectory() as directory:
+            output_root = Path(directory)
+            match_id = "external-permission-worker"
+            match_dir = output_root / match_id
+            match_dir.mkdir()
+            (match_dir / "pipeline_events.jsonl").write_text(
+                json.dumps(
+                    {
+                        "event": "worker_started",
+                        "mode": "live",
+                        "pid": 994,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            for command in (
+                "python event_driven_pipeline.py --match-id external-permission-worker",
+                "python event_driven_pipeline.py --match-id=external-permission-worker",
+            ):
+                with self.subTest(command=command):
+                    process_listing = Mock(
+                        read=Mock(return_value=command),
+                        close=Mock(return_value=None),
+                    )
+                    with patch.object(
+                        dashboard_server, "DEFAULT_OUTPUT", output_root
+                    ), patch(
+                        "dashboard_server.os.kill",
+                        side_effect=PermissionError("operation not permitted"),
+                    ), patch(
+                        "dashboard_server.os.popen", return_value=process_listing
+                    ):
+                        self.assertEqual(
+                            manager.external_worker_pid(match_id),
+                            994,
+                        )
+
+    def test_external_worker_permission_error_does_not_count_unrelated_process(self):
+        manager = dashboard_server.Dashboard(background_monitors=False)
+        with tempfile.TemporaryDirectory() as directory:
+            output_root = Path(directory)
+            match_id = "external-permission-system-process"
+            match_dir = output_root / match_id
+            match_dir.mkdir()
+            (match_dir / "pipeline_events.jsonl").write_text(
+                json.dumps(
+                    {
+                        "event": "worker_started",
+                        "mode": "live",
+                        "pid": 125,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            for command in (
+                "/usr/libexec/mds",
+                "python event_driven_pipeline.py --match-id "
+                "external-permission-system-process-suffix",
+            ):
+                with self.subTest(command=command):
+                    process_listing = Mock(
+                        read=Mock(return_value=command),
+                        close=Mock(return_value=None),
+                    )
+                    with patch.object(
+                        dashboard_server, "DEFAULT_OUTPUT", output_root
+                    ), patch(
+                        "dashboard_server.os.kill",
+                        side_effect=PermissionError("operation not permitted"),
+                    ), patch(
+                        "dashboard_server.os.popen", return_value=process_listing
+                    ):
+                        self.assertIsNone(manager.external_worker_pid(match_id))
+
+    def test_external_worker_permission_error_without_process_listing_is_ignored(self):
+        manager = dashboard_server.Dashboard(background_monitors=False)
+        with tempfile.TemporaryDirectory() as directory:
+            output_root = Path(directory)
+            match_id = "external-permission-no-listing"
+            match_dir = output_root / match_id
+            match_dir.mkdir()
+            (match_dir / "pipeline_events.jsonl").write_text(
+                json.dumps(
+                    {
+                        "event": "worker_started",
+                        "mode": "live",
+                        "pid": 126,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with patch.object(dashboard_server, "DEFAULT_OUTPUT", output_root), patch(
+                "dashboard_server.os.kill",
+                side_effect=PermissionError("operation not permitted"),
+            ), patch(
+                "dashboard_server.os.popen",
+                side_effect=PermissionError("operation not permitted"),
+            ):
+                self.assertIsNone(manager.external_worker_pid(match_id))
 
     def test_match_catalog_excludes_past_and_more_than_15_minute_fixtures(self):
         now = 1_800_000_000.0
@@ -1074,6 +1783,69 @@ class DashboardTests(unittest.TestCase):
             "ocr_target_timeout",
         )
 
+    def test_database_preserves_clock_target_not_located_failure_kind(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "pipeline_state.sqlite3"
+            runtime = dashboard_server.sqlite3.connect(database)
+            runtime.executescript(
+                """
+                CREATE TABLE event_tasks (
+                    event_key TEXT, code TEXT, event_type TEXT, event_json TEXT,
+                    status TEXT, discovered_at_unix REAL, updated_at_unix REAL,
+                    output_path TEXT, output_bytes INTEGER, result_json TEXT,
+                    error TEXT
+                );
+                CREATE TABLE vision_tasks (
+                    event_key TEXT, status TEXT, located_anchor_stream_time REAL,
+                    confidence REAL, inference_seconds REAL, model_name TEXT,
+                    model_version TEXT, output_path TEXT, output_bytes INTEGER,
+                    result_json TEXT, error TEXT, last_error_kind TEXT,
+                    failure_stage TEXT, failure_reason TEXT,
+                    artifact_kind TEXT, created_at_unix REAL
+                );
+                """
+            )
+            event = {
+                "event_key": "m:G:target-not-located",
+                "code": "G",
+                "event_type": "goal",
+            }
+            runtime.execute(
+                "INSERT INTO event_tasks VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    "m:G:target-not-located", "G", "goal", json.dumps(event),
+                    "encoded", 1, 2, "/tmp/default.gif", 10, "{}", None,
+                ),
+            )
+            runtime.execute(
+                "INSERT INTO vision_tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    "m:G:target-not-located", "failed", None, None, None,
+                    "PaddleOCR", "1", None, None,
+                    json.dumps({
+                        "error_kind": "ocr_clock_target_not_located",
+                        "target_failure_cause": "target_passed",
+                        "failure_reason": {
+                            "kind": "ocr_clock_target_not_located",
+                            "stage": "ocr_progressive_scan",
+                            "message": "target passed without a reliable anchor",
+                        },
+                    }),
+                    "target passed without a reliable anchor",
+                    "ocr_clock_target_not_located", "ocr_progressive_scan",
+                    "target passed without a reliable anchor", "ocr_window", 1,
+                ),
+            )
+            runtime.commit()
+            runtime.close()
+            tasks, _, _ = dashboard_server._tasks_from_database(database)
+
+        ocr = tasks[0]["ocr_window"]
+        self.assertEqual(
+            ocr["ocr_pipeline_status"], "ocr_clock_target_not_located"
+        )
+        self.assertEqual(ocr["target_failure_cause"], "target_passed")
+
     def test_database_normalizes_ocr_window_failure_families(self):
         mappings = {
             "ocr_output_video_gap": "ocr_window_evicted",
@@ -1387,6 +2159,10 @@ class DashboardTests(unittest.TestCase):
         self.assertTrue(session.vision_enabled)
         self.assertFalse(session.tdeed_enabled)
         payload = dashboard_server._session_json(session)
+        self.assertEqual(
+            payload["publishing"]["ocr_image_upload_backend"],
+            dashboard_server.OCR_IMAGE_UPLOAD_BACKEND,
+        )
         self.assertEqual(payload["gif"]["before_seconds"], 30.0)
         self.assertEqual(payload["gif"]["after_seconds"], 20.0)
         self.assertEqual(payload["gif"]["event_to_video_offset_seconds"], -10.0)

@@ -14,6 +14,7 @@ from scoreboard_ocr import ScoreboardOcrError
 from vision_locator import VisionCandidateNotFound
 from vision_runtime import (
     OCR_FFMPEG_WATCHDOG_SECONDS,
+    OCR_TARGET_MEDIA_POLL_INTERVAL_SECONDS,
     VisionJob,
     VisualLocationFailed,
     _continuous_search_components,
@@ -2182,6 +2183,20 @@ class VisionRuntimeTests(unittest.TestCase):
             self.assertEqual(progress["state"], "waiting_for_target_media")
             self.assertEqual(progress["last_scan_start_stream_time"], 220.0)
             self.assertEqual(progress["last_scan_end_stream_time"], 280.0)
+            self.assertEqual(
+                progress["wait_strategy"], "target_media_incremental_poll"
+            )
+            self.assertEqual(progress["scan_attempt_count"], 0)
+            self.assertEqual(progress["target_media_poll_count"], 1)
+            self.assertEqual(
+                progress["last_target_media_check_at_unix"],
+                waiting.updated_at_unix,
+            )
+            self.assertAlmostEqual(
+                waiting.next_attempt_at_unix - waiting.updated_at_unix,
+                OCR_TARGET_MEDIA_POLL_INTERVAL_SECONDS,
+                places=3,
+            )
             runtime.close()
 
     def test_clock_mapping_rewinds_late_target_to_focused_window(self):

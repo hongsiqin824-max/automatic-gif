@@ -38,35 +38,57 @@ worker`. Keep unrelated changes separate. A review/PR should describe behavior
 changes, tests, deployment checks, configuration changes, and relevant
 Dashboard or GIF artifacts.
 
-## Standard Server Update
+## Fixed Server Update Workflow
 
-Use the active server directory (currently
-`/opt/automatic-gif-release-c24aa3c`) and follow this order:
+This is the authoritative procedure for every update of the production
+Dashboard. Run these commands in the server SSH terminal, in order, from the
+fixed release directory (currently `/opt/automatic-gif-release-c24aa3c`):
 
-```bash
-cd /opt/automatic-gif-release-c24aa3c
-GIT_TERMINAL_PROMPT=0 git -c http.version=HTTP/1.1 pull --ff-only origin main
-test -x tmp/ocr_venv/bin/python \
-  && echo "OCR environment OK" \
-  || echo "OCR environment missing"
-ps -eo pid,ppid,args | grep -E '[d]ashboard_server.py'
-kill -TERM <current-dashboard-pid>
-sleep 3
-cd /opt/automatic-gif-release-c24aa3c
-nohup env PYTHONUNBUFFERED=1 \
-  /opt/automatic-gif/.venv/bin/python dashboard_server.py \
-  >> dashboard.log 2>&1 &
-echo $!
-sleep 3
-curl -fsS http://127.0.0.1:8899/api/health
-tail -f dashboard.log
-```
+1. Pull only a fast-forward update. A successful pull ends with a summary such
+   as `Updating <old>..<new>`; never use `reset --hard` or force a merge.
 
-The health response must be `{"ok":true,"port":8899}`. Confirm the process
-working directory and inspect the log for OCR worker startup, event handling,
-and GIF generation. Do not run `git clean -fd`; it may delete OCR links,
-SQLite state, caches, or server files. Do not recreate or delete
-`tmp/ocr_venv` for a normal code update. Rebuild it only after creating a new
-release directory, losing the symlink, changing Python/Paddle versions, or
-intentionally upgrading Paddle/PaddleOCR. Keep the previous release and OCR
-environment until health and worker checks pass so rollback remains possible.
+   ```bash
+   cd /opt/automatic-gif-release-c24aa3c
+   GIT_TERMINAL_PROMPT=0 git -c http.version=HTTP/1.1 pull --ff-only origin main
+   ```
+
+2. Verify that the existing OCR virtual-environment link is still executable.
+   The expected output is `OCR environment OK`.
+
+   ```bash
+   test -x tmp/ocr_venv/bin/python \
+     && echo "OCR environment OK" \
+     || echo "OCR environment missing"
+   ```
+
+3. Restart only the 8899 Dashboard. First list the process, then replace
+   `<current-dashboard-pid>` with the PID printed by `ps`.
+
+   ```bash
+   ps -eo pid,ppid,args | grep -E '[d]ashboard_server.py'
+   kill -TERM <current-dashboard-pid>
+   sleep 3
+   cd /opt/automatic-gif-release-c24aa3c
+   nohup env PYTHONUNBUFFERED=1 \
+     /opt/automatic-gif/.venv/bin/python dashboard_server.py \
+     >> dashboard.log 2>&1 &
+   echo $!
+   ```
+
+4. Verify health and then watch the log for OCR-worker startup, event handling,
+   and GIF generation. Health must return `{"ok":true,"port":8899}`.
+
+   ```bash
+   sleep 3
+   curl -fsS http://127.0.0.1:8899/api/health
+   tail -f dashboard.log
+   ```
+
+Do not run `git clean -fd`: it can remove the OCR link, SQLite state, caches,
+or server-only files. Do not recreate/delete `tmp/ocr_venv` for a normal code
+update. Rebuild it only when creating a new release directory, the link was
+manually deleted, Python/Paddle/PaddleOCR is intentionally changed, or a
+cleanup command removed ignored files. If the server keeps a deliberate
+oneDNN-only edit, preserve that edit with the repository's backup/stash
+procedure before pulling and verify it again after the pull. Keep the previous
+release and environment until health checks pass so rollback remains possible.

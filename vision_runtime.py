@@ -119,6 +119,10 @@ OCR_AVAILABILITY_HALFTIME_BREAK_SECONDS = 15.0 * 60.0
 OCR_AVAILABILITY_TARGET_MARGIN_SECONDS = 30.0
 OCR_TARGET_WAIT_INITIAL_SECONDS = 60.0
 OCR_TARGET_WAIT_MARGIN_SECONDS = 20.0
+# Once a trustworthy clock-to-video mapping exists, waiting for the predicted
+# target media is a cheap metadata/readability check. Keep this poll separate
+# from the shared 2/4/8-second readiness backoff used by other tasks.
+OCR_TARGET_MEDIA_POLL_INTERVAL_SECONDS = 3.0
 # The target wait may be extended while the live tail is still advancing, but
 # it must have a finite watchdog so a dead stream cannot occupy an OCR worker
 # forever.  Keep this separate from the per-inference timeout.
@@ -364,6 +368,18 @@ def _job_with_cached_scoreboard_profile(
 ) -> tuple["VisionJob", Any | None]:
     if job.scoreboard_profile is not None:
         return job, None
+    vision_getter = getattr(runtime.store, "get_vision_task", None)
+    if callable(vision_getter):
+        try:
+            current = vision_getter(job.event_key, artifact_kind="ocr_window")
+        except (TypeError, ValueError):
+            current = None
+        metadata = getattr(current, "window_metadata", None)
+        progressive = metadata.get("progressive_scan") if isinstance(metadata, dict) else None
+        if isinstance(progressive, dict) and progressive.get(
+            "scoreboard_roi_cache_bypass"
+        ):
+            return job, None
     getter = getattr(runtime.store, "get_scoreboard_roi_cache", None)
     if not callable(getter):
         return job, None
@@ -504,6 +520,76 @@ def _ocr_recoverable_profile_mismatch(
             ):
                 return False
     return True
+
+
+def _locate_ocr_window_with_cached_profile_recovery(
+    job: "VisionJob",
+    runtime: Any,
+    cached_scoreboard_roi: Any | None,
+    locate: Callable[["VisionJob"], tuple[dict[str, Any], dict[str, Any], list[str]]],
+    *,
+    allow_retry: Callable[[VisualLocationFailed], bool] | None = None,
+) -> tuple["VisionJob", dict[str, Any], dict[str, Any], list[str], bool]:
+    """Retry the current OCR window once after an automatically cached ROI fails.
+
+    Cached profiles are an optimization, not a requirement.  A broadcast can
+    change resolution or move its scoreboard between events, so a
+    ``clock_profile_mismatch`` must immediately fall back to the existing
+    auto-discovery path for this same event.  Explicit profiles are never
+    overridden because they represent an operator choice.
+    """
+    try:
+        located, materialized, paths = locate(job)
+    except VisualLocationFailed as first_error:
+        can_recover = bool(
+            job.clock_only
+            and cached_scoreboard_roi is not None
+            and job.scoreboard_profile is not None
+            and first_error.kind == "clock_profile_mismatch"
+        )
+        if not can_recover or (
+            allow_retry is not None and not allow_retry(first_error)
+        ):
+            raise
+
+        # Invalidate the optimization immediately.  The caller clears its
+        # local cache reference as well, preventing a duplicate increment if
+        # auto-discovery also fails below.
+        _record_scoreboard_roi_failure(
+            runtime,
+            job,
+            first_error.kind,
+            cached=cached_scoreboard_roi,
+        )
+        fallback_job = replace(job, scoreboard_profile=None)
+        recovery = {
+            "status": "rediscovery_pending",
+            "attempted": True,
+            "initial_error_kind": first_error.kind,
+            "initial_error": str(first_error),
+            "initial_diagnostics": first_error.diagnostics,
+        }
+        try:
+            located, materialized, paths = locate(fallback_job)
+        except VisualLocationFailed as second_error:
+            recovery["status"] = "rediscovery_failed"
+            recovery["rediscovery_error_kind"] = second_error.kind
+            recovery["rediscovery_error"] = str(second_error)
+            raise VisualLocationFailed(
+                second_error.kind,
+                str(second_error),
+                {
+                    **second_error.diagnostics,
+                    "scoreboard_roi_cache_recovery": recovery,
+                },
+            ) from second_error
+
+        recovery["status"] = "rediscovered"
+        located = dict(located)
+        located["scoreboard_roi_cache_recovery"] = recovery
+        return fallback_job, located, materialized, paths, True
+
+    return job, located, materialized, paths, False
 
 
 def _tdeed_error_kind(error: BaseException) -> str:
@@ -4733,14 +4819,56 @@ def _ocr_progressive_wait(
         has_scannable_media_after_cursor=has_scannable_media_after_cursor,
     )
     target_deadline = float(deadline_policy["target_deadline_at_unix"])
-    next_attempt_at = _ocr_far_target_retry_at(
-        now_unix=timestamp,
-        target_clock_seconds=target_clock_seconds,
-        latest_trusted_clock_seconds=latest_trusted_clock_seconds,
-        target_deadline_at_unix=target_deadline,
-    )
+    if wait_kind == "waiting_for_target_media":
+        # The mapping branch above has already proved that the target is a
+        # future point in the live buffer. Recheck only cheap TS metadata and
+        # continuity/readability on a short cadence; the locator is not called
+        # until the target window is actually retained.
+        next_attempt_at = min(
+            target_deadline,
+            timestamp + OCR_TARGET_MEDIA_POLL_INTERVAL_SECONDS,
+        )
+    else:
+        next_attempt_at = _ocr_far_target_retry_at(
+            now_unix=timestamp,
+            target_clock_seconds=target_clock_seconds,
+            latest_trusted_clock_seconds=latest_trusted_clock_seconds,
+            target_deadline_at_unix=target_deadline,
+        )
     if retry_immediately:
         next_attempt_at = timestamp
+    wait_delay_seconds = (
+        max(0.0, float(next_attempt_at) - timestamp)
+        if next_attempt_at is not None
+        else None
+    )
+    wait_strategy = (
+        "target_media_incremental_poll"
+        if wait_kind == "waiting_for_target_media"
+        else "progressive_backoff"
+    )
+    target_media_poll = wait_kind == "waiting_for_target_media"
+    target_media_wait_started_at = previous.get(
+        "target_media_wait_started_at_unix"
+    )
+    if target_media_poll and target_media_wait_started_at is None:
+        target_media_wait_started_at = timestamp
+    try:
+        target_media_wait_elapsed_seconds = (
+            max(0.0, timestamp - float(target_media_wait_started_at))
+            if target_media_poll and target_media_wait_started_at is not None
+            else None
+        )
+    except (TypeError, ValueError):
+        target_media_wait_started_at = timestamp if target_media_poll else None
+        target_media_wait_elapsed_seconds = 0.0 if target_media_poll else None
+    bypass_cached_profile = bool(
+        previous.get("scoreboard_roi_cache_bypass")
+        or (
+            isinstance(diagnostics, dict)
+            and diagnostics.get("scoreboard_roi_cache_bypass")
+        )
+    )
     active_processing_budget = _ocr_active_processing_budget(
         previous,
         now_unix=timestamp,
@@ -4751,7 +4879,10 @@ def _ocr_progressive_wait(
         "state": wait_kind,
         "target_revision": _vision_target_revision(job),
         "target_source": _vision_target_source(job),
-        "scan_attempt_count": int(previous.get("scan_attempt_count") or 0) + 1,
+        # A target-media poll does not run PaddleOCR and therefore must not be
+        # reported as another OCR scan attempt.
+        "scan_attempt_count": int(previous.get("scan_attempt_count") or 0)
+        + (0 if target_media_poll else 1),
         "last_scan_start_stream_time": round(scan_start, 3),
         "last_scan_end_stream_time": round(scan_end, 3),
         "scan_cursor_stream_time": round(
@@ -4780,6 +4911,27 @@ def _ocr_progressive_wait(
         "clock_samples": clock_samples,
         "clock_mapping": clock_mapping,
         "target_rescan_attempt_count": prior_rescan_attempt_count,
+        "wait_strategy": wait_strategy,
+        "next_attempt_delay_seconds": (
+            round(wait_delay_seconds, 3)
+            if wait_delay_seconds is not None
+            else None
+        ),
+        "target_media_poll_count": int(
+            previous.get("target_media_poll_count") or 0
+        ) + (1 if target_media_poll else 0),
+        "target_media_wait_started_at_unix": target_media_wait_started_at,
+        "target_media_wait_elapsed_seconds": (
+            round(target_media_wait_elapsed_seconds, 3)
+            if target_media_wait_elapsed_seconds is not None
+            else None
+        ),
+        "last_target_media_check_at_unix": (
+            timestamp if target_media_poll else previous.get(
+                "last_target_media_check_at_unix"
+            )
+        ),
+        "scoreboard_roi_cache_bypass": bypass_cached_profile,
     }
     readiness.update({
         "status": "ready" if clock_mapping.get("status") == "ready" else "waiting",
@@ -4898,6 +5050,12 @@ def _ocr_progressive_wait(
                 latest_trusted_clock_seconds
             ),
             "default_gif_preserved": True,
+            "wait_strategy": wait_strategy,
+            "next_attempt_delay_seconds": (
+                round(wait_delay_seconds, 3)
+                if wait_delay_seconds is not None
+                else None
+            ),
         },
         window_metadata={"progressive_scan": progress},
         next_attempt_at_unix=next_attempt_at,
@@ -6697,37 +6855,61 @@ def _process_ocr_window(
                 / f"{job.event_key.rsplit(':', 1)[-1][:8]}.ocr.mp4"
             )
             try:
-                located, materialized, _paths = _locate_ocr_window_across_components(
-                    job,
-                    segments,
-                    window_start=window_start,
-                    window_end=window_end,
-                    analysis_path=analysis_path,
-                    ffmpeg=ffmpeg,
-                    ocr_python=ocr_python,
-                    ocr_timeout_seconds=ocr_timeout_seconds,
-                    minimum_component_seconds=max(3.0, min_degraded_seconds),
-                    sample_interval_seconds=(
-                        OCR_PROGRESSIVE_TARGET_RESCAN_SAMPLE_INTERVAL_SECONDS
-                        if target_rescan_pending
-                        or mapped_target_ready
-                        or force_final_scan
-                        else 1.0
-                    ),
-                    # Target-centred scans are already bounded to the small
-                    # predicted/retry window. Scan them densely from the
-                    # first pass so a short retained component does not yield
-                    # only one 10-second coarse sample.
-                    coarse_sample_interval_seconds=(
-                        None
-                        if target_rescan_pending
-                        or mapped_target_ready
-                        or force_final_scan
-                        else DEFAULT_COARSE_SAMPLE_INTERVAL_SECONDS
-                    ),
-                    cancel_event=cancel_event,
+                job, located, materialized, _paths, cache_recovery_attempted = (
+                    _locate_ocr_window_with_cached_profile_recovery(
+                        job,
+                        runtime,
+                        cached_scoreboard_roi,
+                        lambda candidate_job: _locate_ocr_window_across_components(
+                            candidate_job,
+                            segments,
+                            window_start=window_start,
+                            window_end=window_end,
+                            analysis_path=analysis_path,
+                            ffmpeg=ffmpeg,
+                            ocr_python=ocr_python,
+                            ocr_timeout_seconds=ocr_timeout_seconds,
+                            minimum_component_seconds=max(
+                                3.0, min_degraded_seconds
+                            ),
+                            sample_interval_seconds=(
+                                OCR_PROGRESSIVE_TARGET_RESCAN_SAMPLE_INTERVAL_SECONDS
+                                if target_rescan_pending
+                                or mapped_target_ready
+                                or force_final_scan
+                                else 1.0
+                            ),
+                            # Target-centred scans are already bounded to the
+                            # small predicted/retry window. Scan them densely
+                            # from the first pass so a short retained
+                            # component does not yield only one 10-second
+                            # coarse sample.
+                            coarse_sample_interval_seconds=(
+                                None
+                                if target_rescan_pending
+                                or mapped_target_ready
+                                or force_final_scan
+                                else DEFAULT_COARSE_SAMPLE_INTERVAL_SECONDS
+                            ),
+                            cancel_event=cancel_event,
+                        ),
+                        allow_retry=lambda mismatch: not _ocr_recoverable_profile_mismatch(
+                            mismatch.kind,
+                            mismatch.diagnostics,
+                            clock_samples,
+                        ),
+                    )
                 )
+                if cache_recovery_attempted:
+                    cached_scoreboard_roi = None
             except VisualLocationFailed as exc:
+                cache_recovery = exc.diagnostics.get(
+                    "scoreboard_roi_cache_recovery"
+                )
+                cache_recovery_attempted = bool(
+                    isinstance(cache_recovery, dict)
+                    and cache_recovery.get("attempted")
+                )
                 recoverable_profile_mismatch = bool(
                     job.clock_only
                     and progressive_scan
@@ -6737,7 +6919,12 @@ def _process_ocr_window(
                         clock_samples,
                     )
                 )
-                if not recoverable_profile_mismatch:
+                cache_bypass_requested = bool(
+                    recoverable_profile_mismatch
+                    and cached_scoreboard_roi is not None
+                    and job.scoreboard_profile is not None
+                )
+                if not recoverable_profile_mismatch and not cache_recovery_attempted:
                     _record_scoreboard_roi_failure(
                         runtime,
                         job,
@@ -7120,6 +7307,12 @@ def _process_ocr_window(
                             recoverable_profile_mismatch
                         ),
                         "scoreboard_roi_cache": readiness_roi_cache,
+                        "scoreboard_roi_cache_bypass": cache_bypass_requested,
+                        "scoreboard_roi_cache_bypass_reason": (
+                            "short_probe_profile_mismatch"
+                            if cache_bypass_requested
+                            else None
+                        ),
                         "predicted_target_media_ready": predicted_target_media_ready,
                         "predicted_target_scan_window": (
                             {

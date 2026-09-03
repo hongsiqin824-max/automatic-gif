@@ -4883,6 +4883,70 @@ def _independent_stoppage_elapsed_seconds(texts: Sequence[str]) -> int | None:
     return parsed.clock_seconds
 
 
+def _clock_layout_kind(parsed: ParsedMatchClock) -> str:
+    """Classify a single parsed clock without guessing on ambiguity."""
+    if parsed.clock_seconds is None or parsed.ambiguous:
+        return "unknown"
+    if parsed.clock_format in {"stoppage", "added_stopwatch"}:
+        return "stoppage"
+    if parsed.clock_format in {"continuous", "compact"}:
+        return "normal"
+    return "unknown"
+
+
+def _stoppage_primary_layout(
+    main_results: Sequence[tuple[list[str], list[float]]],
+    *,
+    base_minute: int,
+) -> tuple[str, dict[str, Any]]:
+    """Decide whether the primary clock is a frozen half-time base.
+
+    An auxiliary right/below stopwatch is safe only when the primary clock
+    repeatedly shows the expected 45:00/90:00 base. Any explicit stoppage
+    format, advanced total clock, or unresolved ambiguity disables the
+    auxiliary scan so the ordinary primary-clock path remains authoritative.
+    """
+    counts = {
+        "normal_before_base": 0,
+        "normal_base": 0,
+        "normal_advanced": 0,
+        "stoppage": 0,
+        "unknown": 0,
+    }
+    for texts, _confidences in main_results:
+        parsed = parse_clock_texts(texts)
+        layout = _clock_layout_kind(parsed)
+        if layout == "normal" and parsed.clock_seconds == base_minute * 60:
+            counts["normal_base"] += 1
+        elif layout == "normal":
+            counts[
+                "normal_before_base"
+                if parsed.clock_seconds < base_minute * 60
+                else "normal_advanced"
+            ] += 1
+        elif layout == "stoppage":
+            counts["stoppage"] += 1
+        else:
+            counts["unknown"] += 1
+
+    if counts["stoppage"]:
+        layout, reason = "unknown", "stoppage_clock_present"
+    elif counts["normal_advanced"]:
+        layout, reason = "unknown", "main_clock_not_frozen_at_base"
+    elif counts["normal_base"] < INDEPENDENT_STOPPAGE_MIN_OBSERVATIONS:
+        layout, reason = "unknown", "insufficient_normal_base_observations"
+    else:
+        layout, reason = "normal", "confirmed_frozen_base_clock"
+    return layout, {
+        "layout": layout,
+        "reason": reason,
+        "base_minute": base_minute,
+        "observed_frame_count": len(main_results),
+        **counts,
+        "minimum_normal_base_observations": INDEPENDENT_STOPPAGE_MIN_OBSERVATIONS,
+    }
+
+
 def _confirmed_independent_stoppage_overrides(
     main_results: Sequence[tuple[list[str], list[float]]],
     candidate_frames: Sequence[
@@ -4915,17 +4979,20 @@ def _confirmed_independent_stoppage_overrides(
         for frame_index in range(frame_count):
             main_texts, _main_confidences = main_results[frame_index]
             main_clock = parse_clock_texts(main_texts)
+            main_layout = _clock_layout_kind(main_clock)
             result = candidate_frames[frame_index].get(label, ([], []))
             texts, confidences = result
             elapsed = _independent_stoppage_elapsed_seconds(texts)
             main_is_frozen_base = bool(
-                main_clock.clock_seconds == base_minute * 60
+                main_layout == "normal"
+                and main_clock.clock_seconds == base_minute * 60
                 and not main_clock.ambiguous
             )
             observations.append({
                 "frame_index": frame_index,
                 "texts": list(texts),
                 "elapsed_seconds": elapsed,
+                "main_clock_layout": main_layout,
                 "main_is_frozen_base": main_is_frozen_base,
             })
             confidence = min((float(value) for value in confidences), default=0.0)
@@ -4971,6 +5038,19 @@ def _confirmed_independent_stoppage_overrides(
     if not confirmed:
         return {}, diagnostics
 
+    channel_origins = {
+        label: sum(
+            elapsed - frame_index * sample_interval
+            for frame_index, elapsed, _confidence in run
+        ) / len(run)
+        for label, run in confirmed.items()
+    }
+    origin_tolerance = max(2.0, sample_interval * 0.75)
+    channel_timeline_conflict = bool(
+        len(channel_origins) > 1
+        and max(channel_origins.values()) - min(channel_origins.values())
+        > origin_tolerance
+    )
     overrides: dict[int, tuple[list[str], list[float]]] = {}
     conflicts: list[int] = []
     for frame_index in range(frame_count):
@@ -4992,11 +5072,34 @@ def _confirmed_independent_stoppage_overrides(
             [f"{base_minute}+{added_minute}:{second:02d}"],
             [confidence],
         )
+    if channel_timeline_conflict or conflicts:
+        diagnostics.update({
+            "confirmed": False,
+            "confirmed_channels": sorted(confirmed),
+            "confirmed_frame_indices": [],
+            "conflicting_frame_indices": conflicts,
+            "conflicting_channels": sorted(confirmed),
+            "channel_timeline_conflict": channel_timeline_conflict,
+            "channel_timeline_origins_seconds": {
+                label: round(origin, 3)
+                for label, origin in channel_origins.items()
+            },
+            "channel_timeline_origin_tolerance_seconds": origin_tolerance,
+            "method": None,
+        })
+        return {}, diagnostics
     diagnostics.update({
         "confirmed": bool(overrides),
         "confirmed_channels": sorted(confirmed),
         "confirmed_frame_indices": sorted(overrides),
         "conflicting_frame_indices": conflicts,
+        "conflicting_channels": [],
+        "channel_timeline_conflict": False,
+        "channel_timeline_origins_seconds": {
+            label: round(origin, 3)
+            for label, origin in channel_origins.items()
+        },
+        "channel_timeline_origin_tolerance_seconds": origin_tolerance,
         "method": (
             "independent_stoppage_stopwatch" if overrides else None
         ),
@@ -5826,83 +5929,113 @@ def run_request(
             remaining_missing_start = _first_clock_missing_run(recognized, crop_kinds)
             auto_diagnostics["remaining_missing_start"] = remaining_missing_start
         if independent_stoppage_base is not None:
-            try:
-                if profile is not None:
-                    assert profile_diagnostics is not None
-                    frame_width, frame_height = profile_diagnostics["frame_resolution"]
-                    stoppage_clock_roi = tuple(profile_diagnostics["clock_roi"])
-                else:
-                    assert auto_tracker is not None
-                    assert auto_tracker.clock_roi is not None
-                    frame_width, frame_height = (
-                        auto_tracker.frame_width,
-                        auto_tracker.frame_height,
-                    )
-                    stoppage_clock_roi = auto_tracker.clock_roi
-                stoppage_paths, stoppage_labels, extraction_diagnostics = (
-                    extract_independent_stoppage_frames(
-                        candidate_path,
-                        Path(directory),
-                        ffmpeg=ffmpeg,
-                        sample_interval_seconds=sample_interval,
-                        frame_width=int(frame_width),
-                        frame_height=int(frame_height),
-                        clock_roi=stoppage_clock_roi,
-                        maximum_frames=maximum_frames,
-                        deadline_monotonic=deadline_monotonic,
-                        input_format=candidate_input_format,
-                        input_seek_seconds=candidate_seek_seconds,
-                        input_duration_seconds=candidate_duration_seconds,
-                    )
-                )
-                stoppage_recognized, stoppage_failed_frames = (
-                    _recognize_request_paths(
-                        stoppage_paths,
-                        ["clock"] * len(stoppage_paths),
-                        engine=engine,
-                        batch_worker=batch_worker,
-                        request=request,
-                        profile_id=f"{profile_id}:independent_stoppage",
-                        sample_interval=sample_interval,
-                        minimum_confidence=minimum_confidence,
-                        inference_batch_size=inference_batch_size,
-                        deadline_monotonic=deadline_monotonic,
-                    )
-                )
-                stoppage_recognized, stoppage_repairs = (
-                    _normalize_clock_recognition_results(
-                        stoppage_recognized,
-                        ["clock"] * len(stoppage_recognized),
-                        source="independent_stoppage",
-                    )
-                )
-                independent_stoppage_frames = (
-                    _independent_stoppage_results_by_frame(
-                        stoppage_recognized,
-                        stoppage_labels,
-                    )
-                )
+            main_results_for_layout = (
+                [
+                    frame.get("clock", ([], []))
+                    for frame in _auto_results_by_frame(recognized, crop_kinds)
+                ]
+            )
+            primary_layout, primary_layout_diagnostics = _stoppage_primary_layout(
+                main_results_for_layout,
+                base_minute=independent_stoppage_base,
+            )
+            independent_stoppage_diagnostics["primary_clock_layout"] = (
+                primary_layout_diagnostics
+            )
+            if primary_layout != "normal":
                 independent_stoppage_diagnostics.update({
-                    "status": "analyzed",
-                    "extraction": extraction_diagnostics,
-                    "failed_frame_count": len(stoppage_failed_frames),
-                    "character_repairs": stoppage_repairs,
-                })
-            except (OSError, ValueError, WorkerError) as exc:
-                error = (
-                    exc.as_dict()
-                    if isinstance(exc, WorkerError)
-                    else {
-                        "kind": "independent_stoppage_analysis_failed",
-                        "message": str(exc),
-                        "diagnostics": {},
-                    }
-                )
-                independent_stoppage_diagnostics.update({
-                    "status": "failed",
+                    "status": "skipped",
                     "fallback": "primary_clock",
-                    "error": error,
+                    "reason": "unknown_layout",
+                    "error": {
+                        "kind": "unknown_layout",
+                        "message": (
+                            "primary match clock layout was not confirmed as a "
+                            "frozen normal half-time base"
+                        ),
+                        "diagnostics": primary_layout_diagnostics,
+                    },
                 })
+            else:
+                try:
+                    if profile is not None:
+                        assert profile_diagnostics is not None
+                        frame_width, frame_height = profile_diagnostics[
+                            "frame_resolution"
+                        ]
+                        stoppage_clock_roi = tuple(profile_diagnostics["clock_roi"])
+                    else:
+                        assert auto_tracker is not None
+                        assert auto_tracker.clock_roi is not None
+                        frame_width, frame_height = (
+                            auto_tracker.frame_width,
+                            auto_tracker.frame_height,
+                        )
+                        stoppage_clock_roi = auto_tracker.clock_roi
+                    stoppage_paths, stoppage_labels, extraction_diagnostics = (
+                        extract_independent_stoppage_frames(
+                            candidate_path,
+                            Path(directory),
+                            ffmpeg=ffmpeg,
+                            sample_interval_seconds=sample_interval,
+                            frame_width=int(frame_width),
+                            frame_height=int(frame_height),
+                            clock_roi=stoppage_clock_roi,
+                            maximum_frames=maximum_frames,
+                            deadline_monotonic=deadline_monotonic,
+                            input_format=candidate_input_format,
+                            input_seek_seconds=candidate_seek_seconds,
+                            input_duration_seconds=candidate_duration_seconds,
+                        )
+                    )
+                    stoppage_recognized, stoppage_failed_frames = (
+                        _recognize_request_paths(
+                            stoppage_paths,
+                            ["clock"] * len(stoppage_paths),
+                            engine=engine,
+                            batch_worker=batch_worker,
+                            request=request,
+                            profile_id=f"{profile_id}:independent_stoppage",
+                            sample_interval=sample_interval,
+                            minimum_confidence=minimum_confidence,
+                            inference_batch_size=inference_batch_size,
+                            deadline_monotonic=deadline_monotonic,
+                        )
+                    )
+                    stoppage_recognized, stoppage_repairs = (
+                        _normalize_clock_recognition_results(
+                            stoppage_recognized,
+                            ["clock"] * len(stoppage_recognized),
+                            source="independent_stoppage",
+                        )
+                    )
+                    independent_stoppage_frames = (
+                        _independent_stoppage_results_by_frame(
+                            stoppage_recognized,
+                            stoppage_labels,
+                        )
+                    )
+                    independent_stoppage_diagnostics.update({
+                        "status": "analyzed",
+                        "extraction": extraction_diagnostics,
+                        "failed_frame_count": len(stoppage_failed_frames),
+                        "character_repairs": stoppage_repairs,
+                    })
+                except (OSError, ValueError, WorkerError) as exc:
+                    error = (
+                        exc.as_dict()
+                        if isinstance(exc, WorkerError)
+                        else {
+                            "kind": "independent_stoppage_analysis_failed",
+                            "message": str(exc),
+                            "diagnostics": {},
+                        }
+                    )
+                    independent_stoppage_diagnostics.update({
+                        "status": "failed",
+                        "fallback": "primary_clock",
+                        "error": error,
+                    })
         continuity_diagnostics: list[dict[str, Any]] | None = None
         profile_quality: dict[str, Any] | None = None
         if profile is not None:
@@ -5947,7 +6080,10 @@ def run_request(
                 independent_stoppage_diagnostics["confirmation"] = dict(confirmed)
                 if confirmed.get("confirmed"):
                     independent_stoppage_diagnostics["status"] = "confirmed"
-                elif independent_stoppage_diagnostics["status"] != "failed":
+                elif independent_stoppage_diagnostics["status"] not in {
+                    "failed",
+                    "skipped",
+                }:
                     independent_stoppage_diagnostics["status"] = "not_confirmed"
         if profile is not None:
             try:

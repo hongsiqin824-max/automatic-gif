@@ -30,6 +30,7 @@ from scoreboard_ocr_worker import (
     _profile_readings,
     _recognize_paths_shared,
     _restartable_backend_generation,
+    _stoppage_primary_layout,
     _validate_profile_content_quality,
     extract_auto_roi_frames,
     extract_independent_stoppage_frames,
@@ -827,6 +828,47 @@ class ProfileCropTests(unittest.TestCase):
                 if name == "static_stopwatch":
                     self.assertTrue(diagnostics["static_candidate_rejected"])
 
+    def test_stoppage_layout_accepts_pre_base_transition_before_frozen_clock(self):
+        layout, diagnostics = _stoppage_primary_layout(
+            [
+                (["44:58"], [0.9]),
+                (["44:59"], [0.9]),
+                (["45:00"], [0.9]),
+                (["45:00"], [0.9]),
+                (["45:00"], [0.9]),
+            ],
+            base_minute=45,
+        )
+
+        self.assertEqual(layout, "normal")
+        self.assertEqual(diagnostics["reason"], "confirmed_frozen_base_clock")
+        self.assertEqual(diagnostics["normal_before_base"], 2)
+        self.assertEqual(diagnostics["normal_base"], 3)
+
+    def test_disjoint_conflicting_stoppage_channels_are_all_rejected(self):
+        main = [(["90:00"], [0.9])] * 6
+        auxiliary = [
+            {"right": ([clock], [0.9])}
+            for clock in ("2:16", "2:17", "2:18")
+        ] + [
+            {"below": ([clock], [0.9])}
+            for clock in ("5:00", "5:01", "5:02")
+        ]
+
+        overrides, diagnostics = _confirmed_independent_stoppage_overrides(
+            main,
+            auxiliary,
+            base_minute=90,
+            sample_interval=1,
+        )
+
+        self.assertEqual(overrides, {})
+        self.assertFalse(diagnostics["confirmed"])
+        self.assertTrue(diagnostics["channel_timeline_conflict"])
+        self.assertEqual(
+            diagnostics["conflicting_channels"], ["below", "right"]
+        )
+
     def test_existing_combined_stoppage_formats_are_not_overridden(self):
         auxiliary = [
             {"right": ([clock], [0.9])}
@@ -848,6 +890,30 @@ class ProfileCropTests(unittest.TestCase):
                 self.assertEqual(readings[0].clock_seconds, expected)
                 self.assertFalse(
                     continuity[0]["independent_stoppage"]["confirmed"]
+                )
+
+    def test_unknown_or_total_clock_layout_keeps_primary_clock_path(self):
+        auxiliary = [
+            {"right": ([clock], [0.9])}
+            for clock in ("2:16", "2:17", "2:18")
+        ]
+        for main_texts in (
+            ("90:00", "90+3"),  # conflicting normal/stoppage readings
+            ("93:10",),          # already a total elapsed clock
+        ):
+            with self.subTest(main_texts=main_texts):
+                main = [([*main_texts], [0.9] * len(main_texts))] * 3
+                overrides, diagnostics = _confirmed_independent_stoppage_overrides(
+                    main,
+                    auxiliary,
+                    base_minute=90,
+                    sample_interval=1,
+                )
+                self.assertEqual(overrides, {})
+                self.assertFalse(diagnostics["confirmed"])
+                self.assertEqual(
+                    diagnostics["observations"]["right"][0]["main_clock_layout"],
+                    "unknown" if len(main_texts) > 1 else "normal",
                 )
 
     def test_clock_only_locates_exact_second_after_stream_gap_resynchronization(self):
@@ -1712,6 +1778,7 @@ class ProfileCropTests(unittest.TestCase):
             candidate.write_bytes(b"video")
             main_paths = [Path(f"clock-{index}.png") for index in range(3)]
             with (
+                self.assertRaises(WorkerError) as raised,
                 patch(
                     "scoreboard_ocr_worker.extract_profile_clock_frames",
                     return_value=(
@@ -1731,6 +1798,67 @@ class ProfileCropTests(unittest.TestCase):
                         "ocr_frame_extraction_failed", "auxiliary crop failed"
                     ),
                 ),
+                patch(
+                    "scoreboard_ocr_worker._recognize_request_paths",
+                    return_value=(
+                        [
+                            (["45:00"], [0.9]),
+                            (["45:00"], [0.9]),
+                            (["45:00"], [0.9]),
+                        ],
+                        [],
+                    ),
+                ),
+                patch(
+                    "scoreboard_ocr_worker._validate_profile_content_quality",
+                    return_value={},
+                ),
+            ):
+                run_request(
+                    {
+                        "candidate_path": str(candidate),
+                        "event_code": "G",
+                        "event_minute": "45+2",
+                        "event_second": 47 * 60 + 17,
+                        "clock_only": True,
+                        "scoreboard_profile": profile,
+                    },
+                    engine=object(),
+                )
+
+        independent = raised.exception.diagnostics["independent_stoppage"]
+        self.assertEqual(independent["status"], "failed")
+        self.assertEqual(independent["fallback"], "primary_clock")
+        self.assertEqual(
+            independent["error"]["kind"], "ocr_frame_extraction_failed"
+        )
+
+    def test_stoppage_analysis_skips_when_primary_clock_is_already_advancing(self):
+        profile = ProfileCropTests._profile()
+        with tempfile.TemporaryDirectory() as directory:
+            candidate = Path(directory) / "candidate.mp4"
+            candidate.write_bytes(b"video")
+            main_paths = [Path(f"clock-{index}.png") for index in range(3)]
+            with (
+                patch(
+                    "scoreboard_ocr_worker.extract_profile_clock_frames",
+                    return_value=(
+                        main_paths,
+                        {
+                            "profile_id": profile.profile_id,
+                            "clock_only": True,
+                            "frame_resolution": [1920, 1080],
+                            "clock_roi": [100, 40, 220, 90],
+                            "score_roi": None,
+                        },
+                    ),
+                ),
+                patch(
+                    "scoreboard_ocr_worker.extract_independent_stoppage_frames",
+                    side_effect=AssertionError(
+                        "unknown primary layout must not trigger auxiliary OCR"
+                    ),
+                ) as auxiliary_extraction,
                 patch(
                     "scoreboard_ocr_worker._recognize_request_paths",
                     return_value=(
@@ -1755,12 +1883,13 @@ class ProfileCropTests(unittest.TestCase):
                     engine=object(),
                 )
 
-        self.assertEqual(result["anchor_seconds"], 1.0)
+        auxiliary_extraction.assert_not_called()
         independent = result["diagnostics"]["independent_stoppage"]
-        self.assertEqual(independent["status"], "failed")
-        self.assertEqual(independent["fallback"], "primary_clock")
+        self.assertEqual(independent["status"], "skipped")
+        self.assertEqual(independent["reason"], "unknown_layout")
         self.assertEqual(
-            independent["error"]["kind"], "ocr_frame_extraction_failed"
+            independent["primary_clock_layout"]["reason"],
+            "main_clock_not_frozen_at_base",
         )
 
     def test_auto_run_disables_discovered_score_rois(self):

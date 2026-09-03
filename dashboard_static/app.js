@@ -593,6 +593,7 @@ function visionPresentation(vision, enabled = true, resourceWait = null) {
       ocr_range_fallback:{label:vision.fallback_complete === true ? '未精确定位 · 120 秒范围 GIF 已生成' : '未精确定位 · 残缺范围 GIF 已生成',cls:'warning'},
       ocr_no_clock_detected:{label:'没有读到画面上的比赛时间',cls:'failed'},
       ocr_target_timeout:{label:'查找比赛时间超时',cls:'failed'},
+      ocr_clock_target_not_located:{label:'目标已越过但未完成可靠定位',cls:'failed'},
       ocr_target_media_not_arrived:{label:'视频还没播放到这个时间',cls:'failed'},
       ocr_target_media_stalled:{label:'视频暂时没有新画面',cls:'failed'},
       ocr_clock_paused_timeout:{label:'比赛时间暂时没有继续',cls:'failed'},
@@ -652,7 +653,7 @@ function visionFailureDetail(vision) {
     waiting_for_postroll:'等待目标后的画面', ocr_second_exact:'精确到秒', ocr_second_interpolated:'根据前后画面推算秒数', ocr_second_estimated:'估算附近几秒',
     ocr_second_projected:'时钟被遮挡后按前后时间推算',
     ocr_minute_fallback:'查找分钟附近画面', ocr_range_fallback:'生成接口时间范围兜底', ocr_no_clock_detected:'读取比赛时间',
-    ocr_target_timeout:'查找接口对应时间', ocr_window_evicted:'查找历史画面',
+    ocr_target_timeout:'查找接口对应时间', ocr_clock_target_not_located:'验证目标画面', ocr_window_evicted:'查找历史画面',
     ocr_target_media_not_arrived:'等待目标画面', ocr_target_media_stalled:'等待新画面',
     ocr_clock_paused_timeout:'等待比赛时间继续',
     ocr_discontinuous_clock:'核对画面时间', ocr_encode_failed:'生成画面 GIF',
@@ -793,7 +794,7 @@ function ocrPipelineDiagnosticsText(vision) {
       ocr_window_encoding:'生成 GIF', buffer_coverage:'检查视频范围',
       waiting_for_clock_readiness:'确认比赛计时器', waiting_for_target_media:'等待目标画面',
       waiting_for_clock_target:'等待接口时间出现在画面中', waiting_for_postroll:'等待目标后面的画面',
-      ocr_no_clock_detected:'读取画面比赛时间', ocr_target_timeout:'查找目标画面',
+      ocr_no_clock_detected:'读取画面比赛时间', ocr_target_timeout:'查找目标画面', ocr_clock_target_not_located:'验证目标画面',
       ocr_target_before_recording:'核对录像开始时间', ocr_target_history_cleaned:'核对历史画面',
       ocr_window_evicted:'检查历史画面', ocr_discontinuous_clock:'核对比赛时间是否连贯',
       ocr_encode_failed:'生成 GIF', ocr_dependency_unavailable:'检查画面读取服务', ocr_incomplete:'比赛结束收尾', waiting_for_latest_tail_rescan:'扫描新增视频尾部'
@@ -1161,6 +1162,7 @@ function render(data) {
   for (const [id, src, letter] of [['team-a-logo', detail.team_A_logo, 'A'], ['team-b-logo', detail.team_B_logo, 'B']]) { const el = $(id); el.innerHTML = src ? `<img src="${escapeHtml(src)}" alt="">` : letter; }
   const source = data.source_health || {}; $('resource').textContent = source.resource || (source.error ? detailedErrorMessage(source.error, '暂时没有获取到直播地址') : '尚未获取直播地址'); $('updated-at').textContent = source.updated_at || '--'; $('source-change').classList.toggle('hidden', !source.changed);
   const setHealth = (id, text, cls) => { const el = $(id); el.textContent = text; el.className = cls || ''; };
+  const publishing = data.publishing || {}; const uploadBackend = String(publishing.ocr_image_upload_backend || ''); const uploadBackendLabel = uploadBackend === 'official' ? '懂球帝官方接口' : uploadBackend === 'self_hosted' ? '自有服务器' : '未配置'; const uploadBackendReady = publishing.ocr_image_upload_ready === true; setHealth('ocr-upload-backend', uploadBackend ? `${uploadBackendLabel}${uploadBackendReady ? '' : '（未配置）'}` : uploadBackendLabel, uploadBackendReady ? 'ok' : 'warn');
   const worker = data.worker || {}; const telemetry = data.telemetry || {}; const counts = telemetry.task_counts || {};
   const lifecycle = data.lifecycle || {}; const lifecycleState = lifecycle.state || '';
   syncSessionSelection(data, worker, lifecycle);

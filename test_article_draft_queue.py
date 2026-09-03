@@ -143,6 +143,109 @@ class ArticleDraftQueueTests(unittest.TestCase):
         self.assertEqual(decision["reason_code"], "trusted_ocr_edge_truncated")
         self.assertIn("自动发布", decision["reason"])
 
+    def test_publication_gate_allows_small_internal_gap_at_boundaries(self):
+        decision = ocr_publication_eligibility(
+            self.publication_result(
+                stitched_across_gap=True,
+                video_gap_count=1,
+                skipped_gap_seconds=8.0,
+                anchor_stream_time=126.0,
+                actual_media_window={
+                    "start_stream_time": 100.0,
+                    "end_stream_time": 152.0,
+                },
+                available_media_duration_seconds=52.0,
+                duration_sec=52.0,
+            )
+        )
+
+        self.assertTrue(decision["eligible"])
+        self.assertEqual(decision["reason_code"], "trusted_ocr_small_internal_gap")
+        self.assertEqual(decision["skipped_gap_seconds"], 8.0)
+        self.assertIn("允许自动发布", decision["reason"])
+
+    def test_publication_gate_allows_typical_three_second_gap(self):
+        decision = ocr_publication_eligibility(
+            self.publication_result(
+                stitched_across_gap=True,
+                video_gap_count=1,
+                skipped_gap_seconds=3.1,
+                anchor_stream_time=130.0,
+                actual_media_window={
+                    "start_stream_time": 100.0,
+                    "end_stream_time": 156.9,
+                },
+                available_media_duration_seconds=56.8,
+                duration_sec=56.8,
+            )
+        )
+
+        self.assertTrue(decision["eligible"])
+        self.assertEqual(decision["reason_code"], "trusted_ocr_small_internal_gap")
+        self.assertAlmostEqual(decision["skipped_gap_seconds"], 3.1)
+
+    def test_publication_gate_rejects_internal_gap_over_eight_seconds(self):
+        decision = ocr_publication_eligibility(
+            self.publication_result(
+                stitched_across_gap=True,
+                video_gap_count=1,
+                skipped_gap_seconds=8.1,
+            )
+        )
+
+        self.assertFalse(decision["eligible"])
+        self.assertEqual(decision["reason_code"], "internal_gap")
+        self.assertEqual(decision["skipped_gap_seconds"], 8.1)
+
+    def test_publication_gate_rejects_clip_below_52_seconds(self):
+        decision = ocr_publication_eligibility(
+            self.publication_result(
+                actual_media_window={
+                    "start_stream_time": 100.0,
+                    "end_stream_time": 151.9,
+                },
+                anchor_stream_time=126.0,
+                available_media_duration_seconds=51.9,
+                duration_sec=51.9,
+            )
+        )
+
+        self.assertFalse(decision["eligible"])
+        self.assertEqual(decision["reason_code"], "insufficient_coverage")
+
+    def test_small_internal_gap_enters_queue_and_publishes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = self.write_source(root)
+            platform = SequencePlatformClient()
+            queue = self.make_queue(root, platform)
+            artifact = self.publication_result(
+                stitched_across_gap=True,
+                video_gap_count=1,
+                skipped_gap_seconds=3.1,
+                available_media_duration_seconds=56.8,
+                duration_sec=56.8,
+                actual_media_window={
+                    "start_stream_time": 100.0,
+                    "end_stream_time": 156.9,
+                },
+            )
+
+            queued = self.enqueue(
+                queue,
+                match_id="54478914",
+                event=self.event(),
+                match_detail={"team_A_name": "主队"},
+                source_path=source,
+                artifact_result=artifact,
+            )
+            self.assertEqual(queued["status"], "queued")
+            self.assertTrue(queue.run_once())
+            record = queue.records_for_match("54478914")[self.event()["event_key"]]
+            self.assertEqual(record["status"], "published")
+            self.assertEqual(record["error_code"], None)
+            self.assertEqual(len(platform.calls), 1)
+
     def test_publication_gate_rejects_missing_event_side_even_when_duration_is_55(self):
         decision = ocr_publication_eligibility(
             self.publication_result(
@@ -210,6 +313,14 @@ class ArticleDraftQueueTests(unittest.TestCase):
             (
                 "internal_gap",
                 {"video_gap_count": 1},
+            ),
+            (
+                "internal_gap",
+                {
+                    "stitched_across_gap": True,
+                    "video_gap_count": 1,
+                    "skipped_gap_seconds": 0.0,
+                },
             ),
             (
                 "unverified_api_fallback",
@@ -639,11 +750,53 @@ class ArticleDraftQueueTests(unittest.TestCase):
             self.assertEqual(waiting["status"], "retry_wait")
             self.assertTrue(waiting["retriable"])
             self.assertEqual(waiting["next_attempt_at_unix"], 101.0)
+            refreshed = self.enqueue(
+                queue,
+                match_id="54478914",
+                event=self.event(),
+                match_detail={},
+                source_path=source,
+            )
+            self.assertEqual(refreshed["status"], "retry_wait")
+            self.assertEqual(refreshed["error_code"], waiting["error_code"])
+            self.assertEqual(refreshed["error"], waiting["error"])
+            self.assertEqual(
+                refreshed["next_attempt_at_unix"], waiting["next_attempt_at_unix"]
+            )
+            self.assertEqual(refreshed["diagnostics"], waiting["diagnostics"])
             self.assertFalse(queue.run_once(now=100.5))
             self.assertTrue(queue.run_once(now=101.0))
             completed = queue.records_for_match("54478914")[self.event()["event_key"]]
             self.assertEqual(completed["status"], "published")
             self.assertEqual(len(platform.calls), 2)
+
+    def test_retry_wait_preserves_deadline_when_refresh_has_no_ocr_metadata(self):
+        temporary_error = OpenPlatformError(
+            "平台暂时繁忙", code=50001, status_code=503, retriable=True
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = self.write_source(root)
+            queue = self.make_queue(
+                root,
+                SequencePlatformClient([temporary_error]),
+                retry_delays_seconds=(10, 20, 30, 40),
+            )
+            self.enqueue(queue, match_id="54478914", event=self.event(), match_detail={}, source_path=source)
+            self.assertTrue(queue.run_once(now=100.0))
+            before = queue.records_for_match("54478914")[self.event()["event_key"]]
+            refreshed = self.enqueue(
+                queue,
+                match_id="54478914",
+                event=self.event(),
+                match_detail={},
+                source_path=source,
+                artifact_result={},
+            )
+            self.assertEqual(refreshed["status"], "retry_wait")
+            self.assertEqual(refreshed["next_attempt_at_unix"], before["next_attempt_at_unix"])
+            self.assertEqual(refreshed["error_code"], before["error_code"])
+            self.assertFalse(queue.run_once(now=105.0))
 
     def test_manual_retry_exposes_platform_code_and_diagnostics(self):
         rejected = OpenPlatformError(
@@ -671,6 +824,19 @@ class ArticleDraftQueueTests(unittest.TestCase):
             self.assertIn("code=5", failed["error"])
             self.assertGreater(failed["diagnostics"]["gif_bytes"], 0)
             self.assertIn("match_id", failed["diagnostics"]["request_summary"])
+
+            refreshed = self.enqueue(
+                queue,
+                match_id="54478914",
+                event=self.event(),
+                match_detail={"team_A_name": "主队", "team_B_name": "客队"},
+                source_path=source,
+            )
+            self.assertEqual(refreshed["status"], "failed")
+            self.assertEqual(refreshed["error_code"], failed["error_code"])
+            self.assertEqual(refreshed["error"], failed["error"])
+            self.assertEqual(refreshed["platform_code"], failed["platform_code"])
+            self.assertEqual(refreshed["diagnostics"], failed["diagnostics"])
 
             queued = queue.retry(
                 match_id="54478914", event_key=self.event()["event_key"]

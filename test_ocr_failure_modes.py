@@ -11,6 +11,7 @@ from pipeline_runtime import PipelineRuntime
 from vision_runtime import (
     VisionJob,
     VisualLocationFailed,
+    _job_with_cached_scoreboard_profile,
     _ocr_recoverable_profile_mismatch,
     _ocr_target_not_located_diagnostics,
     _ocr_progressive_coverage_diagnostics,
@@ -432,6 +433,7 @@ class OcrFailureModeTests(unittest.TestCase):
                 progress = waiting.window_metadata["progressive_scan"]
                 self.assertEqual(progress["clock_mapping"]["status"], "ready")
                 self.assertEqual(progress["latest_trusted_clock_seconds"], 54)
+                self.assertTrue(progress["scoreboard_roi_cache_bypass"])
                 self.assertTrue(
                     progress["last_scan_diagnostics"][
                         "recoverable_profile_mismatch"
@@ -445,6 +447,12 @@ class OcrFailureModeTests(unittest.TestCase):
                 roi_cache = runtime.store.get_scoreboard_roi_cache(job.match_id)
                 self.assertIsNotNone(roi_cache)
                 self.assertEqual(roi_cache.failure_streak, 0)
+                next_job, next_cached = _job_with_cached_scoreboard_profile(
+                    runtime,
+                    job,
+                )
+                self.assertIsNone(next_job.scoreboard_profile)
+                self.assertIsNone(next_cached)
                 default_task = runtime.store.get(job.event_key)
                 self.assertEqual(default_task.status, "encoded")
                 self.assertEqual(default_task.result["source"], "default")
