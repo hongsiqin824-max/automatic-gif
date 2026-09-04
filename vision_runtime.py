@@ -334,7 +334,11 @@ def _profile_configuration_error(job: "VisionJob") -> tuple[str, str] | None:
     return None
 
 
-def _walk_diagnostic_dicts(value: Any) -> list[dict[str, Any]]:
+def _walk_diagnostic_dicts(
+    value: Any,
+    *,
+    excluded_keys: frozenset[str] = frozenset(),
+) -> list[dict[str, Any]]:
     found: list[dict[str, Any]] = []
     stack = [value]
     visited: set[int] = set()
@@ -346,7 +350,11 @@ def _walk_diagnostic_dicts(value: Any) -> list[dict[str, Any]]:
                 continue
             visited.add(identity)
             found.append(item)
-            stack.extend(item.values())
+            stack.extend(
+                child
+                for key, child in item.items()
+                if str(key) not in excluded_keys
+            )
         elif isinstance(item, (list, tuple)):
             stack.extend(item)
     return found
@@ -358,7 +366,19 @@ def _scoreboard_roi_profile_from_result(
 ) -> tuple[dict[str, Any], float | None] | None:
     """Build a reusable fixed profile from successful auto-discovery output."""
     confidence: float | None = None
-    for item in _walk_diagnostic_dicts(value):
+    # ``fragment_attempts`` contains failed/partial scans from other TS
+    # fragments.  Those diagnostics may contain a plausible-looking ROI, but
+    # they are not evidence that the selected final result succeeded there.
+    # Only walk the selected result and its successful diagnostics tree.
+    successful_diagnostics = _walk_diagnostic_dicts(
+        value,
+        excluded_keys=frozenset({
+            "fragment_attempts",
+            "failed_attempts",
+            "failure_attempts",
+        }),
+    )
+    for item in successful_diagnostics:
         raw_rate = item.get("clock_readable_rate")
         if raw_rate is not None:
             try:
@@ -401,7 +421,14 @@ def _scoreboard_roi_profile_from_result(
 
 
 def _scoreboard_result_frame_resolution(value: Any) -> tuple[int, int] | None:
-    for item in _walk_diagnostic_dicts(value):
+    for item in _walk_diagnostic_dicts(
+        value,
+        excluded_keys=frozenset({
+            "fragment_attempts",
+            "failed_attempts",
+            "failure_attempts",
+        }),
+    ):
         resolution = item.get("frame_resolution")
         if not isinstance(resolution, (list, tuple)) or len(resolution) != 2:
             continue
@@ -412,6 +439,74 @@ def _scoreboard_result_frame_resolution(value: Any) -> tuple[int, int] | None:
         if width > 0 and height > 0:
             return width, height
     return None
+
+
+def _scoreboard_result_layout_mode(
+    job: "VisionJob", value: Any
+) -> str | None:
+    """Classify the cache bucket from successful OCR evidence when possible.
+
+    The API event minute is only a target.  A delayed event can target ``90+5``
+    while the selected frame still shows 89:50, which belongs to the normal
+    layout.  Explicit phase/text evidence wins; numeric readings are used only
+    to disambiguate a stoppage target that has not reached its boundary.
+    """
+    target_mode = _scoreboard_layout_mode(job)
+    phases: set[str] = set()
+    stoppage_text = False
+    observed_clocks: list[int] = []
+    for item in _walk_diagnostic_dicts(
+        value,
+        excluded_keys=frozenset({
+            "fragment_attempts",
+            "failed_attempts",
+            "failure_attempts",
+        }),
+    ):
+        for key in ("clock_phase", "phase"):
+            normalized = _normalize_ocr_clock_phase(item.get(key))
+            if normalized is not None:
+                phases.add(normalized)
+        for key in ("clock", "observed_clock"):
+            raw = item.get(key)
+            if isinstance(raw, str) and "+" in raw:
+                stoppage_text = True
+        raw_clock_texts = item.get("clock_texts")
+        if isinstance(raw_clock_texts, (list, tuple)) and any(
+            isinstance(raw, str) and "+" in raw for raw in raw_clock_texts
+        ):
+            stoppage_text = True
+        for key in ("observed_clock_seconds", "effective_clock_seconds", "clock_seconds"):
+            raw = item.get(key)
+            if isinstance(raw, bool):
+                continue
+            try:
+                parsed = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if parsed >= 0:
+                observed_clocks.append(parsed)
+
+    phase_modes = {
+        "stoppage" if phase.endswith("_stoppage") else "normal"
+        for phase in phases
+    }
+    if len(phase_modes) == 1:
+        return next(iter(phase_modes))
+    if len(phase_modes) > 1 or stoppage_text:
+        return "stoppage" if not (phase_modes == {"normal"}) else None
+
+    # A numeric reading before the relevant 45/90 boundary contradicts a
+    # stoppage target.  Do not let the event target contaminate that cache row.
+    if target_mode == "stoppage" and observed_clocks:
+        minute = str(_event_minute(job)).split("+", 1)[0].rstrip("'").strip()
+        try:
+            boundary = int(float(minute)) * 60
+        except (TypeError, ValueError):
+            boundary = None
+        if boundary is not None and max(observed_clocks) < boundary:
+            return "normal"
+    return target_mode
 
 
 def _job_with_cached_scoreboard_profile(
@@ -464,7 +559,7 @@ def _record_scoreboard_roi_success(
         # Operator-provided profiles are configuration, not auto-discovery.
         # Never copy or replace them through the automatic ROI cache.
         return None
-    layout_mode = _scoreboard_layout_mode(job)
+    layout_mode = _scoreboard_result_layout_mode(job, located)
     saver_v2 = getattr(runtime.store, "save_scoreboard_roi_cache_v2", None)
     if not callable(saver_v2):
         return None
@@ -503,6 +598,12 @@ def _record_scoreboard_roi_success(
         confidence=confidence,
         expected_profile_fingerprint=old_profile_fingerprint,
         expected_resolution_key=old_resolution_key,
+        expected_updated_at_unix=(
+            getattr(cached, "updated_at_unix", None) if cached is not None else None
+        ),
+        expected_failure_streak=(
+            getattr(cached, "failure_streak", None) if cached is not None else None
+        ),
     )
     write_applied = bool(
         stored is not None and getattr(stored, "profile", None) == profile
@@ -575,6 +676,8 @@ def _record_scoreboard_roi_failure(
             resolution_key,
             invalidate=error_kind == "clock_profile_mismatch",
             profile_fingerprint=getattr(cached, "profile_fingerprint", None),
+            expected_updated_at_unix=getattr(cached, "updated_at_unix", None),
+            expected_failure_streak=getattr(cached, "failure_streak", None),
         )
         return
 

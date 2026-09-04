@@ -112,6 +112,8 @@ OPEN_PLATFORM_TOKEN_PATH=./data/open-platform-token.json
 # 默认使用自有服务器上传；只有明确改为 official 才调用懂球帝图片接口。
 OCR_IMAGE_UPLOAD_BACKEND=self_hosted
 OPEN_PLATFORM_IMAGE_UPLOAD_TOKEN=<app 登录 token>
+# 官方图片上传单独超时，范围 60～120 秒，默认 120 秒。
+OPEN_PLATFORM_IMAGE_UPLOAD_TIMEOUT_SECONDS=120
 ```
 
 When a local Dashboard **发布** button is clicked, the local process:

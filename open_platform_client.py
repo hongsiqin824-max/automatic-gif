@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import secrets
@@ -23,6 +24,9 @@ DEFAULT_API_NAME = "admin-archive-createarticle"
 IMAGE_UPLOAD_API_NAME = "image-uploadimage-ai"
 TOKEN_REFRESH_LEEWAY_SECONDS = 5 * 60
 OAUTH_STATE_TTL_SECONDS = 10 * 60
+DEFAULT_IMAGE_UPLOAD_TIMEOUT_SECONDS = 120.0
+MIN_IMAGE_UPLOAD_TIMEOUT_SECONDS = 60.0
+MAX_IMAGE_UPLOAD_TIMEOUT_SECONDS = 120.0
 
 
 class OpenPlatformError(RuntimeError):
@@ -68,6 +72,7 @@ class OpenPlatformConfig:
     token_path: Path
     token_service_url: str = ""
     image_upload_token: str = ""
+    image_upload_timeout_seconds: float = DEFAULT_IMAGE_UPLOAD_TIMEOUT_SECONDS
 
     @classmethod
     def from_environment(cls, root: Path) -> "OpenPlatformConfig":
@@ -89,7 +94,38 @@ class OpenPlatformConfig:
             image_upload_token=os.environ.get(
                 "OPEN_PLATFORM_IMAGE_UPLOAD_TOKEN", ""
             ).strip(),
+            image_upload_timeout_seconds=_image_upload_timeout_from_environment(),
         )
+
+
+def _image_upload_timeout_from_environment() -> float:
+    """Read the official image-upload timeout with a bounded safe range."""
+    raw_value = os.environ.get(
+        "OPEN_PLATFORM_IMAGE_UPLOAD_TIMEOUT_SECONDS",
+        str(DEFAULT_IMAGE_UPLOAD_TIMEOUT_SECONDS),
+    ).strip()
+    try:
+        value = float(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "OPEN_PLATFORM_IMAGE_UPLOAD_TIMEOUT_SECONDS 必须是 60 到 120 秒之间的数字"
+        ) from exc
+    if not _valid_image_upload_timeout(value):
+        raise RuntimeError(
+            "OPEN_PLATFORM_IMAGE_UPLOAD_TIMEOUT_SECONDS 必须是 60 到 120 秒之间的数字"
+        )
+    return value
+
+
+def _valid_image_upload_timeout(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+        and MIN_IMAGE_UPLOAD_TIMEOUT_SECONDS
+        <= float(value)
+        <= MAX_IMAGE_UPLOAD_TIMEOUT_SECONDS
+    )
 
 
 def sign_query(parameters: dict[str, Any], app_secret: str) -> str:
@@ -124,6 +160,11 @@ class OpenPlatformClient:
     ) -> None:
         self.config = config
         self.request_timeout_seconds = request_timeout_seconds
+        if not _valid_image_upload_timeout(config.image_upload_timeout_seconds):
+            raise ValueError(
+                "官方图片上传超时必须是 60 到 120 秒之间的数字"
+            )
+        self.image_upload_timeout_seconds = float(config.image_upload_timeout_seconds)
         self._lock = threading.RLock()
         self._oauth_states: dict[str, float] = {}
         self._token_cache: dict[str, Any] | None | object = _UNSET
@@ -189,6 +230,7 @@ class OpenPlatformClient:
             "multipart_fields": ["file1", "file2"],
             "max_file_bytes": 20 * 1024 * 1024,
             "animated_gif_supported": True,
+            "timeout_seconds": self.image_upload_timeout_seconds,
         }
 
     def _token_service_status(self) -> dict[str, Any]:
@@ -530,6 +572,7 @@ class OpenPlatformClient:
                 url,
                 body=body,
                 content_type=f"multipart/form-data; boundary={boundary}",
+                timeout_seconds=self.image_upload_timeout_seconds,
                 # This image endpoint expects the original token value, not
                 # the OAuth `Bearer <token>` scheme used by article creation.
                 authorization=access_token,
@@ -800,6 +843,7 @@ class OpenPlatformClient:
         body: bytes,
         content_type: str,
         authorization: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
         headers = {
             "Accept": "application/json",
@@ -812,7 +856,12 @@ class OpenPlatformClient:
         request = urllib.request.Request(url, data=body, method=method, headers=headers)
         try:
             with urllib.request.urlopen(
-                request, timeout=self.request_timeout_seconds
+                request,
+                timeout=(
+                    self.request_timeout_seconds
+                    if timeout_seconds is None
+                    else timeout_seconds
+                ),
             ) as response:
                 raw = response.read().decode("utf-8", errors="replace")
                 payload = _parse_json(raw)

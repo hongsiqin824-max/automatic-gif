@@ -470,6 +470,63 @@ class ScoreboardRoiCacheTests(unittest.TestCase):
             finally:
                 runtime.close()
 
+    def test_cache_version_guards_are_checked_for_success_and_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = PipelineRuntime(root / "state.sqlite3", root / "events.jsonl")
+            profile = self._profile()
+            try:
+                cached = runtime.store.save_scoreboard_roi_cache_v2(
+                    "match-version-guard",
+                    "normal",
+                    "1920x1080",
+                    profile,
+                    now=100.0,
+                )
+                stale = runtime.store.save_scoreboard_roi_cache_v2(
+                    "match-version-guard",
+                    "normal",
+                    "1920x1080",
+                    {**profile, "clock_roi": [80, 40, 260, 96]},
+                    expected_profile_fingerprint=cached.profile_fingerprint,
+                    expected_updated_at_unix=99.0,
+                    expected_failure_streak=cached.failure_streak,
+                    now=101.0,
+                )
+                self.assertEqual(stale.profile, cached.profile)
+                self.assertEqual(stale.updated_at_unix, cached.updated_at_unix)
+
+                self.assertIsNone(
+                    runtime.store.record_scoreboard_roi_failure_v2(
+                        "match-version-guard",
+                        "normal",
+                        "1920x1080",
+                        profile_fingerprint=cached.profile_fingerprint,
+                        expected_updated_at_unix=99.0,
+                        expected_failure_streak=cached.failure_streak,
+                        now=102.0,
+                    )
+                )
+                retained = runtime.store.get_scoreboard_roi_cache_v2(
+                    "match-version-guard", "normal", "1920x1080"
+                )
+                self.assertIsNotNone(retained)
+                self.assertEqual(retained.failure_streak, 0)
+
+                updated = runtime.store.record_scoreboard_roi_failure_v2(
+                    "match-version-guard",
+                    "normal",
+                    "1920x1080",
+                    profile_fingerprint=cached.profile_fingerprint,
+                    expected_updated_at_unix=cached.updated_at_unix,
+                    expected_failure_streak=cached.failure_streak,
+                    now=103.0,
+                )
+                self.assertIsNotNone(updated)
+                self.assertEqual(updated.failure_streak, 1)
+            finally:
+                runtime.close()
+
     def test_explicit_profile_is_never_written_to_automatic_cache(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

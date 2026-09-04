@@ -1,3 +1,4 @@
+import os
 import tempfile
 import unittest
 import urllib.parse
@@ -51,6 +52,26 @@ class OpenPlatformImageUploadTests(unittest.TestCase):
         self.assertEqual(status["api_name"], "image-uploadimage-ai")
         self.assertEqual(status["multipart_fields"], ["file1", "file2"])
         self.assertTrue(status["animated_gif_supported"])
+        self.assertEqual(status["timeout_seconds"], 120.0)
+
+    def test_image_upload_timeout_is_read_from_environment(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ,
+            {"OPEN_PLATFORM_IMAGE_UPLOAD_TIMEOUT_SECONDS": "75"},
+            clear=False,
+        ):
+            config = OpenPlatformConfig.from_environment(Path(directory))
+        self.assertEqual(config.image_upload_timeout_seconds, 75.0)
+
+    def test_image_upload_timeout_rejects_values_outside_safe_range(self):
+        for value in (59, 121, "not-a-number"):
+            with self.subTest(value=value), patch.dict(
+                os.environ,
+                {"OPEN_PLATFORM_IMAGE_UPLOAD_TIMEOUT_SECONDS": str(value)},
+                clear=False,
+            ):
+                with self.assertRaises(RuntimeError):
+                    OpenPlatformConfig.from_environment(Path("/tmp"))
 
     def test_uploads_fixed_multipart_fields_and_normalizes_records(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -101,6 +122,7 @@ class OpenPlatformImageUploadTests(unittest.TestCase):
             self.assertEqual(
                 request_args.kwargs["authorization"], "raw-image-token"
             )
+            self.assertEqual(request_args.kwargs["timeout_seconds"], 120.0)
             self.assertEqual(result[0]["image_id"], 11)
             self.assertEqual(result[1]["image_id"], 12)
             self.assertEqual(result[1]["mime"], "image/jpeg")

@@ -5164,6 +5164,39 @@ def open_platform_oauth_callback():
 @app.get("/api/matches")
 def matches_catalog():
     payload = match_catalog.snapshot()
+    # The catalog remains complete for automatic admission, but the browser
+    # should stop showing matches that have been authoritatively confirmed to
+    # have no live source after the configured grace period.  Waiting,
+    # checking, and retrying states stay visible because a source may still
+    # appear; manual ID entry is unaffected by this presentation filter.
+    try:
+        admission_status = auto_admission.snapshot()
+    except Exception:
+        # A presentation-only status lookup must not make the discovery API
+        # unavailable.  In that case keep the catalog unfiltered for this
+        # response and let the next refresh try again.
+        admission_status = {}
+    records = (
+        admission_status.get("records", [])
+        if isinstance(admission_status, dict)
+        else []
+    )
+    if not isinstance(records, list):
+        records = []
+    hidden_match_ids = {
+        str(record.get("match_id") or "").strip()
+        for record in records
+        if isinstance(record, dict)
+        and record.get("state") == "skipped_no_source"
+        and str(record.get("match_id") or "").strip()
+    }
+    if hidden_match_ids:
+        payload["playing"] = [
+            item
+            for item in payload.get("playing", [])
+            if not isinstance(item, dict)
+            or str(item.get("match_id") or "").strip() not in hidden_match_ids
+        ]
     worker_slot = dashboard.worker_slot_status()
     payload.update(worker_slot)
     payload["heavy_tasks"] = _heavy_task_status()

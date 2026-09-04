@@ -1363,6 +1363,8 @@ class TaskStateStore:
         confidence: float | None = None,
         expected_profile_fingerprint: str | None = None,
         expected_resolution_key: str | None = None,
+        expected_updated_at_unix: float | None = None,
+        expected_failure_streak: int | None = None,
         now: float | None = None,
     ) -> StoredScoreboardRoiCache | None:
         """Store an automatic ROI without letting a stale discovery replace it.
@@ -1386,20 +1388,39 @@ class TaskStateStore:
         timestamp = time.time() if now is None else float(now)
         expected_source_key: str | None = None
         with self._lock, self.connection:
-            if expected_profile_fingerprint is not None:
+            if (
+                expected_profile_fingerprint is not None
+                or expected_updated_at_unix is not None
+                or expected_failure_streak is not None
+            ):
                 expected_source_key = self._scoreboard_roi_resolution_key(
                     expected_resolution_key or key
                 )
                 current = self.connection.execute(
                     """
-                    SELECT profile_fingerprint FROM scoreboard_roi_cache_v2
+                    SELECT profile_fingerprint, updated_at_unix, failure_streak
+                    FROM scoreboard_roi_cache_v2
                     WHERE match_id = ? AND layout_mode = ? AND resolution_key = ?
                     """,
                     (str(match_id), mode, expected_source_key),
                 ).fetchone()
                 if (
                     current is None
-                    or current["profile_fingerprint"] != expected_profile_fingerprint
+                    or (
+                        expected_profile_fingerprint is not None
+                        and current["profile_fingerprint"]
+                        != expected_profile_fingerprint
+                    )
+                    or (
+                        expected_updated_at_unix is not None
+                        and float(current["updated_at_unix"])
+                        != float(expected_updated_at_unix)
+                    )
+                    or (
+                        expected_failure_streak is not None
+                        and int(current["failure_streak"])
+                        != int(expected_failure_streak)
+                    )
                 ):
                     return self.get_scoreboard_roi_cache_v2(
                         str(match_id), mode, key
@@ -1449,6 +1470,8 @@ class TaskStateStore:
         *,
         invalidate: bool = False,
         profile_fingerprint: str | None = None,
+        expected_updated_at_unix: float | None = None,
+        expected_failure_streak: int | None = None,
         now: float | None = None,
     ) -> StoredScoreboardRoiCache | None:
         mode = str(layout_mode or "").strip().lower()
@@ -1461,6 +1484,12 @@ class TaskStateStore:
         if profile_fingerprint:
             clauses += " AND profile_fingerprint = ?"
             values.append(str(profile_fingerprint))
+        if expected_updated_at_unix is not None:
+            clauses += " AND updated_at_unix = ?"
+            values.append(float(expected_updated_at_unix))
+        if expected_failure_streak is not None:
+            clauses += " AND failure_streak = ?"
+            values.append(int(expected_failure_streak))
         with self._lock, self.connection:
             cursor = self.connection.execute(
                 f"""

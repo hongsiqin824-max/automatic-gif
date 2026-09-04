@@ -1314,6 +1314,51 @@ class DashboardTests(unittest.TestCase):
         self.assertFalse(response.get_json()["locked"])
         self.assertIsNone(response.get_json()["active_match_id"])
 
+    def test_matches_endpoint_hides_only_confirmed_no_source_matches(self):
+        manager = dashboard_server.Dashboard(background_monitors=False)
+        catalog = Mock()
+        catalog.snapshot.return_value = {
+            "playing": [
+                {"match_id": "confirmed-no-source"},
+                {"match_id": "source-waiting"},
+                {"match_id": "source-checking"},
+                {"match_id": "source-retrying"},
+                {"match_id": "available-source"},
+            ],
+            "upcoming": [{"match_id": "upcoming-match"}],
+            "health": {"state": "healthy"},
+        }
+        admission = Mock()
+        admission.snapshot.return_value = {
+            "records": [
+                {"match_id": "confirmed-no-source", "state": "skipped_no_source"},
+                {"match_id": "source-waiting", "state": "source_waiting"},
+                {"match_id": "source-checking", "state": "source_checking"},
+                {"match_id": "source-retrying", "state": "retrying"},
+            ]
+        }
+
+        with patch.object(dashboard_server, "dashboard", manager), patch.object(
+            dashboard_server, "match_catalog", catalog
+        ), patch.object(dashboard_server, "auto_admission", admission):
+            response = dashboard_server.app.test_client().get("/api/matches")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(
+            [item["match_id"] for item in payload["playing"]],
+            [
+                "source-waiting",
+                "source-checking",
+                "source-retrying",
+                "available-source",
+            ],
+        )
+        self.assertEqual(
+            [item["match_id"] for item in payload["upcoming"]],
+            ["upcoming-match"],
+        )
+
     def test_matches_endpoint_exposes_global_heavy_task_status(self):
         manager = dashboard_server.Dashboard(background_monitors=False)
         catalog = Mock()
