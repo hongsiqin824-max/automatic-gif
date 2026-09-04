@@ -720,6 +720,21 @@ function visionFailureDetail(vision) {
   return `处理到：${stageLabel}；情况：${reasonLabel}${messageDetail}${fragmentDetail}${actionDetail}`;
 }
 
+function scoreboardRegionStatusText(vision) {
+  if (!vision || typeof vision !== 'object') return '';
+  const status = String(vision.scoreboard_region_status || '').trim();
+  if (status === 'rediscovered') {
+    return '之前记住的比赛时间位置不再适合当前画面，系统已重新找到位置并继续处理';
+  }
+  if (status === 'rediscovery_failed') {
+    return '之前记住的比赛时间位置已失效，系统重新查找后仍未找到稳定位置；本次如有兜底 GIF 会继续保留';
+  }
+  if (status === 'explicit_profile_mismatch') {
+    return '手动配置的比赛时间位置与当前画面不一致，系统为保护手动配置没有自动覆盖；需要重新配置或取消手动区域';
+  }
+  return '';
+}
+
 function streamTimeText(value) {
   const seconds = Number(value);
   if (!Number.isFinite(seconds) || seconds < 0) return '';
@@ -1251,7 +1266,7 @@ function render(data) {
       if (source === 'minute_boundary') return '分钟附近';
       return '';
     })();
-    const ocrUserDetail = [secondDetail, ocrSource, ocrPendingStatusText(ocrWindow, ocrResourceWait), ocrFailureDetail, ocrUserDetailText(ocrWindow)].filter(Boolean).join(' · ');
+    const ocrUserDetail = [secondDetail, ocrSource, scoreboardRegionStatusText(ocrWindow), ocrPendingStatusText(ocrWindow, ocrResourceWait), ocrFailureDetail, ocrUserDetailText(ocrWindow)].filter(Boolean).join(' · ');
     const technicalDetail = [ocrPipelineDiagnostics, ocrDiagnostics, tdeed && tdeed.source_ocr_artifact ? '动作精剪使用了上方 60 秒画面时间结果' : ''].filter(Boolean).join(' · ');
     const visionDetail = [visionResourceWaitText(tdeedResourceWait), failureDetail].filter(Boolean).join(' · ');
     const technicalDetailsKey = `${data.match_id || ''}\n${e.event_key || ''}\nocr_window`;

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import sqlite3
@@ -36,6 +37,7 @@ VISION_TASK_STATUSES = (
 )
 VISION_INCOMPLETE_STATUSES = ("pending", "locating", "located", "encoding")
 VISION_ARTIFACT_KINDS = ("ocr_window", "tdeed_refined")
+SCOREBOARD_LAYOUT_MODES = ("normal", "stoppage")
 DEFAULT_VISION_ARTIFACT_KIND = "tdeed_refined"
 LEGACY_VISION_ARTIFACT_KIND = "refined"
 DEFAULT_GIF_DEADLINE_SECONDS = 55.0
@@ -265,6 +267,10 @@ class StoredScoreboardRoiCache:
     success_streak: int
     failure_streak: int
     updated_at_unix: float
+    layout_mode: str | None = None
+    resolution_key: str | None = None
+    profile_source: str = "auto_discovery"
+    profile_fingerprint: str | None = None
 
 
 @dataclass(frozen=True)
@@ -564,6 +570,22 @@ class TaskStateStore:
                 failure_streak INTEGER NOT NULL DEFAULT 0,
                 updated_at_unix REAL NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS scoreboard_roi_cache_v2 (
+                match_id TEXT NOT NULL,
+                layout_mode TEXT NOT NULL CHECK (layout_mode IN ('normal', 'stoppage')),
+                resolution_key TEXT NOT NULL,
+                profile_source TEXT NOT NULL DEFAULT 'auto_discovery'
+                    CHECK (profile_source = 'auto_discovery'),
+                profile_fingerprint TEXT,
+                profile_json TEXT NOT NULL,
+                confidence REAL,
+                success_streak INTEGER NOT NULL DEFAULT 0,
+                failure_streak INTEGER NOT NULL DEFAULT 0,
+                updated_at_unix REAL NOT NULL,
+                PRIMARY KEY (match_id, layout_mode, resolution_key)
+            );
+            CREATE INDEX IF NOT EXISTS scoreboard_roi_cache_v2_match_layout
+                ON scoreboard_roi_cache_v2(match_id, layout_mode, updated_at_unix);
             CREATE TABLE IF NOT EXISTS timeline_states (
                 match_id TEXT PRIMARY KEY,
                 timeline_origin_wall_unix REAL NOT NULL,
@@ -1252,6 +1274,208 @@ class TaskStateStore:
             failure_streak=int(row["failure_streak"]),
             updated_at_unix=float(row["updated_at_unix"]),
         )
+
+    @staticmethod
+    def _scoreboard_roi_resolution_key(value: Any) -> str:
+        """Validate the concrete WIDTHxHEIGHT key used by the v2 cache."""
+        raw = str(value or "").strip().lower()
+        parts = raw.split("x")
+        if len(parts) != 2:
+            raise ValueError("scoreboard ROI resolution key must use WIDTHxHEIGHT")
+        try:
+            width, height = (int(part) for part in parts)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "scoreboard ROI resolution key must use positive integers"
+            ) from exc
+        if width <= 0 or height <= 0:
+            raise ValueError("scoreboard ROI resolution key must use positive integers")
+        return f"{width}x{height}"
+
+    @staticmethod
+    def _scoreboard_roi_profile_fingerprint(profile: Mapping[str, Any]) -> str:
+        payload = json.dumps(
+            dict(profile), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    def get_scoreboard_roi_cache_v2(
+        self,
+        match_id: str,
+        layout_mode: str,
+        resolution_key: str | None = None,
+    ) -> StoredScoreboardRoiCache | None:
+        """Read only an automatic ROI for one match/layout/resolution key.
+
+        A missing resolution is allowed only as a temporary layout-local hint;
+        callers must validate it against the actual OCR frame before reuse.
+        """
+        mode = str(layout_mode or "").strip().lower()
+        if mode not in SCOREBOARD_LAYOUT_MODES:
+            raise ValueError("scoreboard ROI layout mode must be normal or stoppage")
+        parameters: tuple[Any, ...]
+        if resolution_key is None:
+            query = """
+                SELECT * FROM scoreboard_roi_cache_v2
+                WHERE match_id = ? AND layout_mode = ?
+                ORDER BY updated_at_unix DESC
+                LIMIT 1
+            """
+            parameters = (str(match_id), mode)
+        else:
+            key = self._scoreboard_roi_resolution_key(resolution_key)
+            query = """
+                SELECT * FROM scoreboard_roi_cache_v2
+                WHERE match_id = ? AND layout_mode = ? AND resolution_key = ?
+            """
+            parameters = (str(match_id), mode, key)
+        with self._lock:
+            row = self.connection.execute(query, parameters).fetchone()
+        if row is None:
+            return None
+        profile = self._decode_json_object(row["profile_json"])
+        if not profile:
+            return None
+        return StoredScoreboardRoiCache(
+            match_id=str(row["match_id"]),
+            profile=profile,
+            confidence=(float(row["confidence"]) if row["confidence"] is not None else None),
+            success_streak=int(row["success_streak"]),
+            failure_streak=int(row["failure_streak"]),
+            updated_at_unix=float(row["updated_at_unix"]),
+            layout_mode=str(row["layout_mode"]),
+            resolution_key=str(row["resolution_key"]),
+            profile_source=str(row["profile_source"]),
+            profile_fingerprint=(
+                str(row["profile_fingerprint"])
+                if row["profile_fingerprint"] is not None
+                else None
+            ),
+        )
+
+    def save_scoreboard_roi_cache_v2(
+        self,
+        match_id: str,
+        layout_mode: str,
+        resolution_key: str,
+        profile: Mapping[str, Any],
+        *,
+        confidence: float | None = None,
+        expected_profile_fingerprint: str | None = None,
+        expected_resolution_key: str | None = None,
+        now: float | None = None,
+    ) -> StoredScoreboardRoiCache | None:
+        """Store an automatic ROI without letting a stale discovery replace it.
+
+        A caller reusing a cache row supplies its fingerprint. Fresh discovery
+        may create a row, reinforce the same profile, or replace a row already
+        invalidated by repeated failures; it cannot overwrite a different
+        healthy profile established by another task.
+        """
+        mode = str(layout_mode or "").strip().lower()
+        if mode not in SCOREBOARD_LAYOUT_MODES:
+            raise ValueError("scoreboard ROI layout mode must be normal or stoppage")
+        key = self._scoreboard_roi_resolution_key(resolution_key)
+        normalized_profile = dict(profile)
+        if not normalized_profile:
+            raise ValueError("scoreboard ROI profile must not be empty")
+        normalized_confidence = (
+            None if confidence is None else _finite_float(confidence, "scoreboard ROI confidence")
+        )
+        fingerprint = self._scoreboard_roi_profile_fingerprint(normalized_profile)
+        timestamp = time.time() if now is None else float(now)
+        expected_source_key: str | None = None
+        with self._lock, self.connection:
+            if expected_profile_fingerprint is not None:
+                expected_source_key = self._scoreboard_roi_resolution_key(
+                    expected_resolution_key or key
+                )
+                current = self.connection.execute(
+                    """
+                    SELECT profile_fingerprint FROM scoreboard_roi_cache_v2
+                    WHERE match_id = ? AND layout_mode = ? AND resolution_key = ?
+                    """,
+                    (str(match_id), mode, expected_source_key),
+                ).fetchone()
+                if (
+                    current is None
+                    or current["profile_fingerprint"] != expected_profile_fingerprint
+                ):
+                    return self.get_scoreboard_roi_cache_v2(
+                        str(match_id), mode, key
+                    )
+            self.connection.execute(
+                """
+                INSERT INTO scoreboard_roi_cache_v2 (
+                    match_id, layout_mode, resolution_key, profile_source,
+                    profile_fingerprint, profile_json, confidence,
+                    success_streak, failure_streak, updated_at_unix
+                ) VALUES (?, ?, ?, 'auto_discovery', ?, ?, ?, 1, 0, ?)
+                ON CONFLICT(match_id, layout_mode, resolution_key) DO UPDATE SET
+                    profile_source = 'auto_discovery',
+                    profile_fingerprint = excluded.profile_fingerprint,
+                    profile_json = excluded.profile_json,
+                    confidence = excluded.confidence,
+                    success_streak = CASE
+                        WHEN scoreboard_roi_cache_v2.profile_fingerprint = excluded.profile_fingerprint
+                        THEN scoreboard_roi_cache_v2.success_streak + 1
+                        ELSE 1
+                    END,
+                    failure_streak = 0,
+                    updated_at_unix = excluded.updated_at_unix
+                WHERE ?
+                   OR scoreboard_roi_cache_v2.failure_streak >= 3
+                   OR scoreboard_roi_cache_v2.profile_fingerprint = excluded.profile_fingerprint
+                """,
+                (
+                    str(match_id), mode, key, fingerprint,
+                    json.dumps(normalized_profile, ensure_ascii=False, separators=(",", ":")),
+                    normalized_confidence, timestamp,
+                    int(
+                        expected_profile_fingerprint is not None
+                        and expected_source_key == key
+                    ),
+                ),
+            )
+        cached = self.get_scoreboard_roi_cache_v2(str(match_id), mode, key)
+        assert cached is not None
+        return cached
+
+    def record_scoreboard_roi_failure_v2(
+        self,
+        match_id: str,
+        layout_mode: str,
+        resolution_key: str,
+        *,
+        invalidate: bool = False,
+        profile_fingerprint: str | None = None,
+        now: float | None = None,
+    ) -> StoredScoreboardRoiCache | None:
+        mode = str(layout_mode or "").strip().lower()
+        if mode not in SCOREBOARD_LAYOUT_MODES:
+            raise ValueError("scoreboard ROI layout mode must be normal or stoppage")
+        key = self._scoreboard_roi_resolution_key(resolution_key)
+        timestamp = time.time() if now is None else float(now)
+        clauses = "match_id = ? AND layout_mode = ? AND resolution_key = ?"
+        values: list[Any] = [str(match_id), mode, key]
+        if profile_fingerprint:
+            clauses += " AND profile_fingerprint = ?"
+            values.append(str(profile_fingerprint))
+        with self._lock, self.connection:
+            cursor = self.connection.execute(
+                f"""
+                UPDATE scoreboard_roi_cache_v2 SET
+                    success_streak = 0,
+                    failure_streak = CASE WHEN ? THEN 3 ELSE failure_streak + 1 END,
+                    updated_at_unix = ?
+                WHERE {clauses}
+                """,
+                [1 if invalidate else 0, timestamp, *values],
+            )
+            updated = int(cursor.rowcount or 0) > 0
+        if not updated:
+            return None
+        return self.get_scoreboard_roi_cache_v2(str(match_id), mode, key)
 
     def save_scoreboard_roi_cache(
         self,
@@ -2224,6 +2448,72 @@ class TaskStateStore:
             updated = self.get_vision_task(event_key, normalized_artifact_kind)
         assert updated is not None
         return updated
+
+    def merge_vision_task_window_metadata(
+        self,
+        event_key: str,
+        window_metadata: Mapping[str, Any],
+        *,
+        artifact_kind: str = DEFAULT_VISION_ARTIFACT_KIND,
+        expected_statuses: tuple[str, ...] = VISION_INCOMPLETE_STATUSES,
+        expected_progressive_target_revision: int | None = None,
+        now: float | None = None,
+    ) -> StoredVisionTask | None:
+        """Persist diagnostic metadata without changing task state or counters."""
+        normalized_artifact_kind = normalize_vision_artifact_kind(artifact_kind)
+        allowed = tuple(str(status) for status in expected_statuses)
+        if not allowed or any(status not in VISION_TASK_STATUSES for status in allowed):
+            raise ValueError("expected vision task statuses are invalid")
+        timestamp = time.time() if now is None else float(now)
+        with self._lock:
+            current = self.get_vision_task(event_key, normalized_artifact_kind)
+            if current is None or current.status not in allowed:
+                return None
+            merged_window = dict(current.window_metadata)
+            updates = dict(window_metadata)
+            current_progressive = merged_window.get("progressive_scan")
+            progressive_updates = updates.get("progressive_scan")
+            if isinstance(progressive_updates, Mapping):
+                existing_progressive = (
+                    dict(current_progressive)
+                    if isinstance(current_progressive, Mapping)
+                    else {}
+                )
+                if expected_progressive_target_revision is not None:
+                    try:
+                        current_revision = int(
+                            existing_progressive.get("target_revision") or 0
+                        )
+                    except (TypeError, ValueError):
+                        return None
+                    if current_revision != int(expected_progressive_target_revision):
+                        return None
+                existing_progressive.update(dict(progressive_updates))
+                updates["progressive_scan"] = existing_progressive
+            merged_window.update(updates)
+            placeholders = ",".join("?" for _ in allowed)
+            with self.connection:
+                cursor = self.connection.execute(
+                    f"""
+                    UPDATE vision_tasks SET updated_at_unix = ?, window_json = ?
+                    WHERE event_key = ? AND artifact_kind = ?
+                      AND status IN ({placeholders})
+                    """,
+                    (
+                        timestamp,
+                        json.dumps(
+                            merged_window,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                        event_key,
+                        normalized_artifact_kind,
+                        *allowed,
+                    ),
+                )
+            if int(cursor.rowcount or 0) == 0:
+                return None
+            return self.get_vision_task(event_key, normalized_artifact_kind)
 
     def record_vision_readiness_wait(
         self,

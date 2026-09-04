@@ -23,8 +23,10 @@ class DashboardTests(unittest.TestCase):
         timestamp,
         *,
         cmp_type="soccer",
+        competition_id=None,
+        competition_name=None,
     ):
-        return {
+        match = {
             "match_id": match_id,
             "status": status,
             "sort_timestamp": timestamp,
@@ -34,6 +36,11 @@ class DashboardTests(unittest.TestCase):
             "team_B_name": f"B-{match_id}",
             "large_unused_payload": {"must_not_reach_browser": True},
         }
+        if competition_id is not None:
+            match["competition_id"] = competition_id
+        if competition_name is not None:
+            match["competition_name"] = competition_name
+        return match
 
     def test_dotenv_loads_values_without_overriding_shell(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -357,6 +364,70 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(len(catalog.all_playing), 26)
         self.assertIn("excluded-live", {item["match_id"] for item in catalog.all_playing})
 
+    def test_match_catalog_preserves_competition_id_for_admission_priority(self):
+        now = 1_800_000_000.0
+        match = self._catalog_match(
+            "priority-field",
+            "Playing",
+            now - 10,
+            competition_id=136,
+            competition_name="墨超",
+        )
+        catalog = dashboard_server.MatchCatalog()
+
+        with patch("dashboard_server._json_request", return_value={"list": [match]}), patch(
+            "dashboard_server.time.time", return_value=now
+        ):
+            payload = catalog.snapshot()
+
+        self.assertEqual(payload["playing"][0]["competition_id"], 136)
+        self.assertEqual(catalog.all_playing[0]["competition_id"], 136)
+
+    def test_auto_admission_priority_uses_id_then_missing_id_name_fallback(self):
+        for competition_id, competition_name in (
+            dashboard_server.AUTO_ADMISSION_PRIORITY_COMPETITIONS.items()
+        ):
+            with self.subTest(competition_id=competition_id):
+                by_id = self._catalog_match(
+                    f"priority-id-{competition_id}",
+                    "Playing",
+                    100.0,
+                    competition_id=int(competition_id),
+                    competition_name="不是重点联赛",
+                )
+                by_name = self._catalog_match(
+                    f"priority-name-{competition_id}",
+                    "Playing",
+                    100.0,
+                    competition_name=competition_name,
+                )
+                self.assertEqual(
+                    dashboard_server._auto_admission_match_sort_key(by_id)[0], 0
+                )
+                self.assertEqual(
+                    dashboard_server._auto_admission_match_sort_key(by_name)[0], 0
+                )
+
+        mismatched_id = self._catalog_match(
+            "ordinary-mismatched-id",
+            "Playing",
+            100.0,
+            competition_id=999,
+            competition_name="墨超",
+        )
+        unknown = self._catalog_match(
+            "ordinary-unknown",
+            "Playing",
+            100.0,
+            competition_name="其他联赛",
+        )
+        self.assertEqual(
+            dashboard_server._auto_admission_match_sort_key(mismatched_id)[0], 1
+        )
+        self.assertEqual(
+            dashboard_server._auto_admission_match_sort_key(unknown)[0], 1
+        )
+
     def test_source_response_classification_does_not_confuse_errors_with_no_source(self):
         available = dashboard_server.classify_source_response(
             {"errno": 0, "data": {"resource": " rtmp://example/live "}}
@@ -387,6 +458,194 @@ class DashboardTests(unittest.TestCase):
         )
         self.assertEqual(malformed_bool.state, "error")
         self.assertEqual(malformed_bool.error_kind, "source_api_error")
+
+    def test_auto_admission_probes_priority_competitions_in_stable_order(self):
+        manager = dashboard_server.Dashboard(background_monitors=False)
+        catalog = Mock()
+        matches = [
+            self._catalog_match(
+                "ordinary-first-time",
+                "Playing",
+                1.0,
+                competition_id=999,
+            ),
+            self._catalog_match(
+                "priority-later",
+                "Playing",
+                20.0,
+                competition_id=21,
+            ),
+            self._catalog_match(
+                "priority-same-b",
+                "Playing",
+                10.0,
+                competition_id=22,
+            ),
+            self._catalog_match(
+                "priority-same-a",
+                "Playing",
+                10.0,
+                competition_id=59,
+            ),
+        ]
+        catalog.refresh_for_automation.return_value = {
+            "fresh": True,
+            "playing": matches,
+        }
+        coordinator = dashboard_server.AutoAdmissionCoordinator(
+            manager, catalog, poll_seconds=1, source_poll_seconds=1
+        )
+        probe_order = []
+
+        def empty_source(match_id):
+            probe_order.append(match_id)
+            return {"errno": 0, "data": {}}
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            dashboard_server, "DEFAULT_OUTPUT", Path(directory)
+        ), patch.object(
+            dashboard_server, "AUTO_ADMISSION_SOURCE_WORKERS", 1
+        ), patch(
+            "dashboard_server.query_source", side_effect=empty_source
+        ):
+            coordinator.run_once(now=100.0)
+
+        self.assertEqual(
+            probe_order,
+            [
+                "priority-same-a",
+                "priority-same-b",
+                "priority-later",
+                "ordinary-first-time",
+            ],
+        )
+
+    def test_auto_admission_priority_source_wait_does_not_block_ordinary_start(self):
+        manager = dashboard_server.Dashboard(background_monitors=False, max_concurrent_matches=1)
+        catalog = Mock()
+        priority = self._catalog_match(
+            "priority-no-source",
+            "Playing",
+            10.0,
+            competition_id=136,
+        )
+        ordinary = self._catalog_match(
+            "ordinary-with-source",
+            "Playing",
+            20.0,
+            competition_id=999,
+        )
+        catalog.refresh_for_automation.return_value = {
+            "fresh": True,
+            "playing": [ordinary, priority],
+        }
+        coordinator = dashboard_server.AutoAdmissionCoordinator(
+            manager,
+            catalog,
+            poll_seconds=1,
+            source_poll_seconds=1,
+            source_wait_seconds=60,
+            source_empty_confirmations=3,
+        )
+        worker = Mock(pid=998, returncode=None)
+        worker.poll.return_value = None
+        source_by_match = {
+            priority["match_id"]: {"errno": 0, "data": {}},
+            ordinary["match_id"]: {
+                "errno": 0,
+                "data": {"resource": "rtmp://example/ordinary"},
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            dashboard_server, "DEFAULT_OUTPUT", Path(directory)
+        ), patch.object(
+            dashboard_server, "AUTO_ADMISSION_SOURCE_WORKERS", 1
+        ), patch(
+            "dashboard_server.query_source",
+            side_effect=lambda match_id: source_by_match[match_id],
+        ), patch(
+            "dashboard_server.subprocess.Popen", return_value=worker
+        ) as popen:
+            coordinator.run_once(now=100.0)
+
+        self.assertEqual(coordinator.records[priority["match_id"]].state, "source_waiting")
+        self.assertEqual(coordinator.records[ordinary["match_id"]].state, "running")
+        popen.assert_called_once()
+
+    def test_auto_admission_starts_waiting_priority_before_ordinary(self):
+        manager = dashboard_server.Dashboard(background_monitors=False, max_concurrent_matches=1)
+        occupied = manager.get("occupied-priority-test", start_monitor=False)
+        occupied.desired_running = True
+        occupied.worker_mode = "live"
+        occupied.lifecycle_state = "playing"
+        catalog = Mock()
+        priority = self._catalog_match(
+            "priority-waiting",
+            "Playing",
+            20.0,
+            competition_id=21,
+        )
+        ordinary = self._catalog_match(
+            "ordinary-waiting",
+            "Playing",
+            10.0,
+            competition_id=999,
+        )
+        catalog.refresh_for_automation.side_effect = [
+            {"fresh": True, "playing": [ordinary, priority]},
+            {"fresh": True, "playing": [ordinary, priority]},
+        ]
+        coordinator = dashboard_server.AutoAdmissionCoordinator(
+            manager, catalog, poll_seconds=1, source_poll_seconds=1
+        )
+        worker = Mock(pid=999, returncode=None)
+        worker.poll.return_value = None
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            dashboard_server, "DEFAULT_OUTPUT", Path(directory)
+        ), patch(
+            "dashboard_server.query_source",
+            return_value={"errno": 0, "data": {"resource": "rtmp://example/live"}},
+        ), patch("dashboard_server.subprocess.Popen", return_value=worker) as popen:
+            coordinator.run_once(now=100.0)
+            self.assertEqual(
+                coordinator.records[priority["match_id"]].state,
+                "waiting_capacity",
+            )
+            self.assertEqual(
+                coordinator.records[ordinary["match_id"]].state,
+                "waiting_capacity",
+            )
+            occupied.desired_running = False
+            occupied.lifecycle_state = "idle"
+            coordinator.run_once(now=101.0)
+
+        self.assertEqual(coordinator.records[priority["match_id"]].state, "running")
+        self.assertEqual(
+            coordinator.records[ordinary["match_id"]].state,
+            "waiting_capacity",
+        )
+        command = popen.call_args.args[0]
+        self.assertIn("--match-id", command)
+        self.assertIn(priority["match_id"], command)
+
+    def test_auto_admission_full_capacity_does_not_preempt_existing_worker(self):
+        manager = dashboard_server.Dashboard(background_monitors=False, max_concurrent_matches=1)
+        occupied = manager.get("occupied-no-preempt", start_monitor=False)
+        occupied.desired_running = True
+        occupied.worker_mode = "live"
+        occupied.lifecycle_state = "playing"
+        coordinator = dashboard_server.AutoAdmissionCoordinator(
+            manager, Mock(), poll_seconds=1, source_poll_seconds=1
+        )
+        record = dashboard_server.AutoAdmissionRecord("priority-no-preempt")
+        record.source = {"resource": "rtmp://example/live"}
+        record.state = "waiting_capacity"
+        with patch.object(manager, "start") as start:
+            coordinator._start_waiting(record, {"match_id": record.match_id}, 100.0)
+
+        start.assert_not_called()
+        self.assertEqual(record.state, "waiting_capacity")
+        self.assertTrue(occupied.desired_running)
 
     def test_auto_admission_waits_before_skipping_empty_source(self):
         manager = dashboard_server.Dashboard(background_monitors=False)
@@ -1418,6 +1677,92 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(
             set(tasks[0]["vision_artifacts"]),
             {"ocr_window", "tdeed_refined"},
+        )
+
+    def test_database_exposes_scoreboard_region_rediscovery_diagnostics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = PipelineRuntime(root / "pipeline_state.sqlite3", root / "events.jsonl")
+            event_key = "m:G:roi-rediscovery"
+            runtime.discover_task(
+                match_id="m",
+                event_data={
+                    "event_key": event_key,
+                    "code": "G",
+                    "event_type": "goal",
+                    "minute": "90",
+                    "minute_extra": "3",
+                    "team": "A",
+                    "person": "Player",
+                    "person_id": "1",
+                    "score": "1-0",
+                    "reason": "",
+                    "metadata": {},
+                },
+                observed_stream_time=100.0,
+                observed_source_time=None,
+                clip_anchor_stream_time=90.0,
+                clip_anchor_source_time=None,
+                output_due_stream_time=110.0,
+                detected_at_unix=time.time(),
+            )
+            runtime.enqueue_vision_task(
+                event_key,
+                artifact_kind="ocr_window",
+                search_start_stream_time=0.0,
+                search_end_stream_time=100.0,
+                clip_before_seconds=30.0,
+                clip_after_seconds=30.0,
+            )
+            runtime.transition_vision_task(
+                event_key, "locating", artifact_kind="ocr_window"
+            )
+            runtime.transition_vision_task(
+                event_key,
+                "located",
+                artifact_kind="ocr_window",
+                result={"anchor_stream_time": 80.0},
+            )
+            runtime.transition_vision_task(
+                event_key, "encoding", artifact_kind="ocr_window"
+            )
+            runtime.transition_vision_task(
+                event_key,
+                "encoded",
+                artifact_kind="ocr_window",
+                result={
+                    "output": "/tmp/ocr-fallback.gif",
+                    "bytes": 10,
+                    "fallback_generated": True,
+                    "scoreboard_roi_cache_recovery": {
+                        "status": "rediscovery_failed",
+                        "attempt_count": 1,
+                        "initial_error_kind": "clock_profile_mismatch",
+                        "rediscovery_error_kind": "scoreboard_missing",
+                        "rediscovery_diagnostics": {"stage": "clock_discovery"},
+                    },
+                },
+            )
+            runtime.close()
+
+            tasks, _, _ = dashboard_server._tasks_from_database(
+                root / "pipeline_state.sqlite3"
+            )
+
+        ocr = tasks[0]["ocr_window"]
+        self.assertEqual(ocr["scoreboard_region_status"], "rediscovery_failed")
+        self.assertEqual(ocr["scoreboard_region_rediscovery_attempt_count"], 1)
+        self.assertEqual(
+            ocr["scoreboard_region_initial_error_kind"],
+            "clock_profile_mismatch",
+        )
+        self.assertEqual(
+            ocr["scoreboard_region_rediscovery_error_kind"],
+            "scoreboard_missing",
+        )
+        self.assertEqual(
+            ocr["scoreboard_region_rediscovery_diagnostics"]["stage"],
+            "clock_discovery",
         )
 
     def test_legacy_minute_fallback_uses_duration_for_fragment_label(self):
@@ -2504,6 +2849,9 @@ class DashboardTests(unittest.TestCase):
         self.assertIn("openTechnicalDetails", app_js)
         self.assertIn('data-details-key=', app_js)
         self.assertIn("addEventListener('toggle'", app_js)
+        self.assertIn("scoreboardRegionStatusText", app_js)
+        self.assertIn("系统已重新找到位置并继续处理", app_js)
+        self.assertIn("手动配置的比赛时间位置与当前画面不一致", app_js)
 
         error_messages_js = (
             dashboard_server.ROOT / "dashboard_static" / "error_messages.js"

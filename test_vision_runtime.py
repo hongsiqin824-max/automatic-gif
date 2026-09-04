@@ -1734,7 +1734,9 @@ class VisionRuntimeTests(unittest.TestCase):
             self.assertEqual(readiness["status"], "ready")
             self.assertEqual(readiness["accepted_sample_count"], 2)
             self.assertEqual(readiness["last_probe_media_end_stream_time"], 220.0)
-            cached = runtime.store.get_scoreboard_roi_cache(job.match_id)
+            cached = runtime.store.get_scoreboard_roi_cache_v2(
+                job.match_id, "normal", "1920x1080"
+            )
             self.assertIsNotNone(cached)
             self.assertEqual(cached.profile["clock_roi"], [288, 129, 423, 186])
             runtime.close()

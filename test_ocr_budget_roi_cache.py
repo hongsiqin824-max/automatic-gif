@@ -20,6 +20,7 @@ from vision_runtime import (
     _ocr_budget_after_elapsed,
     _record_scoreboard_roi_failure,
     _record_scoreboard_roi_success,
+    _scoreboard_layout_mode,
     process_vision_artifact,
 )
 
@@ -331,6 +332,171 @@ class ScoreboardRoiCacheTests(unittest.TestCase):
             "clock_roi": [40, 30, 180, 82],
         }
 
+    def test_layout_mode_is_conservative_at_period_boundaries(self):
+        job = self._job("match-layout")
+        cases = (
+            ("2", "0", "normal"),
+            ("44", "0", "normal"),
+            ("45", "0", None),
+            ("90", "0", None),
+            ("45+2", "0", "stoppage"),
+            ("90+5", "0", "stoppage"),
+            ("90", "5", "stoppage"),
+            ("45+2", "3", None),
+            ("invalid", "0", None),
+        )
+        for minute, extra, expected in cases:
+            with self.subTest(minute=minute, extra=extra):
+                self.assertEqual(
+                    _scoreboard_layout_mode(
+                        replace(
+                            job,
+                            event_minute=minute,
+                            event_minute_extra=extra,
+                        )
+                    ),
+                    expected,
+                )
+
+    def test_layout_and_resolution_cache_keys_do_not_overwrite_each_other(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = PipelineRuntime(root / "state.sqlite3", root / "events.jsonl")
+            normal = self._profile()
+            stoppage = {**self._profile(), "clock_roi": [100, 60, 300, 120]}
+            smaller = {**self._profile(), "reference_resolution": [1280, 720]}
+            try:
+                runtime.store.save_scoreboard_roi_cache_v2(
+                    "match-isolated", "normal", "1920x1080", normal
+                )
+                runtime.store.save_scoreboard_roi_cache_v2(
+                    "match-isolated", "stoppage", "1920x1080", stoppage
+                )
+                runtime.store.save_scoreboard_roi_cache_v2(
+                    "match-isolated", "normal", "1280x720", smaller
+                )
+
+                self.assertEqual(
+                    runtime.store.get_scoreboard_roi_cache_v2(
+                        "match-isolated", "normal", "1920x1080"
+                    ).profile["clock_roi"],
+                    normal["clock_roi"],
+                )
+                self.assertEqual(
+                    runtime.store.get_scoreboard_roi_cache_v2(
+                        "match-isolated", "stoppage", "1920x1080"
+                    ).profile["clock_roi"],
+                    stoppage["clock_roi"],
+                )
+                self.assertEqual(
+                    runtime.store.get_scoreboard_roi_cache_v2(
+                        "match-isolated", "normal", "1280x720"
+                    ).profile["reference_resolution"],
+                    [1280, 720],
+                )
+            finally:
+                runtime.close()
+
+    def test_legacy_cache_is_preserved_but_not_migrated_or_reused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "state.sqlite3"
+            event_log = root / "events.jsonl"
+            runtime = PipelineRuntime(database, event_log)
+            runtime.store.save_scoreboard_roi_cache("legacy-match", self._profile())
+            runtime.close()
+
+            reopened = PipelineRuntime(database, event_log)
+            try:
+                self.assertIsNotNone(
+                    reopened.store.get_scoreboard_roi_cache("legacy-match")
+                )
+                self.assertIsNone(
+                    reopened.store.get_scoreboard_roi_cache_v2(
+                        "legacy-match", "normal", "1920x1080"
+                    )
+                )
+                effective, cached = _job_with_cached_scoreboard_profile(
+                    reopened, self._job("legacy-match")
+                )
+                self.assertIsNone(cached)
+                self.assertIsNone(effective.scoreboard_profile)
+            finally:
+                reopened.close()
+
+    def test_stale_success_and_failure_cannot_replace_new_profile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = PipelineRuntime(root / "state.sqlite3", root / "events.jsonl")
+            old_profile = self._profile()
+            new_profile = {**self._profile(), "clock_roi": [80, 40, 260, 96]}
+            try:
+                old = runtime.store.save_scoreboard_roi_cache_v2(
+                    "match-cas", "normal", "1920x1080", old_profile
+                )
+                current = runtime.store.save_scoreboard_roi_cache_v2(
+                    "match-cas",
+                    "normal",
+                    "1920x1080",
+                    new_profile,
+                    expected_profile_fingerprint=old.profile_fingerprint,
+                )
+                self.assertIsNone(
+                    runtime.store.record_scoreboard_roi_failure_v2(
+                        "match-cas",
+                        "normal",
+                        "1920x1080",
+                        invalidate=True,
+                        profile_fingerprint=old.profile_fingerprint,
+                    )
+                )
+                retained = runtime.store.save_scoreboard_roi_cache_v2(
+                    "match-cas",
+                    "normal",
+                    "1920x1080",
+                    old_profile,
+                    expected_profile_fingerprint=old.profile_fingerprint,
+                )
+                self.assertEqual(retained.profile, current.profile)
+                self.assertEqual(retained.profile_fingerprint, current.profile_fingerprint)
+                self.assertEqual(retained.failure_streak, 0)
+                rediscovered_late = runtime.store.save_scoreboard_roi_cache_v2(
+                    "match-cas", "normal", "1920x1080", old_profile
+                )
+                self.assertEqual(
+                    rediscovered_late.profile_fingerprint,
+                    current.profile_fingerprint,
+                )
+            finally:
+                runtime.close()
+
+    def test_explicit_profile_is_never_written_to_automatic_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = PipelineRuntime(root / "state.sqlite3", root / "events.jsonl")
+            job = replace(self._job("match-explicit-no-cache"), scoreboard_profile=self._profile())
+            located = {
+                "diagnostics": {
+                    "auto_clock": {
+                        "clock_roi": [40, 30, 180, 82],
+                        "frame_resolution": [1920, 1080],
+                    }
+                }
+            }
+            try:
+                self.assertIsNone(
+                    _record_scoreboard_roi_success(
+                        runtime, job, located, cached=None
+                    )
+                )
+                self.assertIsNone(
+                    runtime.store.get_scoreboard_roi_cache_v2(
+                        job.match_id, "normal", "1920x1080"
+                    )
+                )
+            finally:
+                runtime.close()
+
     def test_auto_discovery_persists_and_is_reused_after_sqlite_reopen(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -354,6 +520,13 @@ class ScoreboardRoiCacheTests(unittest.TestCase):
                 cached=None,
             )
             self.assertEqual(saved["status"], "discovered")
+            self.assertEqual(saved["success_streak"], 1)
+            self.assertEqual(
+                runtime.store.get_scoreboard_roi_cache_v2(
+                    job.match_id, "normal", "1920x1080"
+                ).success_streak,
+                1,
+            )
             cached_job, cached = _job_with_cached_scoreboard_profile(
                 runtime, job
             )
@@ -382,12 +555,56 @@ class ScoreboardRoiCacheTests(unittest.TestCase):
             finally:
                 reopened.close()
 
+    def test_resolution_change_invalidates_only_old_cached_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = PipelineRuntime(root / "state.sqlite3", root / "events.jsonl")
+            job = self._job("match-roi-resolution-change")
+            old_cached = runtime.store.save_scoreboard_roi_cache_v2(
+                job.match_id, "normal", "1920x1080", self._profile()
+            )
+            cached_job = replace(job, scoreboard_profile=dict(old_cached.profile))
+            located = {
+                "diagnostics": {
+                    "clock_readable_rate": 0.9,
+                    "scoreboard_profile": {
+                        "clock_roi": [26, 20, 120, 55],
+                        "frame_resolution": [1280, 720],
+                    },
+                }
+            }
+            try:
+                saved = _record_scoreboard_roi_success(
+                    runtime,
+                    cached_job,
+                    located,
+                    cached=old_cached,
+                )
+                old_entry = runtime.store.get_scoreboard_roi_cache_v2(
+                    job.match_id, "normal", "1920x1080"
+                )
+                new_entry = runtime.store.get_scoreboard_roi_cache_v2(
+                    job.match_id, "normal", "1280x720"
+                )
+                self.assertEqual(saved["resolution_key"], "1280x720")
+                self.assertEqual(old_entry.failure_streak, 3)
+                self.assertEqual(new_entry.failure_streak, 0)
+                self.assertEqual(new_entry.success_streak, 1)
+                self.assertEqual(new_entry.profile["clock_roi"], [26, 20, 120, 55])
+                self.assertEqual(
+                    new_entry.profile["reference_resolution"], [1280, 720]
+                )
+            finally:
+                runtime.close()
+
     def test_cache_is_not_reused_after_three_consecutive_failures(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             runtime = PipelineRuntime(root / "state.sqlite3", root / "events.jsonl")
             job = self._job("match-roi-failures")
-            runtime.store.save_scoreboard_roi_cache(job.match_id, self._profile())
+            runtime.store.save_scoreboard_roi_cache_v2(
+                job.match_id, "normal", "1920x1080", self._profile()
+            )
             try:
                 for expected_streak, error_kind in (
                     (1, "scoreboard_missing"),
@@ -402,8 +619,8 @@ class ScoreboardRoiCacheTests(unittest.TestCase):
                         cached=cached,
                     )
                     self.assertEqual(
-                        runtime.store.get_scoreboard_roi_cache(
-                            job.match_id
+                        runtime.store.get_scoreboard_roi_cache_v2(
+                            job.match_id, "normal", "1920x1080"
                         ).failure_streak,
                         expected_streak,
                     )
@@ -420,7 +637,9 @@ class ScoreboardRoiCacheTests(unittest.TestCase):
             root = Path(directory)
             runtime = PipelineRuntime(root / "state.sqlite3", root / "events.jsonl")
             job = self._job("match-roi-mismatch")
-            runtime.store.save_scoreboard_roi_cache(job.match_id, self._profile())
+            runtime.store.save_scoreboard_roi_cache_v2(
+                job.match_id, "normal", "1920x1080", self._profile()
+            )
             try:
                 _, cached = _job_with_cached_scoreboard_profile(runtime, job)
                 _record_scoreboard_roi_failure(
@@ -435,17 +654,27 @@ class ScoreboardRoiCacheTests(unittest.TestCase):
                 self.assertIsNone(cached)
                 self.assertIsNone(uncached_job.scoreboard_profile)
                 self.assertEqual(
-                    runtime.store.get_scoreboard_roi_cache(
-                        job.match_id
+                    runtime.store.get_scoreboard_roi_cache_v2(
+                        job.match_id, "normal", "1920x1080"
                     ).failure_streak,
                     3,
+                )
+                rediscovered = runtime.store.save_scoreboard_roi_cache_v2(
+                    job.match_id,
+                    "normal",
+                    "1920x1080",
+                    {**self._profile(), "clock_roi": [80, 40, 260, 96]},
+                )
+                self.assertEqual(rediscovered.failure_streak, 0)
+                self.assertEqual(
+                    rediscovered.profile["clock_roi"], [80, 40, 260, 96]
                 )
             finally:
                 runtime.close()
 
     def test_persisted_short_probe_mismatch_bypasses_cache_on_next_attempt(self):
         job = self._job("match-roi-short-probe")
-        cache_reads: list[str] = []
+        cache_reads: list[tuple[str, str, str | None]] = []
 
         class Store:
             @staticmethod
@@ -461,8 +690,8 @@ class ScoreboardRoiCacheTests(unittest.TestCase):
                 )
 
             @staticmethod
-            def get_scoreboard_roi_cache(match_id):
-                cache_reads.append(match_id)
+            def get_scoreboard_roi_cache_v2(match_id, layout_mode, resolution_key):
+                cache_reads.append((match_id, layout_mode, resolution_key))
                 return object()
 
         effective_job, cached = _job_with_cached_scoreboard_profile(
@@ -500,7 +729,9 @@ class ScoreboardRoiCacheTests(unittest.TestCase):
             root = Path(directory)
             runtime = PipelineRuntime(root / "state.sqlite3", root / "events.jsonl")
             job = self._job("match-roi-recovery")
-            runtime.store.save_scoreboard_roi_cache(job.match_id, self._profile())
+            runtime.store.save_scoreboard_roi_cache_v2(
+                job.match_id, "normal", "1920x1080", self._profile()
+            )
             cached_job, cached = _job_with_cached_scoreboard_profile(runtime, job)
             calls: list[dict | None] = []
 
@@ -540,7 +771,9 @@ class ScoreboardRoiCacheTests(unittest.TestCase):
                     "rediscovered",
                 )
                 self.assertEqual(
-                    runtime.store.get_scoreboard_roi_cache(job.match_id).failure_streak,
+                    runtime.store.get_scoreboard_roi_cache_v2(
+                        job.match_id, "normal", "1920x1080"
+                    ).failure_streak,
                     3,
                 )
             finally:
@@ -551,7 +784,9 @@ class ScoreboardRoiCacheTests(unittest.TestCase):
             root = Path(directory)
             runtime = PipelineRuntime(root / "state.sqlite3", root / "events.jsonl")
             job = self._job("match-roi-recovery-failed")
-            runtime.store.save_scoreboard_roi_cache(job.match_id, self._profile())
+            runtime.store.save_scoreboard_roi_cache_v2(
+                job.match_id, "normal", "1920x1080", self._profile()
+            )
             cached_job, cached = _job_with_cached_scoreboard_profile(runtime, job)
             calls: list[dict | None] = []
 
@@ -579,6 +814,148 @@ class ScoreboardRoiCacheTests(unittest.TestCase):
                 self.assertEqual(recovery["rediscovery_error_kind"], "scoreboard_missing")
             finally:
                 runtime.close()
+
+    def test_rediscovery_attempt_is_durable_without_inflating_locate_count(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "state.sqlite3"
+            event_log = root / "events.jsonl"
+            runtime = PipelineRuntime(database, event_log)
+            job = self._job("match-roi-durable-recovery")
+            runtime.discover_task(
+                match_id=job.match_id,
+                event_data={
+                    "event_key": job.event_key,
+                    "code": job.code,
+                    "event_type": job.event_type,
+                    "minute": job.event_minute,
+                    "minute_extra": job.event_minute_extra,
+                    "second": job.event_second,
+                    "team": "teamA",
+                    "person": "Player",
+                    "person_id": "1",
+                    "score": "1-0",
+                    "reason": "",
+                    "metadata": {},
+                },
+                observed_stream_time=job.default_anchor_stream_time,
+                observed_source_time=None,
+                clip_anchor_stream_time=job.default_anchor_stream_time,
+                clip_anchor_source_time=None,
+                output_due_stream_time=job.default_anchor_stream_time + 30.0,
+                detected_at_unix=job.detected_at_unix,
+            )
+            runtime.enqueue_vision_task(
+                job.event_key,
+                artifact_kind="ocr_window",
+                search_start_stream_time=0.0,
+                search_end_stream_time=130.0,
+                clip_before_seconds=30.0,
+                clip_after_seconds=30.0,
+            )
+            runtime.transition_vision_task(
+                job.event_key, "locating", artifact_kind="ocr_window"
+            )
+            cached = runtime.store.save_scoreboard_roi_cache_v2(
+                job.match_id, "normal", "1920x1080", self._profile()
+            )
+            cached_job = replace(job, scoreboard_profile=dict(cached.profile))
+
+            def failed_rediscovery(_candidate: VisionJob):
+                kind = (
+                    "clock_profile_mismatch"
+                    if failed_rediscovery.calls == 0
+                    else "scoreboard_missing"
+                )
+                failed_rediscovery.calls += 1
+                raise VisualLocationFailed(kind, "cannot locate clock", {})
+
+            failed_rediscovery.calls = 0
+            try:
+                with self.assertRaises(VisualLocationFailed):
+                    _locate_ocr_window_with_cached_profile_recovery(
+                        cached_job, runtime, cached, failed_rediscovery
+                    )
+                stored = runtime.store.get_vision_task(
+                    job.event_key, artifact_kind="ocr_window"
+                )
+                self.assertEqual(stored.locate_attempt_count, 1)
+                self.assertEqual(
+                    stored.window_metadata["progressive_scan"][
+                        "roi_rediscovery_attempt_count"
+                    ],
+                    1,
+                )
+                self.assertEqual(
+                    stored.window_metadata["progressive_scan"][
+                        "roi_rediscovery_status"
+                    ],
+                    "failed",
+                )
+                upgraded = runtime.store.merge_vision_task_window_metadata(
+                    job.event_key,
+                    {
+                        "progressive_scan": {
+                            "target_revision": 1,
+                            "scan_cursor_stream_time": 125.0,
+                        }
+                    },
+                    artifact_kind="ocr_window",
+                    expected_statuses=("locating",),
+                    expected_progressive_target_revision=0,
+                )
+                self.assertIsNotNone(upgraded)
+                stale_update = runtime.store.merge_vision_task_window_metadata(
+                    job.event_key,
+                    {"progressive_scan": {"roi_rediscovery_status": "running"}},
+                    artifact_kind="ocr_window",
+                    expected_statuses=("locating",),
+                    expected_progressive_target_revision=0,
+                )
+                self.assertIsNone(stale_update)
+                stored = runtime.store.get_vision_task(
+                    job.event_key, artifact_kind="ocr_window"
+                )
+                self.assertEqual(
+                    stored.window_metadata["progressive_scan"]["target_revision"],
+                    1,
+                )
+                self.assertEqual(
+                    stored.window_metadata["progressive_scan"][
+                        "scan_cursor_stream_time"
+                    ],
+                    125.0,
+                )
+                self.assertEqual(
+                    stored.window_metadata["progressive_scan"][
+                        "roi_rediscovery_status"
+                    ],
+                    "failed",
+                )
+            finally:
+                runtime.close()
+
+            reopened = PipelineRuntime(database, event_log)
+            calls = []
+
+            def mismatch_again(candidate: VisionJob):
+                calls.append(candidate.scoreboard_profile)
+                raise VisualLocationFailed(
+                    "clock_profile_mismatch", "stale cached job retried", {}
+                )
+
+            try:
+                with self.assertRaises(VisualLocationFailed):
+                    _locate_ocr_window_with_cached_profile_recovery(
+                        cached_job, reopened, cached, mismatch_again
+                    )
+                self.assertEqual(len(calls), 1)
+                stored = reopened.store.get_vision_task(
+                    job.event_key, artifact_kind="ocr_window"
+                )
+                self.assertEqual(stored.locate_attempt_count, 1)
+            finally:
+                reopened.close()
 
 
 if __name__ == "__main__":

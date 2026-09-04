@@ -375,8 +375,10 @@ class OcrFailureModeTests(unittest.TestCase):
                 "encoded",
                 result={"output": str(root / "default.gif"), "source": "default"},
             )
-            runtime.store.save_scoreboard_roi_cache(
+            runtime.store.save_scoreboard_roi_cache_v2(
                 job.match_id,
+                "normal",
+                "1920x1080",
                 {
                     "profile_id": "known-clock-region",
                     "reference_resolution": [1920, 1080],
@@ -444,7 +446,9 @@ class OcrFailureModeTests(unittest.TestCase):
                         "media_tail_grew_during_scan"
                     ]
                 )
-                roi_cache = runtime.store.get_scoreboard_roi_cache(job.match_id)
+                roi_cache = runtime.store.get_scoreboard_roi_cache_v2(
+                    job.match_id, "normal", "1920x1080"
+                )
                 self.assertIsNotNone(roi_cache)
                 self.assertEqual(roi_cache.failure_streak, 0)
                 next_job, next_cached = _job_with_cached_scoreboard_profile(
@@ -466,8 +470,10 @@ class OcrFailureModeTests(unittest.TestCase):
             runtime, job = self._create_progressive_ocr_job(
                 root, "profile-mismatch-without-mapping"
             )
-            runtime.store.save_scoreboard_roi_cache(
+            runtime.store.save_scoreboard_roi_cache_v2(
                 job.match_id,
+                "normal",
+                "1920x1080",
                 {
                     "profile_id": "wrong-clock-region",
                     "reference_resolution": [1920, 1080],
@@ -504,8 +510,8 @@ class OcrFailureModeTests(unittest.TestCase):
                     failed.last_error_kind, "clock_profile_mismatch"
                 )
                 self.assertEqual(
-                    runtime.store.get_scoreboard_roi_cache(
-                        job.match_id
+                    runtime.store.get_scoreboard_roi_cache_v2(
+                        job.match_id, "normal", "1920x1080"
                     ).failure_streak,
                     3,
                 )

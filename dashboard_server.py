@@ -251,10 +251,21 @@ AUTO_ADMISSION_MISSING_CONFIRMATIONS = _positive_environment_integer(
 MATCH_CATALOG_EXCLUDED_COMPETITION_NAMES = frozenset(
     {"英超", "西甲", "意甲", "德甲", "法甲", "中超"}
 )
+AUTO_ADMISSION_PRIORITY_COMPETITIONS = {
+    "136": "墨超",
+    "21": "瑞典超",
+    "22": "挪超",
+    "59": "英冠",
+    "117": "K联赛",
+    "19": "巴甲",
+    "1": "荷甲",
+    "16": "芬超",
+}
 MATCH_CATALOG_CARD_FIELDS = (
     "match_id", "team_A_name", "team_A_logo", "team_B_name", "team_B_logo",
-    "competition_name", "round_name", "status", "start_play", "sort_timestamp",
-    "fs_A", "fs_B", "minute", "minute_extra", "minute_period", "cmp_type",
+    "competition_id", "competition_name", "round_name", "status", "start_play",
+    "sort_timestamp", "fs_A", "fs_B", "minute", "minute_extra", "minute_period",
+    "cmp_type",
 )
 BEIJING_TIMEZONE = timezone(timedelta(hours=8))
 MATCH_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
@@ -586,6 +597,30 @@ def _catalog_required_text(item: dict[str, Any], field_name: str, index: int) ->
         if text:
             return text
     raise ValueError(f"赛事目录第 {index + 1} 项缺少有效字段 {field_name}")
+
+
+def _auto_admission_match_sort_key(item: dict[str, Any]) -> tuple[int, float, str]:
+    """Place configured competitions first while preserving stable time order."""
+    raw_competition_id = item.get("competition_id")
+    competition_id = (
+        str(raw_competition_id).strip()
+        if raw_competition_id is not None
+        else ""
+    )
+    if competition_id:
+        priority = competition_id in AUTO_ADMISSION_PRIORITY_COMPETITIONS
+    else:
+        competition_name = str(item.get("competition_name") or "").strip()
+        priority = competition_name in AUTO_ADMISSION_PRIORITY_COMPETITIONS.values()
+    try:
+        match_timestamp = _catalog_match_timestamp(item)
+    except ValueError:
+        match_timestamp = float("inf")
+    return (
+        0 if priority else 1,
+        match_timestamp,
+        str(item.get("match_id") or ""),
+    )
 
 
 class MatchCatalog:
@@ -1241,6 +1276,7 @@ class AutoAdmissionCoordinator:
         playing = catalog_result.get("playing") or []
         current_ids: set[str] = set()
         probe_records: list[AutoAdmissionRecord] = []
+        playing_by_match_id: dict[str, dict[str, Any]] = {}
         with self.lock:
             self.last_run_at_unix = timestamp
             for item in playing:
@@ -1251,6 +1287,7 @@ class AutoAdmissionCoordinator:
                 except ValueError:
                     continue
                 current_ids.add(match_id)
+                playing_by_match_id[match_id] = item
                 record = self.records.get(match_id)
                 if record is None:
                     record = AutoAdmissionRecord(match_id=match_id)
@@ -1335,6 +1372,12 @@ class AutoAdmissionCoordinator:
                 }:
                     probe_records.append(record)
 
+        probe_records.sort(
+            key=lambda record: _auto_admission_match_sort_key(
+                playing_by_match_id.get(record.match_id, {"match_id": record.match_id})
+            )
+        )
+
         # Source probes are network-bound. Run a small bounded batch without
         # holding the coordinator lock, keeping status requests responsive.
         if probe_records:
@@ -1358,6 +1401,7 @@ class AutoAdmissionCoordinator:
                 record = self.records.get(match_id)
                 if record is not None and record.state == "waiting_capacity":
                     waiting_records.append((record, item))
+        waiting_records.sort(key=lambda entry: _auto_admission_match_sort_key(entry[1]))
 
         for record, item in waiting_records:
             self._start_waiting(record, item, timestamp)
@@ -1959,6 +2003,16 @@ def _tasks_from_database(
                         return value
             return None
 
+        scoreboard_recovery = first_ocr_value("scoreboard_roi_cache_recovery")
+        if not isinstance(scoreboard_recovery, dict):
+            last_scan = progressive_scan.get("last_scan_diagnostics")
+            scoreboard_recovery = (
+                last_scan.get("scoreboard_roi_cache_recovery")
+                if isinstance(last_scan, dict)
+                and isinstance(last_scan.get("scoreboard_roi_cache_recovery"), dict)
+                else None
+            )
+
         ocr_pipeline_status = next(
             (
                 candidate
@@ -2431,6 +2485,25 @@ def _tasks_from_database(
             "requested_fallback_seconds": fallback_requested_seconds,
             "default_gif_preserved": vision_result.get("default_gif_preserved"),
             "output_kind": vision_result.get("output_kind"),
+            "scoreboard_region_status": (
+                scoreboard_recovery.get("status") if scoreboard_recovery else None
+            ),
+            "scoreboard_region_initial_error_kind": (
+                scoreboard_recovery.get("initial_error_kind") if scoreboard_recovery else None
+            ),
+            "scoreboard_region_rediscovery_error_kind": (
+                scoreboard_recovery.get("rediscovery_error_kind") if scoreboard_recovery else None
+            ),
+            "scoreboard_region_rediscovery_attempt_count": (
+                scoreboard_recovery.get("attempt_count")
+                if scoreboard_recovery
+                else first_ocr_value("roi_rediscovery_attempt_count")
+            ),
+            "scoreboard_region_rediscovery_diagnostics": (
+                scoreboard_recovery.get("rediscovery_diagnostics")
+                if scoreboard_recovery
+                else first_ocr_value("roi_rediscovery_diagnostics")
+            ),
             "precise_location": vision_result.get("precise_location"),
             "target_clock": target_clock,
             "exact_second_error": exact_second_error,

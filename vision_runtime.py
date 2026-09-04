@@ -10,7 +10,7 @@ import tempfile
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from artifact_naming import build_gif_filename
 from live_goal_pipeline import (
@@ -212,6 +212,57 @@ def _ocr_clock_period(phase: Any) -> str | None:
     return "first_half" if normalized.startswith("first_half") else "second_half"
 
 
+def _scoreboard_layout_mode(job: "VisionJob") -> str | None:
+    """Return an explicit event-clock bucket, or None when it is ambiguous.
+
+    The feed can describe stoppage time either as ``minute_extra`` or as
+    ``90+N``.  A bare 45/90 boundary is deliberately left uncached because
+    broadcasts may show either the frozen main clock or an auxiliary timer.
+    """
+    minute = str(job.event_minute or "").strip().rstrip("'").strip()
+    raw_extra = str(job.event_minute_extra or "").strip()
+    embedded_extra: float | None = None
+    if "+" in minute:
+        parts = [part.strip() for part in minute.split("+")]
+        if len(parts) != 2 or not all(parts):
+            return None
+        minute, extra_text = parts
+        try:
+            embedded_extra = float(extra_text)
+        except (TypeError, ValueError):
+            return None
+    try:
+        base = float(minute)
+        explicit_extra = float(raw_extra) if raw_extra else 0.0
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(base) or not math.isfinite(explicit_extra):
+        return None
+    if base < 0 or explicit_extra < 0:
+        return None
+    if embedded_extra is not None:
+        if explicit_extra not in (0.0, embedded_extra):
+            return None
+        explicit_extra = embedded_extra
+    if explicit_extra > 0:
+        return "stoppage"
+    if base in {45.0, 90.0}:
+        return None
+    return "normal"
+
+
+def _scoreboard_resolution_key(value: Any) -> str | None:
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        return None
+    try:
+        width, height = (int(part) for part in value)
+    except (TypeError, ValueError):
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    return f"{width}x{height}"
+
+
 def _ocr_clock_phases_compatible(left: Any, right: Any) -> bool:
     left_period = _ocr_clock_period(left)
     right_period = _ocr_clock_period(right)
@@ -317,34 +368,35 @@ def _scoreboard_roi_profile_from_result(
             else:
                 if math.isfinite(parsed):
                     confidence = max(0.0, min(1.0, parsed))
-        auto = item.get("auto_clock")
-        if not isinstance(auto, dict):
-            continue
-        roi = auto.get("clock_roi")
-        resolution = auto.get("frame_resolution")
-        if not (
-            isinstance(roi, (list, tuple))
-            and len(roi) == 4
-            and isinstance(resolution, (list, tuple))
-            and len(resolution) == 2
-        ):
-            continue
-        try:
-            normalized_roi = [int(value) for value in roi]
-            width, height = (int(value) for value in resolution)
-        except (TypeError, ValueError):
-            continue
-        if width <= 0 or height <= 0:
-            continue
-        profile = {
-            "profile_id": f"auto-cache-{str(match_id)}",
-            "reference_resolution": [width, height],
-            "clock_roi": normalized_roi,
-            "score_roi": None,
-            "second_half_clock_mode": "auto",
-            "aspect_ratio_tolerance": 0.04,
-        }
-        return profile, confidence
+        for source_key in ("auto_clock", "scoreboard_profile"):
+            source = item.get(source_key)
+            if not isinstance(source, dict):
+                continue
+            roi = source.get("clock_roi")
+            resolution = source.get("frame_resolution")
+            if not (
+                isinstance(roi, (list, tuple))
+                and len(roi) == 4
+                and isinstance(resolution, (list, tuple))
+                and len(resolution) == 2
+            ):
+                continue
+            try:
+                normalized_roi = [int(part) for part in roi]
+                width, height = (int(part) for part in resolution)
+            except (TypeError, ValueError):
+                continue
+            if width <= 0 or height <= 0:
+                continue
+            profile = {
+                "profile_id": f"auto-cache-{str(match_id)}",
+                "reference_resolution": [width, height],
+                "clock_roi": normalized_roi,
+                "score_roi": None,
+                "second_half_clock_mode": "auto",
+                "aspect_ratio_tolerance": 0.04,
+            }
+            return profile, confidence
     return None
 
 
@@ -365,6 +417,8 @@ def _scoreboard_result_frame_resolution(value: Any) -> tuple[int, int] | None:
 def _job_with_cached_scoreboard_profile(
     runtime: Any,
     job: "VisionJob",
+    *,
+    resolution_key: str | None = None,
 ) -> tuple["VisionJob", Any | None]:
     if job.scoreboard_profile is not None:
         return job, None
@@ -380,10 +434,13 @@ def _job_with_cached_scoreboard_profile(
             "scoreboard_roi_cache_bypass"
         ):
             return job, None
-    getter = getattr(runtime.store, "get_scoreboard_roi_cache", None)
-    if not callable(getter):
+    layout_mode = _scoreboard_layout_mode(job)
+    if layout_mode is None:
         return job, None
-    cached = getter(job.match_id)
+    getter_v2 = getattr(runtime.store, "get_scoreboard_roi_cache_v2", None)
+    if not callable(getter_v2):
+        return job, None
+    cached = getter_v2(job.match_id, layout_mode, resolution_key)
     if (
         cached is None
         or int(getattr(cached, "failure_streak", 0))
@@ -403,8 +460,13 @@ def _record_scoreboard_roi_success(
     *,
     cached: Any | None,
 ) -> dict[str, Any] | None:
-    saver = getattr(runtime.store, "save_scoreboard_roi_cache", None)
-    if not callable(saver):
+    if job.scoreboard_profile is not None and cached is None:
+        # Operator-provided profiles are configuration, not auto-discovery.
+        # Never copy or replace them through the automatic ROI cache.
+        return None
+    layout_mode = _scoreboard_layout_mode(job)
+    saver_v2 = getattr(runtime.store, "save_scoreboard_roi_cache_v2", None)
+    if not callable(saver_v2):
         return None
     candidate = _scoreboard_roi_profile_from_result(job.match_id, located)
     if candidate is not None:
@@ -414,25 +476,79 @@ def _record_scoreboard_roi_success(
         confidence = getattr(cached, "confidence", None)
     else:
         return None
-    stored = saver(job.match_id, profile, confidence=confidence)
     current_resolution = _scoreboard_result_frame_resolution(located)
     reference = profile.get("reference_resolution")
-    resolution_changed = bool(
-        current_resolution is not None
-        and isinstance(reference, (list, tuple))
-        and len(reference) == 2
-        and current_resolution != (int(reference[0]), int(reference[1]))
+    resolution_key = _scoreboard_resolution_key(current_resolution)
+    if resolution_key is None:
+        # A cache reuse response from older workers may omit frame_resolution;
+        # retain the key that was actually read instead of inventing one.
+        resolution_key = getattr(cached, "resolution_key", None)
+    if resolution_key is None:
+        resolution_key = _scoreboard_resolution_key(reference)
+    if layout_mode is None or resolution_key is None:
+        return None
+    old_resolution_key = getattr(cached, "resolution_key", None)
+    old_profile_fingerprint = getattr(cached, "profile_fingerprint", None)
+    profile = dict(profile)
+    if current_resolution is not None:
+        profile["reference_resolution"] = list(current_resolution)
+    profile["profile_id"] = (
+        f"auto-cache-{str(job.match_id)}-{layout_mode}-{resolution_key}"
     )
-    if resolution_changed:
-        invalidator = getattr(runtime.store, "record_scoreboard_roi_failure", None)
+    stored = saver_v2(
+        job.match_id,
+        layout_mode,
+        resolution_key,
+        profile,
+        confidence=confidence,
+        expected_profile_fingerprint=old_profile_fingerprint,
+        expected_resolution_key=old_resolution_key,
+    )
+    write_applied = bool(
+        stored is not None and getattr(stored, "profile", None) == profile
+    )
+    cached_reference_key = None
+    if cached is not None and isinstance(getattr(cached, "profile", None), dict):
+        cached_reference_key = _scoreboard_resolution_key(
+            cached.profile.get("reference_resolution")
+        )
+    resolution_changed = bool(
+        cached is not None
+        and (old_resolution_key or cached_reference_key)
+        and (old_resolution_key or cached_reference_key) != resolution_key
+    )
+    if (
+        write_applied
+        and resolution_changed
+        and old_resolution_key
+        and old_resolution_key != resolution_key
+    ):
+        invalidator = getattr(runtime.store, "record_scoreboard_roi_failure_v2", None)
         if callable(invalidator):
-            stored = invalidator(job.match_id, invalidate=True) or stored
+            invalidator(
+                job.match_id,
+                layout_mode,
+                old_resolution_key,
+                invalidate=True,
+                profile_fingerprint=old_profile_fingerprint,
+            )
     return {
-        "status": "rediscover_next_request" if resolution_changed else "reused" if cached else "discovered",
-        "success_streak": int(getattr(stored, "success_streak", 0)),
-        "failure_streak": int(getattr(stored, "failure_streak", 0)),
+        "status": (
+            "stale_write_ignored"
+            if not write_applied
+            else "resolution_updated"
+            if resolution_changed
+            else "reused"
+            if cached
+            else "discovered"
+        ),
+        "success_streak": int(getattr(stored, "success_streak", 0)) if stored else 0,
+        "failure_streak": int(getattr(stored, "failure_streak", 0)) if stored else 0,
         "reference_resolution": list(profile.get("reference_resolution") or []),
         "current_resolution": list(current_resolution) if current_resolution else None,
+        "layout_mode": layout_mode,
+        "resolution_key": resolution_key,
+        "profile_fingerprint": getattr(stored, "profile_fingerprint", None),
     }
 
 
@@ -449,12 +565,18 @@ def _record_scoreboard_roi_failure(
         "clock_profile_mismatch",
     }:
         return
-    recorder = getattr(runtime.store, "record_scoreboard_roi_failure", None)
-    if callable(recorder):
-        recorder(
+    layout_mode = getattr(cached, "layout_mode", None) or _scoreboard_layout_mode(job)
+    resolution_key = getattr(cached, "resolution_key", None)
+    recorder_v2 = getattr(runtime.store, "record_scoreboard_roi_failure_v2", None)
+    if callable(recorder_v2) and layout_mode and resolution_key:
+        recorder_v2(
             job.match_id,
+            layout_mode,
+            resolution_key,
             invalidate=error_kind == "clock_profile_mismatch",
+            profile_fingerprint=getattr(cached, "profile_fingerprint", None),
         )
+        return
 
 
 def _ocr_recoverable_profile_mismatch(
@@ -522,6 +644,29 @@ def _ocr_recoverable_profile_mismatch(
     return True
 
 
+def _persist_ocr_rediscovery_progress(
+    runtime: Any,
+    job: "VisionJob",
+    updates: Mapping[str, Any],
+) -> None:
+    """Merge rediscovery diagnostics without changing task attempts or status."""
+    updater = getattr(runtime.store, "merge_vision_task_window_metadata", None)
+    if not callable(updater):
+        return
+    try:
+        updater(
+            job.event_key,
+            {"progressive_scan": dict(updates)},
+            artifact_kind="ocr_window",
+            expected_statuses=("pending", "locating"),
+            expected_progressive_target_revision=_vision_target_revision(job),
+        )
+    except (KeyError, TypeError, ValueError):
+        # A concurrent final transition wins; the final OCR result/error still
+        # carries the same recovery diagnostics.
+        pass
+
+
 def _locate_ocr_window_with_cached_profile_recovery(
     job: "VisionJob",
     runtime: Any,
@@ -541,11 +686,22 @@ def _locate_ocr_window_with_cached_profile_recovery(
     try:
         located, materialized, paths = locate(job)
     except VisualLocationFailed as first_error:
+        persisted_recovery_attempts = 0
+        current_task = _artifact_task(runtime, job.event_key, "ocr_window")
+        if current_task is not None:
+            current_progress = _ocr_progressive_state(current_task)
+            try:
+                persisted_recovery_attempts = max(
+                    0, int(current_progress.get("roi_rediscovery_attempt_count") or 0)
+                )
+            except (TypeError, ValueError):
+                persisted_recovery_attempts = 0
         can_recover = bool(
             job.clock_only
             and cached_scoreboard_roi is not None
             and job.scoreboard_profile is not None
             and first_error.kind == "clock_profile_mismatch"
+            and persisted_recovery_attempts < 1
         )
         if not can_recover or (
             allow_retry is not None and not allow_retry(first_error)
@@ -562,9 +718,22 @@ def _locate_ocr_window_with_cached_profile_recovery(
             cached=cached_scoreboard_roi,
         )
         fallback_job = replace(job, scoreboard_profile=None)
+        _persist_ocr_rediscovery_progress(
+            runtime,
+            job,
+            {
+                "roi_rediscovery_attempt_count": persisted_recovery_attempts + 1,
+                "roi_rediscovery_status": "running",
+                "roi_rediscovery_trigger": {
+                    "kind": first_error.kind,
+                    "message": str(first_error),
+                },
+            },
+        )
         recovery = {
             "status": "rediscovery_pending",
             "attempted": True,
+            "attempt_count": persisted_recovery_attempts + 1,
             "initial_error_kind": first_error.kind,
             "initial_error": str(first_error),
             "initial_diagnostics": first_error.diagnostics,
@@ -575,6 +744,17 @@ def _locate_ocr_window_with_cached_profile_recovery(
             recovery["status"] = "rediscovery_failed"
             recovery["rediscovery_error_kind"] = second_error.kind
             recovery["rediscovery_error"] = str(second_error)
+            recovery["rediscovery_diagnostics"] = second_error.diagnostics
+            _persist_ocr_rediscovery_progress(
+                runtime,
+                job,
+                {
+                    "roi_rediscovery_attempt_count": persisted_recovery_attempts + 1,
+                    "roi_rediscovery_status": "failed",
+                    "roi_rediscovery_trigger": recovery["initial_diagnostics"],
+                    "roi_rediscovery_diagnostics": second_error.diagnostics,
+                },
+            )
             raise VisualLocationFailed(
                 second_error.kind,
                 str(second_error),
@@ -587,6 +767,19 @@ def _locate_ocr_window_with_cached_profile_recovery(
         recovery["status"] = "rediscovered"
         located = dict(located)
         located["scoreboard_roi_cache_recovery"] = recovery
+        _persist_ocr_rediscovery_progress(
+            runtime,
+            job,
+            {
+                "roi_rediscovery_attempt_count": persisted_recovery_attempts + 1,
+                "roi_rediscovery_status": "succeeded",
+                "roi_rediscovery_trigger": recovery["initial_diagnostics"],
+                "roi_rediscovery_diagnostics": {
+                    "status": "rediscovered",
+                    "initial_error_kind": first_error.kind,
+                },
+            },
+        )
         return fallback_job, located, materialized, paths, True
 
     return job, located, materialized, paths, False
@@ -5886,6 +6079,9 @@ def _encode_ocr_api_range_fallback(
         "degradation_mode": "api_time_range_fallback",
         "degradation_reason": failure_reason,
         "failure_reason": failure_reason,
+        "scoreboard_roi_cache_recovery": failure.diagnostics.get(
+            "scoreboard_roi_cache_recovery"
+        ),
         "fallback_explanation": explanation,
         "fallback_used": True,
         "fallback_generated": True,
@@ -6903,6 +7099,21 @@ def _process_ocr_window(
                 if cache_recovery_attempted:
                     cached_scoreboard_roi = None
             except VisualLocationFailed as exc:
+                if (
+                    job.clock_only
+                    and cached_scoreboard_roi is None
+                    and job.scoreboard_profile is not None
+                    and exc.kind == "clock_profile_mismatch"
+                ):
+                    exc.diagnostics.setdefault(
+                        "scoreboard_roi_cache_recovery",
+                        {
+                            "status": "explicit_profile_mismatch",
+                            "attempted": False,
+                            "initial_error_kind": exc.kind,
+                            "initial_error": str(exc),
+                        },
+                    )
                 cache_recovery = exc.diagnostics.get(
                     "scoreboard_roi_cache_recovery"
                 )
@@ -7416,6 +7627,17 @@ def _process_ocr_window(
                 "progressive_status": "target_located",
                 "default_gif_preserved": True,
                 "scoreboard_roi_cache": scoreboard_roi_cache,
+                "scoreboard_layout_mode": _scoreboard_layout_mode(job),
+                "scoreboard_cache_resolution_key": (
+                    scoreboard_roi_cache.get("resolution_key")
+                    if isinstance(scoreboard_roi_cache, dict)
+                    else None
+                ),
+                "scoreboard_cache_status": (
+                    scoreboard_roi_cache.get("status")
+                    if isinstance(scoreboard_roi_cache, dict)
+                    else "miss"
+                ),
             }
             before, after = _normalized_ocr_clip_window(
                 job,
