@@ -101,6 +101,7 @@ GIF_MAX_CONCURRENT_HEAVY_TASKS=5
 GIF_MAX_CONCURRENT_VISION_TASKS=2
 GIF_VISION_WORKERS=2
 GIF_OCR_TIMEOUT_SECONDS=300
+GIF_OCR_REPLICAS=1
 GIF_WORKER_FINISH_TIMEOUT_SECONDS=600
 ```
 
@@ -109,6 +110,11 @@ On a stronger server, set both `GIF_MAX_CONCURRENT_VISION_TASKS=4` and
 OCR tasks. The OCR timeout applies to one recognition subprocess; slow but
 progressing FFmpeg preparation and earlier OCR passes no longer consume a
 single fatal event budget.
+
+`GIF_OCR_REPLICAS` controls the number of same-language OCR model replicas in
+the persistent worker (1-4, default 1). Each request stays on one replica;
+raising this value increases parallel OCR throughput and memory use, so enable
+`2` only after checking server CPU and memory under load.
 
 The limits apply across all match Worker processes. A ninth match receives an
 HTTP 409 response until one active match has completely stopped. GIF encoding
@@ -399,8 +405,13 @@ Enable `OCR 第二链路` before starting a match Worker. Each new event then ha
 two active artifacts by default: the unchanged default GIF and an OCR-located
 60-second GIF. The optional T-DEED-refined 20-second artifact remains available
 behind `--tdeed-enabled`, but the Dashboard keeps that third chain paused until
-it is explicitly enabled. The Worker polls shotmap independently every
-five seconds and only treats newly added `outcome=goal` rows as goal events. Its
+it is explicitly enabled. New Dashboard Workers use the overview minute-level
+event feed only by default (`GIF_SHOTMAP_ENABLED=false`); this keeps shotmap
+requests and cross-source matching disabled while preserving the complete
+shotmap implementation and historical state. Set the switch to `true` and
+restart the Dashboard, or pass `--shotmap-enabled` to a direct Worker, for a
+legacy/diagnostic run. When enabled, the Worker polls shotmap independently
+every five seconds and only treats newly added `outcome=goal` rows as goal events. Its
 first valid JSON response is a durable SQLite baseline, so goals that existed
 before the Worker started are not replayed after startup or restart. A new goal
 uses the cumulative `second` directly: for example, `455` targets `07:35` while

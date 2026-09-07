@@ -2952,6 +2952,7 @@ class DashboardTests(unittest.TestCase):
         )
         self.assertIn("--vision-enabled", command)
         self.assertNotIn("--tdeed-enabled", command)
+        self.assertNotIn("--shotmap-enabled", command)
         self.assertEqual(
             command[command.index("--vision-search-before") + 1],
             "120.0",
@@ -2974,6 +2975,26 @@ class DashboardTests(unittest.TestCase):
         self.assertFalse(payload["vision"]["tdeed_enabled"])
         self.assertFalse(payload["vision"]["worker_tdeed_enabled"])
         self.assertEqual(payload["vision"]["workers"], dashboard_server.VISION_WORKERS)
+        self.assertFalse(payload["polling"]["shotmap_enabled"])
+        self.assertEqual(payload["polling"]["shotmap_status"], "disabled")
+
+    def test_dashboard_can_enable_shotmap_for_legacy_worker(self):
+        manager = dashboard_server.Dashboard(background_monitors=False)
+        session = manager.get("shotmap-legacy-start")
+        session.source = {"resource": "rtmp://example/live"}
+        worker = Mock(pid=127, returncode=None)
+        worker.poll.return_value = None
+
+        with patch.object(dashboard_server, "GIF_SHOTMAP_ENABLED", True), patch(
+            "dashboard_server.subprocess.Popen", return_value=worker
+        ) as popen:
+            manager.start(session)
+            payload = dashboard_server._session_json(session)
+
+        command = popen.call_args.args[0]
+        self.assertIn("--shotmap-enabled", command)
+        self.assertTrue(payload["polling"]["shotmap_enabled"])
+        self.assertEqual(payload["polling"]["shotmap_status"], "enabled")
 
     def test_live_start_passes_match_start_play_to_worker(self):
         manager = dashboard_server.Dashboard(background_monitors=False)
@@ -3057,6 +3078,27 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(command[command.index("--gif-colors") + 1], "128")
         self.assertEqual(command[command.index("--fallback-gif-width") + 1], "384")
         self.assertEqual(command[command.index("--fallback-gif-fps") + 1], "6.0")
+
+    def test_dashboard_can_disable_default_gif_without_disabling_ocr_worker(self):
+        manager = dashboard_server.Dashboard(background_monitors=False)
+        session = manager.get("default-gif-disabled")
+        session.source = {"resource": "rtmp://example/live"}
+        session.vision_enabled = True
+        worker = Mock(pid=129, returncode=None)
+        worker.poll.return_value = None
+
+        with patch.object(dashboard_server, "DEFAULT_GIF_ENABLED", False), patch(
+            "dashboard_server.subprocess.Popen", return_value=worker
+        ) as popen:
+            manager.start(session)
+            payload = dashboard_server._session_json(session)
+
+        command = popen.call_args.args[0]
+        self.assertIn("--disable-default-gif", command)
+        self.assertIn("--vision-enabled", command)
+        self.assertFalse(payload["gif"]["default_enabled"])
+        self.assertFalse(payload["gif"]["worker_default_enabled"])
+        self.assertTrue(payload["vision"]["worker_enabled"])
 
     def test_dashboard_can_disable_clock_only_without_disabling_ai(self):
         manager = dashboard_server.Dashboard(background_monitors=False)
@@ -3282,6 +3324,27 @@ class DashboardTests(unittest.TestCase):
             "history": 1,
             "failed": 0,
         })
+
+    def test_disabled_default_gif_is_not_counted_as_failure(self):
+        manager = dashboard_server.Dashboard(background_monitors=False)
+        session = manager.get("disabled-count-test")
+        session.output_report = lambda: {
+            "events": [
+                {
+                    "event_key": "match-1:G:key",
+                    "code": "G",
+                    "event_type": "goal",
+                    "minute": "18",
+                    "status": "failed",
+                    "last_error_kind": "default_gif_disabled",
+                    "default_gif_disabled": True,
+                }
+            ]
+        }
+        payload = dashboard_server._session_json(session)
+        self.assertEqual(payload["event_counts"]["failed"], 0)
+        self.assertEqual(payload["telemetry"]["task_counts"]["failed"], 0)
+        self.assertEqual(payload["telemetry"]["task_counts"]["disabled"], 1)
 
     def test_runtime_evidence_reports_fresh_worker_heartbeat(self):
         manager = dashboard_server.Dashboard(background_monitors=False)

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import shutil
+import struct
 import subprocess
 import tempfile
 import time
@@ -173,6 +175,407 @@ OCR_MINUTE_FALLBACK_FPS = 6.0
 OCR_MINUTE_FALLBACK_COLORS = 160
 OCR_MINUTE_FALLBACK_COMPLETE_RATIO = 0.9
 OCR_PYTHON = Path(__file__).resolve().parent / "tmp" / "ocr_venv" / "bin" / "python"
+
+# Optional post-processing for the user-facing, precise 60-second OCR GIF.
+# Keep this disabled by default: gifsicle is an operational dependency and a
+# missing/slow binary must never turn an otherwise successful OCR artifact into
+# a failed task.  The environment is read at call time so a long-running
+# dashboard can be configured without re-importing this module in tests.
+OCR_GIF_GIFSICLE_ENABLED = False
+OCR_GIF_GIFSICLE_DEFAULT_TIMEOUT_SECONDS = 60.0
+# Public defaults mirror the environment variable names for callers that
+# prefer importing configuration rather than reading ``os.environ`` directly.
+OCR_GIF_GIFSICLE_PATH: str | None = None
+OCR_GIF_GIFSICLE_TIMEOUT_SECONDS = OCR_GIF_GIFSICLE_DEFAULT_TIMEOUT_SECONDS
+OCR_GIF_GIFSICLE_ALLOWED_SOURCES = frozenset({
+    "exact_second",
+    "exact",
+    "interpolated",
+    "estimated",
+    "projected",
+})
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on", "y"}:
+        return True
+    if normalized in {"0", "false", "no", "off", "n"}:
+        return False
+    return default
+
+
+def _ocr_gifsicle_timeout_seconds() -> float:
+    raw = os.getenv("OCR_GIF_GIFSICLE_TIMEOUT_SECONDS", "")
+    try:
+        value = float(raw) if raw.strip() else OCR_GIF_GIFSICLE_TIMEOUT_SECONDS
+    except (TypeError, ValueError):
+        value = OCR_GIF_GIFSICLE_TIMEOUT_SECONDS
+    if not math.isfinite(value) or value <= 0:
+        return OCR_GIF_GIFSICLE_TIMEOUT_SECONDS
+    return value
+
+
+def _ocr_gifsicle_binary() -> str | None:
+    configured = os.getenv("OCR_GIF_GIFSICLE_PATH", "").strip()
+    if configured:
+        return configured
+    if OCR_GIF_GIFSICLE_PATH:
+        return OCR_GIF_GIFSICLE_PATH
+    return shutil.which("gifsicle")
+
+
+def _strict_ocr_gif_result(result: Mapping[str, Any], *, artifact_kind: str) -> bool:
+    """Return whether ``result`` describes the precise 60-second OCR output.
+
+    Minute/API fallbacks and T-DEED artifacts deliberately fail this check so
+    they continue using their existing output bytes and publication path.
+    Values are read defensively because old persisted rows may contain strings
+    or missing fields.
+    """
+    if artifact_kind != "ocr_window":
+        return False
+    if str(result.get("output_kind") or "") != "ocr_window":
+        return False
+    if str(result.get("localization_source") or "") not in OCR_GIF_GIFSICLE_ALLOWED_SOURCES:
+        return False
+    try:
+        before = float(result.get("clip_before_seconds"))
+        after = float(result.get("clip_after_seconds"))
+    except (TypeError, ValueError):
+        return False
+    return (
+        math.isfinite(before)
+        and math.isfinite(after)
+        and abs(before - OCR_EXACT_WINDOW_BEFORE_SECONDS) <= 1e-6
+        and abs(after - OCR_EXACT_WINDOW_AFTER_SECONDS) <= 1e-6
+    )
+
+
+def _basic_gif_metadata(path: Path) -> dict[str, Any] | None:
+    """Read enough GIF structure to validate an output without Pillow.
+
+    This is intentionally a conservative parser used only when ffprobe is not
+    available.  It checks the GIF signature, dimensions, trailer, and counts
+    image descriptors while skipping extension/image data sub-blocks.  A
+    malformed or single-frame file is rejected rather than adopted.
+    """
+    try:
+        data = path.read_bytes()
+    except (OSError, ValueError):
+        return None
+    if len(data) < 13 or data[:6] not in {b"GIF87a", b"GIF89a"}:
+        return None
+    width, height = struct.unpack_from("<HH", data, 6)
+    if width <= 0 or height <= 0:
+        return None
+    index = 13
+    packed = data[10]
+    if packed & 0x80:
+        index += 3 * (1 << ((packed & 0x07) + 1))
+    frame_count = 0
+    delays: list[float] = []
+    has_trailer = False
+
+    def skip_sub_blocks(cursor: int) -> int | None:
+        while cursor < len(data):
+            size = data[cursor]
+            cursor += 1
+            if size == 0:
+                return cursor
+            cursor += size
+            if cursor > len(data):
+                return None
+        return None
+
+    while index < len(data):
+        marker = data[index]
+        index += 1
+        if marker == 0x3B:  # GIF trailer
+            has_trailer = True
+            break
+        if marker == 0x2C:  # image descriptor
+            if index + 9 > len(data):
+                return None
+            local_packed = data[index + 8]
+            index += 9
+            if local_packed & 0x80:
+                index += 3 * (1 << ((local_packed & 0x07) + 1))
+            if index >= len(data):
+                return None
+            index += 1  # LZW minimum code size
+            index = skip_sub_blocks(index)
+            if index is None:
+                return None
+            frame_count += 1
+            continue
+        if marker == 0x21:  # extension block
+            if index >= len(data):
+                return None
+            label = data[index]
+            index += 1
+            if label == 0xF9 and index < len(data):  # graphics control
+                block_size = data[index]
+                if block_size >= 4 and index + 1 + block_size <= len(data):
+                    delay = struct.unpack_from("<H", data, index + 2)[0]
+                    delays.append(delay / 100.0)
+            index = skip_sub_blocks(index)
+            if index is None:
+                return None
+            continue
+        # Unknown top-level marker: reject rather than risk adopting corrupt
+        # output.  GIF data should only contain image, extension, or trailer.
+        return None
+
+    if not has_trailer or frame_count < 2:
+        return None
+    duration = sum(delays) if delays else None
+    return {
+        "width": int(width),
+        "height": int(height),
+        "frames": frame_count,
+        "duration_sec": duration,
+    }
+
+
+def _probe_gif_metadata(
+    path: Path,
+    ffprobe: str | None,
+    *,
+    timeout_seconds: float,
+) -> dict[str, Any] | None:
+    """Return conservative GIF metadata, preferring ffprobe when available."""
+    if ffprobe:
+        try:
+            completed = subprocess.run(
+                [
+                    ffprobe,
+                    "-v",
+                    "error",
+                    "-count_frames",
+                    "-show_entries",
+                    "format=duration:stream=width,height,nb_read_frames,duration,avg_frame_rate",
+                    "-of",
+                    "json",
+                    str(path),
+                ],
+                check=True,
+                text=True,
+                capture_output=True,
+                timeout=max(0.1, timeout_seconds),
+            )
+            payload = json.loads(completed.stdout or "{}")
+            stream = (payload.get("streams") or [{}])[0]
+            fmt = payload.get("format") or {}
+            width = int(stream["width"])
+            height = int(stream["height"])
+            frames_raw = stream.get("nb_read_frames")
+            frames = int(frames_raw) if frames_raw not in (None, "N/A", "") else None
+            duration_raw = stream.get("duration", fmt.get("duration"))
+            duration = float(duration_raw) if duration_raw not in (None, "N/A", "") else None
+            if width > 0 and height > 0 and frames is not None and frames >= 2:
+                return {
+                    "width": width,
+                    "height": height,
+                    "frames": frames,
+                    "duration_sec": duration,
+                    "avg_frame_rate": stream.get("avg_frame_rate"),
+                }
+        except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError):
+            # Fall back to the dependency-free structural parser below.
+            pass
+    return _basic_gif_metadata(path)
+
+
+def _frame_rate_value(value: Any) -> float | None:
+    if value in (None, "", "N/A"):
+        return None
+    try:
+        if isinstance(value, str) and "/" in value:
+            numerator, denominator = value.split("/", 1)
+            denominator_value = float(denominator)
+            if denominator_value == 0:
+                return None
+            value = float(numerator) / denominator_value
+        else:
+            value = float(value)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+    return value if math.isfinite(value) and value > 0 else None
+
+
+def _compress_ocr_gif(
+    encoded: Mapping[str, Any],
+    *,
+    artifact_kind: str,
+    ffprobe: str | None,
+) -> dict[str, Any]:
+    """Optionally optimize one precise OCR GIF, always preserving the original.
+
+    Compression is best-effort.  Every failure returns a diagnostic and leaves
+    the original path untouched; callers can still transition the artifact to
+    ``encoded``.  A successful optimization atomically replaces the original
+    only when the validated output is strictly smaller.
+    """
+    output_value = encoded.get("output") or encoded.get("output_path")
+    output = Path(str(output_value)) if output_value else None
+    original_bytes = None
+    if output is not None:
+        try:
+            original_bytes = output.stat().st_size
+        except OSError:
+            original_bytes = None
+    base: dict[str, Any] = {
+        "enabled": _env_bool("OCR_GIF_GIFSICLE_ENABLED", OCR_GIF_GIFSICLE_ENABLED),
+        "attempted": False,
+        "status": "not_eligible",
+        "original_bytes": original_bytes,
+        "compressed_bytes": None,
+        "elapsed_seconds": 0.0,
+        "fallback_reason": None,
+        "adopted": False,
+    }
+    if not _strict_ocr_gif_result(encoded, artifact_kind=artifact_kind):
+        return base
+    base["attempted"] = True
+    if not base["enabled"]:
+        base["status"] = "disabled"
+        base["fallback_reason"] = "gifsicle_disabled"
+        return base
+    if output is None or original_bytes is None or original_bytes <= 0:
+        base["status"] = "failed"
+        base["fallback_reason"] = "gif_output_missing"
+        return base
+    binary = _ocr_gifsicle_binary()
+    base["binary"] = binary
+    if not binary:
+        base["status"] = "tool_missing"
+        base["fallback_reason"] = "gifsicle_not_found"
+        return base
+    timeout_seconds = _ocr_gifsicle_timeout_seconds()
+    started = time.perf_counter()
+    temporary: Path | None = None
+    try:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            prefix=f".{output.stem}.gifsicle-",
+            suffix=".gif",
+            dir=output.parent,
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+        subprocess.run(
+            [binary, "-O3", "--colors", "128", str(output), "-o", str(temporary)],
+            check=True,
+            text=True,
+            capture_output=True,
+            timeout=timeout_seconds,
+        )
+        compressed_bytes = temporary.stat().st_size
+        base["compressed_bytes"] = compressed_bytes
+        original_metadata = _probe_gif_metadata(
+            output,
+            ffprobe,
+            timeout_seconds=min(timeout_seconds, 10.0),
+        ) or {
+            "width": encoded.get("width"),
+            "height": encoded.get("height"),
+            "frames": None,
+            "duration_sec": encoded.get("duration_sec"),
+        }
+        optimized_metadata = _probe_gif_metadata(
+            temporary,
+            ffprobe,
+            timeout_seconds=min(timeout_seconds, 10.0),
+        )
+        if optimized_metadata is None:
+            base["status"] = "invalid_output"
+            base["fallback_reason"] = "gifsicle_output_not_valid_animated_gif"
+            return base
+        base["validated"] = optimized_metadata
+        expected_width = original_metadata.get("width")
+        expected_height = original_metadata.get("height")
+        if (
+            expected_width is not None
+            and expected_height is not None
+            and (
+                int(optimized_metadata["width"]) != int(expected_width)
+                or int(optimized_metadata["height"]) != int(expected_height)
+            )
+        ):
+            base["status"] = "invalid_output"
+            base["fallback_reason"] = "gifsicle_output_dimensions_changed"
+            return base
+        expected_frames = original_metadata.get("frames")
+        optimized_frames = optimized_metadata.get("frames")
+        if (
+            expected_frames is not None
+            and optimized_frames is not None
+            and int(optimized_frames) != int(expected_frames)
+        ):
+            base["status"] = "invalid_output"
+            base["fallback_reason"] = "gifsicle_output_frame_count_changed"
+            return base
+        expected_duration = original_metadata.get("duration_sec")
+        optimized_duration = optimized_metadata.get("duration_sec")
+        if (
+            expected_duration is not None
+            and optimized_duration is not None
+            and abs(float(optimized_duration) - float(expected_duration))
+            > max(0.5, float(expected_duration) * 0.10)
+        ):
+            base["status"] = "invalid_output"
+            base["fallback_reason"] = "gifsicle_output_duration_changed"
+            return base
+        expected_rate = _frame_rate_value(encoded.get("fps"))
+        optimized_rate = _frame_rate_value(optimized_metadata.get("avg_frame_rate"))
+        if expected_rate is not None and optimized_rate is not None:
+            if abs(optimized_rate - expected_rate) > max(0.1, expected_rate * 0.10):
+                base["status"] = "invalid_output"
+                base["fallback_reason"] = "gifsicle_output_frame_rate_changed"
+                return base
+            expected_frames = (
+                round(float(expected_duration) * expected_rate)
+                if expected_duration is not None
+                else None
+            )
+            optimized_frames = optimized_metadata.get("frames")
+            if (
+                expected_frames is not None
+                and optimized_frames is not None
+                and abs(int(optimized_frames) - expected_frames)
+                > max(2, round(expected_frames * 0.10))
+            ):
+                base["status"] = "invalid_output"
+                base["fallback_reason"] = "gifsicle_output_frame_count_changed"
+                return base
+        if compressed_bytes >= original_bytes:
+            base["status"] = "larger_or_equal"
+            base["fallback_reason"] = "compressed_output_not_smaller"
+            return base
+        os.replace(temporary, output)
+        temporary = None
+        base["status"] = "compressed"
+        base["adopted"] = True
+        return base
+    except subprocess.TimeoutExpired:
+        base["status"] = "timeout"
+        base["fallback_reason"] = "gifsicle_timeout"
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        base["status"] = "failed"
+        base["fallback_reason"] = str(exc) or "gifsicle_failed"
+    finally:
+        base["elapsed_seconds"] = round(time.perf_counter() - started, 3)
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+    return base
 
 
 class VisualLocationFailed(RuntimeError):
@@ -6452,10 +6855,10 @@ def _process_ocr_window(
                 job.api_observed_stream_time
                 - OCR_PROGRESSIVE_INITIAL_LOOKBACK_SECONDS,
             )
-            first_scan_start = max(
-                intended_initial_start,
-                float(current.search_start_stream_time),
-            )
+            # The persisted task bound is the union of the API look-back and
+            # any accepted match-clock window. It can legitimately start
+            # before the API look-back, so do not clip it back to 120 seconds.
+            first_scan_start = max(0.0, float(current.search_start_stream_time))
             window_start = (
                 max(
                     first_scan_start,
@@ -8114,6 +8517,31 @@ def _process_ocr_window(
             },
             "default_gif_preserved": True,
         })
+        # Gifsicle is deliberately applied only after the OCR result has been
+        # classified as the precise 60-second main window.  Fallback clips and
+        # T-DEED artifacts never enter this helper.  Compression is best effort
+        # and cannot change an otherwise successful OCR task into a failure.
+        compression_started_monotonic = time.monotonic()
+        compression_diagnostics = _compress_ocr_gif(
+            encoded,
+            artifact_kind=artifact_kind,
+            ffprobe=ffprobe,
+        )
+        active_processing_budget = _ocr_budget_after_elapsed(
+            active_processing_budget,
+            time.monotonic() - compression_started_monotonic,
+            phase="gif_compression",
+        )
+        encoded["gifsicle_compression"] = compression_diagnostics
+        if compression_diagnostics.get("adopted"):
+            compressed_bytes = compression_diagnostics.get("compressed_bytes")
+            if compressed_bytes is not None:
+                encoded["bytes"] = int(compressed_bytes)
+                encoding = encoded.get("encoding")
+                if isinstance(encoding, dict):
+                    encoding["bytes"] = int(compressed_bytes)
+                    encoding["gifsicle_compressed"] = True
+        encoded["active_processing_budget"] = active_processing_budget
         if _ocr_target_revision_is_stale(
             runtime, job.event_key, worker_target_revision
         ):
@@ -8144,7 +8572,13 @@ def _process_ocr_window(
         return True
     except VisualLocationFailed as exc:
         try:
-            fallback_allowed = exc.kind != "ocr_target_before_recording"
+            # Clock-only is the production OCR contract: an unverified API
+            # arrival range must not masquerade as a clock-located artifact.
+            # Retain the legacy fallback only for explicitly non-clock runs.
+            fallback_allowed = (
+                not job.clock_only
+                and exc.kind != "ocr_target_before_recording"
+            )
             if (
                 fallback_allowed
                 and _encode_ocr_api_range_fallback(

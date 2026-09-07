@@ -11,11 +11,13 @@ from event_driven_pipeline import (
     EVENT_VISUAL_WINDOW_LEASE_OWNER,
     EventRevisionTracker,
     MatchEvent,
+    DEFAULT_GIF_DISABLED_ERROR_KIND,
     disable_incomplete_tdeed_tasks,
     enabled_vision_artifact_kinds,
     encode_event_job,
     protect_incomplete_vision_event_segments,
     parse_match_events,
+    mark_default_gif_disabled,
     recovered_event_job,
     release_terminal_event_visual_window_leases,
 )
@@ -1210,6 +1212,15 @@ class PipelineRuntimeTests(unittest.TestCase):
             clip_after_seconds=30.0,
             deadline_at_unix=1060.0,
             now=1000.0,
+            window_metadata={
+                "search_windows": [
+                    {
+                        "source": "match_clock",
+                        "start_stream_time": 65.0,
+                        "end_stream_time": 68.0,
+                    }
+                ]
+            },
         )
         runtime.enqueue_vision_task(
             "match-1:G:key",
@@ -1220,12 +1231,23 @@ class PipelineRuntimeTests(unittest.TestCase):
             clip_after_seconds=12.0,
             deadline_at_unix=1060.0,
             now=1000.0,
+            window_metadata={
+                "search_windows": [
+                    {
+                        "source": "match_clock",
+                        "start_stream_time": 65.0,
+                        "end_stream_time": 68.0,
+                    }
+                ]
+            },
         )
         old_path = self.directory / "old.ts"
         first_path = self.directory / "first.ts"
+        clock_path = self.directory / "clock.ts"
         added_path = self.directory / "added.ts"
         old_path.write_bytes(b"old")
         first_path.write_bytes(b"first")
+        clock_path.write_bytes(b"clock")
         added_path.write_bytes(b"added")
         tasks = runtime.store.list_incomplete_vision_tasks("match-1")
 
@@ -1235,16 +1257,17 @@ class PipelineRuntimeTests(unittest.TestCase):
             [
                 Segment(old_path, 0.0, 5.0),
                 Segment(first_path, 15.0, 25.0),
+                Segment(clock_path, 62.0, 64.0),
             ],
             ocr_timeout_seconds=30.0,
             vision_timeout_seconds=30.0,
             graceful_stop_timeout_seconds=30.0,
             now_unix=1000.0,
         )
-        self.assertEqual(created[0]["new_segment_count"], 1)
+        self.assertEqual(created[0]["new_segment_count"], 2)
         self.assertEqual(
             runtime.store.protected_segment_paths(now=1001.0),
-            {str(first_path.resolve())},
+            {str(first_path.resolve()), str(clock_path.resolve())},
         )
         runtime.close()
 
@@ -1289,7 +1312,7 @@ class PipelineRuntimeTests(unittest.TestCase):
 
         released = release_terminal_event_visual_window_leases(runtime)
 
-        self.assertEqual(released, {"match-1:G:key": 2})
+        self.assertEqual(released, {"match-1:G:key": 3})
         remaining = runtime.store.list_segment_leases(event_key="match-1:G:key")
         self.assertEqual({lease.lease_id for lease in remaining}, {worker_lease})
         self.assertNotIn(
@@ -1398,6 +1421,46 @@ class PipelineRuntimeTests(unittest.TestCase):
         self.assertEqual(job.pending.stream_time, 24.0)
         self.assertEqual(job.pending.source_time, 124.0)
         self.assertEqual(job.pending.status, "pending")
+        runtime.close()
+
+    def test_default_gif_can_be_disabled_without_touching_its_ocr_task(self):
+        runtime = PipelineRuntime(self.database_path, self.log_path)
+        discover(runtime)
+        enqueue_vision(runtime)
+
+        mark_default_gif_disabled(runtime, "match-1:G:key")
+
+        default_task = runtime.store.get("match-1:G:key")
+        vision_task = runtime.store.get_vision_task(
+            "match-1:G:key", "tdeed_refined"
+        )
+        self.assertEqual(default_task.status, "failed")
+        self.assertEqual(default_task.last_error_kind, DEFAULT_GIF_DISABLED_ERROR_KIND)
+        self.assertTrue(default_task.result["default_gif_disabled"])
+        self.assertEqual(default_task.result["output_kind"], "disabled")
+        self.assertEqual(vision_task.status, "pending")
+        self.assertEqual(runtime.recover_incomplete("match-1"), [])
+        runtime.close()
+
+    def test_default_gif_disabled_does_not_require_a_new_database_status(self):
+        runtime = PipelineRuntime(self.database_path, self.log_path)
+        discover(runtime, "match-1:G:legacy")
+        task = runtime.store.get("match-1:G:legacy")
+        self.assertEqual(task.status, "pending")
+        runtime.transition(
+            "match-1:G:legacy",
+            "failed",
+            result={
+                "output_kind": "disabled",
+                "default_gif_disabled": True,
+            },
+            error="默认 GIF 编码已按配置关闭；仅继续处理画面时间 GIF",
+            error_kind=DEFAULT_GIF_DISABLED_ERROR_KIND,
+        )
+        stored = runtime.store.get("match-1:G:legacy")
+        self.assertEqual(stored.status, "failed")
+        self.assertTrue(stored.result["default_gif_disabled"])
+        self.assertEqual(stored.last_error_kind, DEFAULT_GIF_DISABLED_ERROR_KIND)
         runtime.close()
 
     def test_buffer_not_ready_returns_task_to_pending_then_can_encode(self):

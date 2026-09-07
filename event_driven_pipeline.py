@@ -624,7 +624,29 @@ def _event_visual_task_window_bounds(tasks: list[Any]) -> tuple[float, float]:
     ends = [float(task.search_end_stream_time) for task in tasks]
     for task in tasks:
         metadata = getattr(task, "window_metadata", {})
-        state = metadata.get("progressive_scan") if isinstance(metadata, dict) else None
+        if not isinstance(metadata, dict):
+            metadata = {}
+        # A task's persisted bounds are normally the union of every search
+        # source.  Keep the individual windows here as well so a future task
+        # migration or a discontiguous source window cannot lose lease
+        # coverage during queue wait.
+        search_windows = metadata.get("search_windows")
+        if isinstance(search_windows, list):
+            for window in search_windows:
+                if not isinstance(window, dict):
+                    continue
+                start = window.get("start_stream_time")
+                end = window.get("end_stream_time")
+                if (
+                    isinstance(start, (int, float))
+                    and math.isfinite(float(start))
+                    and isinstance(end, (int, float))
+                    and math.isfinite(float(end))
+                    and float(end) >= float(start)
+                ):
+                    starts.append(float(start))
+                    ends.append(float(end))
+        state = metadata.get("progressive_scan")
         if not isinstance(state, dict):
             continue
         for key in (
@@ -1136,28 +1158,128 @@ def vision_search_window(
     search_after: float,
     minute_uncertainty: float,
 ) -> tuple[float, float]:
-    """Return a retained window before the raw API observation timestamp.
+    """Return the bounded union of API and match-clock search windows.
 
     ``clip_anchor`` is intentionally the unshifted first-observed stream time
     for this helper.  The default GIF may use a negative offset, but OCR must
     search backwards from the raw API observation instead of subtracting that
-    offset twice.  Match-minute estimates are retained as diagnostic inputs
-    only and never alter this search window.
+    offset twice.  A valid match-minute estimate adds a second, bounded window;
+    the API observation window remains as a fallback for delayed or inaccurate
+    event clocks.
     """
-    if buffer_seconds <= segment_slack:
+    details = _vision_search_window_details(
+        clip_anchor=clip_anchor,
+        match_clock_anchor=match_clock_anchor,
+        buffer_seconds=buffer_seconds,
+        segment_slack=segment_slack,
+        search_before=search_before,
+        search_after=search_after,
+        minute_uncertainty=minute_uncertainty,
+    )
+    return details["search_start_stream_time"], details["search_end_stream_time"]
+
+
+def _vision_search_window_details(
+    *,
+    clip_anchor: float,
+    match_clock_anchor: float | None,
+    buffer_seconds: float,
+    segment_slack: float,
+    search_before: float,
+    search_after: float,
+    minute_uncertainty: float,
+) -> dict[str, Any]:
+    """Build visual search bounds and provenance for one event.
+
+    The rolling buffer is the hard lower boundary.  Invalid, stale, or
+    clearly-future minute estimates are ignored rather than allowing a bad
+    API/timeline value to expand the search indefinitely.
+    """
+    numeric_values = {
+        "clip_anchor": clip_anchor,
+        "buffer_seconds": buffer_seconds,
+        "segment_slack": segment_slack,
+        "search_before": search_before,
+        "search_after": search_after,
+        "minute_uncertainty": minute_uncertainty,
+    }
+    try:
+        numeric = {key: float(value) for key, value in numeric_values.items()}
+    except (TypeError, ValueError) as exc:
+        raise ValueError("vision search values must be numeric") from exc
+    if any(not math.isfinite(value) for value in numeric.values()):
+        raise ValueError("vision search values must be finite")
+    if numeric["buffer_seconds"] <= numeric["segment_slack"]:
         raise ValueError("buffer_seconds must exceed segment_slack")
-    if search_before < 0 or search_after < 0 or minute_uncertainty < 0:
+    if (
+        numeric["search_before"] < 0
+        or numeric["search_after"] < 0
+        or numeric["minute_uncertainty"] < 0
+        or numeric["segment_slack"] < 0
+        or numeric["buffer_seconds"] <= 0
+    ):
         raise ValueError("vision search durations must not be negative")
-    del match_clock_anchor, minute_uncertainty
-    clip_anchor = max(0.0, float(clip_anchor))
-    api_start = clip_anchor - float(search_before)
+    clip_anchor = max(0.0, numeric["clip_anchor"])
+    search_before = numeric["search_before"]
+    search_after = numeric["search_after"]
+    minute_uncertainty = numeric["minute_uncertainty"]
     retention_floor = max(
         0.0,
-        clip_anchor - (float(buffer_seconds) - float(segment_slack)),
+        clip_anchor - (numeric["buffer_seconds"] - numeric["segment_slack"]),
     )
-    search_start = max(retention_floor, api_start)
-    search_end = clip_anchor + float(search_after)
-    return search_start, search_end
+    api_window = {
+        "source": "api_observation",
+        "start_stream_time": max(retention_floor, clip_anchor - search_before),
+        "end_stream_time": clip_anchor + search_after,
+    }
+    search_windows = [api_window]
+    anchor_value: float | None = None
+    anchor_reason = "missing"
+    if match_clock_anchor is not None:
+        try:
+            candidate = float(match_clock_anchor)
+        except (TypeError, ValueError):
+            candidate = None
+        # The feed should not report an event whose mapped video time is
+        # materially ahead of the first observation.  A small segment-slack
+        # allowance handles timestamp quantization and clock jitter.
+        if candidate is None or not math.isfinite(candidate) or candidate < 0:
+            anchor_reason = "invalid"
+        elif candidate > clip_anchor + max(numeric["segment_slack"], search_after):
+            anchor_reason = "future"
+        elif candidate < retention_floor:
+            anchor_reason = "outside_retention"
+        else:
+            anchor_value = candidate
+            anchor_reason = "accepted"
+            search_windows.append(
+                {
+                    "source": "match_clock",
+                    "start_stream_time": max(
+                        retention_floor, candidate - minute_uncertainty
+                    ),
+                    "end_stream_time": candidate + minute_uncertainty,
+                }
+            )
+    search_start = min(window["start_stream_time"] for window in search_windows)
+    search_end = max(window["end_stream_time"] for window in search_windows)
+    return {
+        "search_start_stream_time": search_start,
+        "search_end_stream_time": search_end,
+        "retention_floor_stream_time": retention_floor,
+        "api_window": api_window,
+        "match_clock_window": next(
+            (
+                window
+                for window in search_windows
+                if window["source"] == "match_clock"
+            ),
+            None,
+        ),
+        "search_windows": search_windows,
+        "match_clock_anchor_stream_time": anchor_value,
+        "match_clock_anchor_status": anchor_reason,
+    }
 
 
 def vision_deadline_at(
@@ -1348,6 +1470,43 @@ def default_gif_failure_result(
         },
         **diagnostics,
     }
+
+
+DEFAULT_GIF_DISABLED_ERROR_KIND = "default_gif_disabled"
+
+
+def default_gif_disabled_result() -> dict[str, Any]:
+    """Return a terminal result for a deliberately disabled default artifact."""
+    message = "默认 GIF 编码已按配置关闭；仅继续处理画面时间 GIF"
+    return {
+        "artifact_kind": "default_gif",
+        "stage": "configuration",
+        "error": message,
+        "error_kind": DEFAULT_GIF_DISABLED_ERROR_KIND,
+        "output_kind": "disabled",
+        "default_gif_disabled": True,
+        "failure_reason": {
+            "kind": DEFAULT_GIF_DISABLED_ERROR_KIND,
+            "stage": "configuration",
+            "message": message,
+        },
+    }
+
+
+def mark_default_gif_disabled(runtime: PipelineRuntime, event_key: str) -> None:
+    """Finish a pending default task without affecting its OCR sibling task."""
+    task = runtime.store.get(event_key)
+    if task is None or task.status not in {"discovered", "pending", "encoding"}:
+        return
+    result = default_gif_disabled_result()
+    runtime.transition(
+        event_key,
+        "failed",
+        result=result,
+        error=result["error"],
+        error_kind=DEFAULT_GIF_DISABLED_ERROR_KIND,
+        reason="default_gif_disabled",
+    )
 
 
 def encode_event_job(
@@ -2105,8 +2264,14 @@ def select_cross_source_goal_incident(
     return None, "ambiguous", len(candidates)
 
 
-def overview_goal_fallback_status(shotmap_source: Any | None) -> str:
+def overview_goal_fallback_status(
+    shotmap_source: Any | None,
+    *,
+    shotmap_enabled: bool = True,
+) -> str:
     """Explain why an unmatched overview goal is allowed through immediately."""
+    if not shotmap_enabled:
+        return "overview_only"
     if shotmap_source is None or not getattr(shotmap_source, "initialized", False):
         return "overview_fallback_no_match"
     if getattr(shotmap_source, "last_shot_count", 0) == 0:
@@ -3707,6 +3872,11 @@ def main() -> None:
         default=0.0,
         help="default GIF anchor offset from shotmap first observation",
     )
+    parser.add_argument(
+        "--shotmap-enabled",
+        action="store_true",
+        help="enable the optional shotmap goal source and cross-source matching",
+    )
     parser.add_argument("--emit-existing-events", action="store_true")
     parser.add_argument(
         "--event-to-video-offset",
@@ -3788,6 +3958,11 @@ def main() -> None:
         type=int,
         default=2,
         help="maximum simultaneous GIF encodes (default: 2)",
+    )
+    parser.add_argument(
+        "--disable-default-gif",
+        action="store_true",
+        help="skip default GIF encoding while keeping OCR GIF processing enabled",
     )
     parser.add_argument("--vision-enabled", action="store_true")
     parser.add_argument(
@@ -4232,6 +4407,7 @@ def main() -> None:
     http_event_source_enabled = bool(
         args.event_url and not args.mock_events and not args.replay_events
     )
+    shotmap_enabled = bool(args.shotmap_enabled and http_event_source_enabled)
     shotmap_event_source = (
         HttpShotmapGoalSource(
             args.shotmap_url,
@@ -4241,7 +4417,7 @@ def main() -> None:
             timeout=args.event_timeout_seconds,
             poll_interval=args.shotmap_poll_seconds,
         )
-        if http_event_source_enabled
+        if shotmap_enabled
         else None
     )
 
@@ -4258,8 +4434,16 @@ def main() -> None:
             match_id=args.match_id,
             count=recovered_draft_count,
         )
-    jobs = [recovered_event_job(task) for task in runtime.recover_incomplete(args.match_id)]
-    event_report_order = [job.match_event.event_key for job in jobs]
+    recovered_tasks = runtime.recover_incomplete(args.match_id)
+    if args.disable_default_gif:
+        for task in recovered_tasks:
+            mark_default_gif_disabled(runtime, task.event_key)
+        jobs: list[EventJob] = []
+    else:
+        jobs = [recovered_event_job(task) for task in recovered_tasks]
+    # Keep recovered events in the report even when default GIF encoding is
+    # disabled and therefore no EventJob is created for them.
+    event_report_order = [task.event_key for task in recovered_tasks]
     event_report_contexts: dict[str, dict[str, Any]] = {}
     vision_jobs: dict[str, VisionJob] = {}
     if args.vision_enabled:
@@ -4352,7 +4536,7 @@ def main() -> None:
                 target_source=_event_source_name(event_data),
                 target_revision=recovered_target_revision,
             )
-    recovered_jobs = len(jobs)
+    recovered_jobs = len(recovered_tasks)
     run_id = (
         time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(pipeline_started_wall))
         + f"_{uuid.uuid4().hex[:8]}"
@@ -4481,10 +4665,15 @@ def main() -> None:
     )
     print(
         f"[gif] fixed={args.gif_width}px/{args.gif_fps:g}fps/{args.gif_colors}colors "
-        f"size_reference={args.gif_size_reference_mb:g}MB adaptive_reduction=false"
+        f"size_reference={args.gif_size_reference_mb:g}MB adaptive_reduction=false "
+        f"default_enabled={not args.disable_default_gif}"
     )
     print(
-        f"[runtime] recovered={len(jobs)} state={state_db_path.resolve()} "
+        f"[shotmap] enabled={shotmap_enabled} "
+        f"route={'shotmap+overview' if shotmap_enabled else 'overview_only'}"
+    )
+    print(
+        f"[runtime] recovered={recovered_jobs} state={state_db_path.resolve()} "
         f"log={event_log_path.resolve()}"
     )
 
@@ -4689,14 +4878,18 @@ def main() -> None:
                     if shotmap_event_source is not None
                     else []
                 )
-                shotmap_events = promote_shotmap_goal_candidates(
-                    shotmap_candidates,
-                    overview_events,
-                    segment_reader() if shotmap_candidates else [],
-                    timeline,
-                    stream_rate=stream_rate,
-                    before=args.before,
-                    after=args.after,
+                shotmap_events = (
+                    promote_shotmap_goal_candidates(
+                        shotmap_candidates,
+                        overview_events,
+                        segment_reader() if shotmap_candidates else [],
+                        timeline,
+                        stream_rate=stream_rate,
+                        before=args.before,
+                        after=args.after,
+                    )
+                    if shotmap_enabled
+                    else []
                 )
                 if shotmap_event_source is not None and shotmap_events:
                     shotmap_event_source.acknowledge(shotmap_events)
@@ -4722,7 +4915,11 @@ def main() -> None:
                 for updated_event in updated_events:
                     updated = runtime.update_task_event(asdict(updated_event))
                     canonical_update = updated_event
-                    if not updated and updated_event.event_type == "goal":
+                    if (
+                        shotmap_enabled
+                        and not updated
+                        and updated_event.event_type == "goal"
+                    ):
                         (
                             existing_incident,
                             selection_status,
@@ -4773,14 +4970,21 @@ def main() -> None:
                             f"person={canonical_update.person or '-'}"
                         )
                 for match_event in new_events:
-                    (
-                        existing_incident,
-                        selection_status,
-                        candidate_count,
-                    ) = select_cross_source_goal_incident(
-                        runtime.store.list_for_match(args.match_id),
-                        match_event,
-                    )
+                    if shotmap_enabled:
+                        (
+                            existing_incident,
+                            selection_status,
+                            candidate_count,
+                        ) = select_cross_source_goal_incident(
+                            runtime.store.list_for_match(args.match_id),
+                            match_event,
+                        )
+                    else:
+                        existing_incident, selection_status, candidate_count = (
+                            None,
+                            "disabled",
+                            0,
+                        )
                     if selection_status == "ambiguous":
                         runtime.logger.log(
                             "event_cross_source_ambiguous",
@@ -4828,10 +5032,17 @@ def main() -> None:
                             f"incoming={_event_source_name(match_event)}"
                         )
                         continue
-                    is_shotmap_event = _event_source_name(match_event) == "shotmap"
+                    # A persisted/replayed event may carry old shotmap metadata,
+                    # but a disabled run must never use it as a live source or
+                    # anchor. Historical fields remain readable for reporting.
+                    is_shotmap_event = (
+                        shotmap_enabled
+                        and _event_source_name(match_event) == "shotmap"
+                    )
                     if match_event.event_type == "goal" and not is_shotmap_event:
                         fallback_status = overview_goal_fallback_status(
-                            shotmap_event_source
+                            shotmap_event_source,
+                            shotmap_enabled=shotmap_enabled,
                         )
                         match_event = replace(
                             match_event,
@@ -4860,6 +5071,12 @@ def main() -> None:
                                         shotmap_event_source,
                                         "last_goal_count",
                                         0,
+                                    ),
+                                    "enabled": shotmap_enabled,
+                                    "status": (
+                                        "enabled"
+                                        if shotmap_enabled
+                                        else "disabled"
                                     ),
                                 },
                             },
@@ -4908,9 +5125,9 @@ def main() -> None:
                         0.0, observed_stream_time + event_offset
                     )
                     match_clock_anchor = estimate_match_clock_anchor(match_event)
-                    vision_search_start, vision_search_end = vision_search_window(
+                    vision_window_details = _vision_search_window_details(
                         clip_anchor=observed_stream_time,
-                        match_clock_anchor=None,
+                        match_clock_anchor=match_clock_anchor,
                         buffer_seconds=args.buffer_seconds,
                         segment_slack=args.segment_slack,
                         search_before=args.vision_search_before,
@@ -4919,6 +5136,12 @@ def main() -> None:
                             args.match_minute_uncertainty_seconds
                         ),
                     )
+                    vision_search_start = vision_window_details[
+                        "search_start_stream_time"
+                    ]
+                    vision_search_end = vision_window_details[
+                        "search_end_stream_time"
+                    ]
                     (
                         effective_vision_deadline_at,
                         effective_vision_wait_seconds,
@@ -4981,6 +5204,12 @@ def main() -> None:
                             "match_clock_anchor_stream_time": match_clock_anchor,
                             "vision_search_start_stream_time": vision_search_start,
                             "vision_search_end_stream_time": vision_search_end,
+                            "vision_search_windows": vision_window_details[
+                                "search_windows"
+                            ],
+                            "match_clock_anchor_status": vision_window_details[
+                                "match_clock_anchor_status"
+                            ],
                             "vision_wait_budget_seconds": (
                                 effective_vision_wait_seconds
                             ),
@@ -5025,17 +5254,22 @@ def main() -> None:
                             f"key={match_event.event_key}"
                         )
                         continue
-                    jobs.append(
-                        EventJob(
-                            match_event=match_event,
-                            pending=pending,
-                            observed_stream_time=observed_stream_time,
-                            observed_source_time=observed_source_time,
-                            match_clock_anchor_stream_time=match_clock_anchor,
-                            vision_search_start_stream_time=vision_search_start,
-                            vision_search_end_stream_time=vision_search_end,
+                    if not args.disable_default_gif:
+                        jobs.append(
+                            EventJob(
+                                match_event=match_event,
+                                pending=pending,
+                                observed_stream_time=observed_stream_time,
+                                observed_source_time=observed_source_time,
+                                match_clock_anchor_stream_time=match_clock_anchor,
+                                vision_search_start_stream_time=vision_search_start,
+                                vision_search_end_stream_time=vision_search_end,
+                            )
                         )
-                    )
+                    else:
+                        mark_default_gif_disabled(
+                            runtime, match_event.event_key
+                        )
                     event_report_order.append(match_event.event_key)
                     runtime.logger.log(
                         "event_timeline_anchor",
@@ -5071,6 +5305,19 @@ def main() -> None:
                             deadline_at_unix=(
                                 effective_vision_deadline_at
                             ),
+                            window_metadata={
+                                "search_windows": vision_window_details[
+                                    "search_windows"
+                                ],
+                                "match_clock_anchor_stream_time": (
+                                    match_clock_anchor
+                                ),
+                                "match_clock_anchor_status": (
+                                    vision_window_details[
+                                        "match_clock_anchor_status"
+                                    ]
+                                ),
+                            },
                         )
                         if args.tdeed_enabled:
                             runtime.enqueue_vision_task(
@@ -5085,6 +5332,19 @@ def main() -> None:
                                 deadline_at_unix=(
                                     effective_vision_deadline_at
                                 ),
+                                window_metadata={
+                                    "search_windows": vision_window_details[
+                                        "search_windows"
+                                    ],
+                                    "match_clock_anchor_stream_time": (
+                                        match_clock_anchor
+                                    ),
+                                    "match_clock_anchor_status": (
+                                        vision_window_details[
+                                            "match_clock_anchor_status"
+                                        ]
+                                    ),
+                                },
                             )
                         vision_jobs[match_event.event_key] = VisionJob(
                             event_key=match_event.event_key,
@@ -5423,7 +5683,12 @@ def main() -> None:
                     stored_statuses = runtime.store.list_for_match(args.match_id)
                     status_counts = {
                         status: sum(task.status == status for task in stored_statuses)
-                        for status in ("pending", "encoding", "encoded", "failed")
+                        for status in (
+                            "pending",
+                            "encoding",
+                            "encoded",
+                            "failed",
+                        )
                     }
                     coverage_seconds = 0.0
                     if heartbeat_segments:
@@ -5438,6 +5703,10 @@ def main() -> None:
                         event_poll_count=getattr(event_source, "poll_count", 0),
                         event_error_count=getattr(event_source, "error_count", 0),
                         last_event_error=getattr(event_source, "last_error", None),
+                        shotmap_enabled=shotmap_enabled,
+                        shotmap_status=(
+                            "enabled" if shotmap_enabled else "disabled"
+                        ),
                         shotmap_poll_count=getattr(
                             shotmap_event_source, "request_count", 0
                         ),
@@ -5841,6 +6110,8 @@ def main() -> None:
             if any(
                 stored_default_tasks.get(event_key) is not None
                 and stored_default_tasks[event_key].status == "failed"
+                and stored_default_tasks[event_key].last_error_kind
+                != DEFAULT_GIF_DISABLED_ERROR_KIND
                 for event_key in event_report_order
             )
             else "completed"
@@ -5917,13 +6188,26 @@ def main() -> None:
         "shotmap_source": (
             shotmap_event_source.report()
             if shotmap_event_source is not None
-            else None
+            else {
+                "type": "http_shotmap_goal",
+                "enabled": False,
+                "status": "disabled",
+                "request_count": 0,
+                "error_count": 0,
+                "last_error": None,
+            }
         ),
         "runtime": {
             "state_database": str(state_db_path.resolve()),
             "event_log": str(event_log_path.resolve()),
             "recovered_task_count": recovered_jobs,
             "gif_workers": args.gif_workers,
+            "default_gif_enabled": not args.disable_default_gif,
+            "shotmap_enabled": shotmap_enabled,
+            "shotmap_status": "enabled" if shotmap_enabled else "disabled",
+            "goal_route_status": (
+                "shotmap_plus_overview" if shotmap_enabled else "overview_only"
+            ),
             "ingest_restart_count": supervisor.restart_count,
             "vision_enabled": args.vision_enabled,
             "tdeed_enabled": args.vision_enabled and args.tdeed_enabled,
@@ -6031,6 +6315,8 @@ def main() -> None:
         processing_wall_seconds=round(final_elapsed_wall, 3),
         event_poll_count=getattr(event_source, "poll_count", 0),
         event_error_count=getattr(event_source, "error_count", 0),
+        shotmap_enabled=shotmap_enabled,
+        shotmap_status="enabled" if shotmap_enabled else "disabled",
         shotmap_poll_count=getattr(shotmap_event_source, "request_count", 0),
         shotmap_error_count=getattr(shotmap_event_source, "error_count", 0),
     )

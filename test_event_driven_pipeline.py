@@ -1446,6 +1446,10 @@ class ShotmapSecondEnrichmentTests(unittest.TestCase):
         self.assertFalse(cross_source_goal_incident(historical, current_overview))
 
     def test_overview_fallback_status_distinguishes_empty_and_non_goal_shotmap(self):
+        self.assertEqual(
+            overview_goal_fallback_status(None, shotmap_enabled=False),
+            "overview_only",
+        )
         self.assertEqual(overview_goal_fallback_status(None), "overview_fallback_no_match")
         self.assertEqual(
             overview_goal_fallback_status(
@@ -2958,6 +2962,60 @@ class EventParsingTests(unittest.TestCase):
         )
         self.assertEqual(vision_jobs, {})
 
+    def test_disabled_default_jobs_are_evicted_after_durable_completion(self):
+        event = MatchEvent(
+            event_key="match-1:G:disabled",
+            code="G",
+            event_type="goal",
+            minute="1",
+            minute_extra="0",
+            team="teamA",
+            person="Scorer",
+            person_id="9",
+            score="1-0",
+            reason="",
+        )
+        pending = PendingEvent(
+            event_type="goal",
+            stream_time=10.0,
+            source_time=None,
+            detected_wall_time=100.0,
+            change_fraction=0.0,
+            stability_fraction=0.0,
+            output_due_stream_time=12.0,
+            status="failed",
+            result={
+                "output_kind": "disabled",
+                "default_gif_disabled": True,
+            },
+        )
+        job = EventJob(event, pending, 10.0, None)
+        runtime = SimpleNamespace(
+            store=SimpleNamespace(
+                get=lambda key: SimpleNamespace(status="failed")
+                if key == event.event_key else None,
+            )
+        )
+        jobs = [job]
+        contexts = {}
+
+        self.assertEqual(
+            evict_terminal_runtime_jobs(
+                jobs,
+                {},
+                runtime,
+                contexts,
+                before=10.0,
+                after=20.0,
+            ),
+            (1, 0),
+        )
+        self.assertEqual(jobs, [])
+        self.assertEqual(
+            contexts[event.event_key]["clip_anchor_stream_time_sec"],
+            10.0,
+        )
+
     def test_match_start_play_defaults_naive_values_to_beijing(self):
         expected = parse_match_start_play("2026-05-20T11:00:00+08:00")
         self.assertEqual(
@@ -3841,8 +3899,22 @@ class EventParsingTests(unittest.TestCase):
             "event_driven_pipeline.IngestSupervisor", ReconnectingSupervisor
         ), patch(
             "event_driven_pipeline.HttpMatchEventSource", return_value=event_source
-        ):
+        ), patch(
+            "event_driven_pipeline.HttpShotmapGoalSource"
+        ) as shotmap_source:
+            shotmap_source.return_value.poll.return_value = []
+            shotmap_source.return_value.request_count = 0
+            shotmap_source.return_value.error_count = 0
+            shotmap_source.return_value.last_error = None
+            shotmap_source.return_value.initialized = False
+            shotmap_source.return_value.report.return_value = {
+                "type": "test-shotmap",
+                "request_count": 0,
+                "error_count": 0,
+            }
             main()
+
+        shotmap_source.assert_not_called()
 
         self.assertTrue(event_source.polled)
         self.assertEqual(
@@ -3853,6 +3925,61 @@ class EventParsingTests(unittest.TestCase):
             ReconnectingSupervisor.last_kwargs["backoff_max"],
             5.0,
         )
+
+    def test_direct_worker_can_enable_shotmap_explicitly(self):
+        class InterruptingEventSource:
+            error_count = 0
+            poll_count = 0
+            last_error = None
+
+            def __init__(self):
+                self.polled = False
+
+            def poll(self, stream_time, now_monotonic):
+                del stream_time, now_monotonic
+                self.polled = True
+                raise KeyboardInterrupt
+
+            def report(self):
+                return {"type": "test", "poll_count": self.poll_count}
+
+        event_source = InterruptingEventSource()
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            sys,
+            "argv",
+            [
+                "event_driven_pipeline.py",
+                "rtmp://example/live",
+                "--event-url",
+                "https://example.test/{match_id}",
+                "--match-id",
+                "match-1",
+                "--output-dir",
+                directory,
+                "--shotmap-enabled",
+            ],
+        ), patch(
+            "event_driven_pipeline.shutil.which", return_value="/usr/bin/true"
+        ), patch(
+            "event_driven_pipeline.IngestSupervisor", ReconnectingSupervisor
+        ), patch(
+            "event_driven_pipeline.HttpMatchEventSource", return_value=event_source
+        ), patch(
+            "event_driven_pipeline.HttpShotmapGoalSource"
+        ) as shotmap_source:
+            shotmap_source.return_value.poll.return_value = []
+            shotmap_source.return_value.request_count = 0
+            shotmap_source.return_value.error_count = 0
+            shotmap_source.return_value.last_error = None
+            shotmap_source.return_value.initialized = False
+            shotmap_source.return_value.report.return_value = {
+                "type": "test-shotmap",
+                "request_count": 0,
+                "error_count": 0,
+            }
+            main()
+
+        shotmap_source.assert_called_once()
 
     def test_worker_restart_restores_manifest_clock_instead_of_resetting(self):
         class InterruptingEventSource:

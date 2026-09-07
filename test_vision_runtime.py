@@ -1443,7 +1443,7 @@ class VisionRuntimeTests(unittest.TestCase):
             self.assertIn("历史视频已被清理", encoded.result["fallback_explanation"])
             runtime.close()
 
-    def test_terminal_ocr_localization_failure_invokes_api_range_fallback(self):
+    def test_terminal_ocr_localization_failure_does_not_invoke_api_range_fallback(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             runtime, job = self._create_progressive_ocr_job(
@@ -1465,11 +1465,14 @@ class VisionRuntimeTests(unittest.TestCase):
                 )
 
             self.assertTrue(completed)
-            fallback.assert_called_once()
+            fallback.assert_not_called()
+            failed = runtime.store.get_vision_task(job.event_key, "ocr_window")
+            self.assertEqual(failed.status, "failed")
             self.assertEqual(
-                fallback.call_args.kwargs["failure"].kind,
-                "unsupported_extra_time_or_penalties_v1",
+                failed.result["output_kind"], "failed"
             )
+            self.assertFalse(failed.result["fallback_generated"])
+            self.assertTrue(failed.result["default_gif_preserved"])
             runtime.close()
 
     def test_target_before_recording_does_not_generate_unrelated_range_fallback(self):
@@ -1614,6 +1617,45 @@ class VisionRuntimeTests(unittest.TestCase):
             self.assertEqual(locate.call_args.kwargs["window_end"], 240.0)
             self.assertEqual(second_progress["latest_trusted_clock_seconds"], 110)
             self.assertEqual(second_progress["scan_attempt_count"], 2)
+            runtime.close()
+
+    def test_progressive_ocr_honors_search_start_before_api_lookback(self):
+        """A mapped match-clock window must not be clipped to API-120s."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime, job = self._create_progressive_ocr_job(
+                root,
+                "mapped-window",
+                observed_stream_time=200.0,
+                search_start_stream_time=20.0,
+            )
+            # Disable clock-only readiness so this assertion isolates the
+            # progressive scan's initial window calculation.
+            job.clock_only = False
+            segment_path = root / "segment.ts"
+            segment_path.write_bytes(b"video")
+            miss = VisualLocationFailed(
+                "ocr_clock_unreadable",
+                "no trustworthy clock in mapped window",
+                {"stage": "ocr_progressive_scan"},
+            )
+
+            with patch(
+                "vision_runtime._locate_ocr_window_across_components",
+                side_effect=miss,
+            ) as locate:
+                self.assertFalse(
+                    self._run_progressive_ocr(
+                        job,
+                        runtime,
+                        lambda: [Segment(segment_path, 0.0, 220.0)],
+                        root,
+                    )
+                )
+
+            first_call = locate.call_args_list[0]
+            self.assertEqual(first_call.kwargs["window_start"], 20.0)
+            self.assertEqual(first_call.kwargs["window_end"], 220.0)
             runtime.close()
 
     def test_clock_readiness_probes_tail_and_waits_for_fifteen_seconds_growth(self):
@@ -4847,13 +4889,7 @@ class VisionRuntimeTests(unittest.TestCase):
                     "vision_runtime.locate_candidate_video",
                     side_effect=VisionCandidateNotFound("no standalone candidate"),
                 ) as tdeed,
-                patch(
-                    "vision_runtime.encode_gif",
-                    return_value={
-                        "output": str(root / "ocr-range.gif"),
-                        "bytes": 1234,
-                    },
-                ) as encode,
+                patch("vision_runtime.encode_gif") as encode,
             ):
                 self.assertTrue(refine_event_job(
                     job, runtime, lambda: [Segment(segment_path, 0.0, 200.0)],
@@ -4865,16 +4901,15 @@ class VisionRuntimeTests(unittest.TestCase):
                     python=Path("python"), timeout_seconds=3.0,
                 ))
 
-            encode.assert_called_once()
+            encode.assert_not_called()
             ocr_task = runtime.store.get_vision_task(event_key, "ocr_window")
             refined_task = runtime.store.get_vision_task(
                 event_key, "tdeed_refined"
             )
-            self.assertEqual(ocr_task.status, "encoded")
-            self.assertEqual(
-                ocr_task.result["output_kind"], "api_time_range_fallback"
-            )
-            self.assertFalse(ocr_task.result["ocr_verified"])
+            self.assertEqual(ocr_task.status, "failed")
+            self.assertEqual(ocr_task.result["output_kind"], "failed")
+            self.assertFalse(ocr_task.result["fallback_generated"])
+            self.assertTrue(ocr_task.result["default_gif_preserved"])
             self.assertEqual(refined_task.status, "failed")
             self.assertEqual(refined_task.last_error_kind, "tdeed_no_candidate")
             self.assertEqual(
@@ -4936,10 +4971,7 @@ class VisionRuntimeTests(unittest.TestCase):
 
             self.assertEqual(tdeed.call_args.kwargs["candidate_window_start_seconds"], 60.0)
             self.assertEqual(tdeed.call_args.kwargs["candidate_window_end_seconds"], 180.0)
-            self.assertEqual(encode.call_count, 2)
-            self.assertIn(
-                "ocr-fallback", encode.call_args_list[0].kwargs["output_filename"]
-            )
+            self.assertEqual(encode.call_count, 1)
             refined = runtime.store.get_vision_task(event_key, "tdeed_refined")
             self.assertEqual(refined.status, "encoded")
             self.assertEqual(refined.result["locator_method"], "tdeed_after_ocr_failure")

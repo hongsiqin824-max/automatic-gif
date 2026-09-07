@@ -28,7 +28,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from flask import Flask, abort, jsonify, redirect, request, send_from_directory
 
@@ -188,6 +188,11 @@ OCR_IMAGE_UPLOAD_BACKEND = _environment_choice(
     "OCR_IMAGE_UPLOAD_BACKEND", "self_hosted", {"official", "self_hosted"}
 )
 ARTICLE_PUBLISH_ENABLED = environment_boolean("ARTICLE_PUBLISH_ENABLED", True)
+DEFAULT_GIF_ENABLED = environment_boolean("DEFAULT_GIF_ENABLED", True)
+# New Workers use the overview minute-level event feed by default. Set this to
+# true (or pass --shotmap-enabled to a direct Worker) only for legacy/diagnostic
+# runs that need the optional shotmap source and cross-source matching.
+GIF_SHOTMAP_ENABLED = environment_boolean("GIF_SHOTMAP_ENABLED", False)
 # OCR GIF article delivery is automatic. The environment switch remains so an
 # operator can stop article delivery without stopping GIF generation.
 OCR_DRAFT_AUTO_CREATE = environment_boolean("OCR_DRAFT_AUTO_CREATE", True)
@@ -2801,6 +2806,14 @@ def _runtime_evidence(
     current_report = report if report_is_current else {}
     event_source = current_report.get("event_source") or {}
     shotmap_source = current_report.get("shotmap_source") or {}
+    report_runtime = current_report.get("runtime") or {}
+    reported_shotmap_enabled = report_runtime.get("shotmap_enabled")
+    if isinstance(reported_shotmap_enabled, bool):
+        shotmap_enabled = reported_shotmap_enabled
+    elif session.worker_command:
+        shotmap_enabled = "--shotmap-enabled" in session.worker_command
+    else:
+        shotmap_enabled = GIF_SHOTMAP_ENABLED
 
     segment_count = 0
     latest_segment_unix: float | None = None
@@ -2876,9 +2889,16 @@ def _runtime_evidence(
         heartbeat.get("last_shotmap_error") or shotmap_source.get("last_error")
     )
     task_counts = {
-        status: sum(item.get("status") == status for item in tasks)
+        status: sum(
+            item.get("status") == status
+            and (status != "failed" or not _default_gif_is_disabled(item))
+            for item in tasks
+        )
         for status in ("pending", "encoding", "encoded", "failed")
     }
+    task_counts["disabled"] = sum(
+        _default_gif_is_disabled(item) for item in tasks
+    )
 
     if session.worker_cleanup_failure:
         state, label = "failed", "旧进程清理失败 · 已阻止重启"
@@ -2985,6 +3005,8 @@ def _runtime_evidence(
         "shotmap_poll_count": shotmap_poll_count,
         "shotmap_error_count": shotmap_error_count,
         "last_shotmap_error": last_shotmap_error,
+        "shotmap_enabled": shotmap_enabled,
+        "shotmap_status": "enabled" if shotmap_enabled else "disabled",
         "shotmap_initialized": bool(
             heartbeat.get("shotmap_initialized")
             or shotmap_source.get("initialized")
@@ -3001,6 +3023,14 @@ def _runtime_evidence(
         "exit_reason": session.exit_reason,
         "finishing_deadline_unix": session.finishing_deadline,
     }
+
+
+def _default_gif_is_disabled(task: Mapping[str, Any]) -> bool:
+    """Return whether a default GIF task was intentionally disabled."""
+    return bool(task.get("default_gif_disabled")) or (
+        task.get("last_error_kind") == "default_gif_disabled"
+        or task.get("error_kind") == "default_gif_disabled"
+    )
 
 
 def _session_json(session: MatchSession) -> dict[str, Any]:
@@ -3096,7 +3126,11 @@ def _session_json(session: MatchSession) -> dict[str, Any]:
             for item in tasks
         ),
         "history": sum(item.get("status") == "history" for item in tasks),
-        "failed": sum(item.get("status") == "failed" for item in tasks),
+        "failed": sum(
+            item.get("status") == "failed"
+            and not _default_gif_is_disabled(item)
+            for item in tasks
+        ),
     }
     telemetry = _runtime_evidence(session, report, tasks)
     upload_backend_status = _ocr_image_upload_backend_status(
@@ -3160,10 +3194,15 @@ def _session_json(session: MatchSession) -> dict[str, Any]:
         "polling": {
             "events_seconds": session.event_poll_seconds,
             "shotmap_seconds": session.shotmap_poll_seconds,
+            "shotmap_enabled": telemetry["shotmap_enabled"],
+            "shotmap_status": telemetry["shotmap_status"],
             "source_seconds": session.source_poll_seconds,
             "detail_seconds": session.detail_poll_seconds,
         },
         "gif": {
+            "default_enabled": DEFAULT_GIF_ENABLED,
+            "worker_default_enabled": DEFAULT_GIF_ENABLED
+            and "--disable-default-gif" not in session.worker_command,
             "before_seconds": session.before_seconds,
             "after_seconds": session.after_seconds,
             "event_to_video_offset_seconds": session.event_to_video_offset_seconds,
@@ -4727,6 +4766,10 @@ class Dashboard:
                     # manual/recovery starts retain their historical seeding
                     # behavior.
                     command.append("--emit-existing-events")
+            if not DEFAULT_GIF_ENABLED:
+                command.append("--disable-default-gif")
+            if GIF_SHOTMAP_ENABLED:
+                command.append("--shotmap-enabled")
             match_start_play = _usable_match_start_play(session.detail)
             if match_start_play is not None:
                 command.extend([

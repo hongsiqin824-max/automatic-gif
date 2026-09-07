@@ -1032,6 +1032,29 @@ class ScoreboardLocationTests(unittest.TestCase):
 
 
 class ScoreboardClientTests(unittest.TestCase):
+    def test_persistent_socket_path_is_unique_per_replica(self):
+        from scoreboard_ocr import _persistent_socket_path
+
+        with tempfile.TemporaryDirectory() as directory:
+            worker = Path(directory) / "worker.py"
+            worker.write_text("# worker", encoding="utf-8")
+            first = _persistent_socket_path(worker, "ocr-python", replica_id=0)
+            second = _persistent_socket_path(worker, "ocr-python", replica_id=1)
+
+        self.assertNotEqual(first, second)
+        self.assertTrue(str(second).endswith("_r1.sock"))
+
+    def test_replica_count_validation_defaults_to_one(self):
+        from scoreboard_ocr import _persistent_replica_count
+
+        with patch.dict("scoreboard_ocr.os.environ", {}, clear=True):
+            self.assertEqual(_persistent_replica_count(), 1)
+        with patch.dict("scoreboard_ocr.os.environ", {"GIF_OCR_REPLICAS": "2"}):
+            self.assertEqual(_persistent_replica_count(), 2)
+        with patch.dict("scoreboard_ocr.os.environ", {"GIF_OCR_REPLICAS": "5"}):
+            with self.assertRaises(ScoreboardOcrError):
+                _persistent_replica_count()
+
     def test_clock_only_contract_requires_minute_and_omits_legacy_false_flag(self):
         with tempfile.TemporaryDirectory() as directory:
             candidate = Path(directory) / "candidate.mp4"

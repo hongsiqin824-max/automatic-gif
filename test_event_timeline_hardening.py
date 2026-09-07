@@ -107,7 +107,7 @@ class EventTimelineHardeningTests(unittest.TestCase):
         )
         self.assertEqual(resumed, 50.0)
 
-    def test_visual_window_uses_raw_api_observation_not_match_clock(self):
+    def test_visual_window_rejects_clearly_future_match_clock_anchor(self):
         start, end = vision_search_window(
             clip_anchor=100.0,
             match_clock_anchor=135.0,
@@ -117,8 +117,37 @@ class EventTimelineHardeningTests(unittest.TestCase):
             search_after=0.0,
             minute_uncertainty=60.0,
         )
+        # A future clock anchor beyond segment slack is rejected, so the API
+        # observation window remains the only trusted source.
         self.assertEqual(start, 0.0)
         self.assertEqual(end, 100.0)
+
+    def test_visual_window_accepts_match_clock_anchor_within_retention(self):
+        start, end = vision_search_window(
+            clip_anchor=500.0,
+            match_clock_anchor=350.0,
+            buffer_seconds=900.0,
+            segment_slack=7.0,
+            search_before=120.0,
+            search_after=0.0,
+            minute_uncertainty=60.0,
+        )
+        self.assertEqual(start, 290.0)
+        self.assertEqual(end, 500.0)
+
+    def test_visual_window_rejects_invalid_or_evicted_match_clock_anchor(self):
+        for anchor in (float("nan"), float("inf"), -1.0, 1_000.0):
+            with self.subTest(anchor=anchor):
+                start, end = vision_search_window(
+                    clip_anchor=100.0,
+                    match_clock_anchor=anchor,
+                    buffer_seconds=180.0,
+                    segment_slack=7.0,
+                    search_before=120.0,
+                    search_after=0.0,
+                    minute_uncertainty=60.0,
+                )
+                self.assertEqual((start, end), (0.0, 100.0))
 
     def test_visual_window_respects_retention_floor(self):
         start, end = vision_search_window(

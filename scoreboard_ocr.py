@@ -16,6 +16,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -24,6 +25,8 @@ from typing import Any, Callable, Mapping, Sequence
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_WORKER = ROOT / "scoreboard_ocr_worker.py"
+_PERSISTENT_REPLICA_LOCK = threading.Lock()
+_PERSISTENT_REPLICA_CURSOR: dict[tuple[str, str, int], int] = {}
 DEFAULT_COARSE_SAMPLE_INTERVAL_SECONDS = 10.0
 DEFAULT_RECOVERY_SAMPLE_INTERVAL_SECONDS = 5.0
 DEFAULT_FINE_SCAN_RADIUS_SECONDS = 15.0
@@ -1063,10 +1066,37 @@ def _persistent_worker_enabled(runner: Runner, persistent: bool | None) -> bool:
     )
 
 
-def _persistent_socket_path(worker: Path, python: str) -> Path:
+def _persistent_replica_count() -> int:
+    raw_value = os.environ.get("GIF_OCR_REPLICAS", "1").strip() or "1"
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise ScoreboardOcrError(
+            "ocr_invalid_request",
+            f"GIF_OCR_REPLICAS must be an integer, got {raw_value!r}",
+        ) from exc
+    if not 1 <= value <= 4:
+        raise ScoreboardOcrError(
+            "ocr_invalid_request",
+            "GIF_OCR_REPLICAS must be in [1, 4]",
+        )
+    return value
+
+
+def _persistent_socket_path(
+    worker: Path,
+    python: str,
+    *,
+    replica_id: int = 0,
+) -> Path:
     configured = os.environ.get("GIF_OCR_SOCKET_PATH", "").strip()
     if configured:
-        return Path(configured).expanduser().resolve()
+        configured_path = Path(configured).expanduser().resolve()
+        if replica_id > 0:
+            return configured_path.with_name(
+                f"{configured_path.stem}_r{int(replica_id)}{configured_path.suffix}"
+            )
+        return configured_path
     try:
         worker_version = worker.stat().st_mtime_ns
     except OSError:
@@ -1076,7 +1106,10 @@ def _persistent_socket_path(worker: Path, python: str) -> Path:
     # macOS resolves its temporary directory under /var/folders, which can push
     # Unix-domain socket names past the platform limit. /tmp keeps the same
     # machine-local lifetime while leaving enough room for the unique suffix.
-    return Path("/tmp") / f"automatic_gif_ocr_{os.getuid()}_{digest}.sock"
+    base = Path("/tmp") / f"automatic_gif_ocr_{os.getuid()}_{digest}.sock"
+    if replica_id <= 0:
+        return base
+    return base.with_name(f"{base.stem}_r{int(replica_id)}{base.suffix}")
 
 
 def _connect_worker(socket_path: Path, timeout_seconds: float) -> socket.socket:
@@ -1122,6 +1155,10 @@ def _ensure_persistent_worker(
                 connection = _connect_worker(socket_path, 0.25)
             except OSError:
                 try:
+                    child_environment = os.environ.copy()
+                    # One process owns one model. The parent client creates
+                    # additional sockets/processes for configured replicas.
+                    child_environment["GIF_OCR_REPLICAS"] = "1"
                     subprocess.Popen(
                         [python, str(worker.resolve()), "--serve-socket", str(socket_path)],
                         stdin=subprocess.DEVNULL,
@@ -1129,6 +1166,7 @@ def _ensure_persistent_worker(
                         stderr=subprocess.DEVNULL,
                         close_fds=True,
                         start_new_session=True,
+                        env=child_environment,
                     )
                 except OSError as exc:
                     raise ScoreboardOcrError(
@@ -1165,7 +1203,15 @@ def _run_persistent_worker(
     timeout_seconds: float,
     cancel_event: Any = None,
 ) -> subprocess.CompletedProcess[str]:
-    socket_path = _persistent_socket_path(worker, python)
+    replica_count = _persistent_replica_count()
+    with _PERSISTENT_REPLICA_LOCK:
+        cursor_key = (str(worker.resolve()), python, replica_count)
+        replica_id = _PERSISTENT_REPLICA_CURSOR.get(cursor_key, 0) % replica_count
+        _PERSISTENT_REPLICA_CURSOR[cursor_key] = (replica_id + 1) % replica_count
+    replica_order = [
+        (replica_id + offset) % replica_count
+        for offset in range(replica_count)
+    ]
     deadline = time.monotonic() + timeout_seconds
     response = b""
     last_communication_error: OSError | None = None
@@ -1179,6 +1225,12 @@ def _run_persistent_worker(
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
+        selected_replica = replica_order[min(attempt, len(replica_order) - 1)]
+        socket_path = _persistent_socket_path(
+            worker,
+            python,
+            replica_id=selected_replica,
+        )
         _ensure_persistent_worker(
             socket_path=socket_path,
             worker=worker,
@@ -1281,12 +1333,14 @@ def _run_persistent_worker(
             "persistent scoreboard OCR worker returned an invalid response",
             diagnostics={"socket_path": str(socket_path)},
         )
-    return subprocess.CompletedProcess(
+    completed = subprocess.CompletedProcess(
         [python, str(worker.resolve()), "--serve-socket", str(socket_path)],
         0,
         stdout=response.decode("utf-8"),
         stderr="",
     )
+    completed.replica_id = selected_replica
+    return completed
 
 
 def run_scoreboard_ocr(
@@ -1351,6 +1405,7 @@ def run_scoreboard_ocr(
             ) from exc
 
     document = _decode_worker_document(completed)
+    selected_replica = getattr(completed, "replica_id", None)
     if document.get("ok") is not True:
         error = document.get("error")
         if not isinstance(error, dict):
@@ -1360,6 +1415,9 @@ def run_scoreboard_ocr(
         if not isinstance(diagnostics, dict):
             diagnostics = {}
         diagnostics.setdefault("return_code", completed.returncode)
+        if selected_replica is not None:
+            diagnostics["backend_replica_id"] = int(selected_replica)
+            diagnostics["backend_replica_count"] = _persistent_replica_count()
         stderr = (completed.stderr or "").strip()
         if stderr:
             diagnostics.setdefault("worker_stderr", stderr[-2000:])
@@ -1384,6 +1442,9 @@ def run_scoreboard_ocr(
     )
     diagnostics.setdefault("worker_python", python)
     diagnostics.setdefault("worker_mode", worker_mode)
+    if selected_replica is not None:
+        diagnostics["backend_replica_id"] = int(selected_replica)
+        diagnostics["backend_replica_count"] = _persistent_replica_count()
     result["diagnostics"] = diagnostics
     return result
 

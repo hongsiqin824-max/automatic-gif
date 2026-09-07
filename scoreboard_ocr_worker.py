@@ -268,6 +268,7 @@ class OcrCropResult:
     batch_size: int
     inference_seconds: float
     backend_generation: int = 0
+    backend_replica_id: int = 0
 
     @property
     def profile_id(self) -> str:
@@ -285,6 +286,7 @@ class OcrCropResult:
             "batch_size": self.batch_size,
             "inference_seconds": self.inference_seconds,
             "backend_generation": self.backend_generation,
+            "backend_replica_id": self.backend_replica_id,
         }
 
 
@@ -3276,6 +3278,8 @@ class BatchOcrWorker:
         batch_wait_seconds: float = 0.02,
         queue_capacity: int = 128,
         generation: int = 0,
+        replica_id: int = 0,
+        replica_count: int = 1,
         engine_factory: EngineFactory = load_ocr_engine,
         batch_recognizer: Callable[
             ..., list[tuple[list[str], list[float]]]
@@ -3291,12 +3295,18 @@ class BatchOcrWorker:
             raise ValueError("queue_capacity must be at least max_batch_size")
         if int(generation) < 0:
             raise ValueError("generation must not be negative")
+        if int(replica_count) < 1:
+            raise ValueError("replica_count must be positive")
+        if not 0 <= int(replica_id) < int(replica_count):
+            raise ValueError("replica_id must be within replica_count")
 
         self.language = str(language)
         self.max_batch_size = int(max_batch_size)
         self.batch_wait_seconds = float(batch_wait_seconds)
         self.queue_capacity = int(queue_capacity)
         self.generation = int(generation)
+        self.replica_id = int(replica_id)
+        self.replica_count = int(replica_count)
         self._engine_factory = engine_factory
         self._batch_recognizer = batch_recognizer
         self._queue: queue.Queue[_QueuedCrop] = queue.Queue(
@@ -3323,6 +3333,18 @@ class BatchOcrWorker:
     @property
     def is_alive(self) -> bool:
         return self._thread.is_alive()
+
+    @property
+    def is_available(self) -> bool:
+        with self._state_lock:
+            accepting = self._accepting and self._terminal_error is None
+        return accepting and self.is_alive
+
+    @property
+    def load(self) -> int:
+        with self._active_lock:
+            active_count = len(self._active)
+        return self.queue_size + active_count
 
     def wait_until_ready(self, timeout: float | None = None) -> bool:
         ready = self._ready.wait(timeout)
@@ -3404,9 +3426,8 @@ class BatchOcrWorker:
     def __exit__(self, *_exc: Any) -> None:
         self.close()
 
-    @staticmethod
     def _error_for_request(
-        error: WorkerError, request: OcrCropRequest
+        self, error: WorkerError, request: OcrCropRequest
     ) -> WorkerError:
         return WorkerError(
             error.kind,
@@ -3417,6 +3438,10 @@ class BatchOcrWorker:
                 "video_pts": request.video_pts,
                 "kind": request.kind,
                 "profile": request.profile,
+                "backend_generation": self.generation,
+                "backend_replica_id": self.replica_id,
+                "backend_replica_count": self.replica_count,
+                "backend_queue_size": self.load,
             },
         )
 
@@ -3451,6 +3476,8 @@ class BatchOcrWorker:
                 "stage": "batch_inference",
                 "backend_unhealthy": True,
                 "backend_generation": self.generation,
+                "backend_replica_id": self.replica_id,
+                "backend_replica_count": self.replica_count,
             },
         )
         with self._state_lock:
@@ -3600,6 +3627,7 @@ class BatchOcrWorker:
                                 batch_size=len(active),
                                 inference_seconds=round(inference_seconds, 6),
                                 backend_generation=self.generation,
+                                backend_replica_id=self.replica_id,
                             )
                         )
         finally:
@@ -4804,6 +4832,8 @@ def _recognize_paths_shared(
                 "stage": "batch_inference",
                 "backend_unhealthy": True,
                 "backend_generation": batch_worker.generation,
+                "backend_replica_id": batch_worker.replica_id,
+                "backend_replica_count": batch_worker.replica_count,
             },
         ) from exc
     except WorkerError as exc:
@@ -6194,6 +6224,8 @@ def _request_document(
 
 
 class _SocketOcrRuntime:
+    MAX_REPLICAS = 4
+
     def __init__(
         self,
         *,
@@ -6204,21 +6236,55 @@ class _SocketOcrRuntime:
         max_batch_size: int = 8,
         batch_wait_seconds: float = 0.02,
         queue_capacity: int = 128,
+        replicas: int = 1,
     ) -> None:
+        try:
+            replica_count = int(replicas)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("OCR replicas must be an integer") from exc
+        if not 1 <= replica_count <= self.MAX_REPLICAS:
+            raise ValueError(
+                f"OCR replicas must be in [1, {self.MAX_REPLICAS}]"
+            )
         self._engine_factory = engine_factory
         self._batch_recognizer = batch_recognizer
         self._max_batch_size = max_batch_size
         self._batch_wait_seconds = batch_wait_seconds
         self._queue_capacity = queue_capacity
-        self._workers: dict[str, BatchOcrWorker] = {}
+        self._replicas = replica_count
+        self._workers: dict[str, list[BatchOcrWorker]] = {}
+        self._next_replica: dict[str, int] = {}
         self._lock = threading.Lock()
         self._generation = 1
         self._closed = False
 
     @property
+    def replicas(self) -> int:
+        return self._replicas
+
+    @property
     def generation(self) -> int:
         with self._lock:
             return self._generation
+
+    def _new_worker(
+        self,
+        language: str,
+        *,
+        replica_id: int,
+        generation: int,
+    ) -> BatchOcrWorker:
+        return BatchOcrWorker(
+            language=language,
+            max_batch_size=self._max_batch_size,
+            batch_wait_seconds=self._batch_wait_seconds,
+            queue_capacity=self._queue_capacity,
+            generation=generation,
+            replica_id=replica_id,
+            replica_count=self._replicas,
+            engine_factory=self._engine_factory,
+            batch_recognizer=self._batch_recognizer,
+        )
 
     def worker_for(self, language: str) -> BatchOcrWorker:
         normalized = str(language or "en").strip() or "en"
@@ -6228,41 +6294,103 @@ class _SocketOcrRuntime:
                     "ocr_worker_closed",
                     "persistent OCR backend is closed",
                 )
-            worker = self._workers.get(normalized)
-            if worker is None:
-                worker = BatchOcrWorker(
-                    language=normalized,
-                    max_batch_size=self._max_batch_size,
-                    batch_wait_seconds=self._batch_wait_seconds,
-                    queue_capacity=self._queue_capacity,
-                    generation=self._generation,
-                    engine_factory=self._engine_factory,
-                    batch_recognizer=self._batch_recognizer,
-                )
-                self._workers[normalized] = worker
+            workers = self._workers.get(normalized)
+            if workers is None:
+                workers = [
+                    self._new_worker(
+                        normalized,
+                        replica_id=index,
+                        generation=self._generation,
+                    )
+                    for index in range(self._replicas)
+                ]
+                self._workers[normalized] = workers
+                self._next_replica[normalized] = 0
+            start = self._next_replica.get(normalized, 0) % len(workers)
+            ordered = workers[start:] + workers[:start]
+            available = [worker for worker in ordered if worker.is_available]
+            worker = min(available or ordered, key=lambda candidate: candidate.load)
+            self._next_replica[normalized] = (
+                workers.index(worker) + 1
+            ) % len(workers)
             return worker
 
-    def invalidate_generation(self, generation: int) -> dict[str, Any]:
-        """Atomically replace one unhealthy generation and keep serving."""
+    def invalidate_generation(
+        self,
+        generation: int,
+        *,
+        language: str | None = None,
+        replica_id: int | None = None,
+    ) -> dict[str, Any]:
+        """Replace one unhealthy replica; no-identity calls retain old behavior."""
+        previous_worker: BatchOcrWorker | None = None
         with self._lock:
-            if self._closed or int(generation) != self._generation:
+            if self._closed:
                 return {
-                    "ocr_backend_restarted": self._generation > int(generation),
+                    "ocr_backend_restarted": False,
                     "backend_generation_before": int(generation),
                     "backend_generation_after": self._generation,
                 }
-            previous_generation = self._generation
-            self._generation += 1
-            workers = list(self._workers.values())
-            self._workers.clear()
-        for worker in workers:
-            worker.invalidate_generation()
-            worker.close(wait=False)
-        return {
-            "ocr_backend_restarted": True,
-            "backend_generation_before": previous_generation,
-            "backend_generation_after": previous_generation + 1,
-        }
+            if language is not None and replica_id is not None:
+                normalized = str(language or "en").strip() or "en"
+                workers = self._workers.get(normalized)
+                replica_index = int(replica_id)
+                if (
+                    workers is None
+                    or not 0 <= replica_index < len(workers)
+                    or workers[replica_index].generation != int(generation)
+                ):
+                    return {
+                        "ocr_backend_restarted": False,
+                        "backend_generation_before": int(generation),
+                        "backend_generation_after": self._generation,
+                        "backend_replica_id": replica_index,
+                    }
+                previous_generation = self._generation
+                self._generation += 1
+                previous_worker = workers[replica_index]
+                workers[replica_index] = self._new_worker(
+                    normalized,
+                    replica_id=replica_index,
+                    generation=self._generation,
+                )
+                restart = {
+                    "ocr_backend_restarted": True,
+                    "backend_generation_before": previous_generation,
+                    "backend_generation_after": self._generation,
+                    "backend_replica_id": replica_index,
+                    "backend_replica_count": self._replicas,
+                }
+            else:
+                if int(generation) != self._generation:
+                    return {
+                        "ocr_backend_restarted": self._generation > int(generation),
+                        "backend_generation_before": int(generation),
+                        "backend_generation_after": self._generation,
+                    }
+                previous_generation = self._generation
+                self._generation += 1
+                workers = [
+                    worker
+                    for group in self._workers.values()
+                    for worker in group
+                ]
+                self._workers.clear()
+                self._next_replica.clear()
+                restart = {
+                    "ocr_backend_restarted": True,
+                    "backend_generation_before": previous_generation,
+                    "backend_generation_after": previous_generation + 1,
+                    "backend_replica_count": self._replicas,
+                }
+        if previous_worker is not None:
+            previous_worker.invalidate_generation()
+            previous_worker.close(wait=False)
+        else:
+            for worker in workers:
+                worker.invalidate_generation()
+                worker.close(wait=False)
+        return restart
 
     def mark_unhealthy(self) -> None:
         """Backward-compatible generation invalidation hook."""
@@ -6271,8 +6399,13 @@ class _SocketOcrRuntime:
     def close(self, *, timeout: float = 2.0) -> None:
         with self._lock:
             self._closed = True
-            workers = list(self._workers.values())
+            workers = [
+                worker
+                for group in self._workers.values()
+                for worker in group
+            ]
             self._workers.clear()
+            self._next_replica.clear()
         deadline = time.monotonic() + max(0.0, timeout)
         for worker in workers:
             worker.close(
@@ -6324,6 +6457,24 @@ def _restartable_backend_generation(
     except (TypeError, ValueError):
         return None
     return generation if generation >= 0 else None
+
+
+def _restartable_backend_target(
+    document: Mapping[str, Any],
+) -> tuple[int, int | None] | None:
+    """Return a restartable generation and its replica when available."""
+    generation = _restartable_backend_generation(document)
+    if generation is None:
+        return None
+    error = document.get("error")
+    diagnostics = error.get("diagnostics") if isinstance(error, Mapping) else None
+    if not isinstance(diagnostics, Mapping):
+        return generation, None
+    try:
+        replica_id = int(diagnostics["backend_replica_id"])
+    except (KeyError, TypeError, ValueError):
+        replica_id = None
+    return generation, replica_id
 
 
 def _record_backend_restart(
@@ -6441,10 +6592,8 @@ def _serve_socket_connection(
                                             remaining, attempt_budget
                                         ),
                                     )
-                                    failed_generation = (
-                                        _restartable_backend_generation(document)
-                                    )
-                                    if failed_generation is None:
+                                    failed_target = _restartable_backend_target(document)
+                                    if failed_target is None:
                                         if restart_diagnostics is not None:
                                             _record_backend_restart(
                                                 document,
@@ -6452,11 +6601,17 @@ def _serve_socket_connection(
                                                 retry_count=retry_count,
                                             )
                                         break
-                                    restart_diagnostics = (
-                                        runtime.invalidate_generation(
+                                    failed_generation, failed_replica_id = failed_target
+                                    if failed_replica_id is None:
+                                        restart_diagnostics = runtime.invalidate_generation(
                                             failed_generation
                                         )
-                                    )
+                                    else:
+                                        restart_diagnostics = runtime.invalidate_generation(
+                                            failed_generation,
+                                            language=str(request.get("language") or "en"),
+                                            replica_id=failed_replica_id,
+                                        )
                                     remaining = request_deadline - time.monotonic()
                                     if retry_count >= 1 or remaining <= 0.05:
                                         _record_backend_restart(
@@ -6495,7 +6650,7 @@ def serve_socket(
     ] = recognize_batch,
     request_executor: Callable[..., tuple[dict[str, Any], int]] = _request_document,
 ) -> int:
-    """Serve local JSON-line requests while retaining one recognition model."""
+    """Serve local JSON-line requests with a bounded OCR replica pool."""
     socket_path = socket_path.resolve()
     socket_path.parent.mkdir(parents=True, exist_ok=True)
     if socket_path.exists() or socket_path.is_symlink():
@@ -6507,9 +6662,17 @@ def serve_socket(
         1,
         int(os.environ.get("GIF_OCR_MAX_CLIENTS", "32")),
     )
+    raw_replicas = os.environ.get("GIF_OCR_REPLICAS", "1").strip()
+    try:
+        replicas = int(raw_replicas)
+    except ValueError as exc:
+        raise ValueError(
+            f"GIF_OCR_REPLICAS must be an integer, got {raw_replicas!r}"
+        ) from exc
     runtime = _SocketOcrRuntime(
         engine_factory=engine_factory,
         batch_recognizer=batch_recognizer,
+        replicas=replicas,
     )
     stop_requested = threading.Event()
     client_slots = threading.BoundedSemaphore(max_clients)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import socket
 import subprocess
 import tempfile
@@ -2069,6 +2070,79 @@ class ProfileCropTests(unittest.TestCase):
 
 
 class BatchOcrWorkerTests(unittest.TestCase):
+    def test_runtime_distributes_requests_across_configured_replicas(self):
+        factory_calls: list[str] = []
+
+        def factory(language):
+            factory_calls.append(language)
+            return FakeEngine()
+
+        runtime = _SocketOcrRuntime(
+            engine_factory=factory,
+            max_batch_size=1,
+            batch_wait_seconds=0,
+            queue_capacity=2,
+            replicas=2,
+        )
+        try:
+            first = runtime.worker_for("en")
+            second = runtime.worker_for("en")
+            self.assertNotEqual(first.replica_id, second.replica_id)
+            self.assertEqual({first.replica_id, second.replica_id}, {0, 1})
+            first_result = first.submit(
+                match_id="match-a",
+                video_pts=1,
+                kind="clock",
+                profile="source-a",
+                crop="10:00",
+            ).result(timeout=1)
+            second_result = second.submit(
+                match_id="match-b",
+                video_pts=2,
+                kind="clock",
+                profile="source-b",
+                crop="10:01",
+            ).result(timeout=1)
+        finally:
+            runtime.close(timeout=1)
+
+        self.assertEqual(len(factory_calls), 2)
+        self.assertEqual(first_result.backend_replica_id, first.replica_id)
+        self.assertEqual(second_result.backend_replica_id, second.replica_id)
+
+    def test_replica_restart_does_not_invalidate_healthy_replica(self):
+        runtime = _SocketOcrRuntime(
+            engine_factory=lambda _language: FakeEngine(),
+            max_batch_size=1,
+            batch_wait_seconds=0,
+            queue_capacity=2,
+            replicas=2,
+        )
+        try:
+            failed = runtime.worker_for("en")
+            healthy = runtime.worker_for("en")
+            old_generation = failed.generation
+            restart = runtime.invalidate_generation(
+                old_generation,
+                language="en",
+                replica_id=failed.replica_id,
+            )
+            replacement = runtime._workers["en"][failed.replica_id]
+            self.assertTrue(restart["ocr_backend_restarted"])
+            self.assertIsNot(replacement, failed)
+            self.assertEqual(replacement.replica_id, failed.replica_id)
+            self.assertGreater(replacement.generation, old_generation)
+            self.assertIs(runtime._workers["en"][healthy.replica_id], healthy)
+            self.assertEqual(healthy.generation, old_generation)
+        finally:
+            runtime.close(timeout=1)
+
+    def test_invalid_replica_count_is_rejected(self):
+        with self.assertRaises(ValueError):
+            _SocketOcrRuntime(replicas=0)
+        with self.assertRaises(ValueError):
+            _SocketOcrRuntime(replicas=5)
+
     def test_runtime_invalidates_only_failed_generation(self):
         release_first = threading.Event()
         first_started = threading.Event()
@@ -2512,7 +2586,11 @@ class PersistentSocketTests(unittest.TestCase):
             result = future.result(timeout=request_timeout_seconds)
             return {"ok": True, "result": result.as_dict()}, 0
 
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ,
+            {"GIF_OCR_REPLICAS": "1"},
+            clear=False,
+        ):
             socket_path = Path(directory) / "ocr.sock"
             server = threading.Thread(
                 target=serve_socket,
