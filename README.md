@@ -65,6 +65,11 @@ python3 dashboard_server.py
 `.env.example` documents all supported environment variables, while `.env` is
 git-ignored and contains the local values. The live-source secret is read by
 the Flask backend only and is never returned to the browser.
+
+服务器生产环境的人工运维步骤请参阅：[安全关闭手册](SERVICE_SHUTDOWN_GUIDE.md) 和
+[完整重启手册](SERVICE_RESTART_GUIDE.md)。两份手册均按当前固定发布目录、8899
+Dashboard、比赛 Worker 和 FFmpeg 进程组整理，关闭或重启时应优先按手册执行。
+
 The default API identities and polling intervals are:
 
 | Purpose | Default |
