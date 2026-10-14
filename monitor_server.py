@@ -1,0 +1,596 @@
+#!/usr/bin/env python3
+"""Manual match-monitoring console (port 8901).
+
+This standalone service is independent from the automated dashboard on 8899.
+It auto-discovers the currently ``Playing`` matches, plays each live source in a
+grid for a human to watch, and lets the operator capture the last N seconds of a
+match as a GIF ("回捞"). Upstream event alerts are intentionally left as a
+pluggable hook and are not wired yet.
+
+It reuses the shared modules (``dqd_api``, ``source_client``, ``match_catalog``,
+``live_preview``) so the live-source query, catalog, and HLS preview behave
+exactly like the dashboard without importing that monolith.
+"""
+
+from __future__ import annotations
+
+import atexit
+import json
+import os
+import re
+import shutil
+import subprocess
+import time
+import uuid
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+from flask import Flask, abort, jsonify, request, send_from_directory
+
+from dqd_api import MATCH_STATUS_LABELS, positive_env_float, positive_env_int, validate_match_id
+from source_client import classify_source_response, query_source
+from match_catalog import MatchCatalog
+from live_preview import LivePreviewManager, resolve_ffmpeg
+from article_draft_queue import (
+    ArticleDraftQueue,
+    DRAFT_DELIVERY_MODE,
+    MANUAL_ARTIFACT_KIND,
+)
+
+
+ROOT = Path(__file__).resolve().parent
+
+
+def _load_dotenv(path: Path) -> None:
+    """Load simple KEY=VALUE settings without overriding shell variables."""
+    if not path.exists():
+        return
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        key, separator, value = line.partition("=")
+        key = key.strip()
+        if not separator or not key or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        os.environ.setdefault(key, value)
+
+
+_load_dotenv(ROOT / ".env")
+
+HOST = os.environ.get("GIF_MONITOR_HOST", "127.0.0.1")
+PORT = int(os.environ.get("GIF_MONITOR_PORT", "8901"))
+# Keep enough rolling HLS buffer that a backward capture always has material.
+CLIP_BEFORE_SECONDS = positive_env_float("GIF_MONITOR_CLIP_SECONDS", 15.0)
+CLIP_GIF_WIDTH = positive_env_int("GIF_MONITOR_CLIP_WIDTH", 480)
+CLIP_GIF_FPS = positive_env_int("GIF_MONITOR_CLIP_FPS", 12)
+# ~2s segments. The operator often watches tens of seconds behind the live edge
+# (hls.js back-buffer), so retain a generous on-disk history — enough to cover
+# that lag plus the capture window — or the requested frames are already gone.
+PREVIEW_LIST_SIZE = positive_env_int("GIF_MONITOR_PREVIEW_SEGMENTS", 90)
+MAX_PREVIEWS = positive_env_int("GIF_MONITOR_MAX_PREVIEWS", 16)
+CLIP_OUTPUT_ROOT = ROOT / "output_gifs" / "monitor"
+
+
+live_preview = LivePreviewManager(
+    list_size=PREVIEW_LIST_SIZE,
+    idle_timeout_seconds=positive_env_float("GIF_PREVIEW_IDLE_TIMEOUT_SECONDS", 120.0),
+)
+match_catalog = MatchCatalog()
+atexit.register(live_preview.shutdown)
+
+
+def _build_manual_draft_queue() -> "ArticleDraftQueue | None":
+    """Build a MANUAL-only draft queue that shares the dashboard's publish DB.
+
+    Returns ``None`` (local-save-only) when publishing is disabled or the publish
+    stack is not configured, so the monitor never breaks over a missing credential.
+    The queue claims only ``MANUAL_ARTIFACT_KIND`` so the 8899 worker (OCR-only by
+    default) and this worker share one table without stealing each other's tasks.
+    """
+    if os.environ.get("GIF_MONITOR_PUBLISH_ENABLED", "true").strip().lower() in {
+        "0", "false", "no", "off",
+    }:
+        return None
+    try:
+        from article_publisher import (
+            ArticlePublisher,
+            PublishedGifStore,
+            RemoteGifUploadClient,
+            environment_boolean,
+        )
+        from publish_account_pool import PublishAccountPool
+        from open_platform_client import OpenPlatformClient, OpenPlatformConfig
+
+        data_dir = ROOT / "data"
+        gif_dir = Path(os.environ.get("ARTICLE_PUBLISH_GIF_DIR", str(data_dir / "published_gifs")))
+        db_path = Path(os.environ.get("ARTICLE_PUBLISH_DB_PATH", str(data_dir / "article_publish.sqlite3")))
+        accounts_path = Path(
+            os.environ.get("ARTICLE_PUBLISH_ACCOUNTS_PATH", str(data_dir / "publish_accounts.json"))
+        )
+        backend = os.environ.get("OCR_IMAGE_UPLOAD_BACKEND", "self_hosted").strip() or "self_hosted"
+        if backend not in {"official", "self_hosted"}:
+            raise RuntimeError(f"不支持的 OCR 图片上传后端：{backend}")
+        upload_endpoint = os.environ.get("GIF_UPLOAD_ENDPOINT", "").strip()
+        upload_token = os.environ.get("GIF_UPLOAD_TOKEN", "").strip()
+
+        platform_client = OpenPlatformClient(OpenPlatformConfig.from_environment(ROOT))
+        publisher = ArticlePublisher(
+            platform_client=platform_client,
+            ocr_image_upload_client=(platform_client if backend == "official" else None),
+            gif_store=PublishedGifStore(
+                gif_dir,
+                os.environ.get("GIF_PUBLIC_ORIGIN", "https://matchgif.aisportsapp.com"),
+                max_bytes=positive_env_int("ARTICLE_PUBLISH_GIF_MAX_BYTES", 50 * 1024 * 1024),
+            ),
+            database_path=db_path,
+            verify_public_url=environment_boolean("ARTICLE_PUBLISH_VERIFY_PUBLIC_URL", True),
+            remote_upload_client=(
+                RemoteGifUploadClient(
+                    upload_endpoint,
+                    upload_token,
+                    timeout=positive_env_float("GIF_UPLOAD_TIMEOUT_SECONDS", 120.0),
+                )
+                if upload_endpoint
+                else None
+            ),
+            account_pool=PublishAccountPool(accounts_path),
+        )
+        queue = ArticleDraftQueue(
+            database_path=publisher.database_path,
+            publisher=publisher,
+            allowed_output_root=CLIP_OUTPUT_ROOT,
+            poll_seconds=positive_env_float("GIF_MONITOR_DRAFT_POLL_SECONDS", 2.0),
+            lease_seconds=positive_env_float("GIF_MONITOR_DRAFT_LEASE_SECONDS", 180.0),
+            person_wait_seconds=positive_env_float("GIF_MONITOR_PERSON_WAIT_SECONDS", 5.0),
+            claim_artifact_kinds=(MANUAL_ARTIFACT_KIND,),
+            start_worker=True,
+        )
+        return queue
+    except Exception as exc:  # noqa: BLE001 - degrade to local-only on any wiring gap
+        print(
+            json.dumps(
+                {"event": "manual_publish_disabled", "error": str(exc)},
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+        return None
+
+
+manual_draft_queue = _build_manual_draft_queue()
+if manual_draft_queue is not None:
+    atexit.register(manual_draft_queue.close)
+
+app = Flask(__name__, static_folder="monitor_static", static_url_path="/static")
+
+
+def _resolve_source(match_id: str) -> str:
+    """Return a usable live-source resource or raise a descriptive error."""
+    result = classify_source_response(query_source(match_id))
+    if result.state == "available":
+        return str(result.data.get("resource") or "").strip()
+    if result.state == "no_source":
+        raise LookupError("该比赛暂未配置直播源")
+    raise RuntimeError(result.error or "直播源查询失败")
+
+
+def _wait_playlist_ready(match_id: str, timeout: float = 9.0) -> bool:
+    """Wait until ffmpeg has written the first HLS playlist and a segment.
+
+    Returning only after the manifest exists removes the race where the browser
+    attaches hls.js before the first segment is written and hits a fatal 404.
+    """
+    playlist = live_preview.media_dir(match_id) / "index.m3u8"
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not live_preview.status(match_id).get("running"):
+            return False
+        if playlist.is_file() and _read_playlist_segments(playlist.parent):
+            return True
+        time.sleep(0.3)
+    return playlist.is_file()
+
+
+def _parse_pdt(raw: str) -> float | None:
+    """Parse an ``EXT-X-PROGRAM-DATE-TIME`` value into epoch seconds.
+
+    ffmpeg emits a colon-less offset (``+0800``) which ``datetime.fromisoformat``
+    rejects before Python 3.11, so normalise it to ``+08:00`` first.
+    """
+    raw = raw.strip()
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    else:
+        match = re.search(r"([+-]\d{2})(\d{2})$", raw)
+        if match:
+            raw = raw[: match.start()] + f"{match.group(1)}:{match.group(2)}"
+    try:
+        return datetime.fromisoformat(raw).timestamp()
+    except ValueError:
+        return None
+
+
+def _read_playlist_segments(directory: Path) -> list[tuple[Path, float, float | None]]:
+    """Parse the rolling HLS playlist into ordered (path, duration, pdt_epoch).
+
+    ``pdt_epoch`` is the ``EXT-X-PROGRAM-DATE-TIME`` of each segment (epoch
+    seconds) and lets a capture anchor on the exact displayed frame instead of
+    the server's wall-clock receive time.
+    """
+    playlist = directory / "index.m3u8"
+    try:
+        lines = playlist.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    segments: list[tuple[Path, float, float | None]] = []
+    pending_duration = 0.0
+    pending_pdt: float | None = None
+    for line in lines:
+        line = line.strip()
+        if line.startswith("#EXT-X-PROGRAM-DATE-TIME:"):
+            pending_pdt = _parse_pdt(line[len("#EXT-X-PROGRAM-DATE-TIME:"):])
+        elif line.startswith("#EXTINF:"):
+            try:
+                pending_duration = float(line[len("#EXTINF:"):].split(",", 1)[0])
+            except ValueError:
+                pending_duration = 0.0
+        elif line and not line.startswith("#"):
+            segment_path = directory / line
+            if segment_path.is_file():
+                segments.append((segment_path, pending_duration, pending_pdt))
+            pending_duration = 0.0
+            pending_pdt = None
+    return segments
+
+
+def _select_clip_window(
+    segments: list[tuple[Path, float, float | None]],
+    before_seconds: float,
+    anchor_epoch: float | None,
+) -> tuple[list[tuple[Path, float, float | None]], float, float]:
+    """Return (kept_segments, start_offset, window) for the GIF cut.
+
+    When ``anchor_epoch`` is given and every segment carries a PROGRAM-DATE-TIME,
+    the cut is anchored on the exact displayed frame (``[anchor-before, anchor]``)
+    so pipeline delay never shifts the result. Otherwise it falls back to the
+    trailing ``before_seconds`` of the rolling buffer.
+    """
+    pdts_ok = bool(segments) and all(seg[2] is not None for seg in segments)
+    if anchor_epoch is not None and pdts_ok:
+        last_end = segments[-1][2] + segments[-1][1]
+        # Clamp a slightly future anchor (clock skew) to the latest frame we have.
+        anchor = min(anchor_epoch, last_end)
+        want_start = anchor - before_seconds
+        kept = [
+            seg for seg in segments
+            if (seg[2] + seg[1]) > want_start and seg[2] < anchor
+        ]
+        if not kept:
+            kept = [segments[-1]]
+        base = kept[0][2]
+        start_offset = max(0.0, want_start - base)
+        effective_start = base + start_offset
+        available = (kept[-1][2] + kept[-1][1]) - effective_start
+        window = min(anchor - effective_start, available)
+        if window <= 0:
+            window = min(before_seconds, sum(seg[1] for seg in kept))
+        return kept, start_offset, window
+    # Fallback: trailing window of the rolling buffer.
+    kept = []
+    accumulated = 0.0
+    for segment in reversed(segments):
+        kept.append(segment)
+        accumulated += segment[1]
+        if accumulated >= before_seconds + 2.0:
+            break
+    kept.reverse()
+    kept_duration = sum(duration for _, duration, _ in kept)
+    start_offset = max(0.0, kept_duration - before_seconds)
+    window = min(before_seconds, kept_duration) or kept_duration
+    return kept, start_offset, window
+
+
+def _encode_clip_gif(
+    segments: list[tuple[Path, float, float | None]],
+    before_seconds: float,
+    output_path: Path,
+    anchor_epoch: float | None = None,
+) -> None:
+    """Concatenate recent segments and encode the target window to a GIF."""
+    kept, start_offset, window = _select_clip_window(segments, before_seconds, anchor_epoch)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    # Hard-link the chosen segments into a private directory before encoding.
+    # The preview process keeps deleting its oldest segments (delete_segments);
+    # a hard link pins the inode so ffmpeg can still read the data even if the
+    # original file is unlinked mid-encode. Same filesystem is required, so the
+    # link dir lives beside the output (both under the project tree).
+    link_dir = output_path.parent / f".src_{uuid.uuid4().hex}"
+    link_dir.mkdir(parents=True, exist_ok=True)
+    concat_list = output_path.parent / f".concat_{uuid.uuid4().hex}.txt"
+    try:
+        sources: list[Path] = []
+        for index, (path, _duration, _pdt) in enumerate(kept):
+            link_path = link_dir / f"seg_{index:05d}.ts"
+            try:
+                os.link(path, link_path)
+                sources.append(link_path)
+            except FileNotFoundError:
+                raise RuntimeError("这一刻的画面刚被清理，请重试")
+            except OSError:
+                # Cross-filesystem or unsupported link: fall back to the original
+                # path (no worse than before; the race simply remains possible).
+                sources.append(path)
+        concat_list.write_text(
+            "".join(f"file '{src.resolve()}'\n" for src in sources),
+            encoding="utf-8",
+        )
+        palette_filter = (
+            f"fps={CLIP_GIF_FPS},scale={CLIP_GIF_WIDTH}:-2:flags=lanczos,"
+            "split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse"
+        )
+        command = [
+            resolve_ffmpeg(), "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "concat", "-safe", "0", "-i", str(concat_list),
+            "-ss", f"{start_offset:.3f}", "-t", f"{window:.3f}",
+            "-filter_complex", palette_filter,
+            str(output_path),
+        ]
+        completed = subprocess.run(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=120,
+        )
+    finally:
+        concat_list.unlink(missing_ok=True)
+        shutil.rmtree(link_dir, ignore_errors=True)
+    if completed.returncode != 0 or not output_path.is_file():
+        detail = completed.stderr.decode("utf-8", "replace")[-400:]
+        raise RuntimeError(f"GIF 编码失败：{detail or '未知错误'}")
+
+
+def _clip_dir(match_id: str) -> Path:
+    return CLIP_OUTPUT_ROOT / match_id
+
+
+@app.get("/")
+def index():
+    return send_from_directory(ROOT / "monitor_static", "index.html")
+
+
+@app.get("/api/health")
+def health():
+    return jsonify({"ok": True, "port": PORT, "service": "monitor", "time_unix": time.time()})
+
+
+@app.get("/api/monitor/matches")
+def monitor_matches():
+    snapshot = match_catalog.snapshot()
+    playing = []
+    for item in snapshot.get("playing", []):
+        if not isinstance(item, dict):
+            continue
+        status = str(item.get("status") or "")
+        playing.append(
+            {
+                "match_id": str(item.get("match_id") or ""),
+                "team_A_name": item.get("team_A_name"),
+                "team_B_name": item.get("team_B_name"),
+                "team_A_logo": item.get("team_A_logo"),
+                "team_B_logo": item.get("team_B_logo"),
+                "fs_A": item.get("fs_A"),
+                "fs_B": item.get("fs_B"),
+                "minute": item.get("minute"),
+                "minute_period": item.get("minute_period"),
+                "competition_name": item.get("competition_name"),
+                "status": status,
+                "status_label": MATCH_STATUS_LABELS.get(status, status or "未知"),
+            }
+        )
+    return jsonify(
+        {
+            "playing": playing,
+            "health": snapshot.get("health", {}),
+            "max_previews": MAX_PREVIEWS,
+            "clip_before_seconds": CLIP_BEFORE_SECONDS,
+        }
+    )
+
+
+@app.post("/api/monitor/preview/start")
+def monitor_preview_start():
+    body = request.get_json(silent=True) or {}
+    try:
+        match_id = validate_match_id(str(body.get("match_id") or ""))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    try:
+        resource = _resolve_source(match_id)
+    except LookupError as exc:
+        return jsonify({"error": str(exc), "code": "no_source"}), 409
+    except Exception as exc:
+        return jsonify({"error": f"查询直播源失败：{exc}", "code": "source_error"}), 502
+    if not resource:
+        return jsonify({"error": "该比赛暂未配置直播源", "code": "no_source"}), 409
+    try:
+        status = live_preview.start(match_id, resource)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+    # Only report ready once the first playlist + segment exist, so the browser
+    # never attaches hls.js to a not-yet-written manifest.
+    playlist_ready = _wait_playlist_ready(match_id)
+    status = live_preview.status(match_id)
+    if not status.get("running"):
+        return jsonify(
+            {
+                "error": status.get("error") or "直播源拉流启动失败，请稍后重试",
+                "code": "preview_exited",
+            }
+        ), 502
+    return jsonify(
+        {
+            "ok": True,
+            "match_id": match_id,
+            "playlist_url": live_preview.playlist_url(match_id),
+            "playlist_ready": playlist_ready,
+            **status,
+        }
+    )
+
+
+@app.post("/api/monitor/preview/stop")
+def monitor_preview_stop():
+    body = request.get_json(silent=True) or {}
+    try:
+        match_id = validate_match_id(str(body.get("match_id") or ""))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    live_preview.stop(match_id)
+    return jsonify({"ok": True, "match_id": match_id, "running": False})
+
+
+@app.get("/api/monitor/preview/status")
+def monitor_preview_status():
+    try:
+        match_id = validate_match_id(request.args.get("match_id", ""))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    # A status check means an operator still has the tile open; refresh the
+    # access time so the idle reaper does not kill an actively-watched preview
+    # during a transient playback stall.
+    live_preview.touch(match_id)
+    status = live_preview.status(match_id)
+    status["match_id"] = match_id
+    status["playlist_url"] = (
+        live_preview.playlist_url(match_id) if status.get("running") else None
+    )
+    return jsonify(status)
+
+
+@app.get("/preview/<match_id>/<path:filename>")
+def preview_media(match_id, filename):
+    try:
+        match_id = validate_match_id(match_id)
+    except ValueError:
+        abort(404)
+    if not (filename.endswith(".m3u8") or filename.endswith(".ts")):
+        abort(404)
+    directory = live_preview.media_dir(match_id)
+    if not (directory / filename).is_file():
+        abort(404)
+    live_preview.touch(match_id)
+    mimetype = (
+        "application/vnd.apple.mpegurl"
+        if filename.endswith(".m3u8")
+        else "video/mp2t"
+    )
+    response = send_from_directory(directory, filename, mimetype=mimetype)
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.post("/api/monitor/clip")
+def monitor_clip():
+    body = request.get_json(silent=True) or {}
+    try:
+        match_id = validate_match_id(str(body.get("match_id") or ""))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    before_seconds = CLIP_BEFORE_SECONDS
+    if "before_seconds" in body:
+        try:
+            before_seconds = float(body["before_seconds"])
+        except (TypeError, ValueError):
+            return jsonify({"error": "before_seconds 必须是数字"}), 400
+        if not (0 < before_seconds <= 120):
+            return jsonify({"error": "before_seconds 必须在 0~120 之间"}), 400
+    anchor_epoch: float | None = None
+    if body.get("anchor_epoch_ms") is not None:
+        try:
+            anchor_epoch = float(body["anchor_epoch_ms"]) / 1000.0
+        except (TypeError, ValueError):
+            return jsonify({"error": "anchor_epoch_ms 必须是数字"}), 400
+    if not live_preview.status(match_id).get("running"):
+        return jsonify({"error": "请先开始预览该场，才能回捞画面", "code": "preview_not_running"}), 409
+    segments = _read_playlist_segments(live_preview.media_dir(match_id))
+    if not segments:
+        return jsonify({"error": "缓冲还没有可用画面，请稍后再试", "code": "buffer_empty"}), 409
+    # When the operator has drifted further behind live than the on-disk history,
+    # the frame they saw is already deleted; refuse rather than silently return
+    # the live edge (which would be the wrong moment).
+    if anchor_epoch is not None and all(seg[2] is not None for seg in segments):
+        oldest = segments[0][2]
+        if anchor_epoch < oldest:
+            retained = int((segments[-1][2] + segments[-1][1]) - oldest)
+            return (
+                jsonify(
+                    {
+                        "error": f"这一刻已超出缓冲（仅保留最近约 {retained} 秒），请离直播更近时再截取",
+                        "code": "anchor_out_of_buffer",
+                    }
+                ),
+                409,
+            )
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    output_path = _clip_dir(match_id) / f"clip_{timestamp}_{uuid.uuid4().hex[:6]}.gif"
+    anchored = anchor_epoch is not None and all(seg[2] is not None for seg in segments)
+    try:
+        _encode_clip_gif(segments, before_seconds, output_path, anchor_epoch)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+    print(
+        json.dumps(
+            {
+                "event": "monitor_clip",
+                "match_id": match_id,
+                "before_seconds": before_seconds,
+                "anchored": anchored,
+                "anchor_epoch_ms": None if anchor_epoch is None else round(anchor_epoch * 1000),
+                "segments": len(segments),
+                "with_pdt": sum(1 for seg in segments if seg[2] is not None),
+                "clip": output_path.name,
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
+    return jsonify(
+        {
+            "ok": True,
+            "match_id": match_id,
+            "before_seconds": before_seconds,
+            "anchored": anchored,
+            "clip_url": f"/clips/{match_id}/{output_path.name}",
+            "bytes": output_path.stat().st_size,
+        }
+    )
+
+
+@app.get("/clips/<match_id>/<path:filename>")
+def clip_file(match_id, filename):
+    try:
+        match_id = validate_match_id(match_id)
+    except ValueError:
+        abort(404)
+    if Path(filename).name != filename or not filename.endswith(".gif"):
+        abort(404)
+    directory = _clip_dir(match_id)
+    if not (directory / filename).is_file():
+        abort(404)
+    return send_from_directory(directory, filename, mimetype="image/gif")
+
+
+if __name__ == "__main__":
+    print(f"Match monitor console: http://{HOST}:{PORT}")
+    app.run(host=HOST, port=PORT, threaded=True, debug=False)

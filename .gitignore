@@ -36,3 +36,10 @@ Thumbs.db
 
 # 本机接口密钥和运行配置
 .env
+.env.backup.*
+
+# 运行日志
+*.log
+
+# 编辑器本机配置
+.vscode/

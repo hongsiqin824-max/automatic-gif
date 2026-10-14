@@ -1,0 +1,123 @@
+# app内图片上传接口
+
+# app内图片上传\(`image-uploadimage-ai`\)
+
+> app内图片上传接口。接收 multipart 表单上传的图片文件\(单次 1\~10 张\),校验大小与图片内容后存入 FastDFS,并写入图片元信息,返回每张图片的存储地址与访问 URL。上传用户由 `Authorization` 登录态解析,**必须为已登录用户**。
+
+## 1\. 基本信息
+
+|项目|值|
+|---|---|
+|接口名称|AI 图片上传|
+|api\_name|`image-uploadimage-ai`|
+|请求方法|`POST`|
+|请求体格式|`multipart/form-data`\(文件上传\)|
+|need\_login|`0`\(无需用户登录\)|
+|调用范围||
+
+> 说明:业务参数\(`type` / `relate_id`\)通过 **URL query** 传递,图片文件通过 **multipart body** 上传,上传用户通过 **Authorization 头**的登录态解析。
+
+## 2\. 请求参数\(URL Query\)
+
+|参数|类型|必填|默认值|说明|
+|---|---|---|---|---|
+|`type`|string|是|- |业务类型。以 `_` 分割后,首段须为 `archive` / `comment` / `topic` / `reply` / `chat` / `common` 之一,否则报参数错误|
+|`relate_id`|int|否|- |关联业务 ID。若传入,必须为纯整数|
+
+## 3\. 请求头
+
+|Header|必填|说明|
+|---|---|---|
+|`Authorization`|是|用户登录 token,用于换取上传用户 ID。缺失或校验不通过\(无法解析出用户\)时,返回 `300002`|
+
+## 4\. 请求体\(multipart/form\-data\)
+
+以 multipart 表单上传图片文件,支持多文件字段。
+
+|字段|类型|必填|说明|
+|---|---|---|---|
+|files|file|是|图片文件,单次 **1\~10** 个;单个文件大小上限 **20MB**;须为合法图片\(可被解析出宽高\)|
+
+> 约束:文件数量为 0 或超过 10 → 返回 `300005`;单文件超过 20MB → `300007`;非图片内容 → `300008`。
+
+## 5\. cURL 示例
+
+```Bash
+curl -X POST \
+  "http://<inner-host>/inner/aiimage/upload?type=common&relate_id=123" \
+  -H "Authorization: <token>" \
+  -F "file1=@/path/to/a.jpg" \
+  -F "file2=@/path/to/b.png"
+
+```
+
+## 6\. 响应格式
+
+`Content-Type: application/json`。返回体结构:
+
+|字段|类型|说明|
+|---|---|---|
+|`code`|int|错误码,`0` 表示成功|
+|`messgae`|string|提示信息\(注:字段名为 `messgae`,与代码保持一致\)|
+|`data`|array|成功时为图片信息数组,每个元素对应一张上传的图片;失败时为 `[]`|
+
+### 6\.1 data 数组元素字段
+
+|字段|类型|说明|
+|---|---|---|
+|`image_id`|int|图片元信息记录 ID|
+|`width`|int|图片宽度\(像素\)|
+|`height`|int|图片高度\(像素\)|
+|`size`|int|文件大小\(字节\)|
+|`mime`|string|文件 MIME 类型,如 `image/jpeg`|
+|`url`|string|FastDFS 存储路径|
+|`file_name`|string|原始上传文件名|
+|`img1_url`|string|完整访问 URL\(图片域名 \+ `url`\)|
+
+### 6\.2 成功
+
+```JSON
+{
+  "code": 0,
+  "data": [
+    {
+      "file_name": "116.png",
+      "height": 590,
+      "image_id": 3,
+      "img1_url": "https://img1.qunliao.info/fastdfs8/M00/CF/6F/rBXRDGpp72CAXtoOAAClsmjT6Co039.png",
+      "mime": "image/png",
+      "size": 42418,
+      "url": "/fastdfs8/M00/CF/6F/rBXRDGpp72CAXtoOAAClsmjT6Co039.png",
+      "width": 300
+    }
+  ],
+  "messgae": "success"
+}
+```
+
+### 6\.3 失败
+
+```JSON
+{
+  "code": 300002,
+  "messgae": "Not login",
+  "data": []
+}
+
+```
+
+## 7\. 错误码
+
+|code|messgae|触发原因|
+|---|---|---|
+|`0`|`success`|成功|
+|`300002`|`Not login`|未登录 / `Authorization` 缺失或校验不通过,无法解析出用户|
+|`300003`|`No para "type" or type value illegal`|缺少 `type` 或取值非法|
+|`300004`|`para "relate_id" not int value`|`relate_id` 非整数|
+|`300005`|`no file or too many files`|未上传文件或文件数超过 10|
+|`300007`|`file size is illegal`|文件为空或超过 20MB|
+|`300008`|`file content is illegal`|文件内容非合法图片|
+|`300009`|`internal error`|内部错误\(存储/落库失败,HTTP 500\)|
+
+
+

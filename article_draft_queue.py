@@ -24,6 +24,7 @@ from match_event_identity import merge_event_metadata
 
 
 OCR_ARTIFACT_KIND = "ocr_window"
+MANUAL_ARTIFACT_KIND = "manual_clip"
 DRAFT_DELIVERY_MODE = "draft"
 DRAFT_ADMIN_ORIGIN = "https://dadmin.dongqiudi.com"
 DEFAULT_RETRY_DELAYS_SECONDS = (30.0, 120.0, 300.0, 600.0)
@@ -136,12 +137,18 @@ def ocr_quality_label(result: dict[str, Any] | None) -> str:
     return "OCR GIF 已生成"
 
 
-def ocr_publication_eligibility(result: dict[str, Any] | None) -> dict[str, Any]:
+def ocr_publication_eligibility(
+    result: dict[str, Any] | None,
+    artifact_kind: str = OCR_ARTIFACT_KIND,
+) -> dict[str, Any]:
     """Classify whether an OCR GIF is safe for automatic article delivery.
 
     The media worker is allowed to retain degraded clips for inspection. Article
     delivery is stricter: a clip must have a trustworthy OCR clock anchor, keep
     the event frame, and contain enough continuous video around that anchor.
+
+    Manually captured clips skip these OCR-only gates: a human already confirmed
+    the event on the live screen, so there is no OCR anchor to verify.
     """
     value = result if isinstance(result, dict) else {}
 
@@ -160,6 +167,9 @@ def ocr_publication_eligibility(result: dict[str, Any] | None) -> dict[str, Any]
             "reason": reason,
             **details,
         }
+
+    if artifact_kind == MANUAL_ARTIFACT_KIND:
+        return allow("manual_confirmed", "人工在直播画面确认事件后触发截取")
 
     if not value:
         return hold(
@@ -378,6 +388,7 @@ class ArticleDraftQueue:
             [str, str, dict[str, Any]], dict[str, Any] | None
         ]
         | None = None,
+        claim_artifact_kinds: Iterable[str] | None = None,
         start_worker: bool = False,
     ) -> None:
         self.database_path = database_path.expanduser().resolve()
@@ -416,6 +427,17 @@ class ArticleDraftQueue:
             else float(auto_publish_after_unix)
         )
         self.latest_event_loader = latest_event_loader
+        # The claim worker only picks up tasks of these artifact kinds. Defaulting
+        # to OCR keeps the dashboard worker unchanged (it has only ever enqueued
+        # OCR tasks); a separate monitor worker claims MANUAL_ARTIFACT_KIND so the
+        # two processes share one table without stealing each other's work.
+        self.claim_artifact_kinds = (
+            tuple(str(kind) for kind in claim_artifact_kinds)
+            if claim_artifact_kinds is not None
+            else (OCR_ARTIFACT_KIND,)
+        )
+        if not self.claim_artifact_kinds:
+            raise ValueError("claim_artifact_kinds 不能为空")
         if (
             not math.isfinite(self.poll_seconds)
             or self.poll_seconds <= 0
@@ -493,8 +515,8 @@ class ArticleDraftQueue:
             raise ValueError("自动草稿需要有效的数字比赛 ID")
         if not event_key:
             raise ValueError("自动草稿缺少事件标识")
-        if artifact_kind != OCR_ARTIFACT_KIND or delivery_mode != DRAFT_DELIVERY_MODE:
-            raise ValueError("自动草稿仅支持 OCR GIF")
+        if artifact_kind not in (OCR_ARTIFACT_KIND, MANUAL_ARTIFACT_KIND) or delivery_mode != DRAFT_DELIVERY_MODE:
+            raise ValueError("自动草稿仅支持 OCR GIF 或人工截取")
 
         resolved_source = source_path.expanduser().resolve()
         if self.allowed_output_root is not None:
@@ -522,7 +544,7 @@ class ArticleDraftQueue:
             separators=(",", ":"),
         )
         quality_label = ocr_quality_label(artifact_result)
-        eligibility = ocr_publication_eligibility(artifact_result)
+        eligibility = ocr_publication_eligibility(artifact_result, artifact_kind=artifact_kind)
         eligibility_json = json.dumps(
             eligibility, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         )
@@ -843,7 +865,9 @@ class ArticleDraftQueue:
                 (task_key,),
             ).fetchone()
 
-    def records_for_match(self, match_id: str) -> dict[str, dict[str, Any]]:
+    def records_for_match(
+        self, match_id: str, artifact_kind: str = OCR_ARTIFACT_KIND
+    ) -> dict[str, dict[str, Any]]:
         if not self.database_path.exists():
             return {}
         try:
@@ -854,7 +878,7 @@ class ArticleDraftQueue:
                     WHERE match_id = ? AND artifact_kind = ? AND delivery_mode = ?
                     ORDER BY updated_at_unix DESC
                     """,
-                    (str(match_id), OCR_ARTIFACT_KIND, DRAFT_DELIVERY_MODE),
+                    (str(match_id), artifact_kind, DRAFT_DELIVERY_MODE),
                 ).fetchall()
         except sqlite3.Error:
             return {}
@@ -870,6 +894,7 @@ class ArticleDraftQueue:
         event: dict[str, Any],
         match_detail: dict[str, Any] | None = None,
         now: float | None = None,
+        artifact_kind: str = OCR_ARTIFACT_KIND,
     ) -> dict[str, Any] | None:
         """Refresh a nonterminal task and wake it when a usable name arrives."""
         event_key = str(event.get("event_key") or "").strip()
@@ -897,7 +922,7 @@ class ArticleDraftQueue:
                 (
                     str(match_id),
                     event_key,
-                    OCR_ARTIFACT_KIND,
+                    artifact_kind,
                     DRAFT_DELIVERY_MODE,
                 ),
             ).fetchone()
@@ -941,7 +966,9 @@ class ArticleDraftQueue:
         self._wake.set()
         return _public_task(row) if row is not None else None
 
-    def retry(self, *, match_id: str, event_key: str) -> dict[str, Any] | None:
+    def retry(
+        self, *, match_id: str, event_key: str, artifact_kind: str = OCR_ARTIFACT_KIND
+    ) -> dict[str, Any] | None:
         """Put one existing OCR draft task at the front of the queue."""
         normalized_match = str(match_id).strip()
         normalized_event = str(event_key).strip()
@@ -960,7 +987,7 @@ class ArticleDraftQueue:
                 (
                     normalized_match,
                     normalized_event,
-                    OCR_ARTIFACT_KIND,
+                    artifact_kind,
                     DRAFT_DELIVERY_MODE,
                 ),
             ).fetchone()
@@ -1290,10 +1317,11 @@ class ArticleDraftQueue:
 
     def _claim_due(self, now: float) -> sqlite3.Row | None:
         publish_after = self.auto_publish_after_unix or 0.0
+        kind_placeholders = ",".join("?" for _ in self.claim_artifact_kinds)
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                """
+                f"""
                 SELECT * FROM article_delivery_tasks
                 WHERE (
                     status = 'queued'
@@ -1305,6 +1333,7 @@ class ArticleDraftQueue:
                     )
                 )
                 AND created_at_unix >= ?
+                AND artifact_kind IN ({kind_placeholders})
                 ORDER BY
                     CASE
                         WHEN status IN ('creating', 'creating_draft', 'publishing') THEN 0
@@ -1315,7 +1344,7 @@ class ArticleDraftQueue:
                     COALESCE(next_attempt_at_unix, created_at_unix), created_at_unix
                 LIMIT 1
                 """,
-                (now, now, now, publish_after),
+                (now, now, now, publish_after, *self.claim_artifact_kinds),
             ).fetchone()
             if row is None:
                 return None

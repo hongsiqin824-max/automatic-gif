@@ -1682,6 +1682,11 @@ class ArticlePublisher:
 
 
 def build_article_title(event: dict[str, Any], detail: dict[str, Any]) -> str:
+    # An explicit operator-provided title wins over the generated one. OCR events
+    # never set this field, so automatic titles are unaffected.
+    override = str(event.get("title_override") or "").strip()
+    if override:
+        return override[:100]
     minute = _match_time(event)
     minute_text = f"{minute}分钟" if minute else "比赛中"
     person = str(event.get("person") or "").strip()

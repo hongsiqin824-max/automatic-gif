@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>足球比赛监控台</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">MATCH MONITOR</p>
+        <h1>足球比赛直播监控台</h1>
+        <p class="subhead">自动列出进行中的比赛，直播画面供人工盯场；进球后点「截取」回捞最近 15 秒。</p>
+      </div>
+      <div class="port-badge"><span class="dot"></span> 8901 · 监控台</div>
+    </header>
+
+    <section class="toolbar">
+      <button id="refresh-btn" class="button secondary" type="button">刷新比赛列表</button>
+      <span id="summary" class="muted">正在读取进行中的比赛…</span>
+      <span id="health" class="health loading"><i></i>连接中</span>
+    </section>
+
+    <div id="notice" class="notice hidden"></div>
+
+    <section id="grid" class="grid">
+      <div class="grid-empty" id="grid-empty">正在加载当前进行中的比赛…</div>
+    </section>
+  </main>
+
+  <div id="stage" class="stage hidden">
+    <div class="stage-inner">
+      <div class="stage-head">
+        <strong id="stage-title">比赛</strong>
+        <div class="stage-actions">
+          <button id="stage-live" class="button secondary" type="button">回到直播</button>
+          <button id="stage-capture" class="button primary" type="button">截取最近 15 秒</button>
+          <button id="stage-close" class="button ghost" type="button">关闭</button>
+        </div>
+      </div>
+      <video id="stage-video" class="stage-video" controls playsinline autoplay muted></video>
+      <div id="stage-status" class="stage-status muted"></div>
+      <div id="stage-clips" class="stage-clips"></div>
+    </div>
+  </div>
+
+  <script src="/static/vendor/hls.min.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>
