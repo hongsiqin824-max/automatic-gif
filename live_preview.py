@@ -44,6 +44,13 @@ class _PreviewEntry:
     log_path: Path
     started_at: float
     last_access: float
+    # Auto-restart bookkeeping (only consulted when auto_restart is enabled).
+    restart_count: int = 0
+    next_restart_at: float = 0.0
+    # True once fast retries are exhausted and we have dropped to low-frequency
+    # (max_delay-spaced) probing; we keep probing so a late source recovery
+    # self-heals instead of requiring a manual refresh.
+    cooling: bool = False
 
 
 class LivePreviewManager:
@@ -58,12 +65,25 @@ class LivePreviewManager:
         list_size: int = PREVIEW_LIST_SIZE,
         height: int = PREVIEW_HEIGHT,
         background_reaper: bool = True,
+        auto_restart: bool = False,
+        restart_base_delay: float = 5.0,
+        restart_max_delay: float = 60.0,
+        restart_max_retries: int = 6,
+        restart_reset_seconds: float = 30.0,
     ) -> None:
         self.root = Path(root)
         self.idle_timeout_seconds = float(idle_timeout_seconds)
         self.segment_seconds = int(segment_seconds)
         self.list_size = int(list_size)
         self.height = int(height)
+        # When enabled, the reaper restarts an ffmpeg that died while the tile is
+        # still being watched (dead/flaky RTMP source), with exponential backoff
+        # and a retry ceiling so a permanently-dead source is not hammered.
+        self.auto_restart = bool(auto_restart)
+        self.restart_base_delay = float(restart_base_delay)
+        self.restart_max_delay = float(restart_max_delay)
+        self.restart_max_retries = int(restart_max_retries)
+        self.restart_reset_seconds = float(restart_reset_seconds)
         self.lock = threading.RLock()
         self.entries: dict[str, _PreviewEntry] = {}
         self._ffmpeg = resolve_ffmpeg()
@@ -101,7 +121,12 @@ class LivePreviewManager:
             command += ["-re"]
         else:
             # Bound a stalled network read so a dead RTMP source fails fast.
-            command += ["-rw_timeout", "15000000"]
+            # 40s (not 15s) tolerates brief HD-feed stalls without killing
+            # ffmpeg; a genuinely dead source is still recovered by the backend
+            # auto-restart plus the frontend 8s self-heal, so the longer bound
+            # only trades slightly slower dead-source detection for far fewer
+            # spurious "直播源中断" blips on heavier HD streams.
+            command += ["-rw_timeout", "40000000"]
         command += [
             "-i", resource,
             "-vf", f"scale=-2:{self.height}",
@@ -191,6 +216,9 @@ class LivePreviewManager:
             "started_at_unix": entry.started_at,
             "return_code": return_code,
             "error": error,
+            # True once fast retries are spent and we have dropped to low-frequency
+            # probing; the source is still being auto-recovered, not abandoned.
+            "auto_restart_cooling": entry.cooling,
         }
 
     @staticmethod
@@ -222,15 +250,62 @@ class LivePreviewManager:
 
     def _reap_loop(self) -> None:
         while not self._stop.wait(5.0):
-            now = time.time()
-            with self.lock:
-                for match_id in list(self.entries):
-                    entry = self.entries[match_id]
-                    # poll() reaps a finished child; the entry is kept so status
-                    # can still surface its error until the tab goes idle.
-                    entry.process.poll()
-                    if now - entry.last_access > self.idle_timeout_seconds:
-                        self._stop_entry_locked(match_id)
+            self._reap_tick(time.time())
+
+    def _reap_tick(self, now: float) -> None:
+        with self.lock:
+            for match_id in list(self.entries):
+                entry = self.entries[match_id]
+                # poll() reaps a finished child; the entry is kept so status
+                # can still surface its error until the tab goes idle.
+                return_code = entry.process.poll()
+                if now - entry.last_access > self.idle_timeout_seconds:
+                    self._stop_entry_locked(match_id)
+                    continue
+                if not self.auto_restart:
+                    continue
+                if return_code is None:
+                    # Alive. If it has run cleanly past the reset window, forget
+                    # earlier failures so a later outage gets a fresh retry budget.
+                    if entry.restart_count and now - entry.started_at > self.restart_reset_seconds:
+                        entry.restart_count = 0
+                        entry.cooling = False
+                    continue
+                # Died while still watched: restart under backoff. After the fast
+                # retries are spent we keep probing at max_delay so a recovering
+                # source self-heals rather than staying dead until a manual reload.
+                if now < entry.next_restart_at:
+                    continue
+                self._restart_entry_locked(match_id, now)
+
+    def _restart_entry_locked(self, match_id: str, now: float) -> None:
+        entry = self.entries.get(match_id)
+        if entry is None:
+            return
+        delay = min(
+            self.restart_base_delay * (2 ** entry.restart_count),
+            self.restart_max_delay,
+        )
+        directory = entry.directory
+        shutil.rmtree(directory, ignore_errors=True)
+        directory.mkdir(parents=True, exist_ok=True)
+        command = self._build_command(entry.resource, directory)
+        log_file = entry.log_path.open("wb")
+        try:
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=log_file,
+                stdin=subprocess.DEVNULL,
+            )
+        finally:
+            log_file.close()
+        entry.process = process
+        entry.started_at = now
+        entry.restart_count += 1
+        entry.next_restart_at = now + delay
+        if entry.restart_count >= self.restart_max_retries:
+            entry.cooling = True
 
     def shutdown(self) -> None:
         self._stop.set()

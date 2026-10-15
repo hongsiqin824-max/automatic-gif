@@ -29,7 +29,7 @@ DRAFT_DELIVERY_MODE = "draft"
 DRAFT_ADMIN_ORIGIN = "https://dadmin.dongqiudi.com"
 DEFAULT_RETRY_DELAYS_SECONDS = (30.0, 120.0, 300.0, 600.0)
 DEFAULT_PERSON_WAIT_SECONDS = 60.0
-TERMINAL_DELIVERY_STATUSES = {"published"}
+TERMINAL_DELIVERY_STATUSES = {"published", "drafted"}
 PUBLICATION_HOLD_STATUS = "held"
 AUTO_PUBLISH_MIN_PLAYABLE_SECONDS = 55.0
 AUTO_PUBLISH_ANCHOR_TOLERANCE_SECONDS = 1.0
@@ -389,6 +389,7 @@ class ArticleDraftQueue:
         ]
         | None = None,
         claim_artifact_kinds: Iterable[str] | None = None,
+        manual_delivery_mode: str = DRAFT_DELIVERY_MODE,
         start_worker: bool = False,
     ) -> None:
         self.database_path = database_path.expanduser().resolve()
@@ -438,6 +439,15 @@ class ArticleDraftQueue:
         )
         if not self.claim_artifact_kinds:
             raise ValueError("claim_artifact_kinds 不能为空")
+        # How operator-confirmed manual clips are delivered. "draft" keeps every
+        # manual clip as an unpublished draft (status=0) for review during
+        # testing; "publish" makes them go live immediately (status=1). Only the
+        # monitor worker claims MANUAL tasks, so this never affects OCR delivery.
+        self.manual_delivery_mode = (
+            str(manual_delivery_mode or DRAFT_DELIVERY_MODE).strip().lower()
+        )
+        if self.manual_delivery_mode not in {"draft", "publish"}:
+            raise ValueError("manual_delivery_mode 必须是 draft 或 publish")
         if (
             not math.isfinite(self.poll_seconds)
             or self.poll_seconds <= 0
@@ -858,11 +868,13 @@ class ArticleDraftQueue:
             ).fetchone()
 
     def _terminal_task(self, task_key: str) -> sqlite3.Row | None:
+        statuses = sorted(TERMINAL_DELIVERY_STATUSES)
+        placeholders = ",".join("?" for _ in statuses)
         with self._connect() as connection:
             return connection.execute(
                 "SELECT * FROM article_delivery_tasks "
-                "WHERE task_key=? AND status='published'",
-                (task_key,),
+                f"WHERE task_key=? AND status IN ({placeholders})",
+                (task_key, *statuses),
             ).fetchone()
 
     def records_for_match(
@@ -1027,6 +1039,41 @@ class ArticleDraftQueue:
             event, detail = self._reload_claim_payload(task)
             if not isinstance(event, dict) or not isinstance(detail, dict):
                 raise ValueError("草稿任务中的比赛信息损坏")
+            if str(task.get("artifact_kind") or "") == MANUAL_ARTIFACT_KIND:
+                # Operator-confirmed clips skip the OCR person-wait/auto-publish
+                # state machine. Deliver exactly once per the worker's configured
+                # manual delivery mode, then settle into a terminal status so
+                # nothing re-publishes it.
+                source_path = self._stage_source(task)
+                if not self._claim_owned(task):
+                    return True
+                final_event = dict(event)
+                mode = self.manual_delivery_mode
+                self._set_claim_phase(
+                    task,
+                    "publishing" if mode == "publish" else "creating_draft",
+                    now=claimed_at,
+                )
+                result = self.publisher.create_or_update_article(
+                    match_id=str(task["match_id"]),
+                    event=final_event,
+                    match_detail=detail,
+                    source_path=source_path,
+                    delivery_mode=mode,
+                )
+                if mode == "publish":
+                    self._record_published(
+                        task,
+                        result,
+                        event=final_event,
+                        publish_reason="manual_confirmed",
+                        now=claimed_at,
+                    )
+                else:
+                    self._record_manual_drafted(
+                        task, result, event=final_event, now=claimed_at
+                    )
+                return True
             eligibility = _json_object(task.get("eligibility_json"))
             if not isinstance(eligibility, dict):
                 self._hold_claim(
@@ -1712,6 +1759,63 @@ class ArticleDraftQueue:
                     _json_value(result.get("diagnostics")),
                     now,
                     publish_reason,
+                    final_event_json,
+                    now,
+                    now,
+                    task["task_key"],
+                    task["generation"],
+                    task["lease_token"],
+                ),
+            )
+        if updated.rowcount == 1:
+            self._delete_previous_staged_if_unused(task.get("previous_staged_path"))
+        else:
+            self._record_stale_article_id(task, result)
+
+    def _record_manual_drafted(
+        self,
+        task: dict[str, Any],
+        result: dict[str, Any],
+        *,
+        event: dict[str, Any],
+        now: float,
+    ) -> None:
+        """Settle a manual clip as a terminal draft (platform status=0).
+
+        Unlike the OCR ``_record_draft_created`` path, operator-confirmed clips
+        do not wait for a player name or auto-publish; the draft is the final
+        delivery and the task reaches the terminal ``drafted`` status.
+        """
+        gif = result.get("gif") if isinstance(result.get("gif"), dict) else {}
+        final_event_json = json.dumps(
+            event, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        with self._connect() as connection:
+            updated = connection.execute(
+                """
+                UPDATE article_delivery_tasks
+                SET status='drafted', stage='drafted', article_id=?,
+                    artifact_sha256=?, staged_path=?, gif_url=?, platform_code=?,
+                    duplicate=?, platform_status_code=?, diagnostics_json=?,
+                    next_attempt_at_unix=NULL, lease_until_unix=NULL, lease_token=NULL,
+                    retriable=0, auth_required=0, error_code=NULL, error=NULL,
+                    previous_staged_path=NULL, draft_created_at_unix=?,
+                    final_event_json=?, updated_at_unix=?, completed_at_unix=?
+                WHERE task_key=? AND generation=? AND lease_token=?
+                  AND status IN ('creating', 'creating_draft')
+                """,
+                (
+                    str(result["article_id"]),
+                    gif.get("gif_id") or task.get("artifact_sha256"),
+                    gif.get("path") or task.get("staged_path"),
+                    gif.get("url") or task.get("gif_url"),
+                    None
+                    if result.get("platform_code") is None
+                    else str(result.get("platform_code")),
+                    int(bool(result.get("duplicate"))),
+                    _diagnostic_value(result.get("diagnostics"), "http_status"),
+                    _json_value(result.get("diagnostics")),
+                    now,
                     final_event_json,
                     now,
                     now,

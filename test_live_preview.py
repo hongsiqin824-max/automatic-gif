@@ -140,5 +140,134 @@ class LivePreviewLifecycleTests(unittest.TestCase):
             self.manager.start("match-1", "   ")
 
 
+def _dying_command_factory():
+    """Return a fake ``_build_command`` whose child dies right after booting.
+
+    It writes the playlist (so ``playlist_ready`` turns true) and then exits
+    non-zero, emulating an RTMP source that drops immediately.
+    """
+
+    def _build(resource, directory):
+        playlist = directory / "index.m3u8"
+        script = (
+            "import pathlib, sys\n"
+            f"pathlib.Path(r'{playlist}').write_text('#EXTM3U', encoding='utf-8')\n"
+            "sys.exit(1)\n"
+        )
+        return [sys.executable, "-c", script]
+
+    return _build
+
+
+class LivePreviewAutoRestartTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.addCleanup(self._cleanup)
+        self.manager = None
+
+    def _cleanup(self):
+        if self.manager is not None:
+            self.manager.shutdown()
+        self._tmp.cleanup()
+
+    def _make(self, **kwargs):
+        params = dict(
+            root=self.root,
+            background_reaper=False,
+            auto_restart=True,
+            restart_base_delay=0.0,
+            restart_max_delay=0.0,
+            restart_max_retries=3,
+            restart_reset_seconds=100.0,
+        )
+        params.update(kwargs)
+        manager = LivePreviewManager(**params)
+        manager._build_command = _dying_command_factory()
+        self.manager = manager
+        return manager
+
+    def test_dead_source_is_restarted_while_watched(self):
+        manager = self._make()
+        manager.start("m1", "rtmp://host/s")
+        entry = manager.entries["m1"]
+        first_pid = entry.process.pid
+        entry.process.wait(timeout=5)
+        manager._reap_tick(time.time())
+        restarted = manager.entries["m1"]
+        self.assertNotEqual(restarted.process.pid, first_pid)
+        self.assertEqual(restarted.restart_count, 1)
+
+    def test_backoff_blocks_restart_until_due(self):
+        manager = self._make(
+            restart_base_delay=100.0,
+            restart_max_delay=100.0,
+            idle_timeout_seconds=10000.0,
+        )
+        manager.start("m1", "rtmp://host/s")
+        entry = manager.entries["m1"]
+        entry.process.wait(timeout=5)
+        now = time.time()
+        manager._reap_tick(now)
+        self.assertEqual(entry.restart_count, 1)
+        pid_after_first = entry.process.pid
+        entry.process.wait(timeout=5)
+        # Same instant: still inside the backoff window, so no second restart.
+        manager._reap_tick(now)
+        self.assertEqual(manager.entries["m1"].process.pid, pid_after_first)
+        self.assertEqual(manager.entries["m1"].restart_count, 1)
+        # Past the backoff window it restarts again.
+        manager._reap_tick(now + 1000)
+        self.assertEqual(manager.entries["m1"].restart_count, 2)
+
+    def test_cooling_after_max_retries_keeps_probing(self):
+        manager = self._make(restart_max_retries=3)
+        manager.start("m1", "rtmp://host/s")
+        for expected in (1, 2, 3):
+            entry = manager.entries["m1"]
+            entry.process.wait(timeout=5)
+            manager._reap_tick(time.time())
+            self.assertEqual(manager.entries["m1"].restart_count, expected)
+        entry = manager.entries["m1"]
+        # Dropped to low-frequency probing, but NOT abandoned: it keeps retrying.
+        self.assertTrue(entry.cooling)
+        entry.process.wait(timeout=5)
+        prev_pid = entry.process.pid
+        manager._reap_tick(time.time())
+        self.assertEqual(manager.entries["m1"].restart_count, 4)
+        self.assertNotEqual(manager.entries["m1"].process.pid, prev_pid)
+
+    def test_disabled_auto_restart_leaves_dead_process(self):
+        manager = self._make(auto_restart=False)
+        manager.start("m1", "rtmp://host/s")
+        entry = manager.entries["m1"]
+        dead_pid = entry.process.pid
+        entry.process.wait(timeout=5)
+        manager._reap_tick(time.time())
+        self.assertIn("m1", manager.entries)
+        self.assertEqual(manager.entries["m1"].process.pid, dead_pid)
+        self.assertEqual(manager.entries["m1"].restart_count, 0)
+
+    def test_idle_dead_source_is_reaped_not_restarted(self):
+        manager = self._make(idle_timeout_seconds=0.0)
+        manager.start("m1", "rtmp://host/s")
+        manager.entries["m1"].process.wait(timeout=5)
+        manager._reap_tick(time.time() + 1)
+        self.assertNotIn("m1", manager.entries)
+
+    def test_stable_run_resets_retry_budget(self):
+        manager = self._make()
+        # Swap to a long-lived child so the entry stays "running" past the reset.
+        manager._build_command = _stub_command_factory(None)
+        manager.start("m1", "rtmp://host/s")
+        entry = manager.entries["m1"]
+        entry.restart_count = 2
+        entry.cooling = True
+        entry.started_at = time.time() - 1000
+        manager._reap_tick(time.time())
+        self.assertEqual(manager.entries["m1"].restart_count, 0)
+        self.assertFalse(manager.entries["m1"].cooling)
+
+
 if __name__ == "__main__":
     unittest.main()

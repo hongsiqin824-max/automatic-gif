@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 
 # The monitor reads GIF_SOURCE_SECRET lazily; a placeholder keeps import clean.
 os.environ.setdefault("GIF_SOURCE_SECRET", "test-secret")
+# Keep tests local-only: do not build the publish stack or start a draft worker.
+os.environ.setdefault("GIF_MONITOR_PUBLISH_ENABLED", "false")
 
 import monitor_server
 from monitor_server import (
@@ -135,7 +139,6 @@ class ClipEncodingTests(unittest.TestCase):
                 "-c:v", "libx264", "-pix_fmt", "yuv420p", "-t", "2",
                 "-f", "mpegts", str(path),
             ]
-            import subprocess
             result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             if result.returncode != 0:
                 self.skipTest("本机 ffmpeg 无法生成测试 TS 片段")
@@ -153,6 +156,56 @@ class ClipEncodingTests(unittest.TestCase):
             # Neither the concat list nor the hard-link staging dir may linger.
             self.assertEqual(list(directory.glob(".concat_*.txt")), [])
             self.assertEqual(list(directory.glob(".src_*")), [])
+
+    def test_encode_survives_segments_deleted_mid_encode(self):
+        """The preview ffmpeg deletes its oldest segments while we encode.
+
+        ``_encode_clip_gif`` hard-links the chosen segments first, so unlinking
+        the originals only drops a reference: the inode and its data stay alive
+        until the staging links go away. This reproduces the delete race by
+        removing every original *after* the links are made but *before* ffmpeg
+        reads them, and asserts the GIF is still produced.
+        """
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            segments = self._make_segments(directory, 10)
+            output = directory / "clip.gif"
+            real_run = subprocess.run
+            deleted: list[Path] = []
+
+            def run_after_deleting_originals(*args, **kwargs):
+                for path, _duration, _pdt in segments:
+                    if path.exists():
+                        path.unlink()
+                        deleted.append(path)
+                return real_run(*args, **kwargs)
+
+            with mock.patch.object(subprocess, "run", run_after_deleting_originals):
+                _encode_clip_gif(segments, before_seconds=15.0, output_path=output)
+
+            # Guard the guard: if nothing was deleted the test proves nothing.
+            self.assertEqual(len(deleted), len(segments))
+            for path in deleted:
+                self.assertFalse(path.exists())
+            self.assertTrue(output.is_file())
+            self.assertGreater(output.stat().st_size, 0)
+            self.assertEqual(list(directory.glob(".src_*")), [])
+
+    def test_hard_link_outlives_original_unlink(self):
+        """Pin the OS assumption the race fix rests on.
+
+        If this ever fails on the deployment filesystem, hard-linking cannot
+        protect the clip encoder and the fix needs a different mechanism.
+        """
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            original = directory / "original.ts"
+            original.write_bytes(b"payload")
+            link = directory / "link.ts"
+            os.link(original, link)
+            original.unlink()
+            self.assertFalse(original.exists())
+            self.assertEqual(link.read_bytes(), b"payload")
 
 
 if __name__ == "__main__":

@@ -49,15 +49,29 @@ body{
 .tile-status.ok{color:var(--green)}
 .tile-status.warn{color:var(--amber)}
 .tile-status.fail{color:var(--red,#ff6b6b)}
+.stage-fields{display:flex;gap:8px;margin:8px 0}
+.stage-input{flex:1;min-width:0;padding:8px 10px;border-radius:8px;border:1px solid rgba(255,255,255,.14);background:rgba(255,255,255,.05);color:inherit;font-size:13px}
+.stage-input::placeholder{color:var(--muted)}
+.stage-seconds{flex:0 0 150px}
 .tile-clip-link{font-size:11px;color:var(--cyan);text-decoration:none}
 .stage{position:fixed;inset:0;background:rgba(3,7,12,.86);display:flex;align-items:center;justify-content:center;z-index:50;padding:24px}
-.stage-inner{width:min(1100px,96vw);background:#0d1723;border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow);overflow:hidden}
+.stage-inner{width:min(1100px,96vw);max-height:calc(100vh - 48px);display:flex;flex-direction:column;background:#0d1723;border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow);overflow:auto}
 .stage-head{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:14px 16px;border-bottom:1px solid var(--line)}
 .stage-head strong{font-size:16px}
 .stage-actions{display:flex;gap:10px}
-.stage-video{width:100%;aspect-ratio:16/9;background:#000;display:block}
+.stage-video{width:100%;aspect-ratio:16/9;max-height:56vh;flex-shrink:0;object-fit:contain;background:#000;display:block}
 .stage-status{padding:10px 16px;font-size:12px}
 .stage-status.ok{color:var(--green)}
 .stage-status.warn{color:var(--amber)}
+.stage-status.fail{color:var(--red,#ff6b6b)}
 .stage-clips{padding:0 16px 16px;display:flex;flex-wrap:wrap;gap:10px}
+.stage-note{font-size:12px;color:var(--muted);border:1px solid var(--line);border-radius:6px;padding:6px 10px}
+.stage-note.fail{color:var(--red,#ff6b6b);border-color:var(--red,#ff6b6b)}
+.stage-clip-card{display:flex;flex-direction:column;gap:5px;border:1px solid var(--line);border-radius:8px;padding:7px;background:rgba(255,255,255,.03)}
+.stage-clip-card img{width:200px;height:112px;object-fit:cover;border-radius:6px;display:block;background:#000;cursor:pointer}
+.stage-clip-label{font-size:11px;color:var(--muted)}
+.stage-clip-draft{font-size:11px;color:var(--cyan)}
+.stage-clip-draft.fail{color:var(--red,#ff6b6b)}
+.stage-clip-draft.warn{color:var(--muted)}
+.stage-clip-draft a{color:var(--cyan);text-decoration:none;font-weight:600}
 .stage-clips a{font-size:12px;color:var(--cyan);text-decoration:none;border:1px solid var(--line);border-radius:6px;padding:6px 10px}

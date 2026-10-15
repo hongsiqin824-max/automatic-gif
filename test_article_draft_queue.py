@@ -2,18 +2,25 @@ import json
 import os
 import sqlite3
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from article_draft_queue import (
     ArticleDraftQueue,
+    MANUAL_ARTIFACT_KIND,
     _event_with_team_fallback,
     draft_admin_url,
     has_reliable_person,
     ocr_publication_eligibility,
 )
-from article_publisher import ArticlePublisher, ArticlePublishError, PublishedGifStore
+from article_publisher import (
+    ArticlePublisher,
+    ArticlePublishError,
+    PublishedGifStore,
+    build_article_title,
+)
 from open_platform_client import OpenPlatformError
 
 
@@ -1230,6 +1237,148 @@ class ArticleDraftQueueTests(unittest.TestCase):
             )
             queue.run_once()
             self.assertTrue(previous.exists())
+
+
+class ManualClipQueueTests(ArticleDraftQueueTests):
+    """Manual clips share the OCR table but bypass OCR-only gates and claiming."""
+
+    def _write_manual_source(self, root):
+        match_dir = root / "output" / "54478914"
+        match_dir.mkdir(parents=True, exist_ok=True)
+        source = match_dir / "clip_manual.gif"
+        source.write_bytes(animated_gif_bytes())
+        return source
+
+    def test_manual_eligibility_bypasses_ocr_gates(self):
+        decision = ocr_publication_eligibility(None, artifact_kind=MANUAL_ARTIFACT_KIND)
+        self.assertTrue(decision["eligible"])
+        self.assertEqual(decision["reason_code"], "manual_confirmed")
+        # The OCR path with no metadata still holds, proving the gate is intact.
+        self.assertFalse(ocr_publication_eligibility(None)["eligible"])
+
+    def test_manual_task_enqueues_as_queued_not_held(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            queue = self.make_queue(
+                root,
+                SequencePlatformClient(),
+                claim_artifact_kinds=(MANUAL_ARTIFACT_KIND,),
+            )
+            source = self._write_manual_source(root)
+            task = queue.enqueue(
+                match_id="54478914",
+                event={"event_key": "manual_100", "code": "G", "person": "球员甲"},
+                match_detail={"team_A_name": "主队", "team_B_name": "客队"},
+                source_path=source,
+                artifact_kind=MANUAL_ARTIFACT_KIND,
+                artifact_result=None,
+            )
+            self.assertEqual(task["status"], "queued")
+
+    def test_workers_do_not_claim_each_others_kinds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manual_queue = self.make_queue(
+                root,
+                SequencePlatformClient(),
+                claim_artifact_kinds=(MANUAL_ARTIFACT_KIND,),
+            )
+            ocr_queue = self.make_queue(root, SequencePlatformClient())  # defaults to OCR
+            source = self._write_manual_source(root)
+            manual_queue.enqueue(
+                match_id="54478914",
+                event={"event_key": "manual_100", "code": "G", "person": "球员甲"},
+                match_detail={"team_A_name": "主队", "team_B_name": "客队"},
+                source_path=source,
+                artifact_kind=MANUAL_ARTIFACT_KIND,
+                artifact_result=None,
+            )
+            # The OCR-only worker must not claim the manual task; the manual one does.
+            self.assertIsNone(ocr_queue._claim_due(time.time()))
+            self.assertIsNotNone(manual_queue._claim_due(time.time()))
+
+    def test_title_override_wins_over_generated_title(self):
+        self.assertEqual(
+            build_article_title({"title_override": "这是自定义标题", "code": "G"}, {}),
+            "这是自定义标题",
+        )
+        # Without an override the generated title is still produced.
+        self.assertNotEqual(
+            build_article_title({"code": "G", "person": "球员甲"}, {"team_A_name": "A", "team_B_name": "B"}),
+            "",
+        )
+
+    def test_manual_draft_mode_creates_unpublished_draft(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            platform = SequencePlatformClient()
+            queue = self.make_queue(
+                root,
+                platform,
+                claim_artifact_kinds=(MANUAL_ARTIFACT_KIND,),
+            )
+            # Draft is the safe default when nothing is configured.
+            self.assertEqual(queue.manual_delivery_mode, "draft")
+            source = self._write_manual_source(root)
+            queue.enqueue(
+                match_id="54478914",
+                event={"event_key": "manual_100", "code": "G", "person": "球员甲"},
+                match_detail={"team_A_name": "主队", "team_B_name": "客队"},
+                source_path=source,
+                artifact_kind=MANUAL_ARTIFACT_KIND,
+                artifact_result=None,
+            )
+            self.assertTrue(queue.run_once())
+            record = queue.records_for_match(
+                "54478914", artifact_kind=MANUAL_ARTIFACT_KIND
+            )["manual_100"]
+            self.assertEqual(record["status"], "drafted")
+            self.assertIsNone(record["error_code"])
+            # The platform received an unpublished article (status=0).
+            self.assertEqual(len(platform.calls), 1)
+            self.assertEqual(platform.calls[-1]["status"], 0)
+            # Terminal: the worker must not re-process or publish it later.
+            self.assertFalse(queue.run_once())
+
+    def test_manual_publish_mode_publishes_immediately(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            platform = SequencePlatformClient()
+            queue = self.make_queue(
+                root,
+                platform,
+                claim_artifact_kinds=(MANUAL_ARTIFACT_KIND,),
+                manual_delivery_mode="publish",
+            )
+            source = self._write_manual_source(root)
+            queue.enqueue(
+                match_id="54478914",
+                event={"event_key": "manual_200", "code": "G", "person": "球员甲"},
+                match_detail={"team_A_name": "主队", "team_B_name": "客队"},
+                source_path=source,
+                artifact_kind=MANUAL_ARTIFACT_KIND,
+                artifact_result=None,
+            )
+            self.assertTrue(queue.run_once())
+            record = queue.records_for_match(
+                "54478914", artifact_kind=MANUAL_ARTIFACT_KIND
+            )["manual_200"]
+            self.assertEqual(record["status"], "published")
+            # The platform received a live article (status=1).
+            self.assertEqual(len(platform.calls), 1)
+            self.assertEqual(platform.calls[-1]["status"], 1)
+            self.assertFalse(queue.run_once())
+
+    def test_invalid_manual_delivery_mode_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with self.assertRaises(ValueError):
+                self.make_queue(
+                    root,
+                    SequencePlatformClient(),
+                    claim_artifact_kinds=(MANUAL_ARTIFACT_KIND,),
+                    manual_delivery_mode="bogus",
+                )
 
 
 if __name__ == "__main__":

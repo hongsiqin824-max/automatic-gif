@@ -71,8 +71,8 @@ _load_dotenv(ROOT / ".env")
 HOST = os.environ.get("GIF_MONITOR_HOST", "127.0.0.1")
 PORT = int(os.environ.get("GIF_MONITOR_PORT", "8901"))
 # Keep enough rolling HLS buffer that a backward capture always has material.
-CLIP_BEFORE_SECONDS = positive_env_float("GIF_MONITOR_CLIP_SECONDS", 15.0)
-CLIP_GIF_WIDTH = positive_env_int("GIF_MONITOR_CLIP_WIDTH", 480)
+CLIP_BEFORE_SECONDS = positive_env_float("GIF_MONITOR_CLIP_SECONDS", 10.0)
+CLIP_GIF_WIDTH = positive_env_int("GIF_MONITOR_CLIP_WIDTH", 440)
 CLIP_GIF_FPS = positive_env_int("GIF_MONITOR_CLIP_FPS", 12)
 # ~2s segments. The operator often watches tens of seconds behind the live edge
 # (hls.js back-buffer), so retain a generous on-disk history — enough to cover
@@ -85,9 +85,28 @@ CLIP_OUTPUT_ROOT = ROOT / "output_gifs" / "monitor"
 live_preview = LivePreviewManager(
     list_size=PREVIEW_LIST_SIZE,
     idle_timeout_seconds=positive_env_float("GIF_PREVIEW_IDLE_TIMEOUT_SECONDS", 120.0),
+    # Auto-recover a preview whose RTMP source briefly drops while an operator is
+    # still watching, so the tile reconnects itself instead of showing stale frames.
+    auto_restart=os.environ.get("GIF_MONITOR_AUTO_RESTART", "true").strip().lower()
+    not in {"0", "false", "no", "off"},
+    restart_base_delay=positive_env_float("GIF_MONITOR_RESTART_BASE_DELAY", 5.0),
+    restart_max_delay=positive_env_float("GIF_MONITOR_RESTART_MAX_DELAY", 60.0),
+    restart_max_retries=positive_env_int("GIF_MONITOR_RESTART_MAX_RETRIES", 6),
 )
 match_catalog = MatchCatalog()
 atexit.register(live_preview.shutdown)
+
+
+def _manual_delivery_mode() -> str:
+    """Resolve how manual clips are delivered.
+
+    ``draft`` (default) keeps every operator截取 as an unpublished draft for
+    review during testing; ``publish`` makes them go live immediately. Switch via
+    ``GIF_MONITOR_DELIVERY_MODE`` in ``.env`` and restart 8901 — no code change.
+    Any unrecognized value falls back to the safe ``draft`` mode.
+    """
+    mode = os.environ.get("GIF_MONITOR_DELIVERY_MODE", "draft").strip().lower()
+    return mode if mode in {"draft", "publish"} else "draft"
 
 
 def _build_manual_draft_queue() -> "ArticleDraftQueue | None":
@@ -154,6 +173,7 @@ def _build_manual_draft_queue() -> "ArticleDraftQueue | None":
             lease_seconds=positive_env_float("GIF_MONITOR_DRAFT_LEASE_SECONDS", 180.0),
             person_wait_seconds=positive_env_float("GIF_MONITOR_PERSON_WAIT_SECONDS", 5.0),
             claim_artifact_kinds=(MANUAL_ARTIFACT_KIND,),
+            manual_delivery_mode=_manual_delivery_mode(),
             start_worker=True,
         )
         return queue
@@ -500,6 +520,19 @@ def preview_media(match_id, filename):
     return response
 
 
+def _match_detail_for(match_id: str) -> dict[str, Any]:
+    """Pull team names/ids for the title from the live catalog snapshot."""
+    for item in match_catalog.snapshot().get("playing", []):
+        if isinstance(item, dict) and str(item.get("match_id") or "") == str(match_id):
+            return {
+                "team_A_name": item.get("team_A_name"),
+                "team_B_name": item.get("team_B_name"),
+                "team_A_id": item.get("team_A_id"),
+                "team_B_id": item.get("team_B_id"),
+            }
+    return {}
+
+
 @app.post("/api/monitor/clip")
 def monitor_clip():
     body = request.get_json(silent=True) or {}
@@ -521,6 +554,8 @@ def monitor_clip():
             anchor_epoch = float(body["anchor_epoch_ms"]) / 1000.0
         except (TypeError, ValueError):
             return jsonify({"error": "anchor_epoch_ms 必须是数字"}), 400
+    person = str(body.get("person") or "").strip()[:40]
+    title = str(body.get("title") or "").strip()[:100]
     if not live_preview.status(match_id).get("running"):
         return jsonify({"error": "请先开始预览该场，才能回捞画面", "code": "preview_not_running"}), 409
     segments = _read_playlist_segments(live_preview.media_dir(match_id))
@@ -565,6 +600,45 @@ def monitor_clip():
         ),
         flush=True,
     )
+    draft: dict[str, Any] | None = None
+    publish_error: str | None = None
+    if manual_draft_queue is not None:
+        event_key = f"manual_{int(anchor_epoch if anchor_epoch is not None else time.time())}"
+        event = {
+            "event_key": event_key,
+            "code": "G",
+            "person": person,
+            "title_override": title,
+        }
+        try:
+            task = manual_draft_queue.enqueue(
+                match_id=match_id,
+                event=event,
+                match_detail=_match_detail_for(match_id),
+                source_path=output_path,
+                artifact_kind=MANUAL_ARTIFACT_KIND,
+                delivery_mode=DRAFT_DELIVERY_MODE,
+                artifact_result=None,
+            )
+            draft = {"event_key": event_key, "status": task.get("status")}
+        except Exception as exc:  # noqa: BLE001 - GIF is already saved locally
+            publish_error = str(exc)
+        print(
+            json.dumps(
+                {
+                    "event": "manual_draft_enqueue",
+                    "match_id": match_id,
+                    "event_key": event_key,
+                    "person": bool(person),
+                    "title_override": bool(title),
+                    "delivery_mode": _manual_delivery_mode(),
+                    "status": (draft or {}).get("status"),
+                    "error": publish_error,
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
     return jsonify(
         {
             "ok": True,
@@ -573,6 +647,33 @@ def monitor_clip():
             "anchored": anchored,
             "clip_url": f"/clips/{match_id}/{output_path.name}",
             "bytes": output_path.stat().st_size,
+            "publish_enabled": manual_draft_queue is not None,
+            "delivery_mode": _manual_delivery_mode(),
+            "draft": draft,
+            "publish_error": publish_error,
+        }
+    )
+
+
+@app.get("/api/monitor/publish/status")
+def monitor_publish_status():
+    if manual_draft_queue is None:
+        return jsonify({"enabled": False, "records": {}})
+    match_id = str(request.args.get("match_id") or "").strip()
+    records: dict[str, Any] = {}
+    if match_id:
+        try:
+            match_id = validate_match_id(match_id)
+            records = manual_draft_queue.records_for_match(
+                match_id, artifact_kind=MANUAL_ARTIFACT_KIND
+            )
+        except ValueError:
+            records = {}
+    return jsonify(
+        {
+            "enabled": True,
+            "queue": manual_draft_queue.status(),
+            "records": records,
         }
     )
 
