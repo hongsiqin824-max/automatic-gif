@@ -30,6 +30,25 @@
     </section>
   </main>
 
+  <button id="alert-launcher" class="alert-launcher" type="button" aria-label="展开实时提醒">
+    <span class="alert-launcher-ico">🔔</span>
+    <span>实时提醒</span>
+    <span id="alert-badge" class="alert-badge hidden">0</span>
+  </button>
+
+  <aside id="alert-panel" class="alert-panel hidden">
+    <div class="alert-panel-head">
+      <strong>实时提醒</strong>
+      <span class="alert-panel-hint">进球 / 红牌</span>
+      <button id="alert-close" class="alert-close" type="button" aria-label="收起">×</button>
+    </div>
+    <div id="alert-list" class="alert-list">
+      <div class="alert-empty" id="alert-empty">暂无进球 / 红牌提醒</div>
+    </div>
+  </aside>
+
+  <div id="toast-container" class="toast-container"></div>
+
   <div id="stage" class="stage hidden">
     <div class="stage-inner">
       <div class="stage-head">

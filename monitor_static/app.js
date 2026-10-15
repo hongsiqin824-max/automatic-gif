@@ -11,6 +11,11 @@ const state = {
   draftPoll: null,       // {matchId, timer, polls} while awaiting draft links
   tileDraftTimer: null,  // single poll loop for grid-capture draft links
   tileDraftPolls: 0,
+  alertSeq: 0,           // cursor: last event seq the page has rendered
+  alertBootId: null,     // server boot id; a change means 8901 restarted
+  alertInit: false,      // skip replaying history on the first poll
+  alertCount: 0,         // unseen-alert badge count
+  alertPanelOpen: false, // panel is collapsed to a launcher pill by default
 };
 
 function escapeHtml(value) {
@@ -331,7 +336,7 @@ function addStageClip(url, sizeMb, warn, data) {
 function startDraftPoll(matchId) {
   if (state.draftPoll && state.draftPoll.matchId === matchId) return;
   stopDraftPoll();
-  state.draftPoll = {matchId, timer: setInterval(() => refreshDraftLinks(matchId), 4000), polls: 0};
+  state.draftPoll = {matchId, timer: setInterval(() => refreshDraftLinks(matchId), 2000), polls: 0};
   refreshDraftLinks(matchId);
 }
 
@@ -343,7 +348,7 @@ function refreshDraftLinks(matchId) {
   if (state.stageMatchId !== matchId) { stopDraftPoll(); return; }
   if (state.draftPoll) {
     state.draftPoll.polls += 1;
-    if (state.draftPoll.polls > 45) {  // give up after ~3min
+    if (state.draftPoll.polls > 90) {  // give up after ~3min (90 × 2s)
       // Say so instead of freezing on "草稿生成中…": the backend may still be
       // working, the operator just has to check the console from here on.
       document.querySelectorAll('#stage-clips .stage-clip-draft').forEach((draftEl) => {
@@ -397,7 +402,7 @@ function refreshDraftLinks(matchId) {
 function startTileDraftPoll() {
   state.tileDraftPolls = 0;  // reset the give-up window on each new capture
   if (state.tileDraftTimer) return;
-  state.tileDraftTimer = setInterval(refreshTileDraftLinks, 4000);
+  state.tileDraftTimer = setInterval(refreshTileDraftLinks, 2000);
   refreshTileDraftLinks();
 }
 
@@ -409,7 +414,7 @@ function refreshTileDraftLinks() {
   const nodes = document.querySelectorAll('.tile-status[data-pending-draft]');
   if (!nodes.length) { stopTileDraftPoll(); return; }
   state.tileDraftPolls += 1;
-  if (state.tileDraftPolls > 45) {  // give up after ~3min, same as the stage poll
+  if (state.tileDraftPolls > 90) {  // give up after ~3min, same as the stage poll (90 × 2s)
     nodes.forEach((node) => { delete node.dataset.pendingDraft; });
     stopTileDraftPoll();
     return;
@@ -579,7 +584,11 @@ $('stage-live').addEventListener('click', () => {
   $('stage-status').textContent = '已回到直播';
   $('stage-status').className = 'stage-status ok';
 });
-document.addEventListener('keydown', (ev) => { if (ev.key === 'Escape') closeStage(); });
+document.addEventListener('keydown', (ev) => {
+  if (ev.key !== 'Escape') return;
+  if (state.alertPanelOpen) { closeAlertPanel(); return; }
+  closeStage();
+});
 window.addEventListener('beforeunload', () => {
   for (const matchId of state.tiles.keys()) {
     navigator.sendBeacon?.('/api/monitor/preview/stop', new Blob([JSON.stringify({match_id: matchId})], {type: 'application/json'}));
@@ -663,3 +672,166 @@ function keepAlivePreviews() {
 refreshMatches();
 setInterval(refreshMatches, REFRESH_MS);
 setInterval(keepAlivePreviews, 8000);
+
+// ---- Real-time goal/red-card alerts (fed by the external push monitor) ----
+const ALERT_POLL_MS = 3000;
+
+function alertWho(ev) {
+  let who = ev.team_name || (ev.team === 'A' || ev.team === 'B' ? `${ev.team}队` : '?');
+  if (ev.team_id) who += `(${ev.team_id})`;
+  return who;
+}
+
+function alertSub(ev) {
+  const parts = [alertWho(ev)];
+  if (ev.from != null && ev.to != null) parts[0] += ` ${ev.from}→${ev.to}`;
+  if (ev.score) parts.push(`比分${ev.score}`);
+  if (ev.minute) parts.push(String(ev.minute));
+  return parts.join(' · ');
+}
+
+function alertTitle(ev) {
+  return ev.match_title || `match ${ev.match_id}`;
+}
+
+function bumpAlertBadge() {
+  state.alertCount += 1;
+  const badge = $('alert-badge');
+  if (badge) { badge.textContent = String(state.alertCount); badge.classList.remove('hidden'); }
+}
+
+function clearAlertBadge() {
+  state.alertCount = 0;
+  const badge = $('alert-badge');
+  if (badge) { badge.textContent = '0'; badge.classList.add('hidden'); }
+}
+
+// The panel is collapsed by default so it never covers the clickable grid.
+// Opening it is a deliberate action, so a brief overlap is acceptable.
+function openAlertPanel() {
+  const panel = $('alert-panel');
+  const launcher = $('alert-launcher');
+  if (panel) panel.classList.remove('hidden');
+  if (launcher) launcher.classList.add('hidden');
+  state.alertPanelOpen = true;
+  clearAlertBadge();
+}
+
+function closeAlertPanel() {
+  const panel = $('alert-panel');
+  const launcher = $('alert-launcher');
+  if (panel) panel.classList.add('hidden');
+  if (launcher) launcher.classList.remove('hidden');
+  state.alertPanelOpen = false;
+}
+
+// Clicking an alert takes the operator to that match: enlarge it if its preview
+// is ready, otherwise scroll it into view and flash it so they can start one.
+// The badge is only cleared when the panel is opened (= the whole list is seen);
+// locating one match from a toast must not zero out the other unread alerts.
+function locateMatch(matchId) {
+  closeAlertPanel();  // collapse so the panel never covers the tile/stage it points to
+  const tile = state.tiles.get(matchId);
+  const el = document.querySelector(`.tile[data-match-id="${matchId}"]`);
+  if (tile && tile.playlistUrl) { openStage(matchId); return; }
+  if (el) {
+    el.scrollIntoView({behavior: 'smooth', block: 'center'});
+    flashTile(matchId);
+    showNotice('该场直播还在准备中，就绪后点格子放大再截取', 'warning');
+    return;
+  }
+  showNotice('该比赛已不在监看列表', 'warning');
+}
+
+function flashTile(matchId) {
+  const el = document.querySelector(`.tile[data-match-id="${matchId}"]`);
+  if (!el) return;
+  el.classList.remove('alert-flash');
+  void el.offsetWidth;  // restart the animation if it is already running
+  el.classList.add('alert-flash');
+  setTimeout(() => el.classList.remove('alert-flash'), 2100);
+}
+
+function addAlertItem(ev) {
+  const list = $('alert-list');
+  if (!list) return;
+  const empty = $('alert-empty');
+  if (empty) empty.classList.add('hidden');
+  const item = document.createElement('div');
+  item.className = `alert-item ${ev.event_type === 'red_card' ? 'red' : ''}`;
+  const time = new Date(ev.ts_unix ? ev.ts_unix * 1000 : Date.now()).toLocaleTimeString();
+  item.innerHTML = `
+    <div class="alert-item-top">
+      <span class="alert-item-tag">${escapeHtml(ev.event_cn || '')}</span>
+      <span>${escapeHtml(alertTitle(ev))}</span>
+      <span class="alert-item-time">${escapeHtml(time)}</span>
+    </div>
+    <div class="alert-item-sub">${escapeHtml(alertSub(ev))}</div>`;
+  item.addEventListener('click', () => locateMatch(ev.match_id));
+  list.insertBefore(item, list.firstChild);
+  const items = list.querySelectorAll('.alert-item');
+  for (let i = items.length - 1; i >= 50; i -= 1) items[i].remove();
+}
+
+function dismissToast(toast) {
+  if (!toast || toast._leaving) return;
+  toast._leaving = true;
+  toast.classList.add('leaving');
+  setTimeout(() => toast.remove(), 300);
+}
+
+function showToast(ev) {
+  const container = $('toast-container');
+  if (!container) return;
+  const toast = document.createElement('div');
+  toast.className = `toast ${ev.event_type === 'red_card' ? 'red' : ''}`;
+  toast.innerHTML = `
+    <div class="toast-title">${escapeHtml(`${ev.event_cn || ''} · ${alertTitle(ev)}`)}</div>
+    <div class="toast-sub">${escapeHtml(alertSub(ev))}</div>`;
+  toast.addEventListener('click', () => { locateMatch(ev.match_id); dismissToast(toast); });
+  container.appendChild(toast);
+  setTimeout(() => dismissToast(toast), 6000);
+}
+
+function pushAlert(ev) {
+  addAlertItem(ev);
+  showToast(ev);
+  if (!state.alertPanelOpen) bumpAlertBadge();  // only count what the operator hasn't seen
+  flashTile(ev.match_id);
+}
+
+async function pollAlerts() {
+  let data;
+  try {
+    data = await requestJson(`/api/monitor/events?since=${state.alertSeq}`);
+  } catch (error) {
+    return;  // transient; next tick retries
+  }
+  // First successful poll only establishes the baseline cursor so a freshly
+  // opened page does not replay every buffered alert as a flurry of toasts.
+  if (!state.alertInit) {
+    state.alertSeq = data.seq || 0;
+    state.alertBootId = data.boot_id || null;
+    state.alertInit = true;
+    return;
+  }
+  // 8901 restarted (its in-memory seq reset to 0): re-baseline the cursor to the
+  // new seq instead of staying stuck behind a cursor that can never be reached.
+  if (data.boot_id && data.boot_id !== state.alertBootId) {
+    state.alertSeq = data.seq || 0;
+    state.alertBootId = data.boot_id;
+    return;
+  }
+  const events = Array.isArray(data.events) ? data.events : [];
+  for (const ev of events) {
+    pushAlert(ev);
+    state.alertSeq = Math.max(state.alertSeq, ev.seq || 0);
+  }
+  if (typeof data.seq === 'number') state.alertSeq = Math.max(state.alertSeq, data.seq);
+}
+
+$('alert-launcher').addEventListener('click', openAlertPanel);
+$('alert-close').addEventListener('click', closeAlertPanel);
+
+pollAlerts();
+setInterval(pollAlerts, ALERT_POLL_MS);

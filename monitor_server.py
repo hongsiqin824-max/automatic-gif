@@ -4,8 +4,9 @@
 This standalone service is independent from the automated dashboard on 8899.
 It auto-discovers the currently ``Playing`` matches, plays each live source in a
 grid for a human to watch, and lets the operator capture the last N seconds of a
-match as a GIF ("回捞"). Upstream event alerts are intentionally left as a
-pluggable hook and are not wired yet.
+match as a GIF ("回捞"). Goal/red-card alerts from the standalone Dongqiudi push
+monitor are received on ``/api/monitor/events/ingest`` and fanned out to the page
+(toast + list) and a Feishu webhook.
 
 It reuses the shared modules (``dqd_api``, ``source_client``, ``match_catalog``,
 ``live_preview``) so the live-source query, catalog, and HLS preview behave
@@ -20,8 +21,11 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
+import urllib.request
 import uuid
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -30,7 +34,7 @@ from flask import Flask, abort, jsonify, request, send_from_directory
 
 from dqd_api import MATCH_STATUS_LABELS, positive_env_float, positive_env_int, validate_match_id
 from source_client import classify_source_response, query_source
-from match_catalog import MatchCatalog
+from match_catalog import MATCH_CATALOG_EXCLUDED_COMPETITION_NAMES, MatchCatalog
 from live_preview import LivePreviewManager, resolve_ffmpeg
 from article_draft_queue import (
     ArticleDraftQueue,
@@ -73,13 +77,39 @@ PORT = int(os.environ.get("GIF_MONITOR_PORT", "8901"))
 # Keep enough rolling HLS buffer that a backward capture always has material.
 CLIP_BEFORE_SECONDS = positive_env_float("GIF_MONITOR_CLIP_SECONDS", 10.0)
 CLIP_GIF_WIDTH = positive_env_int("GIF_MONITOR_CLIP_WIDTH", 440)
-CLIP_GIF_FPS = positive_env_int("GIF_MONITOR_CLIP_FPS", 12)
+# 50/3 ≈ 16.67, matching the automatic pipeline's GIF frame rate. Float rather
+# than int so a non-integer rate like this one is expressible here and in .env.
+CLIP_GIF_FPS = positive_env_float("GIF_MONITOR_CLIP_FPS", 50 / 3)
 # ~2s segments. The operator often watches tens of seconds behind the live edge
 # (hls.js back-buffer), so retain a generous on-disk history — enough to cover
 # that lag plus the capture window — or the requested frames are already gone.
 PREVIEW_LIST_SIZE = positive_env_int("GIF_MONITOR_PREVIEW_SEGMENTS", 90)
 MAX_PREVIEWS = positive_env_int("GIF_MONITOR_MAX_PREVIEWS", 16)
 CLIP_OUTPUT_ROOT = ROOT / "output_gifs" / "monitor"
+
+# ---- Event alerts (进球/红牌) fed by the external monitor WS service ----
+# The standalone Dongqiudi push monitor (match_timeline.mjs) detects goals/red
+# cards in real time and POSTs them to ``/api/monitor/events/ingest``. 8901 is the
+# fan-out hub: it filters to capturable matches, resolves the team name from its
+# catalog cache (by A/B side, not team_id), de-duplicates, keeps a small ring
+# buffer for the page, and mirrors each alert to a Feishu webhook.
+ALERT_ENABLED = os.environ.get("GIF_MONITOR_ALERT_ENABLED", "true").strip().lower() not in {
+    "0", "false", "no", "off",
+}
+ALERT_EVENT_TYPES = frozenset(
+    part.strip()
+    for part in os.environ.get("GIF_MONITOR_ALERT_EVENTS", "goal,red_card").split(",")
+    if part.strip()
+) or frozenset({"goal", "red_card"})
+FEISHU_WEBHOOK = os.environ.get("GIF_MONITOR_FEISHU_WEBHOOK", "").strip()
+# Keep this strictly below the monitor-side POST timeout (3s) so 8901 always
+# responds before the monitor aborts; otherwise a slow-but-successful push shows
+# up as a false failure in the monitor log. See match_timeline.mjs AbortSignal.
+FEISHU_TIMEOUT = positive_env_float("GIF_MONITOR_FEISHU_TIMEOUT_SECONDS", 2.5)
+# Optional shared secret for the monitor→8901 loopback call. Empty = no check.
+ALERT_INGEST_TOKEN = os.environ.get("GIF_MONITOR_INGEST_TOKEN", "").strip()
+ALERT_BUFFER_SIZE = positive_env_int("GIF_MONITOR_ALERT_BUFFER", 50)
+EVENT_CN = {"goal": "进球", "red_card": "红牌", "corner": "角球"}
 
 
 live_preview = LivePreviewManager(
@@ -95,6 +125,52 @@ live_preview = LivePreviewManager(
 )
 match_catalog = MatchCatalog()
 atexit.register(live_preview.shutdown)
+
+
+class _AlertStore:
+    """Thread-safe ring buffer of recent event alerts with monotonic cursors.
+
+    The browser polls ``since`` with the last ``seq`` it has seen, so each new
+    goal/red-card is delivered exactly once per client. ``dedup_key`` guards
+    against the monitor re-POSTing the same event (its own retry or overlap).
+    """
+
+    def __init__(self, capacity: int) -> None:
+        self._lock = threading.Lock()
+        self._events: deque[dict[str, Any]] = deque(maxlen=capacity)
+        self._seen: set[str] = set()
+        self._seen_order: deque[str] = deque(maxlen=512)
+        self._seq = 0
+
+    def add(self, event: dict[str, Any]) -> dict[str, Any] | None:
+        """Store an event; return the stored copy, or ``None`` if duplicate."""
+        key = str(event.get("dedup_key") or "")
+        with self._lock:
+            if key and key in self._seen:
+                return None
+            if key:
+                if len(self._seen_order) == self._seen_order.maxlen:
+                    self._seen.discard(self._seen_order[0])
+                self._seen_order.append(key)
+                self._seen.add(key)
+            self._seq += 1
+            stored = dict(event)
+            stored["seq"] = self._seq
+            stored["ts_unix"] = time.time()
+            self._events.append(stored)
+            return stored
+
+    def since(self, cursor: int) -> tuple[list[dict[str, Any]], int]:
+        with self._lock:
+            events = [dict(item) for item in self._events if item["seq"] > cursor]
+            return events, self._seq
+
+
+alert_store = _AlertStore(ALERT_BUFFER_SIZE)
+# Regenerated every process start. The browser watches this to detect an 8901
+# restart (which resets the in-memory ``seq`` to 0) and re-baseline its cursor,
+# so an already-open page keeps receiving alerts across deploys.
+BOOT_ID = uuid.uuid4().hex
 
 
 def _manual_delivery_mode() -> str:
@@ -356,7 +432,8 @@ def _encode_clip_gif(
             encoding="utf-8",
         )
         palette_filter = (
-            f"fps={CLIP_GIF_FPS},scale={CLIP_GIF_WIDTH}:-2:flags=lanczos,"
+            # ``:g`` keeps a fractional rate short (16.6667, not 16.666666666666668).
+            f"fps={CLIP_GIF_FPS:g},scale={CLIP_GIF_WIDTH}:-2:flags=lanczos,"
             "split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse"
         )
         command = [
@@ -529,8 +606,202 @@ def _match_detail_for(match_id: str) -> dict[str, Any]:
                 "team_B_name": item.get("team_B_name"),
                 "team_A_id": item.get("team_A_id"),
                 "team_B_id": item.get("team_B_id"),
+                "competition_name": item.get("competition_name"),
             }
     return {}
+
+
+def _alert_drop_reason(match_id: str) -> dict[str, Any]:
+    """Classify why a forwarded alert's match is not in the capturable catalog.
+
+    The shown ``playing`` list is both league-filtered (six big leagues) and
+    capped at ``MATCH_CATALOG_LIMIT``; ``all_playing`` is neither. Cross-checking
+    against it tells us whether a dropped alert was a deliberately excluded big
+    league, a match that fell past the display cap, or one not playing at all,
+    so the drop is traceable instead of silent (see the ingest log below).
+    """
+    for item in match_catalog.all_playing:
+        if isinstance(item, dict) and str(item.get("match_id") or "") == str(match_id):
+            competition = str(item.get("competition_name") or "").strip()
+            excluded = competition in MATCH_CATALOG_EXCLUDED_COMPETITION_NAMES
+            return {
+                "reason": "big_league_excluded" if excluded else "beyond_catalog_limit",
+                "competition_name": competition or None,
+                "match_title": _alert_match_title(
+                    {
+                        "team_A_name": item.get("team_A_name"),
+                        "team_B_name": item.get("team_B_name"),
+                        "competition_name": competition,
+                    }
+                )
+                or None,
+            }
+    return {"reason": "not_in_catalog", "competition_name": None, "match_title": None}
+
+
+def _alert_team_name(detail: dict[str, Any], side: str) -> str:
+    """Resolve the scoring side's name from the catalog (by A/B, not team_id)."""
+    if side == "A":
+        return str(detail.get("team_A_name") or "").strip()
+    if side == "B":
+        return str(detail.get("team_B_name") or "").strip()
+    return ""
+
+
+def _alert_match_title(detail: dict[str, Any]) -> str:
+    home = str(detail.get("team_A_name") or "").strip()
+    away = str(detail.get("team_B_name") or "").strip()
+    competition = str(detail.get("competition_name") or "").strip()
+    teams = f"{home} vs {away}" if home and away else ""
+    if competition and teams:
+        return f"{competition} {teams}"
+    return teams or competition
+
+
+def _format_alert_text(event: dict[str, Any]) -> str:
+    """One-line human-readable alert, e.g.
+    ``🔔[进球] 哥伦杯 伊尔韦斯 vs 里耶卡 | 伊尔韦斯(50002103) 1→2 | 比分2-1 | 1H 41``.
+    """
+    title = event.get("match_title") or f"match {event.get('match_id')}"
+    name = str(event.get("team_name") or "").strip()
+    side = event.get("team")
+    who = name or (f"{side}队" if side in {"A", "B"} else "?")
+    team_id = event.get("team_id")
+    if team_id:
+        who = f"{who}({team_id})"
+    delta = ""
+    if event.get("from") is not None and event.get("to") is not None:
+        delta = f" {event['from']}→{event['to']}"
+    parts = [f"🔔[{event.get('event_cn')}] {title}", f"{who}{delta}"]
+    if event.get("score"):
+        parts.append(f"比分{event['score']}")
+    if event.get("minute"):
+        parts.append(str(event["minute"]))
+    return " | ".join(parts)
+
+
+def _send_feishu_text(text: str) -> bool:
+    """POST a plain-text message to the configured Feishu bot webhook.
+
+    Returns whether the push succeeded; never raises so a webhook outage cannot
+    break event ingestion. No webhook configured means page-only alerts.
+    """
+    if not FEISHU_WEBHOOK:
+        return False
+    payload = json.dumps({"msg_type": "text", "content": {"text": text}}).encode("utf-8")
+    request_obj = urllib.request.Request(
+        FEISHU_WEBHOOK,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request_obj, timeout=FEISHU_TIMEOUT) as response:
+            response.read()
+        return True
+    except Exception as exc:  # noqa: BLE001 - alerting must not crash ingestion
+        print(
+            json.dumps({"event": "feishu_push_failed", "error": str(exc)}, ensure_ascii=False),
+            flush=True,
+        )
+        return False
+
+
+@app.post("/api/monitor/events/ingest")
+def monitor_events_ingest():
+    """Receive a goal/red-card event from the external push monitor (loopback)."""
+    if ALERT_INGEST_TOKEN and request.headers.get("X-Monitor-Token", "") != ALERT_INGEST_TOKEN:
+        return jsonify({"error": "unauthorized"}), 401
+    if not ALERT_ENABLED:
+        return jsonify({"ok": True, "accepted": False, "reason": "alerts_disabled"})
+    body = request.get_json(silent=True) or {}
+    try:
+        match_id = validate_match_id(str(body.get("match_id") or ""))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    event_type = str(body.get("event_type") or "").strip()
+    if event_type not in ALERT_EVENT_TYPES:
+        return jsonify({"ok": True, "accepted": False, "reason": "event_type_filtered"})
+    # Only alert for matches the operator can actually capture (i.e. shown in the
+    # browse catalog; big leagues are intentionally excluded there).
+    detail = _match_detail_for(match_id)
+    if not detail:
+        drop = _alert_drop_reason(match_id)
+        print(
+            json.dumps(
+                {
+                    "event": "alert_dropped",
+                    "reason": "match_not_capturable",
+                    "detail_reason": drop["reason"],
+                    "match_id": match_id,
+                    "event_type": event_type,
+                    "competition_name": drop["competition_name"],
+                    "match_title": str(body.get("match_title") or "").strip() or drop["match_title"],
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+        return jsonify(
+            {
+                "ok": True,
+                "accepted": False,
+                "reason": "match_not_capturable",
+                "detail_reason": drop["reason"],
+            }
+        )
+    side = str(body.get("team") or "").strip().upper()
+    side = side if side in {"A", "B"} else "?"
+    team_id = body.get("team_id")
+    score = body.get("score")
+    minute = body.get("minute")
+    match_title = str(body.get("match_title") or "").strip() or _alert_match_title(detail)
+    event = {
+        "match_id": match_id,
+        "event_type": event_type,
+        "event_cn": EVENT_CN.get(event_type, event_type),
+        "team": side,
+        "team_id": None if team_id in (None, "") else str(team_id),
+        "team_name": _alert_team_name(detail, side) or None,
+        "from": body.get("from"),
+        "to": body.get("to"),
+        "score": str(score).strip() if score not in (None, "") else None,
+        "minute": str(minute).strip() if minute not in (None, "") else None,
+        "match_title": match_title or None,
+        "source": str(body.get("source") or "").strip() or None,
+        "dedup_key": str(body.get("dedup_key") or "").strip()
+        or f"{match_id}|{event_type}|{side}|{body.get('to')}",
+    }
+    stored = alert_store.add(event)
+    if stored is None:
+        return jsonify({"ok": True, "accepted": False, "reason": "duplicate"})
+    pushed = _send_feishu_text(_format_alert_text(stored))
+    print(
+        json.dumps(
+            {
+                "event": "monitor_alert",
+                "match_id": match_id,
+                "event_type": event_type,
+                "team": side,
+                "seq": stored["seq"],
+                "feishu": pushed,
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
+    return jsonify({"ok": True, "accepted": True, "seq": stored["seq"], "feishu_pushed": pushed})
+
+
+@app.get("/api/monitor/events")
+def monitor_events():
+    """Return alerts newer than ``since`` plus the latest cursor for polling."""
+    try:
+        since = int(request.args.get("since", "0"))
+    except ValueError:
+        since = 0
+    events, latest = alert_store.since(since)
+    return jsonify({"events": events, "seq": latest, "boot_id": BOOT_ID, "alert_enabled": ALERT_ENABLED})
 
 
 @app.post("/api/monitor/clip")

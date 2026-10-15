@@ -208,5 +208,165 @@ class ClipEncodingTests(unittest.TestCase):
             self.assertEqual(link.read_bytes(), b"payload")
 
 
+class EventAlertTests(unittest.TestCase):
+    """Cover the goal/red-card alert ingest + polling + Feishu fan-out."""
+
+    def setUp(self):
+        self.client = monitor_server.app.test_client()
+        self._patches = [
+            mock.patch.object(monitor_server, "alert_store", monitor_server._AlertStore(50)),
+            mock.patch.object(monitor_server, "ALERT_ENABLED", True),
+            mock.patch.object(
+                monitor_server, "ALERT_EVENT_TYPES", frozenset({"goal", "red_card"})
+            ),
+            mock.patch.object(monitor_server, "ALERT_INGEST_TOKEN", ""),
+        ]
+        for patch in self._patches:
+            patch.start()
+        self.catalog = mock.patch.object(
+            monitor_server.match_catalog,
+            "snapshot",
+            return_value={
+                "playing": [
+                    {
+                        "match_id": "54622319",
+                        "team_A_name": "伊尔韦斯",
+                        "team_B_name": "里耶卡",
+                        "competition_name": "哥伦杯",
+                    }
+                ]
+            },
+        )
+        self.catalog.start()
+        self.feishu = mock.patch.object(monitor_server, "_send_feishu_text", return_value=True)
+        self.feishu_mock = self.feishu.start()
+
+    def tearDown(self):
+        self.feishu.stop()
+        self.catalog.stop()
+        for patch in self._patches:
+            patch.stop()
+
+    def _ingest(self, **overrides):
+        body = {
+            "match_id": "54622319",
+            "event_type": "goal",
+            "team": "A",
+            "team_id": "50002103",
+            "from": 1,
+            "to": 2,
+            "score": "2-1",
+            "minute": "1H 41",
+            "dedup_key": "k1",
+        }
+        body.update(overrides)
+        return self.client.post("/api/monitor/events/ingest", json=body)
+
+    def test_accepts_goal_enriches_name_and_pushes_feishu(self):
+        data = self._ingest().get_json()
+        self.assertTrue(data["accepted"])
+        self.assertEqual(data["seq"], 1)
+        self.assertTrue(data["feishu_pushed"])
+        text = self.feishu_mock.call_args[0][0]
+        self.assertIn("进球", text)
+        self.assertIn("伊尔韦斯", text)  # resolved by A/B side, not team_id
+        self.assertIn("50002103", text)  # team_id still shown
+        self.assertIn("1→2", text)
+
+    def test_side_b_resolves_other_team_name(self):
+        self._ingest(team="B", team_id="50000371", dedup_key="kb")
+        text = self.feishu_mock.call_args[0][0]
+        self.assertIn("里耶卡", text)
+
+    def test_accepts_red_card(self):
+        data = self._ingest(event_type="red_card", dedup_key="kr").get_json()
+        self.assertTrue(data["accepted"])
+
+    def test_filters_non_capturable_match(self):
+        data = self._ingest(match_id="99999999", dedup_key="kx").get_json()
+        self.assertFalse(data["accepted"])
+        self.assertEqual(data["reason"], "match_not_capturable")
+        # Not even in the full Playing set: traceable as "not_in_catalog".
+        self.assertEqual(data["detail_reason"], "not_in_catalog")
+        self.feishu_mock.assert_not_called()
+
+    def test_drop_reason_big_league_excluded(self):
+        # In all_playing (full set) under an excluded league, but absent from the
+        # shown/capturable playing list: the drop is a deliberate big-league skip.
+        all_playing = [
+            {"match_id": "88888888", "team_A_name": "曼城",
+             "team_B_name": "阿森纳", "competition_name": "英超"}
+        ]
+        with mock.patch.object(monitor_server.match_catalog, "all_playing", all_playing):
+            data = self._ingest(match_id="88888888", dedup_key="kbl").get_json()
+        self.assertFalse(data["accepted"])
+        self.assertEqual(data["detail_reason"], "big_league_excluded")
+        self.feishu_mock.assert_not_called()
+
+    def test_drop_reason_beyond_catalog_limit(self):
+        # A non-excluded league present in the full set but past the display cap.
+        all_playing = [
+            {"match_id": "77777777", "team_A_name": "甲队",
+             "team_B_name": "乙队", "competition_name": "哥伦杯"}
+        ]
+        with mock.patch.object(monitor_server.match_catalog, "all_playing", all_playing):
+            data = self._ingest(match_id="77777777", dedup_key="kbc").get_json()
+        self.assertFalse(data["accepted"])
+        self.assertEqual(data["detail_reason"], "beyond_catalog_limit")
+        self.feishu_mock.assert_not_called()
+
+    def test_filters_unwanted_event_type(self):
+        data = self._ingest(event_type="corner", dedup_key="kc").get_json()
+        self.assertFalse(data["accepted"])
+        self.assertEqual(data["reason"], "event_type_filtered")
+        self.feishu_mock.assert_not_called()
+
+    def test_deduplicates_repeated_event(self):
+        self.assertTrue(self._ingest(dedup_key="dup").get_json()["accepted"])
+        second = self._ingest(dedup_key="dup").get_json()
+        self.assertFalse(second["accepted"])
+        self.assertEqual(second["reason"], "duplicate")
+        self.assertEqual(self.feishu_mock.call_count, 1)
+
+    def test_events_poll_respects_cursor(self):
+        self._ingest(dedup_key="a")
+        self._ingest(event_type="red_card", dedup_key="b")
+        full = self.client.get("/api/monitor/events?since=0").get_json()
+        self.assertEqual([e["seq"] for e in full["events"]], [1, 2])
+        self.assertEqual(full["seq"], 2)
+        partial = self.client.get("/api/monitor/events?since=1").get_json()
+        self.assertEqual([e["seq"] for e in partial["events"]], [2])
+
+    def test_events_poll_exposes_boot_id(self):
+        # The browser uses boot_id to detect an 8901 restart (seq reset to 0) and
+        # re-baseline its cursor, so an already-open page keeps getting alerts.
+        data = self.client.get("/api/monitor/events?since=0").get_json()
+        self.assertEqual(data["boot_id"], monitor_server.BOOT_ID)
+        self.assertTrue(data["boot_id"])
+
+    def test_feishu_failure_still_accepts(self):
+        self.feishu_mock.return_value = False
+        data = self._ingest(dedup_key="f").get_json()
+        self.assertTrue(data["accepted"])
+        self.assertFalse(data["feishu_pushed"])
+
+    def test_alerts_disabled_rejects(self):
+        with mock.patch.object(monitor_server, "ALERT_ENABLED", False):
+            data = self._ingest(dedup_key="d").get_json()
+        self.assertFalse(data["accepted"])
+        self.assertEqual(data["reason"], "alerts_disabled")
+
+    def test_ingest_token_enforced(self):
+        with mock.patch.object(monitor_server, "ALERT_INGEST_TOKEN", "secret"):
+            unauthorized = self._ingest(dedup_key="t1")
+            self.assertEqual(unauthorized.status_code, 401)
+            ok = self.client.post(
+                "/api/monitor/events/ingest",
+                json={"match_id": "54622319", "event_type": "goal", "team": "A", "dedup_key": "t2"},
+                headers={"X-Monitor-Token": "secret"},
+            )
+            self.assertTrue(ok.get_json()["accepted"])
+
+
 if __name__ == "__main__":
     unittest.main()
