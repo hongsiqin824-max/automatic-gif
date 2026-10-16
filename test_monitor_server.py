@@ -290,21 +290,9 @@ class EventAlertTests(unittest.TestCase):
         self.assertEqual(data["detail_reason"], "not_in_catalog")
         self.feishu_mock.assert_not_called()
 
-    def test_drop_reason_big_league_excluded(self):
-        # In all_playing (full set) under an excluded league, but absent from the
-        # shown/capturable playing list: the drop is a deliberate big-league skip.
-        all_playing = [
-            {"match_id": "88888888", "team_A_name": "曼城",
-             "team_B_name": "阿森纳", "competition_name": "英超"}
-        ]
-        with mock.patch.object(monitor_server.match_catalog, "all_playing", all_playing):
-            data = self._ingest(match_id="88888888", dedup_key="kbl").get_json()
-        self.assertFalse(data["accepted"])
-        self.assertEqual(data["detail_reason"], "big_league_excluded")
-        self.feishu_mock.assert_not_called()
-
     def test_drop_reason_beyond_catalog_limit(self):
-        # A non-excluded league present in the full set but past the display cap.
+        # A match present in the full set but absent from the shown playing list
+        # (e.g. a transient playing/all_playing skew) is still traceable.
         all_playing = [
             {"match_id": "77777777", "team_A_name": "甲队",
              "team_B_name": "乙队", "competition_name": "哥伦杯"}

@@ -27,11 +27,10 @@ MATCH_CATALOG_REFRESH_SECONDS = 120.0
 MATCH_CATALOG_BACKOFF_SECONDS = (5.0, 10.0, 20.0, 30.0)
 MATCH_CATALOG_LIMIT = 20
 MATCH_CATALOG_UPCOMING_SECONDS = 15 * 60
-# These competitions are hidden from the browser's discovery list. The full
-# Playing set (``all_playing``) keeps everything for background consumers.
-MATCH_CATALOG_EXCLUDED_COMPETITION_NAMES = frozenset(
-    {"英超", "西甲", "意甲", "德甲", "法甲", "中超"}
-)
+# No competition is hidden anymore: the browse list and alerts cover every live
+# soccer match the directory returns. Kept as an empty set so importers (the
+# monitor alert drop-reason) keep working without a code change.
+MATCH_CATALOG_EXCLUDED_COMPETITION_NAMES = frozenset()
 MATCH_CATALOG_CARD_FIELDS = (
     "match_id", "team_A_name", "team_A_logo", "team_B_name", "team_B_logo",
     "competition_id", "competition_name", "round_name", "status", "start_play",
@@ -81,8 +80,8 @@ class MatchCatalog:
     def __init__(self) -> None:
         self.lock = threading.RLock()
         self.playing: list[dict[str, Any]] = []
-        # The browser intentionally receives only MATCH_CATALOG_LIMIT rows.
-        # Keep the complete Playing set for the background coordinator.
+        # Full Playing set for background consumers. With filtering removed this
+        # now mirrors ``playing``.
         self.all_playing: list[dict[str, Any]] = []
         self.upcoming: list[dict[str, Any]] = []
         self.last_success_at: float | None = None
@@ -205,8 +204,8 @@ class MatchCatalog:
         upcoming_rows.sort(key=lambda entry: (entry[1], entry[0]["match_id"]))
         self._pending_all_playing = [item for item, _ in all_playing_rows]
         return (
-            [item for item, _ in playing_rows[:MATCH_CATALOG_LIMIT]],
-            [item for item, _ in upcoming_rows[:MATCH_CATALOG_LIMIT]],
+            [item for item, _ in playing_rows],
+            [item for item, _ in upcoming_rows],
             len(rows),
             soccer_count,
             query_start,
