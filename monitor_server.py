@@ -916,7 +916,7 @@ def monitor_clip():
             "match_id": match_id,
             "before_seconds": before_seconds,
             "anchored": anchored,
-            "clip_url": f"/clips/{match_id}/{output_path.name}",
+            "clip_url": f"clips/{match_id}/{output_path.name}",
             "bytes": output_path.stat().st_size,
             "publish_enabled": manual_draft_queue is not None,
             "delivery_mode": _manual_delivery_mode(),
