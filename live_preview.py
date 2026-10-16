@@ -99,7 +99,7 @@ class LivePreviewManager:
         return self.root / match_id
 
     def playlist_url(self, match_id: str) -> str:
-        return f"/preview/{urllib.parse.quote(match_id)}/index.m3u8"
+        return f"preview/{urllib.parse.quote(match_id)}/index.m3u8"
 
     @staticmethod
     def _is_local_file(resource: str) -> bool:

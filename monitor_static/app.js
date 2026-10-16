@@ -196,7 +196,7 @@ async function startTilePreview(matchId) {
   const overlay = el.querySelector('.tile-overlay');
   setTileStatus(matchId, '正在拉起直播…');
   try {
-    const data = await requestJson('/api/monitor/preview/start', {
+    const data = await requestJson('api/monitor/preview/start', {
       method: 'POST', body: JSON.stringify({match_id: matchId}),
     });
     tile.playlistUrl = data.playlist_url;
@@ -243,7 +243,7 @@ async function captureClip(matchId, button) {
         if (Number.isFinite(secs) && secs > 0 && secs <= 120) payload.before_seconds = secs;
       }
     }
-    const data = await requestJson('/api/monitor/clip', {
+    const data = await requestJson('api/monitor/clip', {
       method: 'POST', body: JSON.stringify(payload),
     });
     const sizeMb = (data.bytes / (1024 * 1024)).toFixed(2);
@@ -360,7 +360,7 @@ function refreshDraftLinks(matchId) {
       return;
     }
   }
-  fetch(`/api/monitor/publish/status?match_id=${encodeURIComponent(matchId)}`)
+  fetch(`api/monitor/publish/status?match_id=${encodeURIComponent(matchId)}`)
     .then((response) => (response.ok ? response.json() : null))
     .then((data) => {
       if (!data || !data.enabled || !data.records) return;
@@ -426,7 +426,7 @@ function refreshTileDraftLinks() {
     if (tileEl && tileEl.dataset.matchId) matchIds.add(tileEl.dataset.matchId);
   });
   matchIds.forEach((matchId) => {
-    fetch(`/api/monitor/publish/status?match_id=${encodeURIComponent(matchId)}`)
+    fetch(`api/monitor/publish/status?match_id=${encodeURIComponent(matchId)}`)
       .then((response) => (response.ok ? response.json() : null))
       .then((data) => {
         if (!data || !data.enabled || !data.records) return;
@@ -537,7 +537,7 @@ function reconcileTiles(playing) {
       if (video && video._hls) { try { video._hls.destroy(); } catch (e) {} }
       el.remove();
     }
-    fetch('/api/monitor/preview/stop', {
+    fetch('api/monitor/preview/stop', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({match_id: matchId}),
     }).catch(() => {});
@@ -551,7 +551,7 @@ function reconcileTiles(playing) {
 async function refreshMatches() {
   const health = $('health');
   try {
-    const data = await requestJson('/api/monitor/matches');
+    const data = await requestJson('api/monitor/matches');
     state.maxPreviews = data.max_previews || state.maxPreviews;
     state.clipBeforeSeconds = data.clip_before_seconds || state.clipBeforeSeconds;
     // Keep the two hard-codable labels honest once the backend default is known.
@@ -591,7 +591,7 @@ document.addEventListener('keydown', (ev) => {
 });
 window.addEventListener('beforeunload', () => {
   for (const matchId of state.tiles.keys()) {
-    navigator.sendBeacon?.('/api/monitor/preview/stop', new Blob([JSON.stringify({match_id: matchId})], {type: 'application/json'}));
+    navigator.sendBeacon?.('api/monitor/preview/stop', new Blob([JSON.stringify({match_id: matchId})], {type: 'application/json'}));
   }
 });
 
@@ -654,7 +654,7 @@ function recoverPreview(matchId) {
 function keepAlivePreviews() {
   for (const [matchId, tile] of state.tiles.entries()) {
     if (!tile.playlistUrl) continue;
-    fetch(`/api/monitor/preview/status?match_id=${encodeURIComponent(matchId)}`)
+    fetch(`api/monitor/preview/status?match_id=${encodeURIComponent(matchId)}`)
       .then((response) => (response.ok ? response.json() : null))
       .then((status) => {
         const current = state.tiles.get(matchId);
@@ -803,7 +803,7 @@ function pushAlert(ev) {
 async function pollAlerts() {
   let data;
   try {
-    data = await requestJson(`/api/monitor/events?since=${state.alertSeq}`);
+    data = await requestJson(`api/monitor/events?since=${state.alertSeq}`);
   } catch (error) {
     return;  // transient; next tick retries
   }
