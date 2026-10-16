@@ -34,6 +34,7 @@ body{
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:16px}
 .grid-empty{grid-column:1/-1;color:var(--muted);text-align:center;padding:60px 0;font-size:14px}
 .tile{background:linear-gradient(145deg,rgba(19,31,46,.96),rgba(14,24,37,.96));border:1px solid var(--line);border-radius:10px;overflow:hidden;box-shadow:var(--shadow);display:flex;flex-direction:column}
+.tile.no-source{order:1}
 .tile-video-wrap{position:relative;aspect-ratio:16/9;background:#000;cursor:pointer}
 .tile-video{width:100%;height:100%;display:block;background:#000}
 .tile-overlay{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:12px;background:rgba(5,10,16,.55);text-align:center;padding:0 12px}

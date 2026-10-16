@@ -1781,7 +1781,6 @@ def build_article_fields(
     fields: dict[str, Any] = {
         "title": title,
         "body": (
-            f"<p>{html.escape(title)}</p>"
             f'<p><img src="{html.escape(gif_url, quote=True)}" alt="比赛 GIF"></p>'
         ),
         "archive_level": "B",

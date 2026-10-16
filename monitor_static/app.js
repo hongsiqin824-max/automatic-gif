@@ -201,6 +201,7 @@ async function startTilePreview(matchId) {
     });
     tile.playlistUrl = data.playlist_url;
     overlay.classList.add('hidden');
+    el.classList.remove('no-source');
     attachHls(video, data.playlist_url, (text, cls) => {
       setTileStatus(matchId, text, cls);
       // Surface a terminal playback failure on the tile instead of a blank frame.
@@ -219,6 +220,7 @@ async function startTilePreview(matchId) {
     overlay.classList.remove('hidden');
     const noSource = /直播源/.test(error.message);
     overlay.textContent = noSource ? '该比赛暂无直播源' : '直播源加载失败';
+    if (noSource) el.classList.add('no-source'); else el.classList.remove('no-source');
     setTileStatus(matchId, error.message, 'warn');
   }
 }
