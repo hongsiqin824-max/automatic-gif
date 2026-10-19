@@ -11,6 +11,7 @@ rolling buffer that doubles as the clip source.
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 import threading
@@ -30,10 +31,17 @@ PREVIEW_IDLE_TIMEOUT_SECONDS = positive_env_float(
 PREVIEW_SEGMENT_SECONDS = 2
 PREVIEW_LIST_SIZE = 6
 PREVIEW_HEIGHT = 480
+# Previous ffmpeg stderr is kept here across a restart so the exit reason
+# survives the directory wipe and can be inspected after the fact.
+PREVIEW_PREV_LOG_NAME = "ffmpeg.prev.log"
 
 
 def resolve_ffmpeg() -> str:
     return shutil.which("ffmpeg") or "/opt/homebrew/bin/ffmpeg"
+
+
+def _log_event(event: str, **fields: Any) -> None:
+    print(json.dumps({"event": event, **fields}, ensure_ascii=False), flush=True)
 
 
 @dataclass
@@ -51,6 +59,12 @@ class _PreviewEntry:
     # (max_delay-spaced) probing; we keep probing so a late source recovery
     # self-heals instead of requiring a manual refresh.
     cooling: bool = False
+    # Diagnostics that survive the retry-budget reset: how many times this
+    # entry has ever been restarted, and why the last process died.
+    restart_count_total: int = 0
+    last_exit_code: int | None = None
+    last_exit_reason: str | None = None
+    last_exit_at: float | None = None
 
 
 class LivePreviewManager:
@@ -219,6 +233,13 @@ class LivePreviewManager:
             # True once fast retries are spent and we have dropped to low-frequency
             # probing; the source is still being auto-recovered, not abandoned.
             "auto_restart_cooling": entry.cooling,
+            # Diagnostics: lifetime restart count and why the last process died.
+            # These are not cleared by the stable-run budget reset, so an operator
+            # can still see that a now-healthy tile had dropped earlier.
+            "restart_count_total": entry.restart_count_total,
+            "last_exit_code": entry.last_exit_code,
+            "last_exit_reason": entry.last_exit_reason,
+            "last_exit_at_unix": entry.last_exit_at,
         }
 
     @staticmethod
@@ -230,6 +251,48 @@ class LivePreviewManager:
         if not text:
             return None
         return text[-limit:]
+
+    @staticmethod
+    def _summarize_exit_reason(log_tail: str | None) -> str | None:
+        """Collapse ffmpeg stderr into the single most informative line.
+
+        ffmpeg's last line is almost always the real cause (``Connection timed
+        out``, ``Server returned 404``, ``Error reading header`` ...); earlier
+        lines are usually decode warnings that are not the exit reason.
+        """
+        if not log_tail:
+            return None
+        lines = [line.strip() for line in log_tail.splitlines() if line.strip()]
+        if not lines:
+            return None
+        return lines[-1][:200]
+
+    def _record_exit_locked(self, match_id: str, entry: _PreviewEntry, return_code: int | None, now: float) -> bytes:
+        """Capture why the current process died; return its raw stderr.
+
+        The caller wipes the media directory before relaunching, so the raw log
+        is handed back to be re-written as ``ffmpeg.prev.log`` afterwards.
+        """
+        log_tail = self._read_log_tail(entry.log_path)
+        reason = self._summarize_exit_reason(log_tail)
+        entry.last_exit_code = return_code
+        entry.last_exit_reason = reason
+        entry.last_exit_at = now
+        try:
+            raw_log = entry.log_path.read_bytes()
+        except OSError:
+            raw_log = b""
+        _log_event(
+            "preview_ffmpeg_exited",
+            match_id=match_id,
+            resource=entry.resource,
+            return_code=return_code,
+            uptime_seconds=round(now - entry.started_at, 1),
+            restart_count=entry.restart_count,
+            restart_count_total=entry.restart_count_total,
+            reason=reason,
+        )
+        return raw_log
 
     def _stop_entry_locked(self, match_id: str) -> None:
         entry = self.entries.pop(match_id, None)
@@ -286,9 +349,15 @@ class LivePreviewManager:
             self.restart_base_delay * (2 ** entry.restart_count),
             self.restart_max_delay,
         )
+        prev_log = self._record_exit_locked(match_id, entry, entry.process.poll(), now)
         directory = entry.directory
         shutil.rmtree(directory, ignore_errors=True)
         directory.mkdir(parents=True, exist_ok=True)
+        if prev_log:
+            try:
+                (directory / PREVIEW_PREV_LOG_NAME).write_bytes(prev_log)
+            except OSError:
+                pass
         command = self._build_command(entry.resource, directory)
         log_file = entry.log_path.open("wb")
         try:
@@ -303,9 +372,19 @@ class LivePreviewManager:
         entry.process = process
         entry.started_at = now
         entry.restart_count += 1
+        entry.restart_count_total += 1
         entry.next_restart_at = now + delay
         if entry.restart_count >= self.restart_max_retries:
             entry.cooling = True
+        _log_event(
+            "preview_ffmpeg_restarted",
+            match_id=match_id,
+            pid=process.pid,
+            restart_count=entry.restart_count,
+            restart_count_total=entry.restart_count_total,
+            next_retry_in_seconds=delay,
+            cooling=entry.cooling,
+        )
 
     def shutdown(self) -> None:
         self._stop.set()

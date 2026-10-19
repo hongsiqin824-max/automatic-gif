@@ -140,10 +140,11 @@ class LivePreviewLifecycleTests(unittest.TestCase):
             self.manager.start("match-1", "   ")
 
 
-def _dying_command_factory():
+def _dying_command_factory(stderr_text: str = ""):
     """Return a fake ``_build_command`` whose child dies right after booting.
 
-    It writes the playlist (so ``playlist_ready`` turns true) and then exits
+    It writes the playlist (so ``playlist_ready`` turns true), optionally emits
+    ``stderr_text`` (emulating ffmpeg's final error line) and then exits
     non-zero, emulating an RTMP source that drops immediately.
     """
 
@@ -152,6 +153,8 @@ def _dying_command_factory():
         script = (
             "import pathlib, sys\n"
             f"pathlib.Path(r'{playlist}').write_text('#EXTM3U', encoding='utf-8')\n"
+            f"sys.stderr.write({stderr_text!r})\n"
+            "sys.stderr.flush()\n"
             "sys.exit(1)\n"
         )
         return [sys.executable, "-c", script]
@@ -267,6 +270,59 @@ class LivePreviewAutoRestartTests(unittest.TestCase):
         manager._reap_tick(time.time())
         self.assertEqual(manager.entries["m1"].restart_count, 0)
         self.assertFalse(manager.entries["m1"].cooling)
+
+    def test_restart_records_exit_reason_and_keeps_prev_log(self):
+        manager = self._make()
+        manager._build_command = _dying_command_factory(
+            "[warn] some decode noise\n"
+            "rtmp://host/s: Connection timed out\n"
+        )
+        manager.start("m1", "rtmp://host/s")
+        entry = manager.entries["m1"]
+        entry.process.wait(timeout=5)
+        manager._reap_tick(time.time())
+        status = manager.status("m1")
+        # The last stderr line is surfaced as the human-readable reason.
+        self.assertEqual(status["last_exit_reason"], "rtmp://host/s: Connection timed out")
+        self.assertEqual(status["last_exit_code"], 1)
+        self.assertIsNotNone(status["last_exit_at_unix"])
+        self.assertEqual(status["restart_count_total"], 1)
+        # The dying process's stderr survives the directory wipe.
+        prev_log = manager.media_dir("m1") / "ffmpeg.prev.log"
+        self.assertTrue(prev_log.is_file())
+        self.assertIn("Connection timed out", prev_log.read_text(encoding="utf-8"))
+
+    def test_restart_total_survives_budget_reset(self):
+        manager = self._make()
+        manager.start("m1", "rtmp://host/s")
+        for _ in range(2):
+            manager.entries["m1"].process.wait(timeout=5)
+            manager._reap_tick(time.time())
+        entry = manager.entries["m1"]
+        self.assertEqual(entry.restart_count, 2)
+        self.assertEqual(entry.restart_count_total, 2)
+        # Emulate a long healthy run: the fast-retry budget resets, but the
+        # lifetime counter and last exit reason are kept for diagnostics.
+        manager._build_command = _stub_command_factory(None)
+        manager.entries["m1"].process.wait(timeout=5)
+        manager._restart_entry_locked("m1", time.time())
+        entry = manager.entries["m1"]
+        entry.started_at = time.time() - 1000
+        manager._reap_tick(time.time())
+        status = manager.status("m1")
+        self.assertEqual(status["restart_count_total"], 3)
+        self.assertEqual(manager.entries["m1"].restart_count, 0)
+        self.assertEqual(status["last_exit_code"], 1)
+
+    def test_exit_reason_is_none_when_stderr_empty(self):
+        manager = self._make()
+        manager.start("m1", "rtmp://host/s")
+        manager.entries["m1"].process.wait(timeout=5)
+        manager._reap_tick(time.time())
+        status = manager.status("m1")
+        self.assertIsNone(status["last_exit_reason"])
+        self.assertEqual(status["last_exit_code"], 1)
+        self.assertFalse((manager.media_dir("m1") / "ffmpeg.prev.log").exists())
 
 
 if __name__ == "__main__":

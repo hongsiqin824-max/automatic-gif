@@ -763,10 +763,28 @@ window.addEventListener('beforeunload', () => {
 
 // ---- keepAlive ----
 
-function markPreviewDown(matchId, cooling) {
+// Turn ffmpeg's last stderr line into a short operator-facing hint so the tile
+// says *why* the source dropped (upstream timeout vs. our side) instead of a
+// bare "中断".
+function describeExitReason(status) {
+  const raw = String((status && (status.last_exit_reason || status.error)) || '').trim();
+  if (!raw) return '';
+  const lower = raw.toLowerCase();
+  if (/timed? ?out|rw_timeout/.test(lower)) return '源站读超时';
+  if (/connection reset|broken pipe|end of file|eof/.test(lower)) return '源站断开连接';
+  if (/connection refused|no route|name or service|could not resolve/.test(lower)) return '源站不可达';
+  if (/server returned 4\d\d|403|404/.test(lower)) return '源站拒绝/地址失效';
+  if (/invalid data|non-monotonous|decode|corrupt/.test(lower)) return '源站流数据异常';
+  return raw.length > 60 ? raw.slice(0, 60) + '…' : raw;
+}
+
+function markPreviewDown(matchId, status) {
   const tile = state.tiles.get(matchId);
   if (tile) tile.down = true;
-  const message = cooling ? '直播源中断，后台持续重连中…' : '直播源中断，正在自动重连…';
+  const cooling = !!(status && status.auto_restart_cooling);
+  let message = cooling ? '直播源中断，后台持续重连中…' : '直播源中断，正在自动重连…';
+  const reason = describeExitReason(status);
+  if (reason) message += `（${reason}）`;
   const el = document.querySelector(`.tile[data-match-id="${matchId}"]`);
   if (el) {
     const overlay = el.querySelector('.tile-overlay');
@@ -779,7 +797,7 @@ function markPreviewDown(matchId, cooling) {
   }
 }
 
-function recoverPreview(matchId) {
+function recoverPreview(matchId, status) {
   const tile = state.tiles.get(matchId);
   if (!tile) return;
   tile.down = false;
@@ -799,11 +817,13 @@ function recoverPreview(matchId) {
     });
     if (staged) state.stageHls = hls;
   }
-  setTileStatus(matchId, '直播源已恢复', 'ok');
+  const total = status && status.restart_count_total;
+  const message = total ? `直播源已恢复（本场累计重连 ${total} 次）` : '直播源已恢复';
+  setTileStatus(matchId, message, 'ok');
   if (staged) {
-    $('stage-status').textContent = '直播源已恢复';
+    $('stage-status').textContent = message;
     $('stage-status').className = 'stage-status ok';
-    addStageNote('直播源已恢复', 'ok');
+    addStageNote(message, 'ok');
   }
 }
 
@@ -816,9 +836,9 @@ function keepAlivePreviews() {
         const current = state.tiles.get(matchId);
         if (!current || !status) return;
         if (status.running === false) {
-          markPreviewDown(matchId, status.auto_restart_cooling);
+          markPreviewDown(matchId, status);
         } else if (status.running && status.playlist_ready && current.down) {
-          recoverPreview(matchId);
+          recoverPreview(matchId, status);
         }
       })
       .catch(() => {});
