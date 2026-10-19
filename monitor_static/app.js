@@ -1007,42 +1007,62 @@ $('alert-close').addEventListener('click', closeAlertPanel);
 // ---- Lag monitoring for diagnostics ----
 let lagMonitoringStarted = false;
 
+// Seconds of continuous buffer ahead of the playhead *in the range that
+// contains it*. Using the last range's end would silently span a gap (after a
+// background pause the newest segments land far ahead of a stale playhead) and
+// report a huge, meaningless number.
+function bufferedAheadSeconds(video) {
+  const ranges = video.buffered;
+  const t = video.currentTime;
+  for (let i = 0; i < ranges.length; i += 1) {
+    if (t >= ranges.start(i) - 0.1 && t <= ranges.end(i) + 0.1) {
+      return Math.max(0, ranges.end(i) - t);
+    }
+  }
+  return 0;
+}
+
 function startLagMonitoring() {
   if (lagMonitoringStarted) return;
   lagMonitoringStarted = true;
 
-  console.log('[LAG-MONITOR] 滞后监控已启动，每 5 秒记录一次');
+  console.log('[LAG-MONITOR] 滞后监控已启动，每 1 秒记录一次');
 
   setInterval(() => {
-    const tiles = document.querySelectorAll('.tile[data-match-id]');
+    for (const matchId of state.tiles.keys()) {
+      // videoForMatch() follows the element into the stage when it is enlarged.
+      const video = videoForMatch(matchId);
+      if (!video || !video._hls) continue;
+      const hls = video._hls;
 
-    tiles.forEach(tile => {
-      const matchId = tile.dataset.matchId;
-      const video = tile.querySelector('.tile-video');
+      // 落后直播：hls.js 用流自身时间轴算的"播放头离服务器最新一帧多少秒"。
+      // 两端同源，ffmpeg 开流 burst 偏移和服务器/本地时钟差互相抵消，
+      // 这是以后 UI 要展示的数。刚 attach、playlist 未就绪时为 0，显示 N/A。
+      const latency = typeof hls.latency === 'number' && hls.latency > 0
+        ? `${hls.latency.toFixed(1)}s`
+        : 'N/A';
+      const target = typeof hls.targetLatency === 'number' && hls.targetLatency > 0
+        ? `${hls.targetLatency.toFixed(0)}s`
+        : '?';
 
-      if (!video || !video._hls) return;
-
-      // 没有 PDT 时间戳的流算不出滞后，显示 N/A 以便区分"滞后小"和"无法测量"
+      // PDT差：旧算法（浏览器墙钟 − 帧 PDT），含时钟差和 burst 偏移。
+      // 暂时保留做对照，确认与"落后直播"相差常数后删除。
       const anchorMs = frameAnchorMs(video);
-      const lagSeconds = anchorMs
+      const pdtDiff = anchorMs
         ? `${Math.round((Date.now() - anchorMs) / 1000)}s`
-        : 'N/A(无PDT)';
-
-      const buffered = video.buffered;
-      const bufferedEnd = buffered.length > 0 ? buffered.end(buffered.length - 1) : 0;
-      const bufferedAhead = Math.round(bufferedEnd - video.currentTime);
+        : 'N/A';
 
       const videoState = video.paused ? 'PAUSED' :
                          (video.readyState < 3 ? 'BUFFERING' : 'PLAYING');
       const pageVisible = document.hidden ? '后台' : '前台';
 
       console.log(
-        `[LAG] ${matchId} | 滞后 ${lagSeconds} | ` +
-        `状态 ${videoState} | 标签页 ${pageVisible} | ` +
-        `缓冲前瞻 ${bufferedAhead}s`
+        `[LAG] ${matchId} | 落后直播 ${latency} (目标 ${target}) | ` +
+        `PDT差 ${pdtDiff} | ${videoState} | ${pageVisible} | ` +
+        `本段缓冲 ${bufferedAheadSeconds(video).toFixed(0)}s`
       );
-    });
-  }, 5000);
+    }
+  }, 1000);
 }
 
 pollAlerts();
