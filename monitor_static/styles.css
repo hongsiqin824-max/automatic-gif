@@ -46,11 +46,21 @@ body{
 .tile-teams{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:14px;font-weight:600}
 .tile-teams .score{color:var(--cyan)}
 .tile-meta{display:flex;justify-content:space-between;color:var(--muted);font-size:11px}
-.tile-actions{display:flex;align-items:center;gap:10px;margin-top:2px}
-.tile-status{font-size:11px;color:var(--muted);flex:1;overflow-wrap:anywhere}
+.tile-actions{display:flex;align-items:center;gap:8px;margin-top:2px;flex-wrap:wrap}
+.tile-status{font-size:11px;color:var(--muted);flex:1;min-width:120px;overflow-wrap:anywhere}
 .tile-status.ok{color:var(--green)}
 .tile-status.warn{color:var(--amber)}
 .tile-status.fail{color:var(--red,#ff6b6b)}
+.tile-live{padding:7px 10px;font-size:11px}
+/* 落后直播徽标：绿 ≤15s / 黄 ≤60s / 红 >60s / 灰 未知 */
+.lag-badge{display:inline-flex;align-items:center;gap:5px;font-size:11px;font-weight:600;font-variant-numeric:tabular-nums;padding:5px 9px;border-radius:999px;border:1px solid var(--line);background:rgba(255,255,255,.04);white-space:nowrap}
+.lag-badge::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor;box-shadow:0 0 8px currentColor}
+.lag-badge.ok{color:var(--green);border-color:rgba(98,217,145,.35)}
+.lag-badge.warn{color:var(--amber);border-color:rgba(245,185,76,.4)}
+.lag-badge.bad{color:var(--red);border-color:rgba(255,107,107,.45)}
+.lag-badge.na{color:var(--muted)}
+.lag-badge.na::before{box-shadow:none}
+.stage-actions .lag-badge{font-size:12px;padding:8px 12px}
 .stage-fields{display:flex;gap:8px;margin:8px 0}
 .stage-input{flex:1;min-width:0;padding:8px 10px;border-radius:8px;border:1px solid rgba(255,255,255,.14);background:rgba(255,255,255,.05);color:inherit;font-size:13px}
 .stage-input::placeholder{color:var(--muted)}

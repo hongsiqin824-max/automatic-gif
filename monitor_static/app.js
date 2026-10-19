@@ -173,6 +173,8 @@ function createTile(data) {
       <div class="tile-meta">${metaText(data)}</div>
       <div class="tile-actions">
         <button class="button primary" data-role="capture" type="button">截取 ${state.clipBeforeSeconds} 秒</button>
+        <span class="lag-badge na" data-role="lag" title="当前画面比服务器最新画面晚多少秒">落后 —</span>
+        <button class="button ghost tile-live" data-role="live" type="button" title="跳到直播最新位置">回到直播</button>
         <span class="tile-status">准备中…</span>
       </div>
     </div>`;
@@ -180,6 +182,11 @@ function createTile(data) {
   el.querySelector('[data-role="capture"]').addEventListener('click', (ev) => {
     ev.stopPropagation();
     captureClip(data.match_id, ev.currentTarget);
+  });
+  el.querySelector('[data-role="live"]').addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    seekToLive(videoForMatch(data.match_id));
+    setTileStatus(data.match_id, '已回到直播', 'ok');
   });
   return el;
 }
@@ -474,6 +481,7 @@ function openStage(matchId) {
   video.setAttribute('controls', '');
   host.appendChild(video);
   state.stageHls = video._hls || null;
+  renderLagBadge($('stage-lag'), liveLagSeconds(video));
   const tileOverlay = wrap.querySelector('.tile-overlay');
   if (tileOverlay) { tileOverlay.classList.remove('hidden'); tileOverlay.textContent = '已在大窗播放'; }
   if (!video._hls) {
@@ -1022,6 +1030,30 @@ function bufferedAheadSeconds(video) {
   return 0;
 }
 
+// Seconds behind the server's newest segment, or null when hls.js has not
+// loaded a playlist yet. Uses hls.latency (stream-timeline based) so ffmpeg's
+// start-up burst offset and server/browser clock skew cancel out.
+function liveLagSeconds(video) {
+  const hls = video && video._hls;
+  if (!hls || typeof hls.latency !== 'number' || !(hls.latency > 0)) return null;
+  return hls.latency;
+}
+
+const LAG_OK_MAX_SECONDS = 15;
+const LAG_WARN_MAX_SECONDS = 60;
+
+function renderLagBadge(node, lag) {
+  if (!node) return;
+  if (lag == null) {
+    node.textContent = '落后 —';
+    node.className = 'lag-badge na';
+    return;
+  }
+  const cls = lag <= LAG_OK_MAX_SECONDS ? 'ok' : lag <= LAG_WARN_MAX_SECONDS ? 'warn' : 'bad';
+  node.textContent = `落后 ${Math.round(lag)}s`;
+  node.className = `lag-badge ${cls}`;
+}
+
 function startLagMonitoring() {
   if (lagMonitoringStarted) return;
   lagMonitoringStarted = true;
@@ -1032,15 +1064,14 @@ function startLagMonitoring() {
     for (const matchId of state.tiles.keys()) {
       // videoForMatch() follows the element into the stage when it is enlarged.
       const video = videoForMatch(matchId);
+      const tileBadge = document.querySelector(`.tile[data-match-id="${matchId}"] [data-role="lag"]`);
+      const lag = liveLagSeconds(video);
+      renderLagBadge(tileBadge, lag);
+      if (state.stageMatchId === matchId) renderLagBadge($('stage-lag'), lag);
       if (!video || !video._hls) continue;
       const hls = video._hls;
 
-      // 落后直播：hls.js 用流自身时间轴算的"播放头离服务器最新一帧多少秒"。
-      // 两端同源，ffmpeg 开流 burst 偏移和服务器/本地时钟差互相抵消，
-      // 这是以后 UI 要展示的数。刚 attach、playlist 未就绪时为 0，显示 N/A。
-      const latency = typeof hls.latency === 'number' && hls.latency > 0
-        ? `${hls.latency.toFixed(1)}s`
-        : 'N/A';
+      const latency = lag != null ? `${lag.toFixed(1)}s` : 'N/A';
       const target = typeof hls.targetLatency === 'number' && hls.targetLatency > 0
         ? `${hls.targetLatency.toFixed(0)}s`
         : '?';
