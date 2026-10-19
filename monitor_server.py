@@ -16,6 +16,7 @@ exactly like the dashboard without importing that monolith.
 from __future__ import annotations
 
 import atexit
+import concurrent.futures
 import json
 import os
 import re
@@ -271,6 +272,36 @@ if manual_draft_queue is not None:
 app = Flask(__name__, static_folder="monitor_static", static_url_path="/static")
 
 
+def _batch_query_sources(match_ids: list[str]) -> dict[str, str]:
+    """Concurrently query live-source state for multiple matches.
+
+    Returns ``{match_id: "available"|"no_source"|"error"}``. Individual query
+    failures never block the batch — they are recorded as ``"error"``.
+    """
+    results: dict[str, str] = {}
+
+    def _one(match_id: str) -> tuple[str, str]:
+        try:
+            result = classify_source_response(query_source(match_id))
+            return match_id, result.state
+        except Exception:
+            return match_id, "error"
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {
+            executor.submit(_one, mid): mid for mid in match_ids
+        }
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                mid, state = future.result()
+                results[mid] = state
+            except Exception:
+                # The _one wrapper already catches, but guard anyway.
+                pass
+
+    return results
+
+
 def _resolve_source(match_id: str) -> str:
     """Return a usable live-source resource or raise a descriptive error."""
     result = classify_source_response(query_source(match_id))
@@ -475,6 +506,7 @@ def health():
 def monitor_matches():
     snapshot = match_catalog.snapshot()
     playing = []
+    match_ids: list[str] = []
     for item in snapshot.get("playing", []):
         if not isinstance(item, dict):
             continue
@@ -495,6 +527,14 @@ def monitor_matches():
                 "status_label": MATCH_STATUS_LABELS.get(status, status or "未知"),
             }
         )
+        match_ids.append(str(item.get("match_id") or ""))
+    # Optionally batch-query live-source states so the list page can show a
+    # per-match source indicator without an N+1 waterfall. The browser passes
+    # ``?with_sources=1`` on initial load and when the operator manually refreshes.
+    if request.args.get("with_sources") == "1" and match_ids:
+        source_states = _batch_query_sources(match_ids)
+        for entry in playing:
+            entry["source_state"] = source_states.get(entry["match_id"], "unknown")
     return jsonify(
         {
             "playing": playing,

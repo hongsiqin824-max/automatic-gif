@@ -10,10 +10,13 @@ body{
   color:var(--text);
 }
 .shell{max-width:1600px;margin:0 auto;padding:28px 28px 40px}
-.topbar{display:flex;justify-content:space-between;gap:24px;align-items:flex-start;margin-bottom:22px}
+.topbar{display:flex;justify-content:space-between;gap:24px;align-items:flex-start;margin-bottom:18px}
+.topbar-actions{display:flex;align-items:center;gap:14px;flex-shrink:0}
 .eyebrow{margin:0 0 8px;color:var(--cyan);font-size:11px;font-weight:700;letter-spacing:1.8px}
 .topbar h1{margin:0;font-size:30px;line-height:1.1}
 .subhead{color:var(--muted);margin:10px 0 0;font-size:13px}
+#enter-workshop-btn{margin-top:14px}
+.topbar-row{display:flex;align-items:center;gap:14px;margin-top:14px}
 .port-badge{font-size:12px;color:#b7c6d6;border:1px solid var(--line);padding:10px 13px;border-radius:7px;background:rgba(17,27,40,.72);white-space:nowrap}
 .dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--green);margin-right:7px;box-shadow:0 0 12px var(--green)}
 .toolbar{display:flex;align-items:center;gap:14px;margin-bottom:18px;flex-wrap:wrap}
@@ -31,7 +34,7 @@ body{
 .notice{padding:12px 14px;border-radius:6px;background:#392e18;border:1px solid #705727;color:#ffd98a;margin-bottom:18px;font-size:13px}
 .notice.error{background:#3a1f22;border-color:#6e343b;color:#ff9f9f}
 .hidden{display:none!important}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:16px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px}
 .grid-empty{grid-column:1/-1;color:var(--muted);text-align:center;padding:60px 0;font-size:14px}
 .tile{background:linear-gradient(145deg,rgba(19,31,46,.96),rgba(14,24,37,.96));border:1px solid var(--line);border-radius:10px;overflow:hidden;box-shadow:var(--shadow);display:flex;flex-direction:column}
 .tile.no-source{order:1}
@@ -39,8 +42,6 @@ body{
 .tile-video{width:100%;height:100%;display:block;background:#000}
 .tile-overlay{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:12px;background:rgba(5,10,16,.55);text-align:center;padding:0 12px}
 .tile-overlay.hidden{display:none}
-.tile-badge{position:absolute;top:8px;left:8px;background:rgba(5,10,16,.7);border:1px solid var(--line);border-radius:4px;padding:3px 7px;font-size:11px;color:#cfe0ef}
-.tile-expand{position:absolute;top:8px;right:8px;background:rgba(5,10,16,.7);border:1px solid var(--line);border-radius:4px;padding:3px 7px;font-size:11px;color:#cfe0ef}
 .tile-body{padding:12px 13px;display:flex;flex-direction:column;gap:8px}
 .tile-teams{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:14px;font-weight:600}
 .tile-teams .score{color:var(--cyan)}
@@ -78,8 +79,6 @@ body{
 .stage-clips a{font-size:12px;color:var(--cyan);text-decoration:none;border:1px solid var(--line);border-radius:6px;padding:6px 10px}
 
 /* ---- Real-time goal/red-card alerts: collapsible launcher + panel + toasts ---- */
-/* Collapsed by default: a small bottom-right pill that never covers the grid.
-   Clicking it slides out the panel, which may briefly overlap cards on purpose. */
 .alert-launcher{position:fixed;right:18px;bottom:18px;z-index:55;display:inline-flex;align-items:center;gap:8px;padding:10px 15px;border:1px solid var(--line);border-radius:22px;background:rgba(17,27,40,.94);color:var(--text);font:600 13px inherit;cursor:pointer;box-shadow:var(--shadow)}
 .alert-launcher:hover{background:rgba(34,52,74,.96)}
 .alert-launcher-ico{font-size:14px;line-height:1}
@@ -110,3 +109,22 @@ body{
 .toast-sub{color:var(--muted);overflow-wrap:anywhere}
 @keyframes toastIn{from{opacity:0;transform:translateX(16px)}to{opacity:1;transform:translateX(0)}}
 @keyframes toastOut{to{opacity:0;transform:translateX(16px)}}
+
+/* ---- Match card grid (two-column) ---- */
+.match-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px}
+.match-card{display:flex;align-items:center;gap:10px;padding:12px 14px;border:1px solid var(--line);border-radius:8px;background:rgba(17,27,40,.55);cursor:pointer;transition:background .12s;font-size:13px}
+.match-card:hover{background:rgba(93,225,208,.06)}
+.match-card.no-source{opacity:.55}
+.match-card .match-card-check{flex-shrink:0}
+.match-card .match-card-check input[type="checkbox"]{width:15px;height:15px;cursor:pointer;accent-color:var(--cyan)}
+.match-card .match-card-teams{flex:1;min-width:0;font-weight:600}
+.match-card .match-card-teams span{display:inline}
+.match-card .match-card-teams .score{color:var(--cyan);margin:0 8px;font-weight:600}
+.match-card .match-card-meta{flex-shrink:0;color:var(--muted);font-size:11px;display:flex;flex-direction:column;align-items:flex-end;gap:2px}
+.match-card .match-card-source{flex-shrink:0;display:flex;align-items:center;gap:4px;font-size:12px;white-space:nowrap}
+.source-dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:6px;vertical-align:middle}
+.source-dot.available{background:var(--green);box-shadow:0 0 8px var(--green)}
+.source-dot.no-source{background:var(--muted)}
+.source-dot.error{background:var(--red)}
+.source-dot.unknown{background:var(--amber)}
+.source-label{color:var(--muted);font-size:11px;vertical-align:middle}

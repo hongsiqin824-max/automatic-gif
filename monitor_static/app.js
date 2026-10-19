@@ -1,11 +1,14 @@
 'use strict';
 const $ = (id) => document.getElementById(id);
-const REFRESH_MS = 30000;
+const REFRESH_MS = 60000;
+const WORKSHOP_IDLE_MS = 90000;
 
 const state = {
   tiles: new Map(),      // match_id -> {data, hls, playlistReady, statusTimer}
   stageMatchId: null,
   stageHls: null,
+  stageVideoNode: null,      // the tile <video> DOM node currently relocated into the stage
+  stageVideoHomeWrap: null,  // the .tile-video-wrap to move that node back into on close
   maxPreviews: 16,
   clipBeforeSeconds: 10,
   draftPoll: null,       // {matchId, timer, polls} while awaiting draft links
@@ -16,6 +19,12 @@ const state = {
   alertInit: false,      // skip replaying history on the first poll
   alertCount: 0,         // unseen-alert badge count
   alertPanelOpen: false, // panel is collapsed to a launcher pill by default
+  // ---- Two-view workflow ----
+  view: 'list',                     // 'list' | 'workshop'
+  allMatches: [],                   // full playing list + optional source_state
+  selectedMatchIds: new Set(),      // checked match_id set
+  sourceCache: {},                  // match_id → source_state (survives refreshes)
+  workshopIdleTimer: null,          // setTimeout id for 90s idle cleanup
 };
 
 function escapeHtml(value) {
@@ -57,9 +66,8 @@ function frameAnchorMs(video) {
 }
 
 function videoForMatch(matchId) {
-  if (state.stageMatchId === matchId) {
-    const stageVideo = $('stage-video');
-    if (stageVideo) return stageVideo;
+  if (state.stageMatchId === matchId && state.stageVideoNode) {
+    return state.stageVideoNode;
   }
   return document.querySelector(`.tile[data-match-id="${matchId}"] .tile-video`);
 }
@@ -102,8 +110,6 @@ function attachHls(video, playlistUrl, onStatus) {
       if (!data || !data.fatal) return;
       if (data.type === window.Hls.ErrorTypes.NETWORK_ERROR) {
         netRetries += 1;
-        // A live source that never delivers (dead RTMP) would otherwise loop
-        // "reconnecting" forever; after a few tries, surface a real failure.
         if (netRetries > 4) {
           try { hls.destroy(); } catch (e) {}
           video._hls = null;
@@ -159,8 +165,6 @@ function createTile(data) {
   el.dataset.matchId = data.match_id;
   el.innerHTML = `
     <div class="tile-video-wrap" data-role="enlarge">
-      <span class="tile-badge">${escapeHtml(data.status_label || '进行中')}</span>
-      <span class="tile-expand">点击放大</span>
       <video class="tile-video" playsinline autoplay muted></video>
       <div class="tile-overlay">正在连接直播源…</div>
     </div>
@@ -183,8 +187,6 @@ function createTile(data) {
 function updateTileInfo(el, data) {
   el.querySelector('.tile-teams').innerHTML = teamsText(data);
   el.querySelector('.tile-meta').innerHTML = metaText(data);
-  const badge = el.querySelector('.tile-badge');
-  if (badge) badge.textContent = data.status_label || '进行中';
 }
 
 async function startTilePreview(matchId) {
@@ -204,14 +206,9 @@ async function startTilePreview(matchId) {
     el.classList.remove('no-source');
     attachHls(video, data.playlist_url, (text, cls) => {
       setTileStatus(matchId, text, cls);
-      // Surface a terminal playback failure on the tile instead of a blank frame.
       if (cls === 'fail') {
         overlay.classList.remove('hidden');
         overlay.textContent = '直播源不可用（源未推流）';
-        // Mark the tile down so keepAlivePreviews re-attaches hls once the
-        // backend (which keeps auto-restarting ffmpeg) is serving again.
-        // Without this, a tile that failed via the hls error path never
-        // self-heals and only recovers when manually enlarged.
         tile.down = true;
       }
     });
@@ -225,6 +222,7 @@ async function startTilePreview(matchId) {
   }
 }
 
+// ---- clip / stage / draft (unchanged from the original) ----
 async function captureClip(matchId, button) {
   const prevLabel = button ? button.textContent : '';
   if (button) { button.disabled = true; button.textContent = '截取中…'; }
@@ -233,7 +231,6 @@ async function captureClip(matchId, button) {
     const anchorMs = frameAnchorMs(videoForMatch(matchId));
     const payload = {match_id: matchId};
     if (anchorMs != null) payload.anchor_epoch_ms = Math.round(anchorMs);
-    // Optional operator fields only exist while the stage of this match is open.
     if (state.stageMatchId === matchId) {
       const personEl = $('stage-person');
       const titleEl = $('stage-title-input');
@@ -250,8 +247,6 @@ async function captureClip(matchId, button) {
     });
     const sizeMb = (data.bytes / (1024 * 1024)).toFixed(2);
     const node = document.querySelector(`.tile[data-match-id="${matchId}"] .tile-status`);
-    // anchored=false means the server fell back to the buffer tail (no frame
-    // timestamp), so the moment may be off — make that visible, not silent.
     const warn = data.anchored === false;
     const publishNote = data.publish_error
       ? ' · 发文失败：' + data.publish_error
@@ -265,19 +260,13 @@ async function captureClip(matchId, button) {
     }
     if (state.stageMatchId === matchId) {
       addStageClip(data.clip_url, sizeMb, warn, data);
-      // A draft is created asynchronously; poll until its admin link is ready.
       if (data.draft && data.draft.event_key) startDraftPoll(matchId);
     } else if (node && data.draft && data.draft.event_key) {
-      // Grid capture (stage closed): the draft is still built asynchronously,
-      // so remember which event this status line is waiting on and poll until
-      // its admin link lands, mirroring the stage path.
       node.dataset.pendingDraft = data.draft.event_key;
       startTileDraftPoll();
     }
   } catch (error) {
     setTileStatus(matchId, error.message, 'warn');
-    // In stage (enlarged) mode the tile status is hidden behind the big player,
-    // so echo the failure where the operator is actually looking.
     if (state.stageMatchId === matchId) addStageNote('截取失败：' + error.message, 'fail');
   } finally {
     if (button) { button.disabled = false; button.textContent = prevLabel; }
@@ -296,8 +285,6 @@ function addStageNote(text, cls) {
 function addStageClip(url, sizeMb, warn, data) {
   const wrap = $('stage-clips');
   if (!wrap) return;
-  // Show the GIF itself (it autoplays) plus an async draft-link slot, so the
-  // operator sees the capture immediately and can jump to the draft once ready.
   const card = document.createElement('div');
   card.className = 'stage-clip-card';
   const eventKey = data && data.draft && data.draft.event_key;
@@ -329,12 +316,9 @@ function addStageClip(url, sizeMb, warn, data) {
   card.appendChild(label);
   card.appendChild(draftEl);
   wrap.prepend(card);
-  // Pull the newest capture into view inside the scrollable stage panel.
   card.scrollIntoView({block: 'nearest'});
 }
 
-// Poll the publish status until each pending draft gets an admin link (or fails),
-// then stop. Only runs while the owning match is on stage.
 function startDraftPoll(matchId) {
   if (state.draftPoll && state.draftPoll.matchId === matchId) return;
   stopDraftPoll();
@@ -350,9 +334,7 @@ function refreshDraftLinks(matchId) {
   if (state.stageMatchId !== matchId) { stopDraftPoll(); return; }
   if (state.draftPoll) {
     state.draftPoll.polls += 1;
-    if (state.draftPoll.polls > 90) {  // give up after ~3min (90 × 2s)
-      // Say so instead of freezing on "草稿生成中…": the backend may still be
-      // working, the operator just has to check the console from here on.
+    if (state.draftPoll.polls > 90) {
       document.querySelectorAll('#stage-clips .stage-clip-draft').forEach((draftEl) => {
         if (draftEl.classList.contains('ok') || draftEl.classList.contains('fail')) return;
         draftEl.textContent = '草稿状态未知，请到发文后台查看';
@@ -372,9 +354,6 @@ function refreshDraftLinks(matchId) {
         const rec = data.records[card.dataset.eventKey];
         const draftEl = card.querySelector('.stage-clip-draft');
         if (!rec || !draftEl) { pending += 1; return; }
-        // Both 'drafted' and 'published' are terminal backend statuses (see
-        // TERMINAL_DELIVERY_STATUSES in article_draft_queue.py). draft mode is
-        // the default, so only matching 'published' left its link unreachable.
         if ((rec.status === 'published' || rec.status === 'drafted') && rec.draft_url) {
           const label = rec.status === 'published' ? '打开文章 ↗' : '打开草稿 ↗';
           draftEl.innerHTML = `<a href="${rec.draft_url}" target="_blank" rel="noreferrer">${label}</a>`;
@@ -383,7 +362,6 @@ function refreshDraftLinks(matchId) {
           draftEl.textContent = '草稿失败：' + (rec.error || '未知错误');
           draftEl.className = 'stage-clip-draft fail';
         } else if (rec.status === 'failed') {
-          // Retriable failure: still pending, but say why the wait is long.
           draftEl.textContent = '草稿重试中：' + (rec.error || '未知错误');
           draftEl.className = 'stage-clip-draft';
           pending += 1;
@@ -398,11 +376,8 @@ function refreshDraftLinks(matchId) {
     .catch(() => {});
 }
 
-// Grid-capture drafts are polled by a single shared loop keyed on the
-// pendingDraft marker each tile status line carries. Only one timer runs; it
-// stops itself once every waiting line is resolved or gives up.
 function startTileDraftPoll() {
-  state.tileDraftPolls = 0;  // reset the give-up window on each new capture
+  state.tileDraftPolls = 0;
   if (state.tileDraftTimer) return;
   state.tileDraftTimer = setInterval(refreshTileDraftLinks, 2000);
   refreshTileDraftLinks();
@@ -416,12 +391,11 @@ function refreshTileDraftLinks() {
   const nodes = document.querySelectorAll('.tile-status[data-pending-draft]');
   if (!nodes.length) { stopTileDraftPoll(); return; }
   state.tileDraftPolls += 1;
-  if (state.tileDraftPolls > 90) {  // give up after ~3min, same as the stage poll (90 × 2s)
+  if (state.tileDraftPolls > 90) {
     nodes.forEach((node) => { delete node.dataset.pendingDraft; });
     stopTileDraftPoll();
     return;
   }
-  // Each distinct match only needs one status request per tick.
   const matchIds = new Set();
   nodes.forEach((node) => {
     const tileEl = node.closest('.tile');
@@ -436,8 +410,6 @@ function refreshTileDraftLinks() {
         if (!node) return;
         const rec = data.records[node.dataset.pendingDraft];
         if (!rec) return;
-        // 'drafted' and 'published' are both terminal (TERMINAL_DELIVERY_STATUSES
-        // in article_draft_queue.py); append the admin link to the status line.
         if ((rec.status === 'published' || rec.status === 'drafted') && rec.draft_url) {
           const label = rec.status === 'published' ? '打开文章 ↗' : '打开草稿 ↗';
           const link = document.createElement('a');
@@ -457,8 +429,6 @@ function refreshTileDraftLinks() {
 }
 
 function stageCaptureSeconds() {
-  // Mirror exactly what captureClip() will send: an out-of-range or unparsable
-  // value is dropped there, so the backend falls back to its own default.
   const secondsEl = $('stage-seconds');
   if (secondsEl && secondsEl.value.trim()) {
     const secs = Number(secondsEl.value);
@@ -469,7 +439,6 @@ function stageCaptureSeconds() {
 
 function syncStageCaptureLabel() {
   const button = $('stage-capture');
-  // Leave the transient '截取中…' label alone; captureClip restores it itself.
   if (!button || button.disabled) return;
   button.textContent = `截取最近 ${stageCaptureSeconds()} 秒`;
 }
@@ -477,6 +446,12 @@ function syncStageCaptureLabel() {
 function openStage(matchId) {
   const tile = state.tiles.get(matchId);
   if (!tile || !tile.playlistUrl) { showNotice('该比赛直播还没准备好', 'warning'); return; }
+  const tileEl = document.querySelector(`.tile[data-match-id="${matchId}"]`);
+  const wrap = tileEl ? tileEl.querySelector('.tile-video-wrap') : null;
+  const video = wrap ? wrap.querySelector('.tile-video') : null;
+  const host = $('stage-video-host');
+  if (!video || !host) { showNotice('该比赛直播还没准备好', 'warning'); return; }
+  if (state.stageMatchId && state.stageMatchId !== matchId) closeStage();
   state.stageMatchId = matchId;
   stopDraftPoll();
   const stage = $('stage');
@@ -485,7 +460,6 @@ function openStage(matchId) {
   $('stage-status').textContent = '直播播放中';
   $('stage-status').className = 'stage-status ok';
   $('stage-clips').innerHTML = '';
-  // Reset optional fields so a previous match's name/title never leak over.
   const personInput = $('stage-person');
   const titleInput = $('stage-title-input');
   const secondsInput = $('stage-seconds');
@@ -493,27 +467,193 @@ function openStage(matchId) {
   if (titleInput) titleInput.value = '';
   if (secondsInput) secondsInput.value = '';
   syncStageCaptureLabel();
-  const video = $('stage-video');
-  state.stageHls = attachHls(video, tile.playlistUrl, (text, cls) => {
-    $('stage-status').textContent = text;
-    $('stage-status').className = `stage-status ${cls || ''}`;
-  });
+  state.stageVideoNode = video;
+  state.stageVideoHomeWrap = wrap;
+  video.classList.remove('tile-video');
+  video.classList.add('stage-video');
+  video.setAttribute('controls', '');
+  host.appendChild(video);
+  state.stageHls = video._hls || null;
+  const tileOverlay = wrap.querySelector('.tile-overlay');
+  if (tileOverlay) { tileOverlay.classList.remove('hidden'); tileOverlay.textContent = '已在大窗播放'; }
+  if (!video._hls) {
+    state.stageHls = attachHls(video, tile.playlistUrl, (text, cls) => {
+      $('stage-status').textContent = text;
+      $('stage-status').className = `stage-status ${cls || ''}`;
+    });
+  }
 }
 
 function closeStage() {
   state.stageMatchId = null;
   stopDraftPoll();
-  const video = $('stage-video');
-  if (video._hls) { try { video._hls.destroy(); } catch (e) {} video._hls = null; }
-  try { video.pause(); } catch (e) {}
-  video.removeAttribute('src');
-  try { video.load(); } catch (e) {}
+  const video = state.stageVideoNode;
+  if (video) {
+    video.removeAttribute('controls');
+    video.classList.remove('stage-video');
+    video.classList.add('tile-video');
+    const wrap = state.stageVideoHomeWrap;
+    if (wrap && document.body.contains(wrap)) {
+      wrap.insertBefore(video, wrap.firstChild);
+      const overlay = wrap.querySelector('.tile-overlay');
+      if (overlay) { overlay.classList.add('hidden'); overlay.textContent = '正在连接直播源…'; }
+    } else {
+      if (video._hls) { try { video._hls.destroy(); } catch (e) {} video._hls = null; }
+      video.remove();
+    }
+  }
+  state.stageVideoNode = null;
+  state.stageVideoHomeWrap = null;
+  state.stageHls = null;
   $('stage').classList.add('hidden');
 }
+
+// ---- Two-view workflow ----
+
+function switchView(view) {
+  state.view = view;
+  const isList = view === 'list';
+  $('list-view').classList.toggle('hidden', !isList);
+  $('workshop-view').classList.toggle('hidden', isList);
+  $('workshop-toolbar').classList.toggle('hidden', isList);
+  const ewBtn = $('enter-workshop-btn');
+  if (ewBtn) ewBtn.classList.toggle('hidden', !isList);
+  const listSummary = $('list-summary');
+  if (listSummary) listSummary.classList.toggle('hidden', !isList);
+  if (isList) {
+    renderMatchGrid();
+    updateSelectionUI();
+  } else {
+    const count = state.selectedMatchIds.size;
+    $('workshop-summary').textContent = `正在监看 ${count} 场`;
+  }
+}
+
+function sourceDot(stateVal) {
+  if (stateVal === 'available') return '<span class="source-dot available" title="有直播源"></span>';
+  if (stateVal === 'no_source') return '<span class="source-dot no-source" title="暂无直播源"></span>';
+  if (stateVal === 'error') return '<span class="source-dot error" title="源查询失败"></span>';
+  return '<span class="source-dot unknown" title="未知"></span>';
+}
+
+function sourceLabel(stateVal) {
+  if (stateVal === 'available') return '有源';
+  if (stateVal === 'no_source') return '无源';
+  if (stateVal === 'error') return '查询失败';
+  return '未知';
+}
+
+function renderMatchGrid() {
+  const grid = $('match-grid');
+  if (!grid) return;
+  grid.innerHTML = '';
+  const matches = state.allMatches;
+  // 有源比赛在前，无源在后
+  matches.sort((a, b) => {
+    const aOk = (a.source_state || state.sourceCache[a.match_id] || 'unknown') === 'available';
+    const bOk = (b.source_state || state.sourceCache[b.match_id] || 'unknown') === 'available';
+    return aOk === bOk ? 0 : aOk ? -1 : 1;
+  });
+  const empty = $('list-empty');
+  if (!matches.length) {
+    if (empty) empty.classList.remove('hidden');
+    return;
+  }
+  if (empty) empty.classList.add('hidden');
+  matches.forEach((data) => {
+    const mid = data.match_id;
+    const checked = state.selectedMatchIds.has(mid) ? 'checked' : '';
+    const srcState = data.source_state || state.sourceCache[mid] || 'unknown';
+    const noSource = srcState !== 'available';
+    const card = document.createElement('div');
+    card.className = 'match-card' + (noSource ? ' no-source' : '');
+    card.dataset.matchId = mid;
+    card.innerHTML =
+      `<div class="match-card-check"><input type="checkbox" class="match-checkbox" data-match-id="${escapeHtml(mid)}" ${checked}></div>` +
+      `<div class="match-card-teams">${teamsText(data)}</div>` +
+      `<div class="match-card-meta">${metaText(data)}</div>` +
+      `<div class="match-card-source">${sourceDot(srcState)} <span class="source-label">${escapeHtml(sourceLabel(srcState))}</span></div>`;
+    card.querySelector('.match-checkbox').addEventListener('change', (ev) => {
+      ev.stopPropagation();
+      if (ev.target.checked) {
+        state.selectedMatchIds.add(mid);
+      } else {
+        state.selectedMatchIds.delete(mid);
+      }
+      updateSelectionUI();
+    });
+    card.addEventListener('click', (ev) => {
+      if (ev.target.tagName === 'INPUT') return; // 让 checkbox 自己的 change 事件处理
+      const cb = card.querySelector('.match-checkbox');
+      cb.checked = !cb.checked;
+      if (cb.checked) {
+        state.selectedMatchIds.add(mid);
+      } else {
+        state.selectedMatchIds.delete(mid);
+      }
+      updateSelectionUI();
+    });
+    grid.appendChild(card);
+  });
+  updateSelectionUI();
+}
+
+function updateSelectionUI() {
+  const btn = $('enter-workshop-btn');
+  if (!btn) return;
+  const n = state.selectedMatchIds.size;
+  btn.textContent = n ? `进入工作台 (${n})` : '进入工作台';
+  btn.disabled = n === 0;
+}
+
+function enterWorkshop() {
+  if (state.selectedMatchIds.size === 0) return;
+  // Cancel idle timer if we came back before the 90s deadline.
+  if (state.workshopIdleTimer) { clearTimeout(state.workshopIdleTimer); state.workshopIdleTimer = null; }
+  switchView('workshop');
+  // Feed reconcileTiles only the selected matches (filtered from the full list).
+  const selected = state.allMatches.filter((m) => state.selectedMatchIds.has(m.match_id));
+  reconcileTiles(selected);
+  // Start lag monitoring (once per session).
+  startLagMonitoring();
+}
+
+function leaveWorkshop() {
+  switchView('list');
+  refreshMatches();
+  // Start a 90s idle timer — if the operator doesn't re-enter the workshop
+  // before it fires, tear down all live streams to free resources.
+  if (state.workshopIdleTimer) clearTimeout(state.workshopIdleTimer);
+  state.workshopIdleTimer = setTimeout(teardownAllTiles, WORKSHOP_IDLE_MS);
+}
+
+function teardownAllTiles() {
+  if (state.view !== 'list') return; // operator came back, don't touch
+  state.workshopIdleTimer = null;
+  for (const matchId of Array.from(state.tiles.keys())) {
+    const el = document.querySelector(`.tile[data-match-id="${matchId}"]`);
+    if (el) {
+      const video = el.querySelector('.tile-video');
+      if (video && video._hls) { try { video._hls.destroy(); } catch (e) {} }
+      el.remove();
+    }
+    fetch('api/monitor/preview/stop', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({match_id: matchId}),
+    }).catch(() => {});
+    if (state.stageMatchId === matchId) closeStage();
+    state.tiles.delete(matchId);
+  }
+  $('grid-empty').classList.add('hidden');
+  $('workshop-summary').textContent = '监看已停止';
+}
+
+// ---- reconcileTiles (modified to accept a filtered list) ----
 
 function reconcileTiles(playing) {
   const grid = $('grid');
   const seen = new Set();
+  // In workshop mode, respect the per-process MAX_PREVIEWS cap.
   const limited = playing.slice(0, state.maxPreviews);
   limited.forEach((data) => {
     if (!data.match_id) return;
@@ -531,6 +671,7 @@ function reconcileTiles(playing) {
       if (el) updateTileInfo(el, data);
     }
   });
+  // Remove tiles that are no longer in the selected set.
   for (const matchId of Array.from(state.tiles.keys())) {
     if (seen.has(matchId)) continue;
     const el = document.querySelector(`.tile[data-match-id="${matchId}"]`);
@@ -548,22 +689,40 @@ function reconcileTiles(playing) {
   }
   $('grid-empty').classList.toggle('hidden', state.tiles.size > 0);
   if (state.tiles.size === 0) $('grid-empty').textContent = '当前没有进行中的比赛';
+  $('workshop-summary').textContent = `正在监看 ${state.tiles.size} 场`;
 }
+
+// ---- refreshMatches (split for list vs workshop) ----
 
 async function refreshMatches() {
   const health = $('health');
+  const listSummary = $('list-summary');
   try {
-    const data = await requestJson('api/monitor/matches');
+    const data = await requestJson('api/monitor/matches?with_sources=1');
     state.maxPreviews = data.max_previews || state.maxPreviews;
     state.clipBeforeSeconds = data.clip_before_seconds || state.clipBeforeSeconds;
-    // Keep the two hard-codable labels honest once the backend default is known.
     const subheadSeconds = $('subhead-seconds');
     if (subheadSeconds) subheadSeconds.textContent = String(state.clipBeforeSeconds);
     syncStageCaptureLabel();
     const playing = Array.isArray(data.playing) ? data.playing : [];
-    reconcileTiles(playing);
-    const shown = Math.min(playing.length, state.maxPreviews);
-    $('summary').textContent = `进行中 ${playing.length} 场 · 正在监看 ${shown} 场`;
+
+    if (state.view === 'list') {
+      // Merge source states into cache, then render grid.
+      playing.forEach((m) => {
+        if (m.source_state) state.sourceCache[m.match_id] = m.source_state;
+      });
+      state.allMatches = playing.map((m) => {
+        m.source_state = m.source_state || state.sourceCache[m.match_id] || 'unknown';
+        return m;
+      });
+      renderMatchGrid();
+      if (listSummary) listSummary.textContent = `进行中 ${playing.length} 场`;
+    } else {
+      // Workshop: only keep tiles for the selected matches.
+      const selected = playing.filter((m) => state.selectedMatchIds.has(m.match_id));
+      reconcileTiles(selected);
+    }
+
     const h = data.health || {};
     health.className = `health ${h.state === 'healthy' ? 'ok' : h.state === 'error' ? 'error' : 'loading'}`;
     health.innerHTML = `<i></i>${escapeHtml(h.label || '赛事目录')}`;
@@ -571,18 +730,23 @@ async function refreshMatches() {
   } catch (error) {
     health.className = 'health error';
     health.innerHTML = '<i></i>接口不可用';
+    if (state.view === 'list' && listSummary) listSummary.textContent = '接口不可用';
     showNotice(`无法读取比赛列表：${error.message}`, 'error');
   }
 }
 
-$('refresh-btn').addEventListener('click', refreshMatches);
+// ---- event bindings ----
+
+$('enter-workshop-btn').addEventListener('click', enterWorkshop);
+$('refresh-btn-2').addEventListener('click', refreshMatches);
+$('back-to-list-btn').addEventListener('click', leaveWorkshop);
 $('stage-close').addEventListener('click', closeStage);
 $('stage-capture').addEventListener('click', (ev) => {
   if (state.stageMatchId) captureClip(state.stageMatchId, ev.currentTarget);
 });
 $('stage-seconds').addEventListener('input', syncStageCaptureLabel);
 $('stage-live').addEventListener('click', () => {
-  seekToLive($('stage-video'));
+  if (state.stageVideoNode) seekToLive(state.stageVideoNode);
   $('stage-status').textContent = '已回到直播';
   $('stage-status').className = 'stage-status ok';
 });
@@ -597,10 +761,8 @@ window.addEventListener('beforeunload', () => {
   }
 });
 
-// A stopped ffmpeg (running:false) means the live source died; the browser may
-// still show stale buffered frames, so cover them and say so plainly. The
-// backend keeps auto-restarting (fast retries, then low-frequency probing), so
-// it always phrases as reconnecting — the source self-heals when it comes back.
+// ---- keepAlive ----
+
 function markPreviewDown(matchId, cooling) {
   const tile = state.tiles.get(matchId);
   if (tile) tile.down = true;
@@ -617,38 +779,30 @@ function markPreviewDown(matchId, cooling) {
   }
 }
 
-// The backend restarted ffmpeg and a fresh playlist is ready; re-attach the
-// player (segments reset to seg_00000) and clear the "down" overlay.
 function recoverPreview(matchId) {
   const tile = state.tiles.get(matchId);
   if (!tile) return;
   tile.down = false;
+  const staged = state.stageMatchId === matchId;
   const el = document.querySelector(`.tile[data-match-id="${matchId}"]`);
-  if (el) {
-    const overlay = el.querySelector('.tile-overlay');
-    if (overlay) overlay.classList.add('hidden');
-    const video = el.querySelector('.tile-video');
-    if (video) {
-      attachHls(video, tile.playlistUrl, (text, cls) => {
-        setTileStatus(matchId, text, cls);
-        if (cls === 'fail' && overlay) {
-          overlay.classList.remove('hidden');
-          overlay.textContent = '直播源不可用（源未推流）';
-          // Keep the tile "down" so the next keepAlive poll retries recovery.
-          tile.down = true;
-        }
-      });
-    }
+  const overlay = el ? el.querySelector('.tile-overlay') : null;
+  if (overlay && !staged) overlay.classList.add('hidden');
+  const video = videoForMatch(matchId);
+  if (video) {
+    const hls = attachHls(video, tile.playlistUrl, (text, cls) => {
+      setTileStatus(matchId, text, cls);
+      if (cls === 'fail' && overlay) {
+        overlay.classList.remove('hidden');
+        overlay.textContent = '直播源不可用（源未推流）';
+        tile.down = true;
+      }
+    });
+    if (staged) state.stageHls = hls;
   }
   setTileStatus(matchId, '直播源已恢复', 'ok');
-  if (state.stageMatchId === matchId) {
-    const stageVideo = $('stage-video');
-    if (stageVideo) {
-      state.stageHls = attachHls(stageVideo, tile.playlistUrl, (text, cls) => {
-        $('stage-status').textContent = text;
-        $('stage-status').className = `stage-status ${cls || ''}`;
-      });
-    }
+  if (staged) {
+    $('stage-status').textContent = '直播源已恢复';
+    $('stage-status').className = 'stage-status ok';
     addStageNote('直播源已恢复', 'ok');
   }
 }
@@ -671,11 +825,14 @@ function keepAlivePreviews() {
   }
 }
 
+// ---- init ----
+
 refreshMatches();
 setInterval(refreshMatches, REFRESH_MS);
 setInterval(keepAlivePreviews, 8000);
 
-// ---- Real-time goal/red-card alerts (fed by the external push monitor) ----
+// ---- Real-time goal/red-card alerts (unchanged) ----
+
 const ALERT_POLL_MS = 3000;
 
 function alertWho(ev) {
@@ -708,8 +865,6 @@ function clearAlertBadge() {
   if (badge) { badge.textContent = '0'; badge.classList.add('hidden'); }
 }
 
-// The panel is collapsed by default so it never covers the clickable grid.
-// Opening it is a deliberate action, so a brief overlap is acceptable.
 function openAlertPanel() {
   const panel = $('alert-panel');
   const launcher = $('alert-launcher');
@@ -727,12 +882,8 @@ function closeAlertPanel() {
   state.alertPanelOpen = false;
 }
 
-// Clicking an alert takes the operator to that match: enlarge it if its preview
-// is ready, otherwise scroll it into view and flash it so they can start one.
-// The badge is only cleared when the panel is opened (= the whole list is seen);
-// locating one match from a toast must not zero out the other unread alerts.
 function locateMatch(matchId) {
-  closeAlertPanel();  // collapse so the panel never covers the tile/stage it points to
+  closeAlertPanel();
   const tile = state.tiles.get(matchId);
   const el = document.querySelector(`.tile[data-match-id="${matchId}"]`);
   if (tile && tile.playlistUrl) { openStage(matchId); return; }
@@ -749,7 +900,7 @@ function flashTile(matchId) {
   const el = document.querySelector(`.tile[data-match-id="${matchId}"]`);
   if (!el) return;
   el.classList.remove('alert-flash');
-  void el.offsetWidth;  // restart the animation if it is already running
+  void el.offsetWidth;
   el.classList.add('alert-flash');
   setTimeout(() => el.classList.remove('alert-flash'), 2100);
 }
@@ -796,9 +947,11 @@ function showToast(ev) {
 }
 
 function pushAlert(ev) {
+  // 只推送已勾选比赛的提醒
+  if (!state.selectedMatchIds.has(ev.match_id)) return;
   addAlertItem(ev);
   showToast(ev);
-  if (!state.alertPanelOpen) bumpAlertBadge();  // only count what the operator hasn't seen
+  if (!state.alertPanelOpen) bumpAlertBadge();
   flashTile(ev.match_id);
 }
 
@@ -807,18 +960,14 @@ async function pollAlerts() {
   try {
     data = await requestJson(`api/monitor/events?since=${state.alertSeq}`);
   } catch (error) {
-    return;  // transient; next tick retries
+    return;
   }
-  // First successful poll only establishes the baseline cursor so a freshly
-  // opened page does not replay every buffered alert as a flurry of toasts.
   if (!state.alertInit) {
     state.alertSeq = data.seq || 0;
     state.alertBootId = data.boot_id || null;
     state.alertInit = true;
     return;
   }
-  // 8901 restarted (its in-memory seq reset to 0): re-baseline the cursor to the
-  // new seq instead of staying stuck behind a cursor that can never be reached.
   if (data.boot_id && data.boot_id !== state.alertBootId) {
     state.alertSeq = data.seq || 0;
     state.alertBootId = data.boot_id;
@@ -834,6 +983,47 @@ async function pollAlerts() {
 
 $('alert-launcher').addEventListener('click', openAlertPanel);
 $('alert-close').addEventListener('click', closeAlertPanel);
+
+// ---- Lag monitoring for diagnostics ----
+let lagMonitoringStarted = false;
+
+function startLagMonitoring() {
+  if (lagMonitoringStarted) return;
+  lagMonitoringStarted = true;
+
+  console.log('[LAG-MONITOR] 滞后监控已启动，每 5 秒记录一次');
+
+  setInterval(() => {
+    const tiles = document.querySelectorAll('.tile[data-match-id]');
+
+    tiles.forEach(tile => {
+      const matchId = tile.dataset.matchId;
+      const video = tile.querySelector('.tile-video');
+
+      if (!video || !video._hls) return;
+
+      // 没有 PDT 时间戳的流算不出滞后，显示 N/A 以便区分"滞后小"和"无法测量"
+      const anchorMs = frameAnchorMs(video);
+      const lagSeconds = anchorMs
+        ? `${Math.round((Date.now() - anchorMs) / 1000)}s`
+        : 'N/A(无PDT)';
+
+      const buffered = video.buffered;
+      const bufferedEnd = buffered.length > 0 ? buffered.end(buffered.length - 1) : 0;
+      const bufferedAhead = Math.round(bufferedEnd - video.currentTime);
+
+      const videoState = video.paused ? 'PAUSED' :
+                         (video.readyState < 3 ? 'BUFFERING' : 'PLAYING');
+      const pageVisible = document.hidden ? '后台' : '前台';
+
+      console.log(
+        `[LAG] ${matchId} | 滞后 ${lagSeconds} | ` +
+        `状态 ${videoState} | 标签页 ${pageVisible} | ` +
+        `缓冲前瞻 ${bufferedAhead}s`
+      );
+    });
+  }, 5000);
+}
 
 pollAlerts();
 setInterval(pollAlerts, ALERT_POLL_MS);
