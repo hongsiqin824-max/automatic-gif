@@ -577,6 +577,12 @@ async function setRangeStart() {
       method: 'POST', body: JSON.stringify({match_id: matchId, start_epoch_ms: Math.round(startMs)}),
     });
     if (data.max_range_seconds) state.clipRangeMaxSeconds = data.max_range_seconds;
+    // The stage may have been closed or switched while the request was in
+    // flight; do not attach a pin of another match (or no match) to the state.
+    if (state.stageMatchId !== matchId) {
+      fetch(`api/monitor/clip/pin/${encodeURIComponent(data.pin_id)}`, {method: 'DELETE'}).catch(() => {});
+      return;
+    }
     state.range = {
       matchId,
       pinId: data.pin_id,

@@ -665,6 +665,37 @@ class _ClipPinStore:
         self._pins: dict[str, dict[str, Any]] = {}
         self.ttl_seconds = ttl_seconds
         self.max_range_seconds = max_range_seconds
+        self._stop = threading.Event()
+        self._reaper: threading.Thread | None = None
+
+    @staticmethod
+    def sweep_orphans(root: Path) -> int:
+        """Delete ``.pin_*`` dirs left by a previous process (SIGKILL/OOM skip atexit)."""
+        removed = 0
+        if not root.is_dir():
+            return removed
+        for link_dir in root.glob("*/.pin_*"):
+            if link_dir.is_dir():
+                shutil.rmtree(link_dir, ignore_errors=True)
+                removed += 1
+        return removed
+
+    def expire(self) -> None:
+        with self._lock:
+            self._expire_locked(time.time())
+
+    def start_reaper(self, interval_seconds: float | None = None) -> None:
+        """Expire pins on a timer so an abandoned start does not live until exit."""
+        if self._reaper is not None:
+            return
+        interval = max(1.0, interval_seconds if interval_seconds is not None else self.ttl_seconds)
+
+        def _run() -> None:
+            while not self._stop.wait(interval):
+                self.expire()
+
+        self._reaper = threading.Thread(target=_run, name="clip-pin-reaper", daemon=True)
+        self._reaper.start()
 
     def _expire_locked(self, now: float) -> None:
         for pin_id in [k for k, p in self._pins.items() if now - p["created_at"] > self.ttl_seconds]:
@@ -745,6 +776,7 @@ class _ClipPinStore:
             self._drop_locked(pin_id)
 
     def shutdown(self) -> None:
+        self._stop.set()
         with self._lock:
             for pin_id in list(self._pins):
                 self._drop_locked(pin_id)
@@ -752,6 +784,11 @@ class _ClipPinStore:
 
 clip_pins = _ClipPinStore(CLIP_PIN_TTL_SECONDS, CLIP_RANGE_MAX_SECONDS)
 atexit.register(clip_pins.shutdown)
+# Pins from a previous process are useless (their ids are gone); sweep the
+# hard-link dirs a crash left behind, then keep expiring on a timer so a start
+# the operator abandoned is freed within one TTL instead of at process exit.
+_ClipPinStore.sweep_orphans(CLIP_OUTPUT_ROOT)
+clip_pins.start_reaper()
 
 
 @app.get("/")

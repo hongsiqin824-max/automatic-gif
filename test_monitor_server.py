@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -207,6 +208,41 @@ class ClipPinStoreTests(unittest.TestCase):
             with mock.patch.object(monitor_server.time, "time", return_value=pin["created_at"] + 6.0):
                 self.assertIsNone(store.get(pin["pin_id"], "1"))
             self.assertFalse(pin["link_dir"].exists())
+
+    def test_reaper_expires_pin_without_any_request(self):
+        # A start the operator abandons must be freed by the timer, not wait
+        # for the next create/get or for process exit.
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            segments = self._segments(directory, 1_000_000.0, 4)
+            store = monitor_server._ClipPinStore(ttl_seconds=0.05, max_range_seconds=10.0)
+            with mock.patch.object(monitor_server, "_clip_dir", return_value=directory / "clips"):
+                pin = store.create("1", 1_000_002.0, segments)
+            self.assertTrue(pin["link_dir"].exists())
+            store.start_reaper(interval_seconds=0.01)
+            try:
+                deadline = time.time() + 2.0
+                while pin["link_dir"].exists() and time.time() < deadline:
+                    time.sleep(0.01)
+                self.assertFalse(pin["link_dir"].exists())
+            finally:
+                store.shutdown()
+
+    def test_sweep_orphans_removes_leftover_pin_dirs_only(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            orphan = root / "54622319" / ".pin_deadbeef"
+            orphan.mkdir(parents=True)
+            (orphan / "seg_00001.ts").write_bytes(b"x")
+            keep_gif = root / "54622319" / "clip.gif"
+            keep_gif.write_bytes(b"GIF")
+            other_dir = root / "54622319" / "not_a_pin"
+            other_dir.mkdir()
+            self.assertEqual(monitor_server._ClipPinStore.sweep_orphans(root), 1)
+            self.assertFalse(orphan.exists())
+            self.assertTrue(keep_gif.exists())
+            self.assertTrue(other_dir.exists())
+            self.assertEqual(monitor_server._ClipPinStore.sweep_orphans(root / "missing"), 0)
 
 
 class ClipRangeEndpointTests(unittest.TestCase):
@@ -922,6 +958,20 @@ class ClipAlertMatchTests(unittest.TestCase):
         self.assertEqual(result["score"], "1-0")
         self.assertEqual(result["code"], "G")
         self.assertTrue(result["ambiguous"])
+
+    def test_exact_tie_picks_older_alert_and_is_ambiguous(self):
+        # Both candidates sit exactly 100s from the expected offset. for_match
+        # returns oldest first and min() keeps the first minimum, so the older
+        # alert wins deterministically; the zero gap must be flagged ambiguous.
+        self._add(1000.0, score="1-0", minute="1H 23")
+        self._add(1200.0, score="2-0", minute="1H 27")
+        result = monitor_server._match_clip_alert("54622319", 1100.0)
+        self.assertEqual(result["candidate_deltas"], [-100.0, 100.0])
+        self.assertEqual(result["alert_seq"], 1)
+        self.assertEqual(result["score"], "1-0")
+        self.assertEqual(result["delta_seconds"], -100.0)
+        self.assertTrue(result["ambiguous"])
+        self.assertFalse(result["weak"])
 
     def test_red_card_alert_sets_rc_code(self):
         self._add(1000.0, event_type="red_card", score="0-0", minute="1H 30")
