@@ -794,8 +794,10 @@ class ClipAlertMatchTests(unittest.TestCase):
         self._patches = [
             mock.patch.object(monitor_server, "alert_store", self.store),
             mock.patch.object(monitor_server, "ALERT_MATCH_LOOKBACK_SECONDS", 600.0),
-            mock.patch.object(monitor_server, "ALERT_MATCH_LOOKAHEAD_SECONDS", 30.0),
+            mock.patch.object(monitor_server, "ALERT_MATCH_LOOKAHEAD_SECONDS", 180.0),
+            mock.patch.object(monitor_server, "ALERT_MATCH_EXPECTED_OFFSET_SECONDS", 0.0),
             mock.patch.object(monitor_server, "ALERT_MATCH_AMBIGUOUS_SECONDS", 180.0),
+            mock.patch.object(monitor_server, "ALERT_MATCH_WEAK_SECONDS", 240.0),
             mock.patch.object(
                 monitor_server.match_catalog,
                 "snapshot",
@@ -830,12 +832,12 @@ class ClipAlertMatchTests(unittest.TestCase):
         self.assertEqual(parts("HT"), ("", ""))
         self.assertEqual(parts(None), ("", ""))
 
-    def test_picks_newest_alert_before_anchor(self):
+    def test_picks_alert_closest_to_anchor(self):
         self._add(1000.0, score="1-0", minute="1H 23")
         self._add(1300.0, score="2-0", minute="2H 55")
-        # Operator clips ~90s after the second goal (live delay). Both goals are
-        # inside the 600s lookback; the newest one wins and the gap (300s) is
-        # wide enough not to count as ambiguous.
+        # Operator clips ~90s after the second push. Both goals are inside the
+        # 600s lookback; the one closest to the frame wins and the runner-up is
+        # 300s farther, so it is neither ambiguous nor weak.
         result = monitor_server._match_clip_alert("54622319", 1390.0)
         self.assertEqual(result["mode"], "alert")
         self.assertEqual(result["score"], "2-0")
@@ -843,6 +845,50 @@ class ClipAlertMatchTests(unittest.TestCase):
         self.assertEqual(result["alert_seq"], 2)
         self.assertEqual(result["candidates"], 2)
         self.assertFalse(result["ambiguous"])
+        self.assertFalse(result["weak"])
+        self.assertEqual(result["delta_seconds"], -90.0)
+        self.assertEqual(result["candidate_deltas"], [-390.0, -90.0])
+
+    def test_closest_beats_newest_when_push_lands_after_frame(self):
+        # Push for the clipped goal arrived 50s before the frame; a later goal's
+        # push is 150s after it. "Newest" would pick the later goal wrongly.
+        self._add(1000.0, score="1-0", minute="1H 23")
+        self._add(1200.0, score="2-0", minute="1H 27")
+        result = monitor_server._match_clip_alert("54622319", 1050.0)
+        self.assertEqual(result["score"], "1-0")
+        self.assertEqual(result["alert_seq"], 1)
+        self.assertEqual(result["candidates"], 2)
+        self.assertTrue(result["ambiguous"])
+
+    def test_push_slower_than_frame_is_still_matched(self):
+        # Push delay exceeds the live delay: the alert lands 120s after the
+        # frame's PDT. The old +30s lookahead would have dropped it.
+        self._add(1120.0, score="1-0", minute="1H 23")
+        result = monitor_server._match_clip_alert("54622319", 1000.0)
+        self.assertEqual(result["mode"], "alert")
+        self.assertEqual(result["score"], "1-0")
+        self.assertEqual(result["delta_seconds"], 120.0)
+        self.assertFalse(result["weak"])
+
+    def test_only_stale_previous_goal_is_flagged_weak(self):
+        # The push for the goal being clipped has not arrived; the only
+        # candidate is the previous goal 400s earlier. We still fill it (no
+        # waiting) but flag it so the operator verifies.
+        self._add(1000.0, score="1-0", minute="1H 23")
+        result = monitor_server._match_clip_alert("54622319", 1400.0)
+        self.assertEqual(result["mode"], "alert")
+        self.assertEqual(result["score"], "1-0")
+        self.assertTrue(result["weak"])
+        self.assertFalse(result["ambiguous"])
+        self.assertEqual(result["delta_seconds"], -400.0)
+
+    def test_expected_offset_shifts_the_pick(self):
+        self._add(1000.0, score="1-0", minute="1H 23")
+        self._add(1100.0, score="2-0", minute="1H 25")
+        with mock.patch.object(monitor_server, "ALERT_MATCH_EXPECTED_OFFSET_SECONDS", -100.0):
+            result = monitor_server._match_clip_alert("54622319", 1100.0)
+        self.assertEqual(result["score"], "1-0")
+        self.assertEqual(result["delta_seconds"], -100.0)
 
     def test_first_goal_clip_ignores_later_goal(self):
         self._add(1000.0, score="1-0", minute="1H 23")
@@ -950,6 +996,7 @@ class ClipEndpointAlertMatchTests(unittest.TestCase):
         self.assertEqual(data["alert_match"]["mode"], "alert")
         self.assertEqual(data["alert_match"]["match_time"], "68")
         self.assertEqual(data["alert_match"]["score"], "1-1")
+        self.assertFalse(data["alert_match"]["weak"])
         event = self.queue.enqueue.call_args.kwargs["event"]
         self.assertEqual(event["minute"], "68")
         self.assertEqual(event["score"], "1-1")

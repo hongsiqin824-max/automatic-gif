@@ -375,7 +375,11 @@ function alertMatchNote(am) {
   if (!am || !am.mode) return '';
   const clock = [am.match_time ? `${am.match_time}'` : '', am.score || ''].filter(Boolean).join(' ');
   if (am.mode === 'alert') {
-    const flag = am.ambiguous ? '（候选多条，请核对）' : '';
+    const flag = am.weak
+      ? '（⚠ 可信度低，这个球的推送可能还没到，请核对）'
+      : am.ambiguous
+      ? '（候选多条，请核对）'
+      : '';
     return ` · 已关联提醒 ${clock}${flag}`;
   }
   if (am.mode === 'catalog') return ` · 未匹配提醒，用当前比分 ${clock}`;

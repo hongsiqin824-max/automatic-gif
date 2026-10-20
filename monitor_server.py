@@ -122,12 +122,23 @@ ALERT_BUFFER_SIZE = positive_env_int("GIF_MONITOR_ALERT_BUFFER", 500)
 # A relative path is anchored to the repo, not the process cwd (systemd differs).
 _alert_db_env = os.environ.get("GIF_MONITOR_ALERT_DB_PATH", "data/monitor_alerts.sqlite3").strip()
 ALERT_DB_PATH = str(ROOT / _alert_db_env) if _alert_db_env and not os.path.isabs(_alert_db_env) else _alert_db_env
-# Clip→alert matching window: the operator clips after the live delay (~1-2 min)
-# plus reaction time, so look back generously but never ahead of the frame.
+# Clip→alert matching window. The clip anchor is the frame's PROGRAM-DATE-TIME,
+# i.e. the server wall clock when ffmpeg sliced it, so ``alert.ts_unix - anchor``
+# is (push delay − live delay) and its sign is not known up front: the push may
+# land before or after the frame. Look generously on both sides and pick the
+# alert closest to ``anchor + EXPECTED_OFFSET`` rather than the newest one.
 ALERT_MATCH_LOOKBACK_SECONDS = positive_env_float("GIF_MONITOR_ALERT_MATCH_LOOKBACK_SECONDS", 600.0)
-ALERT_MATCH_LOOKAHEAD_SECONDS = positive_env_float("GIF_MONITOR_ALERT_MATCH_LOOKAHEAD_SECONDS", 30.0)
-# Two candidate alerts closer than this are flagged ambiguous in the clip log.
+ALERT_MATCH_LOOKAHEAD_SECONDS = positive_env_float("GIF_MONITOR_ALERT_MATCH_LOOKAHEAD_SECONDS", 180.0)
+# Expected ``ts_unix - anchor`` (seconds, may be negative). 0 until measured from
+# the ``delta_seconds`` field in ``monitor_clip`` logs.
+ALERT_MATCH_EXPECTED_OFFSET_SECONDS = float(os.environ.get("GIF_MONITOR_ALERT_MATCH_EXPECTED_OFFSET_SECONDS", "0") or 0)
+# Runner-up closer than this to the best pick (in |delta − expected| space) is
+# flagged ambiguous in the clip log / page.
 ALERT_MATCH_AMBIGUOUS_SECONDS = positive_env_float("GIF_MONITOR_ALERT_MATCH_AMBIGUOUS_SECONDS", 180.0)
+# Best pick farther than this from the expected offset is flagged weak: most
+# likely the push for the clipped goal has not arrived yet and we picked the
+# previous one, so the operator should verify match_time/match_score.
+ALERT_MATCH_WEAK_SECONDS = positive_env_float("GIF_MONITOR_ALERT_MATCH_WEAK_SECONDS", 240.0)
 EVENT_CN = {"goal": "进球", "red_card": "红牌", "corner": "角球"}
 
 
@@ -929,14 +940,18 @@ def _match_clip_alert(match_id: str, anchor_epoch: float) -> dict[str, Any]:
     """Pick the alert a clip most likely captures, or fall back to the catalog clock.
 
     Rule: among this match's alerts inside ``[anchor - lookback, anchor + lookahead]``
-    take the newest. The clipped frame is behind real time by the live delay,
-    while the push alert arrives seconds after the real event, so the newest
-    alert at or before the frame is the one the operator is looking at. Two
-    candidates closer than ``ALERT_MATCH_AMBIGUOUS_SECONDS`` are flagged so the
-    log can tell how often the auto-pick is uncertain.
+    take the one whose ``ts_unix - anchor`` is closest to
+    ``ALERT_MATCH_EXPECTED_OFFSET_SECONDS``. The anchor is the frame's PDT (server
+    wall clock at slicing), so the delta is push delay minus live delay and may
+    be of either sign; "newest" would silently pick the previous goal whenever
+    the push for the clipped goal is still on its way. ``ambiguous`` marks a
+    runner-up within ``ALERT_MATCH_AMBIGUOUS_SECONDS`` of the pick; ``weak``
+    marks a pick farther than ``ALERT_MATCH_WEAK_SECONDS`` from the expected
+    offset so the page can ask the operator to verify.
 
     Returns ``{"mode": "alert"|"catalog"|"none", "minute", "minute_extra",
-    "score", "code", "candidates", "ambiguous", "alert_seq", "alert_minute"}``.
+    "score", "code", "team", "candidates", "ambiguous", "weak", "alert_seq",
+    "alert_minute", "delta_seconds", "candidate_deltas"}``.
     """
     result: dict[str, Any] = {
         "mode": "none",
@@ -947,8 +962,11 @@ def _match_clip_alert(match_id: str, anchor_epoch: float) -> dict[str, Any]:
         "team": "",
         "candidates": 0,
         "ambiguous": False,
+        "weak": False,
         "alert_seq": None,
         "alert_minute": None,
+        "delta_seconds": None,
+        "candidate_deltas": [],
     }
     candidates = alert_store.for_match(
         match_id,
@@ -957,10 +975,14 @@ def _match_clip_alert(match_id: str, anchor_epoch: float) -> dict[str, Any]:
     )
     result["candidates"] = len(candidates)
     if candidates:
-        chosen = candidates[-1]
+        deltas = [float(item.get("ts_unix") or 0.0) - anchor_epoch for item in candidates]
+        result["candidate_deltas"] = [round(delta, 1) for delta in deltas]
+        distances = [abs(delta - ALERT_MATCH_EXPECTED_OFFSET_SECONDS) for delta in deltas]
+        best = min(range(len(candidates)), key=distances.__getitem__)
+        chosen = candidates[best]
         if len(candidates) >= 2:
-            gap = float(chosen.get("ts_unix") or 0.0) - float(candidates[-2].get("ts_unix") or 0.0)
-            result["ambiguous"] = gap < ALERT_MATCH_AMBIGUOUS_SECONDS
+            runner_up = min(d for i, d in enumerate(distances) if i != best)
+            result["ambiguous"] = runner_up - distances[best] < ALERT_MATCH_AMBIGUOUS_SECONDS
         minute, extra = _alert_minute_parts(chosen.get("minute"))
         side = str(chosen.get("team") or "").upper()
         result.update(
@@ -974,6 +996,8 @@ def _match_clip_alert(match_id: str, anchor_epoch: float) -> dict[str, Any]:
                 "team": side if side in {"A", "B"} else "",
                 "alert_seq": chosen.get("seq"),
                 "alert_minute": chosen.get("minute"),
+                "delta_seconds": round(deltas[best], 1),
+                "weak": distances[best] > ALERT_MATCH_WEAK_SECONDS,
             }
         )
         return result
@@ -1339,6 +1363,9 @@ def monitor_clip():
                     "mode": alert_match["mode"],
                     "candidates": alert_match["candidates"],
                     "ambiguous": alert_match["ambiguous"],
+                    "weak": alert_match["weak"],
+                    "delta_seconds": alert_match["delta_seconds"],
+                    "candidate_deltas": alert_match["candidate_deltas"],
                     "alert_seq": alert_match["alert_seq"],
                     "alert_minute": alert_match["alert_minute"],
                     "minute": alert_match["minute"],
@@ -1413,6 +1440,7 @@ def monitor_clip():
                 "mode": alert_match["mode"],
                 "candidates": alert_match["candidates"],
                 "ambiguous": alert_match["ambiguous"],
+                "weak": alert_match["weak"],
                 "match_time": (
                     f"{alert_match['minute']}+{alert_match['minute_extra']}"
                     if alert_match["minute"] and alert_match["minute_extra"] not in ("", "0")
