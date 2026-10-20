@@ -134,6 +134,26 @@ class ArticleDraftQueueTests(unittest.TestCase):
         self.assertEqual(decision["reason_code"], "trusted_ocr_complete")
         self.assertTrue(decision["reason"])
 
+    def test_records_by_source_name_keys_on_gif_basename(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = self.write_source(root)
+            queue = self.make_queue(root, SequencePlatformClient())
+            self.enqueue(
+                queue,
+                match_id="54478914",
+                event=self.event(),
+                match_detail={"team_A_name": "主队"},
+                source_path=source,
+            )
+            by_name = queue.records_by_source_name("54478914")
+            self.assertEqual(list(by_name), ["goal_ocr.gif"])
+            self.assertEqual(by_name["goal_ocr.gif"]["event_key"], self.event()["event_key"])
+            self.assertNotIn("source_path", by_name["goal_ocr.gif"])
+            # Other matches / kinds are not mixed in.
+            self.assertEqual(queue.records_by_source_name("99999999"), {})
+            self.assertEqual(queue.records_by_source_name("54478914", artifact_kind="other"), {})
+
     def test_publication_gate_allows_small_leading_edge_truncation(self):
         decision = ocr_publication_eligibility(
             self.publication_result(

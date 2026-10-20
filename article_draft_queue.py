@@ -899,6 +899,35 @@ class ArticleDraftQueue:
             records.setdefault(str(row["event_key"]), _public_task(row))
         return records
 
+    def records_by_source_name(
+        self, match_id: str, artifact_kind: str = OCR_ARTIFACT_KIND
+    ) -> dict[str, dict[str, Any]]:
+        """Like ``records_for_match`` but keyed by the source file's basename.
+
+        Lets a caller that only has the artifact on disk (a GIF filename) find
+        its delivery record; the public record has no ``source_path`` field.
+        """
+        if not self.database_path.exists():
+            return {}
+        try:
+            with self._connect() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT * FROM article_delivery_tasks
+                    WHERE match_id = ? AND artifact_kind = ? AND delivery_mode = ?
+                    ORDER BY updated_at_unix DESC
+                    """,
+                    (str(match_id), artifact_kind, DRAFT_DELIVERY_MODE),
+                ).fetchall()
+        except sqlite3.Error:
+            return {}
+        records: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            name = Path(str(row["source_path"] or "")).name
+            if name:
+                records.setdefault(name, _public_task(row))
+        return records
+
     def refresh_event(
         self,
         *,

@@ -125,6 +125,331 @@ class ClipWindowSelectionTests(unittest.TestCase):
         self.assertAlmostEqual(window, 15.0)
         self.assertGreaterEqual(sum(s[1] for s in kept), 15.0)
 
+    def test_explicit_start_overrides_before_seconds(self):
+        base = 1_000_000.0
+        segments = self._segments(base, 10)  # covers [base, base+20)
+        start, end = base + 3.0, base + 11.5
+        kept, start_offset, window = _select_clip_window(
+            segments, 99.0, anchor_epoch=end, start_epoch=start
+        )
+        self.assertAlmostEqual(kept[0][2] + start_offset, start)
+        self.assertAlmostEqual(window, 8.5)
+        # Exactly the segments overlapping [start, end): seg 1..5.
+        self.assertEqual([s[0].name for s in kept], [f"seg_{i:05d}.ts" for i in range(1, 6)])
+
+    def test_explicit_start_after_anchor_collapses_to_tail(self):
+        base = 1_000_000.0
+        segments = self._segments(base, 10)
+        kept, start_offset, window = _select_clip_window(
+            segments, 10.0, anchor_epoch=base + 5.0, start_epoch=base + 9.0
+        )
+        # Degenerate range must still yield a positive, bounded window.
+        self.assertGreater(window, 0)
+        self.assertLessEqual(window, 10.0)
+
+
+class ClipPinStoreTests(unittest.TestCase):
+    def _segments(self, directory: Path, base: float, count: int):
+        segments = []
+        for i in range(count):
+            path = directory / f"seg_{i:05d}.ts"
+            path.write_bytes(b"x" * 16)
+            segments.append((path, 2.0, base + i * 2.0))
+        return segments
+
+    def test_pin_hard_links_start_region_and_survives_deletion(self):
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            base = 1_000_000.0
+            segments = self._segments(directory, base, 20)  # [base, base+40)
+            store = monitor_server._ClipPinStore(ttl_seconds=60.0, max_range_seconds=10.0)
+            with mock.patch.object(monitor_server, "_clip_dir", return_value=directory / "clips"):
+                pin = store.create("1", base + 6.0, segments)
+            # Pinned: segments overlapping [start-1, start+max_range+2] = [5, 18] → seg 2..8.
+            self.assertEqual(sorted(pin["segments"]), [f"seg_{i:05d}.ts" for i in range(2, 9)])
+            for path, _d, _p in segments:
+                path.unlink()
+            merged = store.merged_segments(pin, [])
+            self.assertEqual(len(merged), 7)
+            for path, _d, _p in merged:
+                self.assertTrue(path.is_file(), path)
+            store.release(pin["pin_id"])
+            self.assertFalse(pin["link_dir"].exists())
+
+    def test_pin_absorbs_segments_that_appear_later(self):
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            base = 1_000_000.0
+            early = self._segments(directory, base, 4)  # [base, base+8)
+            store = monitor_server._ClipPinStore(ttl_seconds=60.0, max_range_seconds=10.0)
+            with mock.patch.object(monitor_server, "_clip_dir", return_value=directory / "clips"):
+                pin = store.create("1", base + 6.0, early)
+            self.assertEqual(sorted(pin["segments"]), ["seg_00002.ts", "seg_00003.ts"])
+            later = self._segments(directory, base, 12)  # now [base, base+24)
+            merged = store.merged_segments(pin, later)
+            # Newly arrived seg 4..8 fall inside the pin window and are linked.
+            self.assertIn("seg_00008.ts", pin["segments"])
+            self.assertNotIn("seg_00009.ts", pin["segments"])
+            self.assertEqual([s[2] for s in merged], [base + i * 2.0 for i in range(12)])
+            store.shutdown()
+
+    def test_pin_expires_after_ttl(self):
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            segments = self._segments(directory, 1_000_000.0, 4)
+            store = monitor_server._ClipPinStore(ttl_seconds=5.0, max_range_seconds=10.0)
+            with mock.patch.object(monitor_server, "_clip_dir", return_value=directory / "clips"):
+                pin = store.create("1", 1_000_002.0, segments)
+            self.assertIsNotNone(store.get(pin["pin_id"], "1"))
+            self.assertIsNone(store.get(pin["pin_id"], "other-match"))
+            with mock.patch.object(monitor_server.time, "time", return_value=pin["created_at"] + 6.0):
+                self.assertIsNone(store.get(pin["pin_id"], "1"))
+            self.assertFalse(pin["link_dir"].exists())
+
+
+class ClipRangeEndpointTests(unittest.TestCase):
+    """Pin + range clip over the Flask API with a fake playlist on disk."""
+
+    def setUp(self):
+        self.client = monitor_server.app.test_client()
+        self.tmp = TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.base = 1_700_000_000.0
+        self.segments = []
+        lines = ["#EXTM3U", "#EXT-X-TARGETDURATION:2"]
+        for i in range(10):
+            path = self.dir / f"seg_{i:05d}.ts"
+            path.write_bytes(b"x")
+            pdt = self.base + i * 2.0
+            iso = monitor_server.datetime.fromtimestamp(pdt).astimezone().isoformat(timespec="milliseconds")
+            lines += [f"#EXT-X-PROGRAM-DATE-TIME:{iso}", "#EXTINF:2.000,", path.name]
+        (self.dir / "index.m3u8").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        self.store = monitor_server._ClipPinStore(60.0, 30.0)
+        self._patches = [
+            mock.patch.object(monitor_server, "clip_pins", self.store),
+            mock.patch.object(monitor_server, "manual_draft_queue", None),
+            mock.patch.object(monitor_server, "CLIP_RANGE_MAX_SECONDS", 30.0),
+            mock.patch.object(monitor_server, "_clip_dir", return_value=self.dir / "clips"),
+            mock.patch.object(monitor_server.live_preview, "status", return_value={"running": True}),
+            mock.patch.object(monitor_server.live_preview, "media_dir", return_value=self.dir),
+            mock.patch.object(monitor_server, "_encode_clip_gif", side_effect=self._fake_encode),
+        ]
+        for patch in self._patches:
+            patch.start()
+        self.encode_calls = []
+
+    def tearDown(self):
+        for patch in self._patches:
+            patch.stop()
+        self.store.shutdown()
+        self.tmp.cleanup()
+
+    def _fake_encode(self, segments, before_seconds, output_path, anchor_epoch=None, start_epoch=None):
+        self.encode_calls.append((before_seconds, anchor_epoch, start_epoch))
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"GIF")
+
+    def _pin(self, start_offset: float):
+        return self.client.post(
+            "/api/monitor/clip/pin",
+            json={"match_id": "54622319", "start_epoch_ms": round((self.base + start_offset) * 1000)},
+        )
+
+    def test_pin_then_range_clip_passes_start_and_end(self):
+        pinned = self._pin(4.0)
+        self.assertEqual(pinned.status_code, 200, pinned.get_json())
+        pin_id = pinned.get_json()["pin_id"]
+        response = self.client.post(
+            "/api/monitor/clip",
+            json={"match_id": "54622319", "pin_id": pin_id, "end_epoch_ms": round((self.base + 12.5) * 1000)},
+        )
+        self.assertEqual(response.status_code, 200, response.get_json())
+        before, anchor, start = self.encode_calls[-1]
+        self.assertAlmostEqual(start, self.base + 4.0, places=3)
+        self.assertAlmostEqual(anchor, self.base + 12.5, places=3)
+        self.assertAlmostEqual(before, 8.5, places=3)
+        # Pin is released after a successful clip.
+        self.assertIsNone(self.store.get(pin_id, "54622319"))
+
+    def test_range_longer_than_max_is_rejected(self):
+        pin_id = self._pin(0.0).get_json()["pin_id"]
+        response = self.client.post(
+            "/api/monitor/clip",
+            json={"match_id": "54622319", "pin_id": pin_id, "end_epoch_ms": round((self.base + 31.0) * 1000)},
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.get_json()["code"], "range_too_long")
+        self.assertEqual(self.encode_calls, [])
+        # Pin stays alive so the operator can pick a shorter end.
+        self.assertIsNotNone(self.store.get(pin_id, "54622319"))
+
+    def test_end_before_start_is_rejected(self):
+        pin_id = self._pin(10.0).get_json()["pin_id"]
+        response = self.client.post(
+            "/api/monitor/clip",
+            json={"match_id": "54622319", "pin_id": pin_id, "end_epoch_ms": round((self.base + 9.0) * 1000)},
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.get_json()["code"], "range_invalid")
+
+    def test_unknown_pin_is_rejected(self):
+        response = self.client.post(
+            "/api/monitor/clip",
+            json={"match_id": "54622319", "pin_id": "nope", "end_epoch_ms": round((self.base + 9.0) * 1000)},
+        )
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.get_json()["code"], "pin_expired")
+
+    def test_pin_start_outside_buffer_is_rejected(self):
+        response = self._pin(-30.0)
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.get_json()["code"], "anchor_out_of_buffer")
+
+    def test_delete_pin_releases_it(self):
+        pin_id = self._pin(2.0).get_json()["pin_id"]
+        response = self.client.delete(f"/api/monitor/clip/pin/{pin_id}")
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(self.store.get(pin_id, "54622319"))
+
+    def test_plain_clip_without_pin_is_unchanged(self):
+        response = self.client.post(
+            "/api/monitor/clip",
+            json={"match_id": "54622319", "anchor_epoch_ms": round((self.base + 15.0) * 1000), "before_seconds": 5},
+        )
+        self.assertEqual(response.status_code, 200, response.get_json())
+        before, anchor, start = self.encode_calls[-1]
+        self.assertEqual(before, 5.0)
+        self.assertIsNone(start)
+
+    def _run_through_real_encoder(self, body: dict):
+        """POST /api/monitor/clip with the *real* ``_encode_clip_gif``.
+
+        Only ``subprocess.run`` (ffmpeg) is faked. This pins the call contract
+        between the endpoint and the encoder: a signature drift between the two
+        surfaces here as a 500, whereas every other test in this class mocks the
+        encoder away and would stay green.
+        """
+        ffmpeg_cmds = []
+
+        def fake_run(command, **kwargs):
+            ffmpeg_cmds.append(command)
+            Path(command[-1]).write_bytes(b"GIF89a")
+            return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
+
+        self._patches[-1].stop()  # un-mock _encode_clip_gif for this request
+        try:
+            with mock.patch.object(monitor_server.subprocess, "run", side_effect=fake_run):
+                response = self.client.post("/api/monitor/clip", json=body)
+        finally:
+            self._patches[-1].start()
+        return response, ffmpeg_cmds
+
+    def test_endpoint_reaches_real_encoder_in_plain_mode(self):
+        response, cmds = self._run_through_real_encoder(
+            {"match_id": "54622319", "anchor_epoch_ms": round((self.base + 15.0) * 1000), "before_seconds": 5},
+        )
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(len(cmds), 1)
+        ss = float(cmds[0][cmds[0].index("-ss") + 1])
+        t = float(cmds[0][cmds[0].index("-t") + 1])
+        self.assertAlmostEqual(t, 5.0, places=2)
+        # Window [base+10, base+15) starts at seg_00005 (pdt base+10) → offset 0.
+        self.assertAlmostEqual(ss, 0.0, places=2)
+
+    def test_endpoint_reaches_real_encoder_in_range_mode(self):
+        pin_id = self._pin(4.0).get_json()["pin_id"]
+        response, cmds = self._run_through_real_encoder(
+            {"match_id": "54622319", "pin_id": pin_id, "end_epoch_ms": round((self.base + 12.5) * 1000)},
+        )
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(len(cmds), 1)
+        ss = float(cmds[0][cmds[0].index("-ss") + 1])
+        t = float(cmds[0][cmds[0].index("-t") + 1])
+        # Start base+4 falls inside seg_00002 (pdt base+4) → offset 0; span 8.5s.
+        self.assertAlmostEqual(ss, 0.0, places=2)
+        self.assertAlmostEqual(t, 8.5, places=2)
+        self.assertIsNone(self.store.get(pin_id, "54622319"))
+
+
+class ClipListTests(unittest.TestCase):
+    """``GET /api/monitor/clips``: newest-first GIFs joined to draft records."""
+
+    def setUp(self):
+        self.client = monitor_server.app.test_client()
+        self.tmp = TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self._patches = [
+            mock.patch.object(monitor_server, "_clip_dir", return_value=self.dir),
+            mock.patch.object(monitor_server, "CLIP_LIST_LIMIT", 50),
+        ]
+        for patch in self._patches:
+            patch.start()
+
+    def tearDown(self):
+        for patch in self._patches:
+            patch.stop()
+        self.tmp.cleanup()
+
+    def _gif(self, name: str, mtime: float, size: int = 10) -> Path:
+        path = self.dir / name
+        path.write_bytes(b"G" * size)
+        os.utime(path, (mtime, mtime))
+        return path
+
+    def test_lists_newest_first_and_skips_non_clips(self):
+        self._gif("clip_a.gif", 1_000.0)
+        self._gif("clip_b.gif", 3_000.0)
+        self._gif("clip_c.gif", 2_000.0)
+        (self.dir / "other.gif").write_bytes(b"x")          # not a clip
+        (self.dir / "clip_d.txt").write_bytes(b"x")         # wrong suffix
+        (self.dir / ".pin_abc").mkdir()                     # pin staging dir
+        with mock.patch.object(monitor_server, "manual_draft_queue", None):
+            response = self.client.get("/api/monitor/clips?match_id=54622319")
+        self.assertEqual(response.status_code, 200)
+        body = response.get_json()
+        self.assertFalse(body["publish_enabled"])
+        self.assertEqual([c["name"] for c in body["clips"]], ["clip_b.gif", "clip_c.gif", "clip_a.gif"])
+        self.assertEqual(body["clips"][0]["clip_url"], "clips/54622319/clip_b.gif")
+        self.assertIsNone(body["clips"][0]["event_key"])
+
+    def test_joins_draft_records_by_gif_name(self):
+        self._gif("clip_a.gif", 1_000.0)
+        self._gif("clip_b.gif", 2_000.0)
+        queue = mock.Mock()
+        queue.records_by_source_name.return_value = {
+            "clip_b.gif": {"event_key": "manual_42", "status": "drafted", "draft_url": "https://d/1", "error": None, "retriable": False},
+        }
+        with mock.patch.object(monitor_server, "manual_draft_queue", queue):
+            response = self.client.get("/api/monitor/clips?match_id=54622319")
+        body = response.get_json()
+        self.assertTrue(body["publish_enabled"])
+        by_name = {c["name"]: c for c in body["clips"]}
+        self.assertEqual(by_name["clip_b.gif"]["event_key"], "manual_42")
+        self.assertEqual(by_name["clip_b.gif"]["draft_status"], "drafted")
+        self.assertEqual(by_name["clip_b.gif"]["draft_url"], "https://d/1")
+        self.assertIsNone(by_name["clip_a.gif"]["event_key"])
+        queue.records_by_source_name.assert_called_once_with(
+            "54622319", artifact_kind=monitor_server.MANUAL_ARTIFACT_KIND
+        )
+
+    def test_limit_applies_after_sorting(self):
+        for i in range(5):
+            self._gif(f"clip_{i}.gif", 1_000.0 + i)
+        with mock.patch.object(monitor_server, "CLIP_LIST_LIMIT", 2), \
+             mock.patch.object(monitor_server, "manual_draft_queue", None):
+            body = self.client.get("/api/monitor/clips?match_id=54622319").get_json()
+        self.assertEqual([c["name"] for c in body["clips"]], ["clip_4.gif", "clip_3.gif"])
+
+    def test_missing_directory_is_empty_list(self):
+        with mock.patch.object(monitor_server, "_clip_dir", return_value=self.dir / "nope"), \
+             mock.patch.object(monitor_server, "manual_draft_queue", None):
+            body = self.client.get("/api/monitor/clips?match_id=54622319").get_json()
+        self.assertEqual(body["clips"], [])
+
+    def test_invalid_match_id_rejected(self):
+        response = self.client.get("/api/monitor/clips?match_id=../etc")
+        self.assertEqual(response.status_code, 400)
+
 
 class ClipEncodingTests(unittest.TestCase):
     def _make_segments(self, directory: Path, count: int) -> list:
@@ -156,6 +481,41 @@ class ClipEncodingTests(unittest.TestCase):
             # Neither the concat list nor the hard-link staging dir may linger.
             self.assertEqual(list(directory.glob(".concat_*.txt")), [])
             self.assertEqual(list(directory.glob(".src_*")), [])
+
+    def test_encode_clip_gif_with_explicit_range(self):
+        """Real ffmpeg run through the 5-argument (anchor + start) signature.
+
+        Also asserts the operator-chosen start actually drives ``-ss``/``-t``
+        rather than being silently ignored.
+        """
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            base = 1_700_000_000.0
+            segments = [
+                (path, duration, base + index * 2.0)
+                for index, (path, duration, _pdt) in enumerate(self._make_segments(directory, 6))
+            ]
+            output = directory / "range.gif"
+            real_run = subprocess.run
+            seen: list[list[str]] = []
+
+            def spy_run(command, **kwargs):
+                seen.append(command)
+                return real_run(command, **kwargs)
+
+            with mock.patch.object(subprocess, "run", spy_run):
+                _encode_clip_gif(
+                    segments, before_seconds=99.0, output_path=output,
+                    anchor_epoch=base + 7.0, start_epoch=base + 3.0,
+                )
+            self.assertTrue(output.is_file())
+            self.assertGreater(output.stat().st_size, 0)
+            self.assertEqual(len(seen), 1)
+            ss = float(seen[0][seen[0].index("-ss") + 1])
+            t = float(seen[0][seen[0].index("-t") + 1])
+            # kept = seg 1..3 (pdt base+2..base+6); start base+3 is 1s into seg 1.
+            self.assertAlmostEqual(ss, 1.0, places=2)
+            self.assertAlmostEqual(t, 4.0, places=2)
 
     def test_encode_survives_segments_deleted_mid_encode(self):
         """The preview ffmpeg deletes its oldest segments while we encode.

@@ -2,6 +2,9 @@
 const $ = (id) => document.getElementById(id);
 const REFRESH_MS = 60000;
 const WORKSHOP_IDLE_MS = 90000;
+// After a capture succeeds, hold the tile's status line this long before
+// routine player chatter (FRAG_BUFFERED etc.) may overwrite it.
+const TILE_STATUS_STICKY_MS = 5000;
 
 const state = {
   tiles: new Map(),      // match_id -> {data, hls, playlistReady, statusTimer}
@@ -11,9 +14,11 @@ const state = {
   stageVideoHomeWrap: null,  // the .tile-video-wrap to move that node back into on close
   maxPreviews: 16,
   clipBeforeSeconds: 10,
+  clipRangeMaxSeconds: 30,
+  // Operator-chosen [start, end] range on the stage. ``pinId`` is the server
+  // pin that hard-links the start so it survives the rolling buffer.
+  range: {matchId: null, pinId: null, startMs: null, ttlTimer: null, busy: false},
   draftPoll: null,       // {matchId, timer, polls} while awaiting draft links
-  tileDraftTimer: null,  // single poll loop for grid-capture draft links
-  tileDraftPolls: 0,
   alertSeq: 0,           // cursor: last event seq the page has rendered
   alertBootId: null,     // server boot id; a change means 8901 restarted
   alertInit: false,      // skip replaying history on the first poll
@@ -74,15 +79,60 @@ function videoForMatch(matchId) {
 
 // Jump the playhead to the live edge so a capture reflects the newest frame
 // instead of a position the operator has drifted behind.
-function seekToLive(video) {
-  if (!video) return;
+//
+// hls.liveSyncPosition is derived from the *last playlist hls.js fetched* and
+// is clamped to "last known segment − target duration": it can never point
+// past a segment hls.js has not seen yet. After a background pause Chrome
+// throttles the playlist refresh to ~1/min, so seeking immediately lands up to
+// a minute behind real live. We therefore wait for one fresh LEVEL_UPDATED
+// (bounded by LIVE_SEEK_WAIT_MS) before seeking, unless the playlist is
+// already fresh. The landing spot is liveSyncPosition (edge − ~6s), not the
+// raw edge, so the player keeps a few seconds of buffer instead of starving.
+const LIVE_SEEK_FRESH_SECONDS = 4;
+const LIVE_SEEK_WAIT_MS = 2000;
+
+function currentLevelDetails(hls) {
+  const level = hls && Array.isArray(hls.levels) ? hls.levels[hls.currentLevel] : null;
+  return level && level.details ? level.details : null;
+}
+
+function jumpToLiveSync(video) {
   const hls = video._hls;
   if (hls && typeof hls.liveSyncPosition === 'number' && isFinite(hls.liveSyncPosition)) {
     video.currentTime = hls.liveSyncPosition;
   } else if (video.seekable && video.seekable.length) {
     video.currentTime = video.seekable.end(video.seekable.length - 1);
   }
-  video.play().catch(() => {});
+  if (video.paused) video.play().catch(() => {});
+}
+
+function seekToLive(video, onDone) {
+  if (!video) return;
+  const hls = video._hls;
+  const details = currentLevelDetails(hls);
+  const fresh = details && typeof details.age === 'number' && details.age < LIVE_SEEK_FRESH_SECONDS;
+  if (!hls || fresh) {
+    jumpToLiveSync(video);
+    if (onDone) onDone();
+    return;
+  }
+  // Stale playlist: coalesce rapid clicks, then seek once a refresh lands.
+  if (video._liveSeekPending) return;
+  video._liveSeekPending = true;
+  let timer = null;
+  const finish = () => {
+    if (!video._liveSeekPending) return;
+    video._liveSeekPending = false;
+    clearTimeout(timer);
+    try { hls.off(window.Hls.Events.LEVEL_UPDATED, finish); } catch (e) {}
+    jumpToLiveSync(video);
+    if (onDone) onDone();
+  };
+  timer = setTimeout(finish, LIVE_SEEK_WAIT_MS);
+  hls.on(window.Hls.Events.LEVEL_UPDATED, finish);
+  // A background-paused element has idle loaders; resuming nudges hls.js to
+  // refresh the playlist promptly instead of waiting for its throttled timer.
+  if (video.paused) video.play().catch(() => {});
 }
 
 function attachHls(video, playlistUrl, onStatus) {
@@ -154,9 +204,37 @@ function metaText(data) {
   return `<span>${escapeHtml(data.competition_name || '未知赛事')}</span><span>${minute}</span>`;
 }
 
-function setTileStatus(matchId, text, cls = '') {
+// ``sticky`` pins the line for TILE_STATUS_STICKY_MS; while pinned, routine
+// status updates are dropped so a fresh "已生成 GIF" stays readable. Error
+// states (warn/fail) always win so a dying source is never hidden.
+function setTileStatus(matchId, text, cls = '', sticky = false) {
   const node = document.querySelector(`.tile[data-match-id="${matchId}"] .tile-status`);
-  if (node) { node.textContent = text; node.className = `tile-status ${cls}`; }
+  if (!node) return;
+  const until = Number(node.dataset.stickyUntil || 0);
+  if (!sticky && until > Date.now() && cls !== 'warn' && cls !== 'fail') return;
+  node.dataset.stickyUntil = sticky ? String(Date.now() + TILE_STATUS_STICKY_MS) : '0';
+  node.textContent = text;
+  node.className = `tile-status ${cls}`;
+}
+
+function setTileClipCount(matchId, count, flash = false) {
+  const tile = state.tiles.get(matchId);
+  if (tile) tile.clipCount = count;
+  const badge = document.querySelector(`.tile[data-match-id="${matchId}"] [data-role="clips"]`);
+  if (!badge) return;
+  badge.textContent = `GIF ×${count}`;
+  badge.classList.toggle('hidden', count <= 0);
+  if (flash) {
+    badge.classList.add('flash');
+    setTimeout(() => badge.classList.remove('flash'), 1500);
+  }
+}
+
+async function refreshTileClipCount(matchId) {
+  try {
+    const data = await requestJson(`api/monitor/clips?match_id=${encodeURIComponent(matchId)}`);
+    setTileClipCount(matchId, Array.isArray(data.clips) ? data.clips.length : 0);
+  } catch (e) { /* badge stays as-is */ }
 }
 
 function createTile(data) {
@@ -175,18 +253,23 @@ function createTile(data) {
         <button class="button primary" data-role="capture" type="button">截取 ${state.clipBeforeSeconds} 秒</button>
         <span class="lag-badge na" data-role="lag" title="当前画面比服务器最新画面晚多少秒">落后 —</span>
         <button class="button ghost tile-live" data-role="live" type="button" title="跳到直播最新位置">回到直播</button>
+        <button class="tile-clips-badge hidden" data-role="clips" type="button" title="查看本场已截取的 GIF">GIF ×0</button>
         <span class="tile-status">准备中…</span>
       </div>
     </div>`;
   el.querySelector('[data-role="enlarge"]').addEventListener('click', () => openStage(data.match_id));
+  el.querySelector('[data-role="clips"]').addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    openStage(data.match_id);
+  });
   el.querySelector('[data-role="capture"]').addEventListener('click', (ev) => {
     ev.stopPropagation();
     captureClip(data.match_id, ev.currentTarget);
   });
   el.querySelector('[data-role="live"]').addEventListener('click', (ev) => {
     ev.stopPropagation();
-    seekToLive(videoForMatch(data.match_id));
-    setTileStatus(data.match_id, '已回到直播', 'ok');
+    setTileStatus(data.match_id, '正在回到直播…');
+    seekToLive(videoForMatch(data.match_id), () => setTileStatus(data.match_id, '已回到直播', 'ok'));
   });
   return el;
 }
@@ -229,22 +312,29 @@ async function startTilePreview(matchId) {
   }
 }
 
-// ---- clip / stage / draft (unchanged from the original) ----
-async function captureClip(matchId, button) {
+// ---- clip / stage / draft ----
+// ``range`` = {pinId, startMs, endMs} switches the request into range mode.
+// Returns true on success so range callers know whether to reset their state.
+async function captureClip(matchId, button, range) {
   const prevLabel = button ? button.textContent : '';
   if (button) { button.disabled = true; button.textContent = '截取中…'; }
-  setTileStatus(matchId, '正在回捞最近画面…');
+  setTileStatus(matchId, range ? '正在截取所选区间…' : '正在回捞最近画面…');
   try {
-    const anchorMs = frameAnchorMs(videoForMatch(matchId));
     const payload = {match_id: matchId};
-    if (anchorMs != null) payload.anchor_epoch_ms = Math.round(anchorMs);
+    if (range) {
+      payload.pin_id = range.pinId;
+      payload.end_epoch_ms = Math.round(range.endMs);
+    } else {
+      const anchorMs = frameAnchorMs(videoForMatch(matchId));
+      if (anchorMs != null) payload.anchor_epoch_ms = Math.round(anchorMs);
+    }
     if (state.stageMatchId === matchId) {
       const personEl = $('stage-person');
       const titleEl = $('stage-title-input');
       const secondsEl = $('stage-seconds');
       if (personEl && personEl.value.trim()) payload.person = personEl.value.trim();
       if (titleEl && titleEl.value.trim()) payload.title = titleEl.value.trim();
-      if (secondsEl && secondsEl.value.trim()) {
+      if (!range && secondsEl && secondsEl.value.trim()) {
         const secs = Number(secondsEl.value);
         if (Number.isFinite(secs) && secs > 0 && secs <= 120) payload.before_seconds = secs;
       }
@@ -253,84 +343,124 @@ async function captureClip(matchId, button) {
       method: 'POST', body: JSON.stringify(payload),
     });
     const sizeMb = (data.bytes / (1024 * 1024)).toFixed(2);
-    const node = document.querySelector(`.tile[data-match-id="${matchId}"] .tile-status`);
     const warn = data.anchored === false;
     const publishNote = data.publish_error
       ? ' · 发文失败：' + data.publish_error
       : data.draft
       ? ' · 已建草稿'
       : '';
-    if (node) {
-      node.className = `tile-status ${warn ? 'warn' : 'ok'}`;
-      const prefix = warn ? '⚠ 未锚定，画面可能不准 · ' : '已生成 GIF';
-      node.innerHTML = `${prefix}（${sizeMb} MB）${escapeHtml(publishNote)} <a class="tile-clip-link" href="${data.clip_url}" target="_blank" rel="noreferrer">打开</a>`;
-    }
-    if (state.stageMatchId === matchId) {
-      addStageClip(data.clip_url, sizeMb, warn, data);
-      if (data.draft && data.draft.event_key) startDraftPoll(matchId);
-    } else if (node && data.draft && data.draft.event_key) {
-      node.dataset.pendingDraft = data.draft.event_key;
-      startTileDraftPoll();
-    }
+    const prefix = warn ? '⚠ 未锚定，画面可能不准' : '已生成 GIF';
+    setTileStatus(matchId, `${prefix}（${sizeMb} MB）${publishNote}`, warn ? 'warn' : 'ok', true);
+    const tile = state.tiles.get(matchId);
+    setTileClipCount(matchId, ((tile && tile.clipCount) || 0) + 1, true);
+    if (state.stageMatchId === matchId) loadStageClips(matchId);
+    return true;
   } catch (error) {
     setTileStatus(matchId, error.message, 'warn');
     if (state.stageMatchId === matchId) addStageNote('截取失败：' + error.message, 'fail');
+    return false;
   } finally {
     if (button) { button.disabled = false; button.textContent = prevLabel; }
   }
 }
 
 function addStageNote(text, cls) {
-  const wrap = $('stage-clips');
+  const wrap = $('stage-notes');
   if (!wrap) return;
   const note = document.createElement('div');
   note.className = `stage-note ${cls || ''}`;
   note.textContent = `${text} · ${new Date().toLocaleTimeString()}`;
   wrap.prepend(note);
+  while (wrap.children.length > 5) wrap.removeChild(wrap.lastChild);
 }
 
-function addStageClip(url, sizeMb, warn, data) {
-  const wrap = $('stage-clips');
-  if (!wrap) return;
-  const card = document.createElement('div');
-  card.className = 'stage-clip-card';
-  const eventKey = data && data.draft && data.draft.event_key;
-  if (eventKey) card.dataset.eventKey = eventKey;
+// ---- stage clip list (server-backed; every GIF of this match, any window) ----
 
-  const gifLink = document.createElement('a');
-  gifLink.href = url; gifLink.target = '_blank'; gifLink.rel = 'noreferrer';
-  const img = document.createElement('img');
-  img.src = url; img.alt = '截取的 GIF';
-  gifLink.appendChild(img);
+function fmtClipTime(unix) {
+  return new Date(unix * 1000).toLocaleTimeString('zh-CN', {hour12: false});
+}
 
+function applyDraftState(draftEl, status, draftUrl, error, retriable) {
+  if ((status === 'published' || status === 'drafted') && draftUrl) {
+    const label = status === 'published' ? '打开文章 ↗' : '打开草稿 ↗';
+    draftEl.innerHTML = `<a href="${escapeHtml(draftUrl)}" target="_blank" rel="noreferrer">${label}</a>`;
+    draftEl.className = 'stage-clip-draft ok';
+    return false;
+  }
+  if (status === 'failed' && !retriable) {
+    draftEl.textContent = '草稿失败：' + (error || '未知错误');
+    draftEl.className = 'stage-clip-draft fail';
+    return false;
+  }
+  if (status === 'failed') {
+    draftEl.textContent = '草稿重试中：' + (error || '未知错误');
+    draftEl.className = 'stage-clip-draft';
+    return true;
+  }
+  draftEl.textContent = '草稿生成中…';
+  draftEl.className = 'stage-clip-draft';
+  return true;
+}
+
+function renderClipRow(item) {
+  const row = document.createElement('div');
+  row.className = 'stage-clip-row';
+  if (item.event_key) row.dataset.eventKey = item.event_key;
+  const sizeMb = (item.bytes / (1024 * 1024)).toFixed(2);
+  const link = document.createElement('a');
+  link.className = 'stage-clip-open';
+  link.href = item.clip_url; link.target = '_blank'; link.rel = 'noreferrer';
+  link.textContent = '打开 GIF';
   const label = document.createElement('span');
   label.className = 'stage-clip-label';
-  const mark = warn ? '⚠ 未锚定 ' : '';
-  label.textContent = `${mark}${sizeMb} MB · ${new Date().toLocaleTimeString()}`;
-
-  const draftEl = document.createElement('div');
+  label.textContent = `${fmtClipTime(item.created_unix)} · ${sizeMb} MB`;
+  const draftEl = document.createElement('span');
   draftEl.className = 'stage-clip-draft';
-  if (data && data.publish_error) {
-    draftEl.textContent = '发文失败：' + data.publish_error;
-    draftEl.classList.add('fail');
-  } else if (eventKey) {
-    draftEl.textContent = '草稿生成中…';
+  if (item.event_key) {
+    applyDraftState(draftEl, item.draft_status, item.draft_url, item.draft_error, item.draft_retriable);
   } else {
     draftEl.textContent = '仅本地保存';
+    draftEl.className = 'stage-clip-draft warn';
   }
+  row.appendChild(label);
+  row.appendChild(link);
+  row.appendChild(draftEl);
+  return row;
+}
 
-  card.appendChild(gifLink);
-  card.appendChild(label);
-  card.appendChild(draftEl);
-  wrap.prepend(card);
-  card.scrollIntoView({block: 'nearest'});
+async function loadStageClips(matchId) {
+  const list = $('stage-clips');
+  if (!list) return;
+  let data;
+  try {
+    data = await requestJson(`api/monitor/clips?match_id=${encodeURIComponent(matchId)}`);
+  } catch (error) {
+    if (state.stageMatchId === matchId) addStageNote('读取 GIF 列表失败：' + error.message, 'fail');
+    return;
+  }
+  if (state.stageMatchId !== matchId) return;
+  const clips = Array.isArray(data.clips) ? data.clips : [];
+  list.innerHTML = '';
+  if (!clips.length) {
+    const empty = document.createElement('div');
+    empty.className = 'stage-clip-empty';
+    empty.textContent = '本场还没有截取过 GIF';
+    list.appendChild(empty);
+  } else {
+    clips.forEach((item) => list.appendChild(renderClipRow(item)));
+  }
+  setTileClipCount(matchId, clips.length);
+  const pending = clips.some((c) => c.event_key && !(
+    ((c.draft_status === 'published' || c.draft_status === 'drafted') && c.draft_url)
+    || (c.draft_status === 'failed' && !c.draft_retriable)
+  ));
+  if (pending) startDraftPoll(matchId); else stopDraftPoll();
 }
 
 function startDraftPoll(matchId) {
   if (state.draftPoll && state.draftPoll.matchId === matchId) return;
   stopDraftPoll();
   state.draftPoll = {matchId, timer: setInterval(() => refreshDraftLinks(matchId), 2000), polls: 0};
-  refreshDraftLinks(matchId);
 }
 
 function stopDraftPoll() {
@@ -343,7 +473,7 @@ function refreshDraftLinks(matchId) {
     state.draftPoll.polls += 1;
     if (state.draftPoll.polls > 90) {
       document.querySelectorAll('#stage-clips .stage-clip-draft').forEach((draftEl) => {
-        if (draftEl.classList.contains('ok') || draftEl.classList.contains('fail')) return;
+        if (draftEl.classList.contains('ok') || draftEl.classList.contains('fail') || draftEl.classList.contains('warn')) return;
         draftEl.textContent = '草稿状态未知，请到发文后台查看';
         draftEl.className = 'stage-clip-draft warn';
       });
@@ -355,84 +485,17 @@ function refreshDraftLinks(matchId) {
     .then((response) => (response.ok ? response.json() : null))
     .then((data) => {
       if (!data || !data.enabled || !data.records) return;
-      const cards = document.querySelectorAll('#stage-clips .stage-clip-card[data-event-key]');
+      const rows = document.querySelectorAll('#stage-clips .stage-clip-row[data-event-key]');
       let pending = 0;
-      cards.forEach((card) => {
-        const rec = data.records[card.dataset.eventKey];
-        const draftEl = card.querySelector('.stage-clip-draft');
+      rows.forEach((row) => {
+        const rec = data.records[row.dataset.eventKey];
+        const draftEl = row.querySelector('.stage-clip-draft');
         if (!rec || !draftEl) { pending += 1; return; }
-        if ((rec.status === 'published' || rec.status === 'drafted') && rec.draft_url) {
-          const label = rec.status === 'published' ? '打开文章 ↗' : '打开草稿 ↗';
-          draftEl.innerHTML = `<a href="${rec.draft_url}" target="_blank" rel="noreferrer">${label}</a>`;
-          draftEl.className = 'stage-clip-draft ok';
-        } else if (rec.status === 'failed' && !rec.retriable) {
-          draftEl.textContent = '草稿失败：' + (rec.error || '未知错误');
-          draftEl.className = 'stage-clip-draft fail';
-        } else if (rec.status === 'failed') {
-          draftEl.textContent = '草稿重试中：' + (rec.error || '未知错误');
-          draftEl.className = 'stage-clip-draft';
-          pending += 1;
-        } else {
-          draftEl.textContent = '草稿生成中…';
-          draftEl.className = 'stage-clip-draft';
-          pending += 1;
-        }
+        if (applyDraftState(draftEl, rec.status, rec.draft_url, rec.error, rec.retriable)) pending += 1;
       });
       if (pending === 0) stopDraftPoll();
     })
     .catch(() => {});
-}
-
-function startTileDraftPoll() {
-  state.tileDraftPolls = 0;
-  if (state.tileDraftTimer) return;
-  state.tileDraftTimer = setInterval(refreshTileDraftLinks, 2000);
-  refreshTileDraftLinks();
-}
-
-function stopTileDraftPoll() {
-  if (state.tileDraftTimer) { clearInterval(state.tileDraftTimer); state.tileDraftTimer = null; }
-}
-
-function refreshTileDraftLinks() {
-  const nodes = document.querySelectorAll('.tile-status[data-pending-draft]');
-  if (!nodes.length) { stopTileDraftPoll(); return; }
-  state.tileDraftPolls += 1;
-  if (state.tileDraftPolls > 90) {
-    nodes.forEach((node) => { delete node.dataset.pendingDraft; });
-    stopTileDraftPoll();
-    return;
-  }
-  const matchIds = new Set();
-  nodes.forEach((node) => {
-    const tileEl = node.closest('.tile');
-    if (tileEl && tileEl.dataset.matchId) matchIds.add(tileEl.dataset.matchId);
-  });
-  matchIds.forEach((matchId) => {
-    fetch(`api/monitor/publish/status?match_id=${encodeURIComponent(matchId)}`)
-      .then((response) => (response.ok ? response.json() : null))
-      .then((data) => {
-        if (!data || !data.enabled || !data.records) return;
-        const node = document.querySelector(`.tile[data-match-id="${matchId}"] .tile-status[data-pending-draft]`);
-        if (!node) return;
-        const rec = data.records[node.dataset.pendingDraft];
-        if (!rec) return;
-        if ((rec.status === 'published' || rec.status === 'drafted') && rec.draft_url) {
-          const label = rec.status === 'published' ? '打开文章 ↗' : '打开草稿 ↗';
-          const link = document.createElement('a');
-          link.className = 'tile-clip-link';
-          link.href = rec.draft_url; link.target = '_blank'; link.rel = 'noreferrer';
-          link.textContent = label;
-          node.appendChild(document.createTextNode(' · '));
-          node.appendChild(link);
-          delete node.dataset.pendingDraft;
-        } else if (rec.status === 'failed' && !rec.retriable) {
-          node.appendChild(document.createTextNode(' · 草稿失败'));
-          delete node.dataset.pendingDraft;
-        }
-      })
-      .catch(() => {});
-  });
 }
 
 function stageCaptureSeconds() {
@@ -448,6 +511,89 @@ function syncStageCaptureLabel() {
   const button = $('stage-capture');
   if (!button || button.disabled) return;
   button.textContent = `截取最近 ${stageCaptureSeconds()} 秒`;
+}
+
+// ---- stage range capture (operator-chosen start/end) ----
+//
+// Two clicks: 「开始」 pins the frame on screen as the start (server hard-links
+// the segments so they outlive the rolling buffer); 「结束」 takes the frame on
+// screen as the end and captures immediately. Clicking 「开始」 again simply
+// replaces the start.
+
+function renderRange() {
+  const r = state.range;
+  const startBtn = $('stage-range-start');
+  const endBtn = $('stage-range-end');
+  if (!startBtn || !endBtn) return;
+  const hasStart = r.pinId != null && r.startMs != null;
+  startBtn.textContent = hasStart ? '重新开始' : '开始';
+  startBtn.disabled = r.busy;
+  endBtn.disabled = !hasStart || r.busy;
+}
+
+function clearRange(options = {}) {
+  const r = state.range;
+  if (r.ttlTimer) { clearTimeout(r.ttlTimer); r.ttlTimer = null; }
+  if (r.pinId && !options.keepServerPin) {
+    fetch(`api/monitor/clip/pin/${encodeURIComponent(r.pinId)}`, {method: 'DELETE'}).catch(() => {});
+  }
+  state.range = {matchId: null, pinId: null, startMs: null, ttlTimer: null, busy: false};
+  renderRange();
+}
+
+async function setRangeStart() {
+  const matchId = state.stageMatchId;
+  const video = state.stageVideoNode;
+  if (!matchId || !video) return;
+  const startMs = frameAnchorMs(video);
+  if (startMs == null) { addStageNote('当前画面没有时间戳，无法设起点', 'fail'); return; }
+  const btn = $('stage-range-start');
+  btn.disabled = true;
+  try {
+    clearRange();
+    const data = await requestJson('api/monitor/clip/pin', {
+      method: 'POST', body: JSON.stringify({match_id: matchId, start_epoch_ms: Math.round(startMs)}),
+    });
+    if (data.max_range_seconds) state.clipRangeMaxSeconds = data.max_range_seconds;
+    state.range = {
+      matchId,
+      pinId: data.pin_id,
+      startMs: data.start_epoch_ms,
+      busy: false,
+      ttlTimer: setTimeout(() => {
+        addStageNote('起点已失效（超时未截取），请重新点「开始」', 'fail');
+        clearRange({keepServerPin: true});
+      }, Math.max(1000, (data.ttl_seconds || 180) * 1000)),
+    };
+  } catch (error) {
+    addStageNote('设起点失败：' + error.message, 'fail');
+  } finally {
+    btn.disabled = false;
+    renderRange();
+  }
+}
+
+async function setRangeEndAndCapture(button) {
+  const r = state.range;
+  const video = state.stageVideoNode;
+  if (!video || !r.pinId || r.busy || r.matchId !== state.stageMatchId) return;
+  const endMs = frameAnchorMs(video);
+  if (endMs == null) { addStageNote('当前画面没有时间戳，无法设终点', 'fail'); return; }
+  const seconds = (endMs - r.startMs) / 1000;
+  if (seconds < 0.5) { addStageNote('终点必须在起点之后，请往后播放再点「结束」', 'fail'); return; }
+  if (seconds > state.clipRangeMaxSeconds) {
+    addStageNote(`区间 ${seconds.toFixed(1)}s 超过 ${state.clipRangeMaxSeconds}s 上限，请拖回一些再点「结束」`, 'fail');
+    return;
+  }
+  const snapshot = {pinId: r.pinId, startMs: r.startMs, endMs};
+  r.busy = true;
+  renderRange();
+  const ok = await captureClip(r.matchId, button, snapshot);
+  // The server releases the pin on success. On failure keep the start so the
+  // operator can pick another end and retry (the pin is still alive).
+  if (state.range.pinId !== snapshot.pinId) return;
+  if (ok) clearRange({keepServerPin: true});
+  else { state.range.busy = false; renderRange(); }
 }
 
 function openStage(matchId) {
@@ -466,7 +612,9 @@ function openStage(matchId) {
   $('stage-title').textContent = (tile.data.team_A_name || '主队') + ' vs ' + (tile.data.team_B_name || '客队');
   $('stage-status').textContent = '直播播放中';
   $('stage-status').className = 'stage-status ok';
-  $('stage-clips').innerHTML = '';
+  $('stage-notes').innerHTML = '';
+  $('stage-clips').innerHTML = '<div class="stage-clip-empty">正在读取 GIF 列表…</div>';
+  loadStageClips(matchId);
   const personInput = $('stage-person');
   const titleInput = $('stage-title-input');
   const secondsInput = $('stage-seconds');
@@ -474,6 +622,7 @@ function openStage(matchId) {
   if (titleInput) titleInput.value = '';
   if (secondsInput) secondsInput.value = '';
   syncStageCaptureLabel();
+  clearRange();
   state.stageVideoNode = video;
   state.stageVideoHomeWrap = wrap;
   video.classList.remove('tile-video');
@@ -495,6 +644,7 @@ function openStage(matchId) {
 function closeStage() {
   state.stageMatchId = null;
   stopDraftPoll();
+  clearRange();
   const video = state.stageVideoNode;
   if (video) {
     video.removeAttribute('controls');
@@ -670,9 +820,10 @@ function reconcileTiles(playing) {
     if (!tile) {
       const el = createTile(data);
       grid.appendChild(el);
-      tile = {data, playlistUrl: null};
+      tile = {data, playlistUrl: null, clipCount: 0};
       state.tiles.set(data.match_id, tile);
       startTilePreview(data.match_id);
+      refreshTileClipCount(data.match_id);
     } else {
       tile.data = data;
       const el = document.querySelector(`.tile[data-match-id="${data.match_id}"]`);
@@ -709,8 +860,7 @@ async function refreshMatches() {
     const data = await requestJson('api/monitor/matches?with_sources=1');
     state.maxPreviews = data.max_previews || state.maxPreviews;
     state.clipBeforeSeconds = data.clip_before_seconds || state.clipBeforeSeconds;
-    const subheadSeconds = $('subhead-seconds');
-    if (subheadSeconds) subheadSeconds.textContent = String(state.clipBeforeSeconds);
+    state.clipRangeMaxSeconds = data.clip_range_max_seconds || state.clipRangeMaxSeconds;
     syncStageCaptureLabel();
     const playing = Array.isArray(data.playing) ? data.playing : [];
 
@@ -753,10 +903,16 @@ $('stage-capture').addEventListener('click', (ev) => {
   if (state.stageMatchId) captureClip(state.stageMatchId, ev.currentTarget);
 });
 $('stage-seconds').addEventListener('input', syncStageCaptureLabel);
+$('stage-range-start').addEventListener('click', setRangeStart);
+$('stage-range-end').addEventListener('click', (ev) => setRangeEndAndCapture(ev.currentTarget));
 $('stage-live').addEventListener('click', () => {
-  if (state.stageVideoNode) seekToLive(state.stageVideoNode);
-  $('stage-status').textContent = '已回到直播';
-  $('stage-status').className = 'stage-status ok';
+  if (!state.stageVideoNode) return;
+  $('stage-status').textContent = '正在回到直播…';
+  $('stage-status').className = 'stage-status';
+  seekToLive(state.stageVideoNode, () => {
+    $('stage-status').textContent = '已回到直播';
+    $('stage-status').className = 'stage-status ok';
+  });
 });
 document.addEventListener('keydown', (ev) => {
   if (ev.key !== 'Escape') return;

@@ -12,15 +12,11 @@
       <div>
         <p class="eyebrow">MATCH MONITOR</p>
         <h1>足球比赛直播监控台</h1>
-        <p class="subhead">选择比赛进入工作台，直播画面供人工盯场；进球后点「截取」回捞最近 <span id="subhead-seconds">10</span> 秒。</p>
         <div class="topbar-row">
           <button id="enter-workshop-btn" class="button primary" type="button" disabled>进入工作台</button>
           <span id="list-summary" class="muted">正在读取进行中的比赛…</span>
           <span id="health" class="health loading"><i></i>连接中</span>
         </div>
-      </div>
-      <div class="topbar-actions">
-        <div class="port-badge"><span class="dot"></span> 8901 · 监控台</div>
       </div>
     </header>
 
@@ -78,12 +74,18 @@
         </div>
       </div>
       <div id="stage-video-host" class="stage-video-host"></div>
+      <div class="stage-range">
+        <button id="stage-range-start" class="button secondary" type="button" title="把当前画面设为 GIF 起点">开始</button>
+        <button id="stage-range-end" class="button primary" type="button" disabled title="把当前画面设为终点并立即截取">结束</button>
+      </div>
       <div class="stage-fields">
         <input id="stage-seconds" class="stage-input stage-seconds" type="number" min="1" max="120" step="1" placeholder="截取秒数（默认 10）">
         <input id="stage-person" class="stage-input" type="text" maxlength="40" placeholder="进球球员（选填，填了标题更准）">
         <input id="stage-title-input" class="stage-input" type="text" maxlength="100" placeholder="自定义标题（选填，留空自动生成）">
       </div>
       <div id="stage-status" class="stage-status muted"></div>
+      <div id="stage-notes" class="stage-notes"></div>
+      <div class="stage-clips-head">本场已截取的 GIF</div>
       <div id="stage-clips" class="stage-clips"></div>
     </div>
   </div>

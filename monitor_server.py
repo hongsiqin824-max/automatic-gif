@@ -77,6 +77,10 @@ HOST = os.environ.get("GIF_MONITOR_HOST", "127.0.0.1")
 PORT = int(os.environ.get("GIF_MONITOR_PORT", "8901"))
 # Keep enough rolling HLS buffer that a backward capture always has material.
 CLIP_BEFORE_SECONDS = positive_env_float("GIF_MONITOR_CLIP_SECONDS", 10.0)
+# Operator-chosen [start, end] range capture: longest allowed range, and how long
+# a chosen start stays pinned (segments hard-linked) while the end is picked.
+CLIP_RANGE_MAX_SECONDS = positive_env_float("GIF_MONITOR_CLIP_RANGE_MAX_SECONDS", 30.0)
+CLIP_PIN_TTL_SECONDS = positive_env_float("GIF_MONITOR_CLIP_PIN_TTL_SECONDS", 180.0)
 CLIP_GIF_WIDTH = positive_env_int("GIF_MONITOR_CLIP_WIDTH", 440)
 # 50/3 ≈ 16.67, matching the automatic pipeline's GIF frame rate. Float rather
 # than int so a non-integer rate like this one is expressible here and in .env.
@@ -385,20 +389,22 @@ def _select_clip_window(
     segments: list[tuple[Path, float, float | None]],
     before_seconds: float,
     anchor_epoch: float | None,
+    start_epoch: float | None = None,
 ) -> tuple[list[tuple[Path, float, float | None]], float, float]:
     """Return (kept_segments, start_offset, window) for the GIF cut.
 
     When ``anchor_epoch`` is given and every segment carries a PROGRAM-DATE-TIME,
     the cut is anchored on the exact displayed frame (``[anchor-before, anchor]``)
-    so pipeline delay never shifts the result. Otherwise it falls back to the
-    trailing ``before_seconds`` of the rolling buffer.
+    so pipeline delay never shifts the result. ``start_epoch`` replaces the
+    computed ``anchor-before`` with an operator-chosen absolute start. Otherwise
+    it falls back to the trailing ``before_seconds`` of the rolling buffer.
     """
     pdts_ok = bool(segments) and all(seg[2] is not None for seg in segments)
     if anchor_epoch is not None and pdts_ok:
         last_end = segments[-1][2] + segments[-1][1]
         # Clamp a slightly future anchor (clock skew) to the latest frame we have.
         anchor = min(anchor_epoch, last_end)
-        want_start = anchor - before_seconds
+        want_start = anchor - before_seconds if start_epoch is None else min(start_epoch, anchor)
         kept = [
             seg for seg in segments
             if (seg[2] + seg[1]) > want_start and seg[2] < anchor
@@ -433,9 +439,10 @@ def _encode_clip_gif(
     before_seconds: float,
     output_path: Path,
     anchor_epoch: float | None = None,
+    start_epoch: float | None = None,
 ) -> None:
     """Concatenate recent segments and encode the target window to a GIF."""
-    kept, start_offset, window = _select_clip_window(segments, before_seconds, anchor_epoch)
+    kept, start_offset, window = _select_clip_window(segments, before_seconds, anchor_epoch, start_epoch)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     # Hard-link the chosen segments into a private directory before encoding.
     # The preview process keeps deleting its oldest segments (delete_segments);
@@ -492,6 +499,147 @@ def _clip_dir(match_id: str) -> Path:
     return CLIP_OUTPUT_ROOT / match_id
 
 
+CLIP_LIST_LIMIT = positive_env_int("GIF_MONITOR_CLIP_LIST_LIMIT", 50)
+
+
+def _list_clips(match_id: str) -> list[dict[str, Any]]:
+    """Newest-first GIFs for a match, joined to their draft records when any."""
+    directory = _clip_dir(match_id)
+    try:
+        gifs = [p for p in directory.iterdir() if p.is_file() and p.suffix == ".gif" and p.name.startswith("clip_")]
+        stats = {p: p.stat() for p in gifs}
+    except OSError:
+        return []
+    gifs.sort(key=lambda p: stats[p].st_mtime, reverse=True)
+    gifs = gifs[:CLIP_LIST_LIMIT]
+    drafts: dict[str, dict[str, Any]] = {}
+    if manual_draft_queue is not None and gifs:
+        drafts = manual_draft_queue.records_by_source_name(match_id, artifact_kind=MANUAL_ARTIFACT_KIND)
+    items: list[dict[str, Any]] = []
+    for gif in gifs:
+        stat = stats[gif]
+        record = drafts.get(gif.name)
+        items.append(
+            {
+                "name": gif.name,
+                "clip_url": f"clips/{match_id}/{gif.name}",
+                "bytes": stat.st_size,
+                "created_unix": stat.st_mtime,
+                "event_key": record.get("event_key") if record else None,
+                "draft_status": record.get("status") if record else None,
+                "draft_url": record.get("draft_url") if record else None,
+                "draft_error": record.get("error") if record else None,
+                "draft_retriable": bool(record.get("retriable")) if record else False,
+            }
+        )
+    return items
+
+
+class _ClipPinStore:
+    """Pin the segments after an operator-chosen start point.
+
+    The preview ffmpeg keeps deleting its oldest segments (~180s history). When
+    the operator sets a start and then scrubs forward to pick an end, the start
+    could fall off the buffer before they click capture. A pin hard-links every
+    segment covering ``[start-1, start+max_range+2]`` into a private directory
+    so the inodes outlive deletion. Segments that do not exist yet at pin time
+    are absorbed on later ``merged_segments`` calls (the clip request).
+    """
+
+    def __init__(self, ttl_seconds: float, max_range_seconds: float) -> None:
+        self._lock = threading.Lock()
+        self._pins: dict[str, dict[str, Any]] = {}
+        self.ttl_seconds = ttl_seconds
+        self.max_range_seconds = max_range_seconds
+
+    def _expire_locked(self, now: float) -> None:
+        for pin_id in [k for k, p in self._pins.items() if now - p["created_at"] > self.ttl_seconds]:
+            self._drop_locked(pin_id)
+
+    def _drop_locked(self, pin_id: str) -> None:
+        pin = self._pins.pop(pin_id, None)
+        if pin is not None:
+            shutil.rmtree(pin["link_dir"], ignore_errors=True)
+
+    def _absorb_locked(self, pin: dict[str, Any], segments: list[tuple[Path, float, float | None]]) -> None:
+        lo = pin["start_epoch"] - 1.0
+        hi = pin["start_epoch"] + self.max_range_seconds + 2.0
+        pinned: dict[str, tuple[Path, float, float | None]] = pin["segments"]
+        for path, duration, pdt in segments:
+            if pdt is None or path.name in pinned:
+                continue
+            if (pdt + duration) <= lo or pdt >= hi:
+                continue
+            link_path = pin["link_dir"] / path.name
+            try:
+                os.link(path, link_path)
+                pinned[path.name] = (link_path, duration, pdt)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                # Unsupported link: keep the original path (no protection, no worse).
+                pinned[path.name] = (path, duration, pdt)
+
+    def create(
+        self,
+        match_id: str,
+        start_epoch: float,
+        segments: list[tuple[Path, float, float | None]],
+    ) -> dict[str, Any]:
+        now = time.time()
+        pin_id = uuid.uuid4().hex[:12]
+        link_dir = _clip_dir(match_id) / f".pin_{pin_id}"
+        link_dir.mkdir(parents=True, exist_ok=True)
+        pin = {
+            "pin_id": pin_id,
+            "match_id": match_id,
+            "start_epoch": start_epoch,
+            "created_at": now,
+            "link_dir": link_dir,
+            "segments": {},
+        }
+        with self._lock:
+            self._expire_locked(now)
+            self._absorb_locked(pin, segments)
+            self._pins[pin_id] = pin
+        return pin
+
+    def get(self, pin_id: str, match_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            self._expire_locked(time.time())
+            pin = self._pins.get(pin_id)
+            if pin is None or pin["match_id"] != match_id:
+                return None
+            return pin
+
+    def merged_segments(
+        self,
+        pin: dict[str, Any],
+        live_segments: list[tuple[Path, float, float | None]],
+    ) -> list[tuple[Path, float, float | None]]:
+        """Pinned links win over live paths of the same name; sorted by PDT."""
+        with self._lock:
+            self._absorb_locked(pin, live_segments)
+            merged = dict(pin["segments"])
+        for path, duration, pdt in live_segments:
+            if pdt is not None and path.name not in merged:
+                merged[path.name] = (path, duration, pdt)
+        return sorted(merged.values(), key=lambda seg: seg[2])
+
+    def release(self, pin_id: str) -> None:
+        with self._lock:
+            self._drop_locked(pin_id)
+
+    def shutdown(self) -> None:
+        with self._lock:
+            for pin_id in list(self._pins):
+                self._drop_locked(pin_id)
+
+
+clip_pins = _ClipPinStore(CLIP_PIN_TTL_SECONDS, CLIP_RANGE_MAX_SECONDS)
+atexit.register(clip_pins.shutdown)
+
+
 @app.get("/")
 def index():
     return send_from_directory(ROOT / "monitor_static", "index.html")
@@ -541,6 +689,7 @@ def monitor_matches():
             "health": snapshot.get("health", {}),
             "max_previews": MAX_PREVIEWS,
             "clip_before_seconds": CLIP_BEFORE_SECONDS,
+            "clip_range_max_seconds": CLIP_RANGE_MAX_SECONDS,
         }
     )
 
@@ -844,6 +993,57 @@ def monitor_events():
     return jsonify({"events": events, "seq": latest, "boot_id": BOOT_ID, "alert_enabled": ALERT_ENABLED})
 
 
+@app.post("/api/monitor/clip/pin")
+def monitor_clip_pin():
+    """Pin an operator-chosen start point so it survives buffer rollover."""
+    body = request.get_json(silent=True) or {}
+    try:
+        match_id = validate_match_id(str(body.get("match_id") or ""))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    try:
+        start_epoch = float(body["start_epoch_ms"]) / 1000.0
+    except (KeyError, TypeError, ValueError):
+        return jsonify({"error": "start_epoch_ms 必须是数字"}), 400
+    if not live_preview.status(match_id).get("running"):
+        return jsonify({"error": "请先开始预览该场，才能回捞画面", "code": "preview_not_running"}), 409
+    segments = _read_playlist_segments(live_preview.media_dir(match_id))
+    if not segments:
+        return jsonify({"error": "缓冲还没有可用画面，请稍后再试", "code": "buffer_empty"}), 409
+    if any(seg[2] is None for seg in segments):
+        return jsonify({"error": "缓冲缺少时间戳，无法按区间截取", "code": "no_pdt"}), 409
+    oldest = segments[0][2]
+    last_end = segments[-1][2] + segments[-1][1]
+    if start_epoch < oldest:
+        retained = int(last_end - oldest)
+        return (
+            jsonify(
+                {
+                    "error": f"起点已超出缓冲（仅保留最近约 {retained} 秒），请离直播更近时再设起点",
+                    "code": "anchor_out_of_buffer",
+                }
+            ),
+            409,
+        )
+    start_epoch = min(start_epoch, last_end)
+    pin = clip_pins.create(match_id, start_epoch, segments)
+    return jsonify(
+        {
+            "ok": True,
+            "pin_id": pin["pin_id"],
+            "start_epoch_ms": round(start_epoch * 1000),
+            "ttl_seconds": CLIP_PIN_TTL_SECONDS,
+            "max_range_seconds": CLIP_RANGE_MAX_SECONDS,
+        }
+    )
+
+
+@app.delete("/api/monitor/clip/pin/<pin_id>")
+def monitor_clip_unpin(pin_id: str):
+    clip_pins.release(pin_id)
+    return jsonify({"ok": True})
+
+
 @app.post("/api/monitor/clip")
 def monitor_clip():
     body = request.get_json(silent=True) or {}
@@ -865,11 +1065,48 @@ def monitor_clip():
             anchor_epoch = float(body["anchor_epoch_ms"]) / 1000.0
         except (TypeError, ValueError):
             return jsonify({"error": "anchor_epoch_ms 必须是数字"}), 400
+    # Range mode: a pinned start plus the end frame the operator is looking at.
+    pin: dict[str, Any] | None = None
+    start_epoch: float | None = None
+    pin_id = str(body.get("pin_id") or "").strip()
+    if pin_id:
+        try:
+            anchor_epoch = float(body["end_epoch_ms"]) / 1000.0
+        except (KeyError, TypeError, ValueError):
+            return jsonify({"error": "区间截取需要 end_epoch_ms"}), 400
+        pin = clip_pins.get(pin_id, match_id)
+        if pin is None:
+            return (
+                jsonify(
+                    {
+                        "error": f"起点已失效（超过 {CLIP_PIN_TTL_SECONDS:g} 秒未截取），请重新设起点",
+                        "code": "pin_expired",
+                    }
+                ),
+                409,
+            )
+        start_epoch = pin["start_epoch"]
+        range_seconds = anchor_epoch - start_epoch
+        if range_seconds < 0.5:
+            return jsonify({"error": "终点必须在起点之后", "code": "range_invalid"}), 400
+        if range_seconds > CLIP_RANGE_MAX_SECONDS:
+            return (
+                jsonify(
+                    {
+                        "error": f"区间最长 {CLIP_RANGE_MAX_SECONDS:g} 秒，当前 {range_seconds:.1f} 秒",
+                        "code": "range_too_long",
+                    }
+                ),
+                400,
+            )
+        before_seconds = range_seconds
     person = str(body.get("person") or "").strip()[:40]
     title = str(body.get("title") or "").strip()[:100]
     if not live_preview.status(match_id).get("running"):
         return jsonify({"error": "请先开始预览该场，才能回捞画面", "code": "preview_not_running"}), 409
     segments = _read_playlist_segments(live_preview.media_dir(match_id))
+    if pin is not None:
+        segments = clip_pins.merged_segments(pin, segments)
     if not segments:
         return jsonify({"error": "缓冲还没有可用画面，请稍后再试", "code": "buffer_empty"}), 409
     # When the operator has drifted further behind live than the on-disk history,
@@ -892,9 +1129,11 @@ def monitor_clip():
     output_path = _clip_dir(match_id) / f"clip_{timestamp}_{uuid.uuid4().hex[:6]}.gif"
     anchored = anchor_epoch is not None and all(seg[2] is not None for seg in segments)
     try:
-        _encode_clip_gif(segments, before_seconds, output_path, anchor_epoch)
+        _encode_clip_gif(segments, before_seconds, output_path, anchor_epoch, start_epoch)
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
+    if pin is not None:
+        clip_pins.release(pin["pin_id"])
     print(
         json.dumps(
             {
@@ -903,6 +1142,8 @@ def monitor_clip():
                 "before_seconds": before_seconds,
                 "anchored": anchored,
                 "anchor_epoch_ms": None if anchor_epoch is None else round(anchor_epoch * 1000),
+                "start_epoch_ms": None if start_epoch is None else round(start_epoch * 1000),
+                "pin_id": pin_id or None,
                 "segments": len(segments),
                 "with_pdt": sum(1 for seg in segments if seg[2] is not None),
                 "clip": output_path.name,
@@ -985,6 +1226,21 @@ def monitor_publish_status():
             "enabled": True,
             "queue": manual_draft_queue.status(),
             "records": records,
+        }
+    )
+
+
+@app.get("/api/monitor/clips")
+def monitor_clips():
+    try:
+        match_id = validate_match_id(str(request.args.get("match_id") or ""))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify(
+        {
+            "match_id": match_id,
+            "publish_enabled": manual_draft_queue is not None,
+            "clips": _list_clips(match_id),
         }
     )
 

@@ -28,6 +28,8 @@
 | 投递模式 | `GIF_MONITOR_DELIVERY_MODE=draft`（人工审核；验收通过后可改 `publish`） |
 
 ### Nginx（/etc/nginx/conf.d/matchgif.conf）
+> 2026-10-19 起 443 监听已开 HTTP/2：`listen 443 ssl http2;` / `listen [::]:443 ssl http2 ipv6only=on;`（nginx 1.20.1 用 listen 参数写法，不支持 `http2 on;`）。验证：`curl -sI --http2 https://matchgif.aisportsapp.com/gif-monitor/ | head -1` → `HTTP/2 200`。改前备份在同目录 `matchgif.conf.bak-h2-YYYYMMDD`。
+
 ```nginx
 # gif-monitor
 location = /gif-monitor { return 301 /gif-monitor/; }
