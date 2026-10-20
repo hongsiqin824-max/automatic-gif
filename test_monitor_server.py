@@ -890,6 +890,20 @@ class ClipAlertMatchTests(unittest.TestCase):
         self.assertEqual(result["score"], "1-0")
         self.assertEqual(result["delta_seconds"], -100.0)
 
+    def test_rewinding_to_earlier_goal_after_later_push_landed(self):
+        # Operator rewinds the buffer to clip goal A while goal B's push has
+        # already arrived (A at -90s, B at +150s from the frame). With a measured
+        # offset of -90 A is unambiguously closer; "newest" would pick B.
+        self._add(910.0, score="1-0", minute="1H 23")
+        self._add(1150.0, score="2-0", minute="1H 27")
+        with mock.patch.object(monitor_server, "ALERT_MATCH_EXPECTED_OFFSET_SECONDS", -90.0):
+            result = monitor_server._match_clip_alert("54622319", 1000.0)
+        self.assertEqual(result["score"], "1-0")
+        self.assertEqual(result["alert_seq"], 1)
+        self.assertEqual(result["candidates"], 2)
+        self.assertFalse(result["ambiguous"])
+        self.assertFalse(result["weak"])
+
     def test_first_goal_clip_ignores_later_goal(self):
         self._add(1000.0, score="1-0", minute="1H 23")
         self._add(1600.0, score="2-0", minute="2H 55")

@@ -131,7 +131,12 @@ ALERT_MATCH_LOOKBACK_SECONDS = positive_env_float("GIF_MONITOR_ALERT_MATCH_LOOKB
 ALERT_MATCH_LOOKAHEAD_SECONDS = positive_env_float("GIF_MONITOR_ALERT_MATCH_LOOKAHEAD_SECONDS", 180.0)
 # Expected ``ts_unix - anchor`` (seconds, may be negative). 0 until measured from
 # the ``delta_seconds`` field in ``monitor_clip`` logs.
-ALERT_MATCH_EXPECTED_OFFSET_SECONDS = float(os.environ.get("GIF_MONITOR_ALERT_MATCH_EXPECTED_OFFSET_SECONDS", "0") or 0)
+try:
+    ALERT_MATCH_EXPECTED_OFFSET_SECONDS = float(
+        os.environ.get("GIF_MONITOR_ALERT_MATCH_EXPECTED_OFFSET_SECONDS", "0").strip() or 0
+    )
+except ValueError as exc:
+    raise RuntimeError("GIF_MONITOR_ALERT_MATCH_EXPECTED_OFFSET_SECONDS 必须是数字（可为负）") from exc
 # Runner-up closer than this to the best pick (in |delta − expected| space) is
 # flagged ambiguous in the clip log / page.
 ALERT_MATCH_AMBIGUOUS_SECONDS = positive_env_float("GIF_MONITOR_ALERT_MATCH_AMBIGUOUS_SECONDS", 180.0)
