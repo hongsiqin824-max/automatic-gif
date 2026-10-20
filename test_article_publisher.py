@@ -595,7 +595,8 @@ class ArticlePublisherTests(unittest.TestCase):
         )
         self.assertEqual(fields["archive_level"], "B")
         self.assertEqual(fields["status"], 1)
-        self.assertEqual(fields["add_to_tab"], 1)
+        self.assertEqual(fields["add_to_tab"], 0)
+        self.assertEqual(fields["channelsnew"], "12039035")
         self.assertEqual(fields["type"], "article")
         self.assertEqual(fields["style"], "gif")
         self.assertEqual(fields["match_event"], 2)
@@ -621,8 +622,36 @@ class ArticlePublisherTests(unittest.TestCase):
         )
 
         self.assertEqual(fields["status"], 0)
-        self.assertEqual(fields["add_to_tab"], 1)
+        self.assertEqual(fields["add_to_tab"], 0)
         self.assertEqual(fields["archive_id"], 3801234)
+
+    def test_add_to_tab_and_channelsnew_follow_environment(self):
+        import os
+
+        import article_publisher
+
+        common = {
+            "match_id": "54478914",
+            "event": {"code": "G", "minute": "19", "score": "1-0"},
+            "gif_url": "https://matchgif.aisportsapp.com/publish-gifs/a.gif",
+            "cover_url": "https://matchgif.aisportsapp.com/publish-gif-covers/a.jpg",
+            "title": "t",
+        }
+        # Values are read per call so a .env loaded after import still applies.
+        with patch.dict(os.environ, {"ARTICLE_ADD_TO_TAB": "1", "ARTICLE_CHANNELSNEW": "1,22"}):
+            fields = build_article_fields(**common)
+        self.assertEqual(fields["add_to_tab"], 1)
+        self.assertEqual(fields["channelsnew"], "1,22")
+        # Empty channelsnew is omitted from the request, not sent as "".
+        with patch.dict(os.environ, {"ARTICLE_CHANNELSNEW": ""}):
+            fields = build_article_fields(**common)
+        self.assertNotIn("channelsnew", fields)
+        with patch.dict(os.environ, {"ARTICLE_ADD_TO_TAB": "2"}):
+            with self.assertRaises(RuntimeError):
+                article_publisher.article_add_to_tab()
+        with patch.dict(os.environ, {"ARTICLE_CHANNELSNEW": "abc"}):
+            with self.assertRaises(RuntimeError):
+                article_publisher.article_channelsnew()
 
     def test_draft_fields_reject_invalid_delivery_mode_and_archive_id(self):
         common = {
@@ -842,7 +871,8 @@ class ArticlePublisherTests(unittest.TestCase):
             self.assertTrue(second["idempotent_replay"])
             self.assertEqual(len(platform.calls), 1)
             self.assertEqual(platform.calls[0]["status"], 1)
-            self.assertEqual(platform.calls[0]["add_to_tab"], 1)
+            self.assertEqual(platform.calls[0]["add_to_tab"], 0)
+            self.assertEqual(platform.calls[0]["channelsnew"], "12039035")
             self.assertNotIn("archive_id", platform.calls[0])
             self.assertEqual(
                 publisher.records_for_match("54478914")["goal-19"]["article_id"],
@@ -1000,7 +1030,7 @@ class ArticlePublisherTests(unittest.TestCase):
             self.assertEqual(created["gif"]["url"], checked_urls[0])
             self.assertEqual(len(platform.calls), 2)
             self.assertEqual(platform.calls[0]["status"], 0)
-            self.assertEqual(platform.calls[0]["add_to_tab"], 1)
+            self.assertEqual(platform.calls[0]["add_to_tab"], 0)
             self.assertNotIn("archive_id", platform.calls[0])
             self.assertEqual(platform.calls[1]["archive_id"], 3801234)
             self.assertFalse(database_path.exists())

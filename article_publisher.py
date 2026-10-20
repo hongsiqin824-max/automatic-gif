@@ -39,6 +39,26 @@ EVENT_LABELS = {
     "YC": "黄牌",
 }
 GOAL_EVENT_CODES = frozenset({"G", "PG", "OG"})
+
+
+# Read at call time, not import time: both servers import this module before
+# they load ``.env``, so a module-level constant would never see the file.
+def article_add_to_tab() -> int:
+    """Whether created articles appear in the news list (``1``) or not (``0``)."""
+    value = os.environ.get("ARTICLE_ADD_TO_TAB", "0").strip()
+    if value not in {"0", "1"}:
+        raise RuntimeError("ARTICLE_ADD_TO_TAB 必须是 0 或 1")
+    return int(value)
+
+
+def article_channelsnew() -> str:
+    """Secondary tag ids (``channelsnew``), comma separated; empty = not sent."""
+    raw = os.environ.get("ARTICLE_CHANNELSNEW", "12039035")
+    ids = [part.strip() for part in raw.split(",") if part.strip()]
+    for item in ids:
+        if not re.fullmatch(r"\d{1,20}", item):
+            raise RuntimeError("ARTICLE_CHANNELSNEW 必须是逗号分隔的数字标签 id")
+    return ",".join(ids)
 RELIABLE_PERSON_PLACEHOLDERS = frozenset(
     {
         "0",
@@ -668,7 +688,8 @@ class ArticlePublisher:
             ocr_upload_status = {"enabled": False, "configured": False}
         return {
             "archive_level": "B",
-            "add_to_tab": 1,
+            "add_to_tab": article_add_to_tab(),
+            "channelsnew": article_channelsnew() or None,
             "type": "article",
             "style": "gif",
             "default_account": self.account_pool is None,
@@ -1789,8 +1810,11 @@ def build_article_fields(
         "style": "gif",
         "litpic": normalized_cover_url,
         "match_id": match_id,
-        "add_to_tab": 1,
+        "add_to_tab": article_add_to_tab(),
     }
+    channelsnew = article_channelsnew()
+    if channelsnew:
+        fields["channelsnew"] = channelsnew
     if publish_account is not None:
         user_id_text = str(publish_account.get("user_id") or "").strip()
         user_name = str(publish_account.get("user_name") or "").strip()
@@ -1812,7 +1836,9 @@ def build_article_fields(
     match_time = _match_time(event)
     if match_time:
         fields["match_time"] = match_time
-    if code in EVENT_TYPES:
+    # Operator clips (8901) cannot tell a penalty/own goal/disallowed goal from
+    # a normal one, so they leave match_event for the CMS editor to pick.
+    if code in EVENT_TYPES and not event.get("manual_match_event"):
         fields["match_event"] = EVENT_TYPES[code]
     score = _match_score(event.get("score"))
     if score:
@@ -1840,6 +1866,7 @@ def _draft_diagnostics(
             "match_event",
             "match_score",
             "add_to_tab",
+            "channelsnew",
             "archive_id",
             "litpic",
             "user_id",

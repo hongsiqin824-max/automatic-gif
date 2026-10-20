@@ -349,8 +349,13 @@ async function captureClip(matchId, button, range) {
       : data.draft
       ? ' · 已建草稿'
       : '';
+    const alertNote = alertMatchNote(data.alert_match);
     const prefix = warn ? '⚠ 未锚定，画面可能不准' : '已生成 GIF';
-    setTileStatus(matchId, `${prefix}（${sizeMb} MB）${publishNote}`, warn ? 'warn' : 'ok', true);
+    setTileStatus(matchId, `${prefix}（${sizeMb} MB）${publishNote}${alertNote}`, warn ? 'warn' : 'ok', true);
+    if (state.stageMatchId === matchId && alertNote) {
+      const am = data.alert_match || {};
+      addStageNote(alertNote.replace(/^ · /, ''), am.mode === 'alert' && !am.ambiguous ? 'ok' : 'warn');
+    }
     const tile = state.tiles.get(matchId);
     setTileClipCount(matchId, ((tile && tile.clipCount) || 0) + 1, true);
     if (state.stageMatchId === matchId) loadStageClips(matchId);
@@ -362,6 +367,19 @@ async function captureClip(matchId, button, range) {
   } finally {
     if (button) { button.disabled = false; button.textContent = prevLabel; }
   }
+}
+
+// Human-readable summary of which goal/red card the server tied this clip to,
+// so the operator can spot a wrong auto-pick without extra UI.
+function alertMatchNote(am) {
+  if (!am || !am.mode) return '';
+  const clock = [am.match_time ? `${am.match_time}'` : '', am.score || ''].filter(Boolean).join(' ');
+  if (am.mode === 'alert') {
+    const flag = am.ambiguous ? '（候选多条，请核对）' : '';
+    return ` · 已关联提醒 ${clock}${flag}`;
+  }
+  if (am.mode === 'catalog') return ` · 未匹配提醒，用当前比分 ${clock}`;
+  return ' · 未匹配提醒，时间/比分留空';
 }
 
 function addStageNote(text, cls) {

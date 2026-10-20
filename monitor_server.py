@@ -21,6 +21,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import threading
 import time
@@ -113,7 +114,20 @@ FEISHU_WEBHOOK = os.environ.get("GIF_MONITOR_FEISHU_WEBHOOK", "").strip()
 FEISHU_TIMEOUT = positive_env_float("GIF_MONITOR_FEISHU_TIMEOUT_SECONDS", 2.5)
 # Optional shared secret for the monitor→8901 loopback call. Empty = no check.
 ALERT_INGEST_TOKEN = os.environ.get("GIF_MONITOR_INGEST_TOKEN", "").strip()
-ALERT_BUFFER_SIZE = positive_env_int("GIF_MONITOR_ALERT_BUFFER", 50)
+# Ring size for the page cursor and for clip→alert matching. A busy weekend has
+# a dozen concurrent matches, so a few hundred keeps a whole evening in reach.
+ALERT_BUFFER_SIZE = positive_env_int("GIF_MONITOR_ALERT_BUFFER", 500)
+# Alerts are persisted so a deploy restart does not lose the goals needed to
+# fill match_time/match_score on clips taken a minute later. Empty = memory only.
+# A relative path is anchored to the repo, not the process cwd (systemd differs).
+_alert_db_env = os.environ.get("GIF_MONITOR_ALERT_DB_PATH", "data/monitor_alerts.sqlite3").strip()
+ALERT_DB_PATH = str(ROOT / _alert_db_env) if _alert_db_env and not os.path.isabs(_alert_db_env) else _alert_db_env
+# Clip→alert matching window: the operator clips after the live delay (~1-2 min)
+# plus reaction time, so look back generously but never ahead of the frame.
+ALERT_MATCH_LOOKBACK_SECONDS = positive_env_float("GIF_MONITOR_ALERT_MATCH_LOOKBACK_SECONDS", 600.0)
+ALERT_MATCH_LOOKAHEAD_SECONDS = positive_env_float("GIF_MONITOR_ALERT_MATCH_LOOKAHEAD_SECONDS", 30.0)
+# Two candidate alerts closer than this are flagged ambiguous in the clip log.
+ALERT_MATCH_AMBIGUOUS_SECONDS = positive_env_float("GIF_MONITOR_ALERT_MATCH_AMBIGUOUS_SECONDS", 180.0)
 EVENT_CN = {"goal": "进球", "red_card": "红牌", "corner": "角球"}
 
 
@@ -138,14 +152,59 @@ class _AlertStore:
     The browser polls ``since`` with the last ``seq`` it has seen, so each new
     goal/red-card is delivered exactly once per client. ``dedup_key`` guards
     against the monitor re-POSTing the same event (its own retry or overlap).
+
+    With ``db_path`` every accepted alert is also appended to a tiny SQLite
+    table and the newest ``capacity`` rows are reloaded on start, so the ring
+    (and the clip→alert match that relies on it) survives an 8901 restart.
+    Persistence failures are logged and never block ingestion.
     """
 
-    def __init__(self, capacity: int) -> None:
+    def __init__(self, capacity: int, db_path: str | Path | None = None) -> None:
         self._lock = threading.Lock()
         self._events: deque[dict[str, Any]] = deque(maxlen=capacity)
         self._seen: set[str] = set()
-        self._seen_order: deque[str] = deque(maxlen=512)
+        self._seen_order: deque[str] = deque(maxlen=max(512, capacity))
         self._seq = 0
+        self._db: sqlite3.Connection | None = None
+        if db_path:
+            self._open_db(Path(db_path), capacity)
+
+    def _open_db(self, path: Path, capacity: int) -> None:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            db = sqlite3.connect(str(path), check_same_thread=False)
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS monitor_alerts ("
+                "seq INTEGER PRIMARY KEY, ts_unix REAL NOT NULL, match_id TEXT NOT NULL,"
+                " event_type TEXT NOT NULL, dedup_key TEXT, event_json TEXT NOT NULL)"
+            )
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_monitor_alerts_match ON monitor_alerts(match_id, ts_unix)"
+            )
+            db.commit()
+            rows = db.execute(
+                "SELECT seq, dedup_key, event_json FROM monitor_alerts ORDER BY seq DESC LIMIT ?",
+                (capacity,),
+            ).fetchall()
+        except (sqlite3.Error, OSError) as exc:
+            print(
+                json.dumps({"event": "alert_db_unavailable", "path": str(path), "error": str(exc)}, ensure_ascii=False),
+                flush=True,
+            )
+            return
+        for seq, dedup_key, event_json in reversed(rows):
+            try:
+                event = json.loads(event_json)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(event, dict):
+                continue
+            self._events.append(event)
+            self._seq = max(self._seq, int(seq))
+            if dedup_key:
+                self._seen_order.append(dedup_key)
+                self._seen.add(dedup_key)
+        self._db = db
 
     def add(self, event: dict[str, Any]) -> dict[str, Any] | None:
         """Store an event; return the stored copy, or ``None`` if duplicate."""
@@ -163,6 +222,26 @@ class _AlertStore:
             stored["seq"] = self._seq
             stored["ts_unix"] = time.time()
             self._events.append(stored)
+            if self._db is not None:
+                try:
+                    self._db.execute(
+                        "INSERT INTO monitor_alerts (seq, ts_unix, match_id, event_type, dedup_key, event_json)"
+                        " VALUES (?, ?, ?, ?, ?, ?)",
+                        (
+                            stored["seq"],
+                            stored["ts_unix"],
+                            str(stored.get("match_id") or ""),
+                            str(stored.get("event_type") or ""),
+                            key or None,
+                            json.dumps(stored, ensure_ascii=False),
+                        ),
+                    )
+                    self._db.commit()
+                except sqlite3.Error as exc:
+                    print(
+                        json.dumps({"event": "alert_db_write_failed", "error": str(exc)}, ensure_ascii=False),
+                        flush=True,
+                    )
             return stored
 
     def since(self, cursor: int) -> tuple[list[dict[str, Any]], int]:
@@ -170,11 +249,30 @@ class _AlertStore:
             events = [dict(item) for item in self._events if item["seq"] > cursor]
             return events, self._seq
 
+    def for_match(self, match_id: str, since_ts: float, until_ts: float) -> list[dict[str, Any]]:
+        """Alerts of one match with ``since_ts <= ts_unix <= until_ts``, oldest first."""
+        wanted = str(match_id)
+        with self._lock:
+            return [
+                dict(item)
+                for item in self._events
+                if str(item.get("match_id") or "") == wanted
+                and since_ts <= float(item.get("ts_unix") or 0.0) <= until_ts
+            ]
 
-alert_store = _AlertStore(ALERT_BUFFER_SIZE)
+    def close(self) -> None:
+        with self._lock:
+            if self._db is not None:
+                self._db.close()
+                self._db = None
+
+
+alert_store = _AlertStore(ALERT_BUFFER_SIZE, ALERT_DB_PATH or None)
+atexit.register(alert_store.close)
 # Regenerated every process start. The browser watches this to detect an 8901
-# restart (which resets the in-memory ``seq`` to 0) and re-baseline its cursor,
-# so an already-open page keeps receiving alerts across deploys.
+# restart and re-baseline its cursor (``seq`` is restored from SQLite when
+# persistence is on, but falls back to 0 without it), so an already-open page
+# keeps receiving alerts across deploys.
 BOOT_ID = uuid.uuid4().hex
 
 
@@ -800,6 +898,91 @@ def _match_detail_for(match_id: str) -> dict[str, Any]:
     return {}
 
 
+_ALERT_MINUTE_RE = re.compile(r"(\d{1,3})(?:\s*\+\s*(\d{1,2}))?\s*'?\s*$")
+
+
+def _alert_minute_parts(value: Any) -> tuple[str, str]:
+    """Split a monitor minute such as ``"2H 68"`` / ``"45+2"`` into (minute, extra).
+
+    The push monitor formats minute as ``"{period} {playing_time}"``; only the
+    trailing number (with optional stoppage) is the match clock we can publish.
+    """
+    match = _ALERT_MINUTE_RE.search(str(value or "").strip())
+    if not match:
+        return "", ""
+    return match.group(1), match.group(2) or ""
+
+
+def _catalog_clock_for(match_id: str) -> dict[str, Any]:
+    """Current minute/score of a match from the catalog snapshot (fallback source)."""
+    for item in match_catalog.snapshot().get("playing", []):
+        if isinstance(item, dict) and str(item.get("match_id") or "") == str(match_id):
+            fs_a, fs_b = item.get("fs_A"), item.get("fs_B")
+            score = f"{fs_a}-{fs_b}" if fs_a not in (None, "") and fs_b not in (None, "") else ""
+            minute = str(item.get("minute") or "").strip()
+            extra = str(item.get("minute_extra") or "").strip()
+            return {"minute": minute if minute.isdigit() else "", "minute_extra": extra, "score": score}
+    return {}
+
+
+def _match_clip_alert(match_id: str, anchor_epoch: float) -> dict[str, Any]:
+    """Pick the alert a clip most likely captures, or fall back to the catalog clock.
+
+    Rule: among this match's alerts inside ``[anchor - lookback, anchor + lookahead]``
+    take the newest. The clipped frame is behind real time by the live delay,
+    while the push alert arrives seconds after the real event, so the newest
+    alert at or before the frame is the one the operator is looking at. Two
+    candidates closer than ``ALERT_MATCH_AMBIGUOUS_SECONDS`` are flagged so the
+    log can tell how often the auto-pick is uncertain.
+
+    Returns ``{"mode": "alert"|"catalog"|"none", "minute", "minute_extra",
+    "score", "code", "candidates", "ambiguous", "alert_seq", "alert_minute"}``.
+    """
+    result: dict[str, Any] = {
+        "mode": "none",
+        "minute": "",
+        "minute_extra": "",
+        "score": "",
+        "code": "",
+        "team": "",
+        "candidates": 0,
+        "ambiguous": False,
+        "alert_seq": None,
+        "alert_minute": None,
+    }
+    candidates = alert_store.for_match(
+        match_id,
+        anchor_epoch - ALERT_MATCH_LOOKBACK_SECONDS,
+        anchor_epoch + ALERT_MATCH_LOOKAHEAD_SECONDS,
+    )
+    result["candidates"] = len(candidates)
+    if candidates:
+        chosen = candidates[-1]
+        if len(candidates) >= 2:
+            gap = float(chosen.get("ts_unix") or 0.0) - float(candidates[-2].get("ts_unix") or 0.0)
+            result["ambiguous"] = gap < ALERT_MATCH_AMBIGUOUS_SECONDS
+        minute, extra = _alert_minute_parts(chosen.get("minute"))
+        side = str(chosen.get("team") or "").upper()
+        result.update(
+            {
+                "mode": "alert",
+                "minute": minute,
+                "minute_extra": extra,
+                "score": str(chosen.get("score") or "").strip(),
+                "code": "RC" if chosen.get("event_type") == "red_card" else "G",
+                # Only a resolved side feeds the title; "?" would be printed verbatim.
+                "team": side if side in {"A", "B"} else "",
+                "alert_seq": chosen.get("seq"),
+                "alert_minute": chosen.get("minute"),
+            }
+        )
+        return result
+    clock = _catalog_clock_for(match_id)
+    if clock.get("minute") or clock.get("score"):
+        result.update({"mode": "catalog", "code": "G", **clock})
+    return result
+
+
 def _alert_drop_reason(match_id: str) -> dict[str, Any]:
     """Classify why a forwarded alert's match is not in the capturable catalog.
 
@@ -1134,6 +1317,11 @@ def monitor_clip():
         return jsonify({"error": str(exc)}), 500
     if pin is not None:
         clip_pins.release(pin["pin_id"])
+    # Resolve which goal/red card this clip belongs to so the draft carries
+    # match_time/match_score; the operator still picks match_event in the CMS.
+    alert_match = _match_clip_alert(
+        match_id, anchor_epoch if anchor_epoch is not None else time.time()
+    )
     print(
         json.dumps(
             {
@@ -1147,6 +1335,16 @@ def monitor_clip():
                 "segments": len(segments),
                 "with_pdt": sum(1 for seg in segments if seg[2] is not None),
                 "clip": output_path.name,
+                "alert_match": {
+                    "mode": alert_match["mode"],
+                    "candidates": alert_match["candidates"],
+                    "ambiguous": alert_match["ambiguous"],
+                    "alert_seq": alert_match["alert_seq"],
+                    "alert_minute": alert_match["alert_minute"],
+                    "minute": alert_match["minute"],
+                    "minute_extra": alert_match["minute_extra"],
+                    "score": alert_match["score"],
+                },
             },
             ensure_ascii=False,
         ),
@@ -1158,9 +1356,17 @@ def monitor_clip():
         event_key = f"manual_{int(anchor_epoch if anchor_epoch is not None else time.time())}"
         event = {
             "event_key": event_key,
-            "code": "G",
+            # ``code`` only drives the generated title's wording; the CMS
+            # ``match_event`` is left for the operator (see manual_match_event).
+            "code": alert_match["code"] or "G",
+            "manual_match_event": True,
             "person": person,
             "title_override": title,
+            "team": alert_match["team"],
+            "minute": alert_match["minute"],
+            "minute_extra": alert_match["minute_extra"],
+            "score": alert_match["score"],
+            "alert_match_mode": alert_match["mode"],
         }
         try:
             task = manual_draft_queue.enqueue(
@@ -1203,6 +1409,17 @@ def monitor_clip():
             "delivery_mode": _manual_delivery_mode(),
             "draft": draft,
             "publish_error": publish_error,
+            "alert_match": {
+                "mode": alert_match["mode"],
+                "candidates": alert_match["candidates"],
+                "ambiguous": alert_match["ambiguous"],
+                "match_time": (
+                    f"{alert_match['minute']}+{alert_match['minute_extra']}"
+                    if alert_match["minute"] and alert_match["minute_extra"] not in ("", "0")
+                    else alert_match["minute"]
+                ),
+                "score": alert_match["score"],
+            },
         }
     )
 

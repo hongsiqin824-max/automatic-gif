@@ -501,7 +501,8 @@ class ArticleDraftQueueTests(unittest.TestCase):
             self.assertEqual(record["article_id"], "6230049")
             self.assertEqual(record["draft_url"], draft_admin_url("6230049"))
             self.assertEqual(platform.calls[0]["status"], 1)
-            self.assertEqual(platform.calls[0]["add_to_tab"], 1)
+            self.assertEqual(platform.calls[0]["add_to_tab"], 0)
+            self.assertEqual(platform.calls[0]["channelsnew"], "12039035")
 
             replay = self.enqueue(queue,
                 match_id="54478914",

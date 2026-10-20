@@ -13,6 +13,8 @@ from unittest import mock
 os.environ.setdefault("GIF_SOURCE_SECRET", "test-secret")
 # Keep tests local-only: do not build the publish stack or start a draft worker.
 os.environ.setdefault("GIF_MONITOR_PUBLISH_ENABLED", "false")
+# Do not touch the real alert database; persistence has its own temp-dir tests.
+os.environ.setdefault("GIF_MONITOR_ALERT_DB_PATH", "")
 
 import monitor_server
 from monitor_server import (
@@ -714,6 +716,304 @@ class EventAlertTests(unittest.TestCase):
                 headers={"X-Monitor-Token": "secret"},
             )
             self.assertTrue(ok.get_json()["accepted"])
+
+
+class AlertStorePersistenceTests(unittest.TestCase):
+    """``_AlertStore`` survives a restart via its SQLite mirror."""
+
+    def setUp(self):
+        self.tmp = TemporaryDirectory()
+        self.db = Path(self.tmp.name) / "alerts.sqlite3"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _event(self, key: str, match_id: str = "54622319", **extra):
+        body = {"match_id": match_id, "event_type": "goal", "team": "A", "score": "1-0",
+                "minute": "1H 23", "dedup_key": key}
+        body.update(extra)
+        return body
+
+    def test_reload_restores_events_seq_and_dedup(self):
+        store = monitor_server._AlertStore(50, self.db)
+        store.add(self._event("a"))
+        store.add(self._event("b", score="2-0", minute="2H 61"))
+        store.close()
+
+        reloaded = monitor_server._AlertStore(50, self.db)
+        events, seq = reloaded.since(0)
+        self.assertEqual([e["seq"] for e in events], [1, 2])
+        self.assertEqual(seq, 2)
+        self.assertEqual(events[1]["score"], "2-0")
+        # Dedup keys came back too, so a monitor retry after restart is still rejected.
+        self.assertIsNone(reloaded.add(self._event("a")))
+        # And new events continue the sequence instead of restarting at 1.
+        self.assertEqual(reloaded.add(self._event("c"))["seq"], 3)
+        reloaded.close()
+
+    def test_reload_keeps_only_newest_capacity(self):
+        store = monitor_server._AlertStore(10, self.db)
+        for i in range(10):
+            store.add(self._event(f"k{i}"))
+        store.close()
+        reloaded = monitor_server._AlertStore(3, self.db)
+        events, seq = reloaded.since(0)
+        self.assertEqual([e["seq"] for e in events], [8, 9, 10])
+        self.assertEqual(seq, 10)
+        reloaded.close()
+
+    def test_memory_only_when_no_db_path(self):
+        store = monitor_server._AlertStore(5, None)
+        store.add(self._event("x"))
+        self.assertEqual(store.since(0)[1], 1)
+        self.assertFalse(self.db.exists())
+
+    def test_unwritable_db_degrades_to_memory(self):
+        bad = Path(self.tmp.name) / "not-a-dir"
+        bad.write_bytes(b"file, not a directory")
+        store = monitor_server._AlertStore(5, bad / "alerts.sqlite3")
+        self.assertIsNotNone(store.add(self._event("y")))
+        self.assertEqual(store.since(0)[1], 1)
+
+    def test_for_match_filters_by_match_and_window(self):
+        store = monitor_server._AlertStore(50, None)
+        with mock.patch.object(monitor_server.time, "time", side_effect=[100.0, 200.0, 300.0]):
+            store.add(self._event("m1"))
+            store.add(self._event("m2", match_id="99999999"))
+            store.add(self._event("m3"))
+        picked = store.for_match("54622319", 150.0, 350.0)
+        self.assertEqual([e["seq"] for e in picked], [3])
+        self.assertEqual([e["seq"] for e in store.for_match("54622319", 0.0, 1000.0)], [1, 3])
+
+
+class ClipAlertMatchTests(unittest.TestCase):
+    """Which goal/red card a clip is tied to, and how that reaches the draft."""
+
+    def setUp(self):
+        self.store = monitor_server._AlertStore(50, None)
+        self._patches = [
+            mock.patch.object(monitor_server, "alert_store", self.store),
+            mock.patch.object(monitor_server, "ALERT_MATCH_LOOKBACK_SECONDS", 600.0),
+            mock.patch.object(monitor_server, "ALERT_MATCH_LOOKAHEAD_SECONDS", 30.0),
+            mock.patch.object(monitor_server, "ALERT_MATCH_AMBIGUOUS_SECONDS", 180.0),
+            mock.patch.object(
+                monitor_server.match_catalog,
+                "snapshot",
+                return_value={
+                    "playing": [
+                        {"match_id": "54622319", "team_A_name": "伊尔韦斯", "team_B_name": "里耶卡",
+                         "fs_A": 2, "fs_B": 1, "minute": "67", "minute_extra": "0"}
+                    ]
+                },
+            ),
+        ]
+        for patch in self._patches:
+            patch.start()
+
+    def tearDown(self):
+        for patch in self._patches:
+            patch.stop()
+
+    def _add(self, ts: float, **fields):
+        body = {"match_id": "54622319", "event_type": "goal", "team": "A", "score": "1-0",
+                "minute": "1H 23", "dedup_key": f"k{ts}"}
+        body.update(fields)
+        with mock.patch.object(monitor_server.time, "time", return_value=ts):
+            return self.store.add(body)
+
+    def test_minute_parsing(self):
+        parts = monitor_server._alert_minute_parts
+        self.assertEqual(parts("2H 68"), ("68", ""))
+        self.assertEqual(parts("1H 45+2"), ("45", "2"))
+        self.assertEqual(parts("45+2'"), ("45", "2"))
+        self.assertEqual(parts("90"), ("90", ""))
+        self.assertEqual(parts("HT"), ("", ""))
+        self.assertEqual(parts(None), ("", ""))
+
+    def test_picks_newest_alert_before_anchor(self):
+        self._add(1000.0, score="1-0", minute="1H 23")
+        self._add(1300.0, score="2-0", minute="2H 55")
+        # Operator clips ~90s after the second goal (live delay). Both goals are
+        # inside the 600s lookback; the newest one wins and the gap (300s) is
+        # wide enough not to count as ambiguous.
+        result = monitor_server._match_clip_alert("54622319", 1390.0)
+        self.assertEqual(result["mode"], "alert")
+        self.assertEqual(result["score"], "2-0")
+        self.assertEqual(result["minute"], "55")
+        self.assertEqual(result["alert_seq"], 2)
+        self.assertEqual(result["candidates"], 2)
+        self.assertFalse(result["ambiguous"])
+
+    def test_first_goal_clip_ignores_later_goal(self):
+        self._add(1000.0, score="1-0", minute="1H 23")
+        self._add(1600.0, score="2-0", minute="2H 55")
+        # Anchor is the frame of the first goal (+80s delay); the second goal has
+        # not happened yet at that wall-clock, so it must not be picked.
+        result = monitor_server._match_clip_alert("54622319", 1080.0)
+        self.assertEqual(result["score"], "1-0")
+        self.assertEqual(result["alert_seq"], 1)
+        self.assertEqual(result["candidates"], 1)
+
+    def test_two_close_alerts_are_flagged_ambiguous(self):
+        self._add(1000.0, event_type="red_card", score="0-0", minute="1H 30")
+        self._add(1060.0, score="1-0", minute="1H 31")
+        result = monitor_server._match_clip_alert("54622319", 1150.0)
+        self.assertEqual(result["mode"], "alert")
+        self.assertEqual(result["score"], "1-0")
+        self.assertEqual(result["code"], "G")
+        self.assertTrue(result["ambiguous"])
+
+    def test_red_card_alert_sets_rc_code(self):
+        self._add(1000.0, event_type="red_card", score="0-0", minute="1H 30")
+        result = monitor_server._match_clip_alert("54622319", 1050.0)
+        self.assertEqual(result["code"], "RC")
+
+    def test_alert_too_old_falls_back_to_catalog(self):
+        self._add(1000.0, score="1-0")
+        result = monitor_server._match_clip_alert("54622319", 1000.0 + 601.0)
+        self.assertEqual(result["mode"], "catalog")
+        self.assertEqual(result["score"], "2-1")
+        self.assertEqual(result["minute"], "67")
+        self.assertEqual(result["candidates"], 0)
+
+    def test_other_match_alert_is_ignored(self):
+        self._add(1000.0, match_id="99999999", score="5-5")
+        result = monitor_server._match_clip_alert("54622319", 1050.0)
+        self.assertEqual(result["mode"], "catalog")
+        self.assertEqual(result["score"], "2-1")
+
+    def test_no_alert_and_no_catalog_is_none(self):
+        with mock.patch.object(monitor_server.match_catalog, "snapshot", return_value={"playing": []}):
+            result = monitor_server._match_clip_alert("54622319", 1050.0)
+        self.assertEqual(result["mode"], "none")
+        self.assertEqual(result["minute"], "")
+        self.assertEqual(result["score"], "")
+
+
+class ClipEndpointAlertMatchTests(unittest.TestCase):
+    """``POST /api/monitor/clip`` forwards the matched alert into the draft event."""
+
+    def setUp(self):
+        self.client = monitor_server.app.test_client()
+        self.tmp = TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.base = 1_700_000_000.0
+        lines = ["#EXTM3U", "#EXT-X-TARGETDURATION:2"]
+        for i in range(10):
+            path = self.dir / f"seg_{i:05d}.ts"
+            path.write_bytes(b"x")
+            iso = monitor_server.datetime.fromtimestamp(self.base + i * 2.0).astimezone().isoformat(timespec="milliseconds")
+            lines += [f"#EXT-X-PROGRAM-DATE-TIME:{iso}", "#EXTINF:2.000,", path.name]
+        (self.dir / "index.m3u8").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        self.store = monitor_server._AlertStore(50, None)
+        self.queue = mock.Mock()
+        self.queue.enqueue.return_value = {"status": "queued"}
+        self._patches = [
+            mock.patch.object(monitor_server, "alert_store", self.store),
+            mock.patch.object(monitor_server, "manual_draft_queue", self.queue),
+            mock.patch.object(monitor_server, "_clip_dir", return_value=self.dir / "clips"),
+            mock.patch.object(monitor_server.live_preview, "status", return_value={"running": True}),
+            mock.patch.object(monitor_server.live_preview, "media_dir", return_value=self.dir),
+            mock.patch.object(monitor_server, "_encode_clip_gif", side_effect=self._fake_encode),
+            mock.patch.object(
+                monitor_server.match_catalog,
+                "snapshot",
+                return_value={"playing": [{"match_id": "54622319", "team_A_name": "甲", "team_B_name": "乙",
+                                           "fs_A": 1, "fs_B": 1, "minute": "70", "minute_extra": "0"}]},
+            ),
+        ]
+        for patch in self._patches:
+            patch.start()
+
+    def tearDown(self):
+        for patch in self._patches:
+            patch.stop()
+        self.tmp.cleanup()
+
+    def _fake_encode(self, segments, before_seconds, output_path, anchor_epoch=None, start_epoch=None):
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"GIF")
+
+    def _clip(self, anchor_offset: float):
+        return self.client.post(
+            "/api/monitor/clip",
+            json={"match_id": "54622319", "anchor_epoch_ms": round((self.base + anchor_offset) * 1000), "before_seconds": 5},
+        )
+
+    def test_matched_alert_fills_minute_score_and_leaves_match_event_manual(self):
+        with mock.patch.object(monitor_server.time, "time", return_value=self.base - 60.0):
+            self.store.add({"match_id": "54622319", "event_type": "goal", "team": "B",
+                            "score": "1-1", "minute": "2H 68", "dedup_key": "g1"})
+        response = self._clip(10.0)
+        self.assertEqual(response.status_code, 200, response.get_json())
+        data = response.get_json()
+        self.assertEqual(data["alert_match"]["mode"], "alert")
+        self.assertEqual(data["alert_match"]["match_time"], "68")
+        self.assertEqual(data["alert_match"]["score"], "1-1")
+        event = self.queue.enqueue.call_args.kwargs["event"]
+        self.assertEqual(event["minute"], "68")
+        self.assertEqual(event["score"], "1-1")
+        self.assertEqual(event["code"], "G")
+        self.assertEqual(event["team"], "B")
+        self.assertTrue(event["manual_match_event"])
+        self.assertEqual(event["alert_match_mode"], "alert")
+        # The auto title now carries clock, side and score instead of "比赛中…对阵…".
+        import article_publisher
+
+        title = article_publisher.build_article_title(event, {"team_A_name": "甲", "team_B_name": "乙"})
+        self.assertEqual(title, "68分钟，乙进球，甲 1-1 乙")
+
+    def test_unresolved_side_is_not_forwarded(self):
+        with mock.patch.object(monitor_server.time, "time", return_value=self.base - 60.0):
+            self.store.add({"match_id": "54622319", "event_type": "goal", "team": "?",
+                            "score": "1-1", "minute": "2H 68", "dedup_key": "g?"})
+        self._clip(10.0)
+        event = self.queue.enqueue.call_args.kwargs["event"]
+        self.assertEqual(event["team"], "")
+
+    def test_stoppage_time_is_rendered_with_plus(self):
+        with mock.patch.object(monitor_server.time, "time", return_value=self.base - 60.0):
+            self.store.add({"match_id": "54622319", "event_type": "goal", "team": "A",
+                            "score": "2-1", "minute": "1H 45+3", "dedup_key": "g2"})
+        data = self._clip(10.0).get_json()
+        self.assertEqual(data["alert_match"]["match_time"], "45+3")
+        event = self.queue.enqueue.call_args.kwargs["event"]
+        self.assertEqual((event["minute"], event["minute_extra"]), ("45", "3"))
+
+    def test_no_alert_falls_back_to_catalog_clock(self):
+        data = self._clip(10.0).get_json()
+        self.assertEqual(data["alert_match"]["mode"], "catalog")
+        self.assertEqual(data["alert_match"]["match_time"], "70")
+        self.assertEqual(data["alert_match"]["score"], "1-1")
+        event = self.queue.enqueue.call_args.kwargs["event"]
+        self.assertEqual(event["minute"], "70")
+        self.assertEqual(event["alert_match_mode"], "catalog")
+
+    def test_publisher_omits_match_event_for_manual_clips(self):
+        import article_publisher
+
+        fields = article_publisher.build_article_fields(
+            match_id="54622319",
+            event={"code": "G", "manual_match_event": True, "minute": "68", "score": "1-1"},
+            gif_url="https://example.com/a.gif",
+            cover_url="https://example.com/a.jpg",
+            title="t",
+            delivery_mode="draft",
+        )
+        self.assertNotIn("match_event", fields)
+        self.assertEqual(fields["match_time"], "68")
+        self.assertEqual(fields["match_score"], "1-1")
+        self.assertEqual(fields["style"], "gif")
+        # OCR-pipeline events are unaffected and still send match_event.
+        auto = article_publisher.build_article_fields(
+            match_id="54622319",
+            event={"code": "G", "minute": "68", "score": "1-1"},
+            gif_url="https://example.com/a.gif",
+            cover_url="https://example.com/a.jpg",
+            title="t",
+            delivery_mode="draft",
+        )
+        self.assertEqual(auto["match_event"], 1)
 
 
 if __name__ == "__main__":
