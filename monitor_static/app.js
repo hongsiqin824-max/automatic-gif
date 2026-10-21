@@ -653,6 +653,8 @@ function openStage(matchId) {
   clearRange();
   state.stageVideoNode = video;
   state.stageVideoHomeWrap = wrap;
+  // The stage is the capture/scrub surface: never speed it up (see applyTileCatchupRate).
+  video.playbackRate = 1;
   video.classList.remove('tile-video');
   video.classList.add('stage-video');
   video.setAttribute('controls', '');
@@ -1263,6 +1265,90 @@ function renderLagBadge(node, lag) {
   node.className = `lag-badge ${cls}`;
 }
 
+// ---- Auto catch-up (BACKLOG 11.8 rules 1/4 + tile speed-up) ----
+//
+// Lag accumulates: every stall leaves the playhead permanently further behind
+// because nothing pulls it forward again. Three mechanisms, by severity:
+//
+// * Tile speed-up: a grid tile has no scrub bar, so any lag there is
+//   involuntary. Above CATCHUP_RATE_MIN_LAG we run it at CATCHUP_RATE until it
+//   is back near the hls.js target, then restore 1x. Never applied to the
+//   stage video: the operator may have scrubbed back deliberately to capture.
+//   (hls.js has maxLiveSyncPlaybackRate, but in 1.5.x it only engages with
+//   lowLatencyMode on, which changes other loading behaviour we do not want.)
+// * Rule 1: when the tab returns to the foreground, seek tiles to live
+//   (Chrome throttles hidden tabs so they fall minutes behind). The stage only
+//   seeks when it is clearly adrift (> STAGE_FOREGROUND_SEEK_LAG) so a
+//   deliberate scrub survives a quick glance at another window.
+// * Rule 4: at HARD_SEEK_LAG, seek unconditionally - 30 s later the server has
+//   deleted that part of the 180 s ring and hls.js would hard-jump on its own.
+const CATCHUP_RATE = 1.5;
+const CATCHUP_RATE_MIN_LAG = 12;
+const STAGE_FOREGROUND_SEEK_LAG = 30;
+const HARD_SEEK_LAG = 150;
+const AUTO_SEEK_NOTE_MS = 3000;
+
+function isStageVideo(video) {
+  return !!video && state.stageVideoNode === video;
+}
+
+function noteAutoSeek(matchId, reason, lag) {
+  const text = `落后 ${Math.round(lag)}s，已自动回到直播`;
+  console.log(`[AUTO-SEEK] ${matchId} | ${reason} | 落后 ${lag.toFixed(1)}s`);
+  setTileStatus(matchId, text, 'warn', true);
+  if (state.stageMatchId === matchId) {
+    addStageNote(text, 'warn');
+    const status = $('stage-status');
+    if (status) {
+      status.textContent = text;
+      status.className = 'stage-status warn';
+      setTimeout(() => {
+        if (status.textContent === text) {
+          status.textContent = '直播播放中';
+          status.className = 'stage-status ok';
+        }
+      }, AUTO_SEEK_NOTE_MS);
+    }
+  }
+}
+
+function autoSeekToLive(matchId, video, reason, lag) {
+  if (!video || !video._hls || video._liveSeekPending) return;
+  noteAutoSeek(matchId, reason, lag);
+  seekToLive(video);
+}
+
+// Hold CATCHUP_RATE while a tile is adrift; drop back to 1x once it is within
+// a segment of the target (or when it is moved into the stage / lag unknown).
+function applyTileCatchupRate(video, lag) {
+  if (!video) return;
+  const hls = video._hls;
+  const target = hls && typeof hls.targetLatency === 'number' && hls.targetLatency > 0
+    ? hls.targetLatency
+    : CATCHUP_RATE_MIN_LAG;
+  const adrift = lag != null && hls && !isStageVideo(video) && !video.paused
+    && lag >= CATCHUP_RATE_MIN_LAG && bufferedAheadSeconds(video) > 1;
+  const settled = lag == null || lag <= target + 1;
+  if (adrift && video.playbackRate !== CATCHUP_RATE) {
+    video.playbackRate = CATCHUP_RATE;
+  } else if (!adrift && video.playbackRate !== 1 && (settled || isStageVideo(video) || !hls)) {
+    video.playbackRate = 1;
+  }
+}
+
+function onVisibilityRestored() {
+  if (document.hidden) return;
+  for (const matchId of state.tiles.keys()) {
+    const video = videoForMatch(matchId);
+    if (!video || !video._hls) continue;
+    const lag = liveLagSeconds(video);
+    if (isStageVideo(video) && !(lag != null && lag > STAGE_FOREGROUND_SEEK_LAG)) continue;
+    autoSeekToLive(matchId, video, 'foreground', lag == null ? 0 : lag);
+  }
+}
+
+document.addEventListener('visibilitychange', onVisibilityRestored);
+
 function startLagMonitoring() {
   if (lagMonitoringStarted) return;
   lagMonitoringStarted = true;
@@ -1280,6 +1366,12 @@ function startLagMonitoring() {
       if (!video || !video._hls) continue;
       const hls = video._hls;
 
+      if (lag != null && lag >= HARD_SEEK_LAG) {
+        autoSeekToLive(matchId, video, 'hard-limit', lag);
+      } else {
+        applyTileCatchupRate(video, lag);
+      }
+
       const latency = lag != null ? `${lag.toFixed(1)}s` : 'N/A';
       const target = typeof hls.targetLatency === 'number' && hls.targetLatency > 0
         ? `${hls.targetLatency.toFixed(0)}s`
@@ -1295,11 +1387,12 @@ function startLagMonitoring() {
       const videoState = video.paused ? 'PAUSED' :
                          (video.readyState < 3 ? 'BUFFERING' : 'PLAYING');
       const pageVisible = document.hidden ? '后台' : '前台';
+      const rate = video.playbackRate !== 1 ? ` | ${video.playbackRate}x追帧` : '';
 
       console.log(
         `[LAG] ${matchId} | 落后直播 ${latency} (目标 ${target}) | ` +
         `PDT差 ${pdtDiff} | ${videoState} | ${pageVisible} | ` +
-        `本段缓冲 ${bufferedAheadSeconds(video).toFixed(0)}s`
+        `本段缓冲 ${bufferedAheadSeconds(video).toFixed(0)}s${rate}`
       );
     }
   }, 1000);
