@@ -87,10 +87,12 @@ CLIP_GIF_WIDTH = positive_env_int("GIF_MONITOR_CLIP_WIDTH", 440)
 # 50/3 ≈ 16.67, matching the automatic pipeline's GIF frame rate. Float rather
 # than int so a non-integer rate like this one is expressible here and in .env.
 CLIP_GIF_FPS = positive_env_float("GIF_MONITOR_CLIP_FPS", 50 / 3)
-# ~2s segments. The operator often watches tens of seconds behind the live edge
-# (hls.js back-buffer), so retain a generous on-disk history — enough to cover
-# that lag plus the capture window — or the requested frames are already gone.
-PREVIEW_LIST_SIZE = positive_env_int("GIF_MONITOR_PREVIEW_SEGMENTS", 90)
+# 1s segments (live_preview.PREVIEW_SEGMENT_SECONDS), so 180 segments keep the
+# same ~180s on-disk history as before. The operator often watches tens of
+# seconds behind the live edge (hls.js back-buffer), so retain a generous
+# history — enough to cover that lag plus the capture window — or the requested
+# frames are already gone.
+PREVIEW_LIST_SIZE = positive_env_int("GIF_MONITOR_PREVIEW_SEGMENTS", 180)
 MAX_PREVIEWS = positive_env_int("GIF_MONITOR_MAX_PREVIEWS", 16)
 CLIP_OUTPUT_ROOT = ROOT / "output_gifs" / "monitor"
 

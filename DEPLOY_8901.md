@@ -104,7 +104,7 @@
 | `GIF_MONITOR_CLIP_SECONDS` | 10 | 默认截取秒数 |
 | `GIF_MONITOR_CLIP_WIDTH` | 440 | GIF 宽 |
 | `GIF_MONITOR_CLIP_FPS` | 16.667 | GIF 帧率（50/3，与 8899 一致） |
-| `GIF_MONITOR_PREVIEW_SEGMENTS` | 90 | 滚动缓冲分片数（约 180s） |
+| `GIF_MONITOR_PREVIEW_SEGMENTS` | 180 | 滚动缓冲分片数（1s/片，约 180s） |
 | `GIF_PREVIEW_IDLE_TIMEOUT_SECONDS` | 120 | 预览空闲回收秒数 |
 | `GIF_MONITOR_AUTO_RESTART` | true | 预览断线自愈 |
 | `GIF_MONITOR_PUBLISH_ENABLED` | true | 是否自动建草稿发文 |

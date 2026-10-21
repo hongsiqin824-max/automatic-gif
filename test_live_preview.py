@@ -60,6 +60,12 @@ class LivePreviewCommandTests(unittest.TestCase):
         # parameter sets; a plain copy leaves later segments undecodable.
         self.assertEqual(command[command.index("-c:v") + 1], "libx264")
         self.assertIn("-force_key_frames", command)
+        # 1s segments with a keyframe forced at every segment boundary: this is
+        # the main lever on preview delay (see live_preview.PREVIEW_SEGMENT_SECONDS).
+        self.assertEqual(command[command.index("-hls_time") + 1], "1")
+        self.assertEqual(
+            command[command.index("-force_key_frames") + 1], "expr:gte(t,n_forced*1)"
+        )
         self.assertEqual(command[command.index("-f") + 1], "hls")
         # PROGRAM-DATE-TIME must be emitted so a capture can anchor on the exact
         # displayed frame instead of the server's wall-clock receive time.
