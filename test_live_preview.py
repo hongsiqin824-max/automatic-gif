@@ -83,7 +83,10 @@ class LivePreviewCommandTests(unittest.TestCase):
         # Scheme H: ffmpeg reads the match back from mediamtx over loopback RTSP.
         command = self.manager._build_command("rtsp://127.0.0.1:8554/54477889", self.root)
         self.assertEqual(command[command.index("-rtsp_transport") + 1], "tcp")
-        self.assertIn("-rw_timeout", command)
+        # The RTSP demuxer rejects -rw_timeout ("Option rw_timeout not found");
+        # verified against a real mediamtx. Its read bound is -timeout.
+        self.assertNotIn("-rw_timeout", command)
+        self.assertEqual(command[command.index("-timeout") + 1], "40000000")
         self.assertNotIn("-re", command)
         self.assertEqual(command[command.index("-i") + 1], "rtsp://127.0.0.1:8554/54477889")
         # Input options must precede -i for ffmpeg to apply them to the source.

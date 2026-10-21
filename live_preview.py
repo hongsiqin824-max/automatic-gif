@@ -145,9 +145,9 @@ class LivePreviewManager:
             command += ["-re"]
         elif resource.lower().startswith(("rtsp://", "rtsps://")):
             # Loopback RTSP from mediamtx (scheme H): TCP interleaving avoids UDP
-            # port negotiation and packet loss on the local hop; the read bound
-            # still fails fast if mediamtx loses the upstream.
-            command += ["-rtsp_transport", "tcp", "-rw_timeout", "40000000"]
+            # port negotiation and packet loss on the local hop. The RTSP
+            # demuxer rejects -rw_timeout; its socket read bound is -timeout.
+            command += ["-rtsp_transport", "tcp", "-timeout", "40000000"]
         else:
             # Bound a stalled network read so a dead RTMP source fails fast.
             # 40s (not 15s) tolerates brief HD-feed stalls without killing

@@ -52,10 +52,192 @@ function showNotice(message, kind = 'warning') {
   el.className = `notice ${kind === 'error' ? 'error' : ''}`;
 }
 
+// ---- WebRTC (WHEP) tile playback — scheme H, BACKLOG 11.13 ----
+//
+// When the server reports ``webrtc: true`` for a match the grid tile plays the
+// mediamtx WebRTC stream (sub-second) instead of HLS. The stage and GIF capture
+// always stay on HLS: WebRTC cannot scrub backwards and carries no
+// PROGRAM-DATE-TIME. Any WebRTC failure falls back to HLS on the same element.
+const WHEP_MAX_RETRIES = 3;
+const WHEP_RETRY_MS = 2000;
+const WHEP_STATS_MS = 1000;
+
+// Server-vs-browser clock offset (serverNow − Date.now()), measured once from
+// /api/health so a WebRTC tile can turn "now − playout delay" into a server
+// epoch that lines up with the PDT-stamped HLS segments used for capture.
+let serverClockOffsetMs = 0;
+let serverClockMeasured = false;
+async function measureServerClock() {
+  try {
+    const t0 = Date.now();
+    const r = await fetch('api/health', {cache: 'no-store'});
+    const t1 = Date.now();
+    const data = await r.json();
+    if (typeof data.time_unix === 'number') {
+      serverClockOffsetMs = data.time_unix * 1000 - (t0 + t1) / 2;
+      serverClockMeasured = true;
+    }
+  } catch (e) { /* keep previous estimate */ }
+}
+
+function detachPlayer(video) {
+  if (!video) return;
+  if (video._hls) { try { video._hls.destroy(); } catch (e) {} video._hls = null; }
+  const whep = video._whep;
+  if (whep) {
+    video._whep = null;
+    clearInterval(whep.statsTimer);
+    clearTimeout(whep.retryTimer);
+    try { whep.pc.close(); } catch (e) {}
+    if (whep.resourceUrl) fetch(whep.resourceUrl, {method: 'DELETE', keepalive: true}).catch(() => {});
+    if (video.srcObject) video.srcObject = null;
+  }
+}
+
+// Estimate how far this WebRTC tile is behind the server's live edge: the
+// receiver jitter buffer (what the browser is deliberately holding) plus half
+// the RTT. mediamtx itself adds only a few ms. Updated every second by
+// attachWhep's stats poll and read by liveLagSeconds / frameAnchorMs.
+async function sampleWhepLag(video) {
+  const whep = video && video._whep;
+  if (!whep || whep.pc.connectionState !== 'connected') return;
+  let stats;
+  try { stats = await whep.pc.getStats(); } catch (e) { return; }
+  let jitterSeconds = null;
+  let rtt = 0;
+  for (const report of stats.values()) {
+    if (report.type === 'inbound-rtp' && report.kind === 'video') {
+      const dDelay = report.jitterBufferDelay - whep.prevJbDelay;
+      const dCount = report.jitterBufferEmittedCount - whep.prevJbCount;
+      whep.prevJbDelay = report.jitterBufferDelay;
+      whep.prevJbCount = report.jitterBufferEmittedCount;
+      if (dCount > 0) jitterSeconds = dDelay / dCount;
+      whep.framesDecoded = report.framesDecoded;
+    } else if (report.type === 'candidate-pair' && report.state === 'succeeded'
+               && typeof report.currentRoundTripTime === 'number') {
+      rtt = report.currentRoundTripTime;
+    }
+  }
+  if (jitterSeconds != null) whep.lagSeconds = Math.max(0.05, jitterSeconds + rtt / 2);
+}
+
+async function attachWhep(video, whepUrl, onStatus, onFallback, retries = 0) {
+  detachPlayer(video);
+  if (!window.RTCPeerConnection) { if (onFallback) onFallback('浏览器不支持 WebRTC'); return null; }
+  const whep = {
+    pc: new RTCPeerConnection(),
+    url: whepUrl,
+    resourceUrl: null,
+    // Carried across re-attach attempts so a dead WHEP endpoint gives up
+    // after WHEP_MAX_RETRIES instead of restarting the count at every retry.
+    retries,
+    retryTimer: null,
+    statsTimer: null,
+    lagSeconds: null,
+    prevJbDelay: 0,
+    prevJbCount: 0,
+    framesDecoded: 0,
+  };
+  video._whep = whep;
+  const pc = whep.pc;
+  pc.addTransceiver('video', {direction: 'recvonly'});
+  pc.ontrack = (event) => {
+    if (video._whep !== whep) return;
+    video.srcObject = event.streams[0];
+    video.play().catch(() => {});
+  };
+  const fail = (reason) => {
+    if (video._whep !== whep) return;
+    if (whep.retries < WHEP_MAX_RETRIES) {
+      whep.retries += 1;
+      if (onStatus) onStatus(`WebRTC 重连中 (${whep.retries}/${WHEP_MAX_RETRIES})…`, 'warn');
+      whep.retryTimer = setTimeout(() => {
+        if (video._whep !== whep) return;
+        attachWhep(video, whepUrl, onStatus, onFallback, whep.retries);
+      }, WHEP_RETRY_MS);
+      return;
+    }
+    console.warn(`[WHEP] ${whepUrl} 放弃，回退 HLS：${reason}`);
+    detachPlayer(video);
+    if (onFallback) onFallback(reason);
+  };
+  pc.onconnectionstatechange = () => {
+    if (video._whep !== whep) return;
+    const s = pc.connectionState;
+    if (s === 'connected') {
+      whep.retries = 0;
+      if (onStatus) onStatus('正在播放直播源（WebRTC）', 'ok');
+    } else if (s === 'failed' || s === 'disconnected' || s === 'closed') {
+      fail(`connection ${s}`);
+    }
+  };
+  try {
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    // Wait for ICE gathering (host candidates only, no STUN configured) so the
+    // offer we POST is complete; WHEP is a single round trip.
+    await new Promise((resolve) => {
+      if (pc.iceGatheringState === 'complete') { resolve(); return; }
+      const t = setTimeout(resolve, 1500);
+      pc.onicegatheringstatechange = () => {
+        if (pc.iceGatheringState === 'complete') { clearTimeout(t); resolve(); }
+      };
+    });
+    if (video._whep !== whep) return null;
+    const res = await fetch(whepUrl, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/sdp'},
+      body: pc.localDescription.sdp,
+    });
+    if (!res.ok) throw new Error(`WHEP ${res.status}`);
+    const location = res.headers.get('Location');
+    if (location) whep.resourceUrl = new URL(location, new URL(whepUrl, window.location.href)).href;
+    const answer = await res.text();
+    if (video._whep !== whep) return null;
+    await pc.setRemoteDescription({type: 'answer', sdp: answer});
+  } catch (error) {
+    fail(error && error.message ? error.message : String(error));
+    return whep;
+  }
+  whep.statsTimer = setInterval(() => sampleWhepLag(video), WHEP_STATS_MS);
+  if (!serverClockMeasured) measureServerClock();
+  return whep;
+}
+
+function isWhepVideo(video) {
+  return !!(video && video._whep);
+}
+
+// Attach the right player to a grid tile from a preview/start|status payload.
+// WebRTC when offered; HLS otherwise or as the fallback target.
+function startTilePlayback(matchId, video, data, onStatus) {
+  const tile = state.tiles.get(matchId);
+  const playlistUrl = data && data.playlist_url ? data.playlist_url : (tile && tile.playlistUrl);
+  const whepUrl = data && data.webrtc && data.whep_url ? data.whep_url : null;
+  if (tile) tile.whepUrl = whepUrl;
+  if (whepUrl) {
+    attachWhep(video, whepUrl, onStatus, (reason) => {
+      if (tile) tile.whepUrl = null;
+      if (onStatus) onStatus('WebRTC 不可用，已切回 HLS', 'warn');
+      attachHls(video, playlistUrl, onStatus);
+    });
+    return null;
+  }
+  return attachHls(video, playlistUrl, onStatus);
+}
+
 // Read the PROGRAM-DATE-TIME of the frame currently on screen so the capture
 // anchors on what the human saw, independent of stream delay.
 function frameAnchorMs(video) {
   if (!video) return null;
+  // WebRTC carries no PDT: the frame on screen is "server now − playout
+  // delay". Accuracy is ±~0.5s, acceptable for a 10s GIF; the stage (HLS)
+  // keeps the exact PDT path.
+  if (video._whep) {
+    const lag = video._whep.lagSeconds;
+    if (lag == null) return null;
+    return Date.now() + serverClockOffsetMs - lag * 1000;
+  }
   const hls = video._hls;
   if (hls && hls.playingDate instanceof Date && !isNaN(hls.playingDate.getTime())) {
     return hls.playingDate.getTime();
@@ -70,11 +252,17 @@ function frameAnchorMs(video) {
   return null;
 }
 
+function tileVideoEl(matchId) {
+  return document.querySelector(`.tile[data-match-id="${matchId}"] .tile-video`);
+}
+
+// The video an operator is looking at for this match: the stage player when
+// enlarged (HLS - exact PDT, scrubbable), otherwise the grid tile.
 function videoForMatch(matchId) {
   if (state.stageMatchId === matchId && state.stageVideoNode) {
     return state.stageVideoNode;
   }
-  return document.querySelector(`.tile[data-match-id="${matchId}"] .tile-video`);
+  return tileVideoEl(matchId);
 }
 
 // Jump the playhead to the live edge so a capture reflects the newest frame
@@ -136,7 +324,7 @@ function seekToLive(video, onDone) {
 }
 
 function attachHls(video, playlistUrl, onStatus) {
-  if (video._hls) { try { video._hls.destroy(); } catch (e) {} video._hls = null; }
+  detachPlayer(video);
   if (window.Hls && window.Hls.isSupported()) {
     const hls = new window.Hls({
       liveSyncDurationCount: 3,
@@ -268,6 +456,8 @@ function createTile(data) {
   });
   el.querySelector('[data-role="live"]').addEventListener('click', (ev) => {
     ev.stopPropagation();
+    const video = tileVideoEl(data.match_id) || videoForMatch(data.match_id);
+    if (isWhepVideo(video)) { setTileStatus(data.match_id, 'WebRTC 始终在直播边缘', 'ok'); return; }
     setTileStatus(data.match_id, '正在回到直播…');
     seekToLive(videoForMatch(data.match_id), () => setTileStatus(data.match_id, '已回到直播', 'ok'));
   });
@@ -294,7 +484,7 @@ async function startTilePreview(matchId) {
     tile.playlistUrl = data.playlist_url;
     overlay.classList.add('hidden');
     el.classList.remove('no-source');
-    attachHls(video, data.playlist_url, (text, cls) => {
+    startTilePlayback(matchId, video, data, (text, cls) => {
       setTileStatus(matchId, text, cls);
       if (cls === 'fail') {
         overlay.classList.remove('hidden');
@@ -651,8 +841,30 @@ function openStage(matchId) {
   if (secondsInput) secondsInput.value = '';
   syncStageCaptureLabel();
   clearRange();
+  const stageStatus = (text, cls) => {
+    $('stage-status').textContent = text;
+    $('stage-status').className = `stage-status ${cls || ''}`;
+  };
+  if (isWhepVideo(video)) {
+    // WebRTC tile: leave it playing in the grid and give the stage its own HLS
+    // player - the stage must scrub and carry PDT for exact capture.
+    const own = document.createElement('video');
+    own.className = 'stage-video';
+    own.setAttribute('playsinline', '');
+    own.setAttribute('autoplay', '');
+    own.muted = true;
+    own.setAttribute('controls', '');
+    host.appendChild(own);
+    state.stageVideoNode = own;
+    state.stageVideoHomeWrap = null;
+    state.stageOwnVideo = true;
+    state.stageHls = attachHls(own, tile.playlistUrl, stageStatus);
+    renderLagBadge($('stage-lag'), null);
+    return;
+  }
   state.stageVideoNode = video;
   state.stageVideoHomeWrap = wrap;
+  state.stageOwnVideo = false;
   // The stage is the capture/scrub surface: never speed it up (see applyTileCatchupRate).
   video.playbackRate = 1;
   video.classList.remove('tile-video');
@@ -664,10 +876,7 @@ function openStage(matchId) {
   const tileOverlay = wrap.querySelector('.tile-overlay');
   if (tileOverlay) { tileOverlay.classList.remove('hidden'); tileOverlay.textContent = '已在大窗播放'; }
   if (!video._hls) {
-    state.stageHls = attachHls(video, tile.playlistUrl, (text, cls) => {
-      $('stage-status').textContent = text;
-      $('stage-status').className = `stage-status ${cls || ''}`;
-    });
+    state.stageHls = attachHls(video, tile.playlistUrl, stageStatus);
   }
 }
 
@@ -676,7 +885,10 @@ function closeStage() {
   stopDraftPoll();
   clearRange();
   const video = state.stageVideoNode;
-  if (video) {
+  if (video && state.stageOwnVideo) {
+    detachPlayer(video);
+    video.remove();
+  } else if (video) {
     video.removeAttribute('controls');
     video.classList.remove('stage-video');
     video.classList.add('tile-video');
@@ -686,12 +898,13 @@ function closeStage() {
       const overlay = wrap.querySelector('.tile-overlay');
       if (overlay) { overlay.classList.add('hidden'); overlay.textContent = '正在连接直播源…'; }
     } else {
-      if (video._hls) { try { video._hls.destroy(); } catch (e) {} video._hls = null; }
+      detachPlayer(video);
       video.remove();
     }
   }
   state.stageVideoNode = null;
   state.stageVideoHomeWrap = null;
+  state.stageOwnVideo = false;
   state.stageHls = null;
   $('stage').classList.add('hidden');
 }
@@ -821,8 +1034,7 @@ function teardownAllTiles() {
   for (const matchId of Array.from(state.tiles.keys())) {
     const el = document.querySelector(`.tile[data-match-id="${matchId}"]`);
     if (el) {
-      const video = el.querySelector('.tile-video');
-      if (video && video._hls) { try { video._hls.destroy(); } catch (e) {} }
+      detachPlayer(el.querySelector('.tile-video'));
       el.remove();
     }
     fetch('api/monitor/preview/stop', {
@@ -865,8 +1077,7 @@ function reconcileTiles(playing) {
     if (seen.has(matchId)) continue;
     const el = document.querySelector(`.tile[data-match-id="${matchId}"]`);
     if (el) {
-      const video = el.querySelector('.tile-video');
-      if (video && video._hls) { try { video._hls.destroy(); } catch (e) {} }
+      detachPlayer(el.querySelector('.tile-video'));
       el.remove();
     }
     fetch('api/monitor/preview/stop', {
@@ -1001,7 +1212,10 @@ function recoverPreview(matchId, status) {
   if (overlay && !staged) overlay.classList.add('hidden');
   const video = videoForMatch(matchId);
   if (video) {
-    const hls = attachHls(video, tile.playlistUrl, (text, cls) => {
+    // The stage keeps its own HLS player when the tile is on WebRTC; only
+    // re-attach the element that actually belongs to this tile.
+    const target = staged && state.stageOwnVideo ? tileVideoEl(matchId) : video;
+    const hls = startTilePlayback(matchId, target, status, (text, cls) => {
       setTileStatus(matchId, text, cls);
       if (cls === 'fail' && overlay) {
         overlay.classList.remove('hidden');
@@ -1009,7 +1223,7 @@ function recoverPreview(matchId, status) {
         tile.down = true;
       }
     });
-    if (staged) state.stageHls = hls;
+    if (staged && !state.stageOwnVideo) state.stageHls = hls;
   }
   const total = status && status.restart_count_total;
   const message = total ? `直播源已恢复（本场累计重连 ${total} 次）` : '直播源已恢复';
@@ -1245,6 +1459,10 @@ function bufferedAheadSeconds(video) {
 // loaded a playlist yet. Uses hls.latency (stream-timeline based) so ffmpeg's
 // start-up burst offset and server/browser clock skew cancel out.
 function liveLagSeconds(video) {
+  if (video && video._whep) {
+    const lag = video._whep.lagSeconds;
+    return typeof lag === 'number' && lag > 0 ? lag : null;
+  }
   const hls = video && video._hls;
   if (!hls || typeof hls.latency !== 'number' || !(hls.latency > 0)) return null;
   return hls.latency;
@@ -1261,7 +1479,7 @@ function renderLagBadge(node, lag) {
     return;
   }
   const cls = lag <= LAG_OK_MAX_SECONDS ? 'ok' : lag <= LAG_WARN_MAX_SECONDS ? 'warn' : 'bad';
-  node.textContent = `落后 ${Math.round(lag)}s`;
+  node.textContent = `落后 ${lag < 1 ? lag.toFixed(1) : Math.round(lag)}s`;
   node.className = `lag-badge ${cls}`;
 }
 
@@ -1357,11 +1575,21 @@ function startLagMonitoring() {
 
   setInterval(() => {
     for (const matchId of state.tiles.keys()) {
+      // Badge each surface from its own player: with a WebRTC tile the stage
+      // runs a separate HLS element, so the two lags differ.
+      const tileVideo = tileVideoEl(matchId);
+      const tileBadge = document.querySelector(`.tile[data-match-id="${matchId}"] [data-role="lag"]`);
+      renderLagBadge(tileBadge, liveLagSeconds(tileVideo));
+      if (tileVideo && tileVideo._whep) {
+        const w = tileVideo._whep;
+        console.log(
+          `[LAG] ${matchId} | WebRTC 落后 ${w.lagSeconds == null ? 'N/A' : w.lagSeconds.toFixed(2) + 's'} | ` +
+          `${w.pc.connectionState} | ${document.hidden ? '后台' : '前台'} | frames ${w.framesDecoded}`
+        );
+      }
       // videoForMatch() follows the element into the stage when it is enlarged.
       const video = videoForMatch(matchId);
-      const tileBadge = document.querySelector(`.tile[data-match-id="${matchId}"] [data-role="lag"]`);
       const lag = liveLagSeconds(video);
-      renderLagBadge(tileBadge, lag);
       if (state.stageMatchId === matchId) renderLagBadge($('stage-lag'), lag);
       if (!video || !video._hls) continue;
       const hls = video._hls;

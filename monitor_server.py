@@ -443,6 +443,11 @@ def _batch_query_sources(match_ids: list[str]) -> dict[str, str]:
 
 def _resolve_source(match_id: str) -> str:
     """Return a usable live-source resource or raise a descriptive error."""
+    # Local-only escape hatch: point every match at a fixed test stream so the
+    # player path can be exercised without a real fixture. Never set in prod.
+    override = os.environ.get("GIF_MONITOR_SOURCE_OVERRIDE", "").strip()
+    if override:
+        return override
     result = classify_source_response(query_source(match_id))
     if result.state == "available":
         return str(result.data.get("resource") or "").strip()
@@ -848,6 +853,26 @@ def monitor_matches():
             }
         )
         match_ids.append(str(item.get("match_id") or ""))
+    if os.environ.get("GIF_MONITOR_SOURCE_OVERRIDE", "").strip() and not playing:
+        # Local-only: pair with the source override so the tile/stage path can
+        # be exercised in a browser when the platform has no live fixture.
+        playing.append(
+            {
+                "match_id": "54477889",
+                "team_A_name": "本地测试A",
+                "team_B_name": "本地测试B",
+                "team_A_logo": None,
+                "team_B_logo": None,
+                "fs_A": 0,
+                "fs_B": 0,
+                "minute": 1,
+                "minute_period": None,
+                "competition_name": "本地 WebRTC 验证",
+                "status": "Playing",
+                "status_label": MATCH_STATUS_LABELS.get("Playing", "Playing"),
+            }
+        )
+        match_ids.append("54477889")
     # Optionally batch-query live-source states so the list page can show a
     # per-match source indicator without an N+1 waterfall. The browser passes
     # ``?with_sources=1`` on initial load and when the operator manually refreshes.
