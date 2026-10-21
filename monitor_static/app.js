@@ -28,6 +28,7 @@ const state = {
   alertSeq: 0,           // cursor: last event seq the page has rendered
   alertBootId: null,     // server boot id; a change means 8901 restarted
   alertInit: false,      // skip replaying history on the first poll
+  alertPolling: false,   // a poll is in flight; do not start another one
   alertCount: 0,         // unseen-alert badge count
   alertPanelOpen: false, // panel is collapsed to a launcher pill by default
   // ---- Two-view workflow ----
@@ -1485,11 +1486,17 @@ function pushAlert(ev) {
 }
 
 async function pollAlerts() {
+  // 上一轮还没返回（8901 卡顿时常见）就不再发第二个同游标请求，
+  // 否则两个响应带回同一批事件，面板里就会出现重复的提醒。
+  if (state.alertPolling) return;
+  state.alertPolling = true;
   let data;
   try {
     data = await requestJson(`api/monitor/events?since=${state.alertSeq}`);
   } catch (error) {
     return;
+  } finally {
+    state.alertPolling = false;
   }
   if (!state.alertInit) {
     state.alertSeq = data.seq || 0;
@@ -1504,6 +1511,8 @@ async function pollAlerts() {
   }
   const events = Array.isArray(data.events) ? data.events : [];
   for (const ev of events) {
+    // 游标之内的事件已经渲染过，再收到一次（并发轮询/重复响应）直接丢弃。
+    if (typeof ev.seq === 'number' && ev.seq <= state.alertSeq) continue;
     pushAlert(ev);
     state.alertSeq = Math.max(state.alertSeq, ev.seq || 0);
   }
