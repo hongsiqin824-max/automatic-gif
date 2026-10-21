@@ -106,11 +106,13 @@ def env_flag(name: str, default: bool) -> bool:
     return raw.strip().lower() not in {"0", "false", "no", "off"}
 
 
-def _env_seconds_or_off(name: str) -> float:
-    """Seconds threshold where 0 / off / empty means disabled (unlike
-    positive_env_float, which rejects zero)."""
+def _env_seconds_or_off(name: str, default: float = 0.0) -> float:
+    """Seconds threshold where 0 / off means disabled (unlike
+    positive_env_float, which rejects zero). Empty/unset → ``default``."""
     raw = os.environ.get(name, "").strip().lower()
-    if raw in {"", "0", "off", "false", "no"}:
+    if not raw:
+        return default
+    if raw in {"0", "off", "false", "no"}:
         return 0.0
     try:
         value = float(raw)
@@ -175,6 +177,15 @@ def _build_latency_config() -> dict[str, Any]:
     tile_seek_lag_raw = _env_seconds_or_off("GIF_MONITOR_TILE_SEEK_LAG")
     tile_seek_lag = 0.0 if tile_seek_lag_raw <= 0 else bound(
         "tile_seek_lag", tile_seek_lag_raw, target + 2, hard_seek_lag)
+    # Stage auto seek (0 / off = disabled): same idea for the enlarged player,
+    # but the browser suspends it while the operator is visibly working there
+    # (range pin set, video paused, or a manual scrub/pause within the grace).
+    stage_auto_seek_lag_raw = _env_seconds_or_off("GIF_MONITOR_STAGE_AUTO_SEEK_LAG")
+    stage_auto_seek_lag = 0.0 if stage_auto_seek_lag_raw <= 0 else bound(
+        "stage_auto_seek_lag", stage_auto_seek_lag_raw, target + 2, hard_seek_lag)
+    stage_user_grace = bound("stage_user_grace_seconds",
+                             _env_seconds_or_off("GIF_MONITOR_STAGE_USER_GRACE_SECONDS", 60.0),
+                             0.0, 600.0)
     return {
         "segment_seconds": segment_seconds,
         "preview_segments": list_size,
@@ -187,6 +198,8 @@ def _build_latency_config() -> dict[str, Any]:
         "catchup_rate": catchup_rate,
         "catchup_min_lag": catchup_min_lag,
         "tile_seek_lag": tile_seek_lag,
+        "stage_auto_seek_lag": stage_auto_seek_lag,
+        "stage_user_grace_seconds": stage_user_grace,
         "stage_seek_lag": stage_seek_lag,
         "hard_seek_lag": hard_seek_lag,
         "adjusted": adjusted,

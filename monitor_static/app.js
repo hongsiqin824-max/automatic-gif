@@ -20,6 +20,10 @@ const state = {
   // Operator-chosen [start, end] range on the stage. ``pinId`` is the server
   // pin that hard-links the start so it survives the rolling buffer.
   range: {matchId: null, pinId: null, startMs: null, ttlTimer: null, busy: false},
+  // Date.now() of the operator's last manual scrub/pause on the stage. Stage
+  // auto-seek stays off for stageUserGraceSeconds after it (see lagMonitor).
+  stageUserActionAt: 0,
+  stageOpenedAt: 0,      // Date.now() of the last openStage (ignore its own pause/seek noise)
   draftPoll: null,       // {matchId, timer, polls} while awaiting draft links
   alertSeq: 0,           // cursor: last event seq the page has rendered
   alertBootId: null,     // server boot id; a change means 8901 restarted
@@ -74,6 +78,8 @@ const LATENCY = {
   catchupRate: 1.5,          // GIF_MONITOR_CATCHUP_RATE
   catchupMinLag: 12,         // GIF_MONITOR_CATCHUP_MIN_LAG
   tileSeekLag: 0,            // GIF_MONITOR_TILE_SEEK_LAG (0 = off)
+  stageAutoSeekLag: 0,       // GIF_MONITOR_STAGE_AUTO_SEEK_LAG (0 = off)
+  stageUserGraceSeconds: 60, // GIF_MONITOR_STAGE_USER_GRACE_SECONDS
   stageSeekLag: 30,          // GIF_MONITOR_STAGE_SEEK_LAG
   hardSeekLag: 150,          // GIF_MONITOR_HARD_SEEK_LAG
 };
@@ -308,6 +314,9 @@ function currentLevelDetails(hls) {
 
 function jumpToLiveSync(video) {
   const hls = video._hls;
+  // Stamp so the stage's user-action listener can tell this seek apart from
+  // a manual scrub (the `seeking` event fires for both).
+  video._programmaticSeekAt = Date.now();
   if (hls && typeof hls.liveSyncPosition === 'number' && isFinite(hls.liveSyncPosition)) {
     video.currentTime = hls.liveSyncPosition;
   } else if (video.seekable && video.seekable.length) {
@@ -836,6 +845,45 @@ async function setRangeEndAndCapture(button) {
   else { state.range.busy = false; renderRange(); }
 }
 
+// ---- Stage user-action tracking (for GIF_MONITOR_STAGE_AUTO_SEEK_LAG) ----
+// A manual scrub-back or pause on the stage's native controls means the
+// operator is working there; auto-seek must leave the stage alone for the
+// grace period. Not counted: our own jumpToLiveSync (stamped), hls.js stall
+// nudges (+0.1s) and live re-syncs (forward) - only a seek that moves the
+// playhead backwards by at least MANUAL_SEEK_BACK_MIN_SECONDS qualifies.
+const PROGRAMMATIC_SEEK_WINDOW_MS = 1500;
+const MANUAL_SEEK_BACK_MIN_SECONDS = 1;
+
+function noteStageUserAction(video, kind) {
+  // Only the open stage counts: a tile has no controls, and the DOM moves in
+  // openStage/closeStage can fire `pause` on their own.
+  if (!state.stageMatchId || !isStageVideo(video)) return;
+  if (Date.now() - state.stageOpenedAt < PROGRAMMATIC_SEEK_WINDOW_MS) return;
+  if (kind === 'seeking') {
+    if (video._programmaticSeekAt && Date.now() - video._programmaticSeekAt < PROGRAMMATIC_SEEK_WINDOW_MS) return;
+    const from = video._lastPlayheadTime;
+    if (typeof from !== 'number' || video.currentTime > from - MANUAL_SEEK_BACK_MIN_SECONDS) return;
+  }
+  state.stageUserActionAt = Date.now();
+}
+
+function attachStageUserActionListeners(video) {
+  if (!video || video._stageActionBound) return;
+  video._stageActionBound = true;
+  video.addEventListener('timeupdate', () => { if (!video.seeking) video._lastPlayheadTime = video.currentTime; });
+  video.addEventListener('seeking', () => noteStageUserAction(video, 'seeking'));
+  video.addEventListener('pause', () => noteStageUserAction(video, 'pause'));
+}
+
+// Why the stage must not be auto-seeked right now, or null when it may be.
+function stageAutoSeekBlocker(video) {
+  if (state.range.pinId != null) return 'range';
+  if (video.paused) return 'paused';
+  const grace = LATENCY.stageUserGraceSeconds * 1000;
+  if (grace > 0 && Date.now() - state.stageUserActionAt < grace) return 'grace';
+  return null;
+}
+
 function openStage(matchId) {
   const tile = state.tiles.get(matchId);
   if (!tile || !tile.playlistUrl) { showNotice('该比赛直播还没准备好', 'warning'); return; }
@@ -846,6 +894,8 @@ function openStage(matchId) {
   if (!video || !host) { showNotice('该比赛直播还没准备好', 'warning'); return; }
   if (state.stageMatchId && state.stageMatchId !== matchId) closeStage();
   state.stageMatchId = matchId;
+  state.stageOpenedAt = Date.now();
+  state.stageUserActionAt = 0;
   stopDraftPoll();
   const stage = $('stage');
   stage.classList.remove('hidden');
@@ -881,6 +931,7 @@ function openStage(matchId) {
     state.stageVideoHomeWrap = null;
     state.stageOwnVideo = true;
     state.stageHls = attachHls(own, tile.playlistUrl, stageStatus);
+    attachStageUserActionListeners(own);
     renderLagBadge($('stage-lag'), null);
     return;
   }
@@ -893,6 +944,7 @@ function openStage(matchId) {
   video.classList.add('stage-video');
   video.setAttribute('controls', '');
   host.appendChild(video);
+  attachStageUserActionListeners(video);
   state.stageHls = video._hls || null;
   renderLagBadge($('stage-lag'), liveLagSeconds(video));
   const tileOverlay = wrap.querySelector('.tile-overlay');
@@ -1522,6 +1574,10 @@ function renderLagBadge(node, lag) {
 // * Tile instant jump: at TILE_SEEK_LAG (0 = off) a tile seeks straight to
 //   live instead of waiting for the speed-up to close the gap. Timeliness
 //   over continuity; the stage is excluded for the same reason as above.
+// * Stage jump: at STAGE_AUTO_SEEK_LAG (0 = off) the stage seeks too, but
+//   only when nobody is working there - no range pin, not paused, and no
+//   manual scrub-back/pause within STAGE_USER_GRACE_SECONDS (see
+//   stageAutoSeekBlocker). Rules 1/4 below still apply to the stage.
 // * Rule 1: when the tab returns to the foreground, seek tiles to live
 //   (Chrome throttles hidden tabs so they fall minutes behind). The stage only
 //   seeks when it is clearly adrift (> STAGE_FOREGROUND_SEEK_LAG) so a
@@ -1543,6 +1599,8 @@ function applyLatencyConfig(cfg) {
   LATENCY.catchupMinLag = num(cfg.catchup_min_lag, LATENCY.catchupMinLag);
   // 0 is a legitimate value here (= off), so do not route it through num().
   if (typeof cfg.tile_seek_lag === 'number' && cfg.tile_seek_lag >= 0) LATENCY.tileSeekLag = cfg.tile_seek_lag;
+  if (typeof cfg.stage_auto_seek_lag === 'number' && cfg.stage_auto_seek_lag >= 0) LATENCY.stageAutoSeekLag = cfg.stage_auto_seek_lag;
+  if (typeof cfg.stage_user_grace_seconds === 'number' && cfg.stage_user_grace_seconds >= 0) LATENCY.stageUserGraceSeconds = cfg.stage_user_grace_seconds;
   LATENCY.stageSeekLag = num(cfg.stage_seek_lag, LATENCY.stageSeekLag);
   LATENCY.hardSeekLag = num(cfg.hard_seek_lag, LATENCY.hardSeekLag);
   if (!latencyConfigLogged) {
@@ -1552,6 +1610,7 @@ function applyLatencyConfig(cfg) {
       `回看 ${cfg.history_seconds}s | x264 ${cfg.x264_preset} | 追帧总开关 ${state.catchupEnabled ? '开' : '关'} | ` +
       `倍速 ${LATENCY.catchupRateEnabled ? `${LATENCY.catchupRate}x@≥${LATENCY.catchupMinLag}s` : '关'} | ` +
       `小窗跳回 ${LATENCY.tileSeekLag > 0 ? `≥${LATENCY.tileSeekLag}s` : '关'} | ` +
+      `大窗跳回 ${LATENCY.stageAutoSeekLag > 0 ? `≥${LATENCY.stageAutoSeekLag}s（操作后豁免 ${LATENCY.stageUserGraceSeconds}s）` : '关'} | ` +
       `大窗前台≥${LATENCY.stageSeekLag}s 硬跳≥${LATENCY.hardSeekLag}s` +
       (Array.isArray(cfg.adjusted) && cfg.adjusted.length ? ` | 已被服务器修正: ${cfg.adjusted.join(', ')}` : '')
     );
@@ -1658,10 +1717,23 @@ function startLagMonitoring() {
       if (lag != null && lag >= LATENCY.hardSeekLag) {
         autoSeekToLive(matchId, video, 'hard-limit', lag);
       } else if (lag != null && LATENCY.tileSeekLag > 0 && lag >= LATENCY.tileSeekLag && !isStageVideo(video)) {
-        // Tile-only instant jump (GIF_MONITOR_TILE_SEEK_LAG). The stage is
-        // excluded: the operator may have scrubbed back on purpose to capture.
+        // Tile-only instant jump (GIF_MONITOR_TILE_SEEK_LAG).
         autoSeekToLive(matchId, video, 'tile-limit', lag);
+      } else if (lag != null && LATENCY.stageAutoSeekLag > 0 && lag >= LATENCY.stageAutoSeekLag && isStageVideo(video)) {
+        // Stage jump (GIF_MONITOR_STAGE_AUTO_SEEK_LAG), unless the operator is
+        // working there: range pin set, paused, or a manual action within grace.
+        const blocker = stageAutoSeekBlocker(video);
+        if (blocker) {
+          if (!video._stageHoldLogged) {
+            video._stageHoldLogged = true;
+            console.log(`[AUTO-SEEK] ${matchId} | stage-hold (${blocker}) | 落后 ${lag.toFixed(1)}s，大窗有人在用，不跳`);
+          }
+        } else {
+          video._stageHoldLogged = false;
+          autoSeekToLive(matchId, video, 'stage-limit', lag);
+        }
       } else {
+        if (video._stageHoldLogged) video._stageHoldLogged = false;
         applyTileCatchupRate(video, lag);
       }
 

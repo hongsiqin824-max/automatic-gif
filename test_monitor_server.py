@@ -1328,6 +1328,7 @@ class LatencyKillSwitchTests(unittest.TestCase):
             "segment_seconds", "preview_segments", "history_seconds", "x264_preset",
             "hls_live_sync_count", "hls_target_seconds", "catchup_enabled",
             "catchup_rate_enabled", "catchup_rate", "catchup_min_lag", "tile_seek_lag",
+            "stage_auto_seek_lag", "stage_user_grace_seconds",
             "stage_seek_lag", "hard_seek_lag", "adjusted",
         ):
             self.assertIn(key, latency)
@@ -1338,6 +1339,7 @@ class LatencyKillSwitchTests(unittest.TestCase):
     LATENCY_ENV_KEYS = (
         "GIF_MONITOR_HLS_LIVE_SYNC_COUNT", "GIF_MONITOR_CATCHUP_RATE_ENABLED",
         "GIF_MONITOR_CATCHUP_RATE", "GIF_MONITOR_CATCHUP_MIN_LAG", "GIF_MONITOR_TILE_SEEK_LAG",
+        "GIF_MONITOR_STAGE_AUTO_SEEK_LAG", "GIF_MONITOR_STAGE_USER_GRACE_SECONDS",
         "GIF_MONITOR_STAGE_SEEK_LAG", "GIF_MONITOR_HARD_SEEK_LAG",
     )
 
@@ -1354,6 +1356,8 @@ class LatencyKillSwitchTests(unittest.TestCase):
         self.assertEqual(cfg["catchup_rate"], 1.5)
         self.assertEqual(cfg["catchup_min_lag"], 12.0)
         self.assertEqual(cfg["tile_seek_lag"], 0.0)   # off unless the operator opts in
+        self.assertEqual(cfg["stage_auto_seek_lag"], 0.0)
+        self.assertEqual(cfg["stage_user_grace_seconds"], 60.0)
         self.assertEqual(cfg["stage_seek_lag"], 30.0)
         self.assertEqual(cfg["hard_seek_lag"], 150.0)
         self.assertEqual(cfg["adjusted"], [])
@@ -1394,6 +1398,33 @@ class LatencyKillSwitchTests(unittest.TestCase):
             cfg = monitor_server._build_latency_config()
         self.assertEqual(cfg["tile_seek_lag"], 40.0)
         self.assertIn("tile_seek_lag=100.0->40.0", cfg["adjusted"])
+
+    def test_stage_auto_seek_lag_and_grace_are_bounded(self):
+        with mock.patch.dict(os.environ, {"GIF_MONITOR_STAGE_AUTO_SEEK_LAG": "8",
+                                          "GIF_MONITOR_STAGE_USER_GRACE_SECONDS": "60"}):
+            cfg = monitor_server._build_latency_config()
+        self.assertEqual(cfg["stage_auto_seek_lag"], 8.0)
+        self.assertEqual(cfg["stage_user_grace_seconds"], 60.0)
+        self.assertEqual(cfg["adjusted"], [])
+        # off spellings
+        for off in ("0", "off"):
+            with mock.patch.dict(os.environ, {"GIF_MONITOR_STAGE_AUTO_SEEK_LAG": off}):
+                self.assertEqual(monitor_server._build_latency_config()["stage_auto_seek_lag"], 0.0, off)
+        # below target+2 → raised; above hard limit → capped
+        with mock.patch.dict(os.environ, {"GIF_MONITOR_STAGE_AUTO_SEEK_LAG": "1"}):
+            cfg = monitor_server._build_latency_config()
+        self.assertEqual(cfg["stage_auto_seek_lag"], cfg["hls_target_seconds"] + 2)
+        with mock.patch.dict(os.environ, {"GIF_MONITOR_HARD_SEEK_LAG": "40",
+                                          "GIF_MONITOR_STAGE_AUTO_SEEK_LAG": "100"}):
+            cfg = monitor_server._build_latency_config()
+        self.assertEqual(cfg["stage_auto_seek_lag"], 40.0)
+        # grace: 0 allowed (= no grace), huge values capped at 600
+        with mock.patch.dict(os.environ, {"GIF_MONITOR_STAGE_USER_GRACE_SECONDS": "0"}):
+            self.assertEqual(monitor_server._build_latency_config()["stage_user_grace_seconds"], 0.0)
+        with mock.patch.dict(os.environ, {"GIF_MONITOR_STAGE_USER_GRACE_SECONDS": "5000"}):
+            cfg = monitor_server._build_latency_config()
+        self.assertEqual(cfg["stage_user_grace_seconds"], 600.0)
+        self.assertIn("stage_user_grace_seconds=5000.0->600.0", cfg["adjusted"])
 
     def test_catchup_rate_switch_is_independent_of_master(self):
         with mock.patch.dict(os.environ, {"GIF_MONITOR_CATCHUP_RATE_ENABLED": "false"}):
