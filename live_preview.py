@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from dqd_api import positive_env_float
+from dqd_api import positive_env_float, positive_env_int
 
 
 PREVIEW_ROOT = Path(__file__).resolve().parent / "tmp" / "preview"
@@ -32,8 +32,10 @@ PREVIEW_IDLE_TIMEOUT_SECONDS = positive_env_float(
 # and the browser only learns about a segment once it is fully written, so
 # segment length is the single biggest lever on steady-state preview delay
 # (2s -> 1s cuts it from ~8.5s to ~4.5s). Costs: one keyframe per second
-# (+15-30% bitrate) and twice the request rate per stream.
-PREVIEW_SEGMENT_SECONDS = 1
+# (+15-30% bitrate) and twice the request rate per stream. Operator kill
+# switch: GIF_PREVIEW_SEGMENT_SECONDS=2 restores the previous behaviour
+# (pair it with GIF_MONITOR_PREVIEW_SEGMENTS=90 to keep ~180s of history).
+PREVIEW_SEGMENT_SECONDS = positive_env_int("GIF_PREVIEW_SEGMENT_SECONDS", 1)
 PREVIEW_LIST_SIZE = 12
 PREVIEW_HEIGHT = 480
 # Previous ffmpeg stderr is kept here across a restart so the exit reason

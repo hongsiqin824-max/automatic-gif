@@ -19,6 +19,8 @@ os.environ.setdefault("GIF_MONITOR_PUBLISH_ENABLED", "false")
 os.environ.setdefault("GIF_MONITOR_ALERT_DB_PATH", "")
 
 import monitor_server
+import live_preview
+from dqd_api import positive_env_int
 from monitor_server import (
     _encode_clip_gif,
     _parse_pdt,
@@ -1271,6 +1273,31 @@ class PreviewStartWebRTCTests(unittest.TestCase):
             data = self.app.get("/api/monitor/preview/status?match_id=54477889").get_json()
         self.assertFalse(data["webrtc"])
         self.assertIsNone(data["whep_url"])
+
+
+class LatencyKillSwitchTests(unittest.TestCase):
+    """Operator switches that restore pre-optimisation behaviour without a code change."""
+
+    def test_matches_advertises_catchup_switch(self):
+        app = monitor_server.app.test_client()
+        with mock.patch.object(monitor_server.match_catalog, "snapshot", return_value={"playing": []}):
+            with mock.patch.object(monitor_server, "CATCHUP_ENABLED", True):
+                self.assertTrue(app.get("/api/monitor/matches").get_json()["catchup_enabled"])
+            with mock.patch.object(monitor_server, "CATCHUP_ENABLED", False):
+                self.assertFalse(app.get("/api/monitor/matches").get_json()["catchup_enabled"])
+
+    def test_segment_seconds_env_restores_two_second_segments(self):
+        with mock.patch.dict(os.environ, {"GIF_PREVIEW_SEGMENT_SECONDS": "2"}):
+            self.assertEqual(positive_env_int("GIF_PREVIEW_SEGMENT_SECONDS", 1), 2)
+        with TemporaryDirectory() as tmp:
+            manager = live_preview.LivePreviewManager(
+                root=Path(tmp), background_reaper=False, segment_seconds=2
+            )
+            command = manager._build_command("rtmp://host/app/s", Path(tmp))
+        self.assertEqual(command[command.index("-hls_time") + 1], "2")
+        self.assertEqual(
+            command[command.index("-force_key_frames") + 1], "expr:gte(t,n_forced*2)"
+        )
 
 
 if __name__ == "__main__":

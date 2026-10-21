@@ -94,6 +94,12 @@ CLIP_GIF_FPS = positive_env_float("GIF_MONITOR_CLIP_FPS", 50 / 3)
 # history — enough to cover that lag plus the capture window — or the requested
 # frames are already gone.
 PREVIEW_LIST_SIZE = positive_env_int("GIF_MONITOR_PREVIEW_SEGMENTS", 180)
+# Browser-side auto catch-up (tile 1.5x when adrift, auto seek on foreground /
+# hard limit; BACKLOG 11.8). Operator kill switch: false = tiles never change
+# playbackRate and never auto-seek, exactly as before 75493ae.
+CATCHUP_ENABLED = os.environ.get("GIF_MONITOR_CATCHUP_ENABLED", "true").strip().lower() not in {
+    "0", "false", "no", "off"
+}
 MAX_PREVIEWS = positive_env_int("GIF_MONITOR_MAX_PREVIEWS", 16)
 CLIP_OUTPUT_ROOT = ROOT / "output_gifs" / "monitor"
 
@@ -887,6 +893,7 @@ def monitor_matches():
             "max_previews": MAX_PREVIEWS,
             "clip_before_seconds": CLIP_BEFORE_SECONDS,
             "clip_range_max_seconds": CLIP_RANGE_MAX_SECONDS,
+            "catchup_enabled": CATCHUP_ENABLED,
         }
     )
 

@@ -15,6 +15,8 @@ const state = {
   maxPreviews: 16,
   clipBeforeSeconds: 10,
   clipRangeMaxSeconds: 30,
+  // Mirrors GIF_MONITOR_CATCHUP_ENABLED; false disables tile speed-up and auto seek.
+  catchupEnabled: true,
   // Operator-chosen [start, end] range on the stage. ``pinId`` is the server
   // pin that hard-links the start so it survives the rolling buffer.
   range: {matchId: null, pinId: null, startMs: null, ttlTimer: null, busy: false},
@@ -1102,6 +1104,7 @@ async function refreshMatches() {
     state.maxPreviews = data.max_previews || state.maxPreviews;
     state.clipBeforeSeconds = data.clip_before_seconds || state.clipBeforeSeconds;
     state.clipRangeMaxSeconds = data.clip_range_max_seconds || state.clipRangeMaxSeconds;
+    if (typeof data.catchup_enabled === 'boolean') state.catchupEnabled = data.catchup_enabled;
     syncStageCaptureLabel();
     const playing = Array.isArray(data.playing) ? data.playing : [];
 
@@ -1531,6 +1534,7 @@ function noteAutoSeek(matchId, reason, lag) {
 }
 
 function autoSeekToLive(matchId, video, reason, lag) {
+  if (!state.catchupEnabled) return;
   if (!video || !video._hls || video._liveSeekPending) return;
   noteAutoSeek(matchId, reason, lag);
   seekToLive(video);
@@ -1540,6 +1544,11 @@ function autoSeekToLive(matchId, video, reason, lag) {
 // a segment of the target (or when it is moved into the stage / lag unknown).
 function applyTileCatchupRate(video, lag) {
   if (!video) return;
+  if (!state.catchupEnabled) {
+    // Switch flipped off at runtime: make sure nothing is left running fast.
+    if (video.playbackRate !== 1) video.playbackRate = 1;
+    return;
+  }
   const hls = video._hls;
   const target = hls && typeof hls.targetLatency === 'number' && hls.targetLatency > 0
     ? hls.targetLatency
@@ -1555,7 +1564,7 @@ function applyTileCatchupRate(video, lag) {
 }
 
 function onVisibilityRestored() {
-  if (document.hidden) return;
+  if (document.hidden || !state.catchupEnabled) return;
   for (const matchId of state.tiles.keys()) {
     const video = videoForMatch(matchId);
     if (!video || !video._hls) continue;
@@ -1576,8 +1585,12 @@ function startLagMonitoring() {
   setInterval(() => {
     for (const matchId of state.tiles.keys()) {
       // Badge each surface from its own player: with a WebRTC tile the stage
-      // runs a separate HLS element, so the two lags differ.
-      const tileVideo = tileVideoEl(matchId);
+      // runs a separate HLS element, so the two lags differ. On HLS the tile
+      // element itself moves into the stage, so fall back to that element to
+      // keep the tile badge populated exactly as before.
+      // videoForMatch() follows the element into the stage when it is enlarged.
+      const video = videoForMatch(matchId);
+      const tileVideo = tileVideoEl(matchId) || video;
       const tileBadge = document.querySelector(`.tile[data-match-id="${matchId}"] [data-role="lag"]`);
       renderLagBadge(tileBadge, liveLagSeconds(tileVideo));
       if (tileVideo && tileVideo._whep) {
@@ -1587,8 +1600,6 @@ function startLagMonitoring() {
           `${w.pc.connectionState} | ${document.hidden ? '后台' : '前台'} | frames ${w.framesDecoded}`
         );
       }
-      // videoForMatch() follows the element into the stage when it is enlarged.
-      const video = videoForMatch(matchId);
       const lag = liveLagSeconds(video);
       if (state.stageMatchId === matchId) renderLagBadge($('stage-lag'), lag);
       if (!video || !video._hls) continue;
