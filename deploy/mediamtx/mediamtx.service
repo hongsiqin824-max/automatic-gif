@@ -1,0 +1,25 @@
+[Unit]
+Description=mediamtx - WebRTC gateway for gif-monitor tiles (scheme H)
+Documentation=https://github.com/bluenviron/mediamtx
+After=network-online.target
+Wants=network-online.target
+# 不要 Before/Requires gif-monitor：8901 探测不到 mediamtx 会自动回退 HLS，两者独立起停。
+
+[Service]
+Type=simple
+User=mediamtx
+Group=mediamtx
+WorkingDirectory=/opt/mediamtx
+ExecStart=/opt/mediamtx/mediamtx /opt/mediamtx/mediamtx.yml
+Restart=always
+RestartSec=2
+# 每路 WebRTC + RTSP 读者都是 fd；20 场 × 若干观看者绰绰有余。
+LimitNOFILE=65536
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadOnlyPaths=/opt/mediamtx
+
+[Install]
+WantedBy=multi-user.target

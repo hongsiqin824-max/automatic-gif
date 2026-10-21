@@ -193,7 +193,13 @@ async function attachWhep(video, whepUrl, onStatus, onFallback, retries = 0) {
     });
     if (!res.ok) throw new Error(`WHEP ${res.status}`);
     const location = res.headers.get('Location');
-    if (location) whep.resourceUrl = new URL(location, new URL(whepUrl, window.location.href)).href;
+    if (location) {
+      // mediamtx answers with an absolute path (/<path>/whep/<session>) that
+      // knows nothing about the reverse-proxy prefix we sit behind. Keep only
+      // the session id and hang it off the WHEP URL we actually posted to.
+      const sessionId = location.split('/').filter(Boolean).pop();
+      whep.resourceUrl = new URL(`${whepUrl.replace(/\/+$/, '')}/${sessionId}`, window.location.href).href;
+    }
     const answer = await res.text();
     if (video._whep !== whep) return null;
     await pc.setRemoteDescription({type: 'answer', sdp: answer});

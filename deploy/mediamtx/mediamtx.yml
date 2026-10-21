@@ -1,0 +1,74 @@
+# mediamtx 生产配置 —— 8901 监控台小窗 WebRTC（方案 H，BACKLOG 11.13）
+#
+# 放到服务器 /opt/mediamtx/mediamtx.yml。只需改一处：webrtcAdditionalHosts 填服务器公网 IP。
+# 与本地验证用的 tmp/webrtc_h1/mediamtx.yml 差异：rtmp 关闭（生产由 mediamtx 主动去拉懂球帝源，
+# 不需要接收推流）、UDP/TCP 都监听 0.0.0.0:8189、公网 IP 做 ICE 候选。
+#
+# 端口一览（只有 8189 需要开安全组）：
+#   9997/tcp  127.0.0.1  控制 API —— 8901 按场注册/删除拉流 path
+#   8554/tcp  127.0.0.1  RTSP     —— 预览 ffmpeg 从这里回读，写 HLS 环形缓冲
+#   8889/tcp  127.0.0.1  WHEP     —— nginx 反代 /gif-monitor/whep/ 到这里
+#   8189/udp+tcp 0.0.0.0 WebRTC 媒体 —— 浏览器直连；UDP 不通时回退 TCP
+
+logLevel: info
+logDestinations: [stdout]
+
+# ---- 控制 API（仅本机）----
+api: yes
+apiAddress: 127.0.0.1:9997
+
+# ---- 预览 ffmpeg 回读口（仅本机）----
+rtsp: yes
+rtspAddress: 127.0.0.1:8554
+rtspTransports: [tcp]
+
+# ---- 不用的协议全部关掉 ----
+rtmp: no
+hls: no
+srt: no
+moq: no
+metrics: no
+pprof: no
+playback: no
+
+# ---- WebRTC / WHEP ----
+webrtc: yes
+webrtcAddress: 127.0.0.1:8889
+# 浏览器经 nginx 同源访问，不需要 CORS；'*' 只是避免本地直连调试时被拦。
+webrtcAllowOrigins: ['*']
+# 单端口 mux：UDP 优先，办公网封 UDP 时自动用 TCP。两者都要开安全组。
+webrtcLocalUDPAddress: :8189
+webrtcLocalTCPAddress: :8189
+# 云主机网卡上是内网 IP，浏览器连不到；关掉自动枚举，只给公网 IP。
+webrtcIPsFromInterfaces: no
+webrtcAdditionalHosts: [PUBLIC_IP_HERE]
+# 内网/公网直连，不走 STUN/TURN。
+webrtcICEServers2: []
+# 浏览器拿不到首帧就断，别让半死会话占着上游。
+webrtcHandshakeTimeout: 10s
+webrtcTrackGatherTimeout: 2s
+
+# ---- 鉴权：API 只允许本机，读流（WHEP）无需账号（与 HLS 预览同等暴露面）----
+authMethod: internal
+authInternalUsers:
+  - user: any
+    pass:
+    ips: []
+    permissions:
+      - action: read
+      - action: playback
+  - user: any
+    pass:
+    ips: ['127.0.0.1', '::1']
+    permissions:
+      - action: api
+      - action: publish
+
+# ---- path 由 8901 通过 API 按场动态添加（名字 = match_id，source = 懂球帝 RTMP）----
+# 这里不预置任何 path；all_others 兜底让未知 path 也能按默认规则处理。
+pathDefaults:
+  # 源断了就反复重连，不要让 path 消失（8901 的 ffmpeg 自愈也依赖它）。
+  sourceOnDemand: no
+  rtspTransport: tcp
+paths:
+  all_others:

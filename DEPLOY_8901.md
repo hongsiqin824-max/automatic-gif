@@ -93,6 +93,118 @@
 - [ ] 截取后主屏看到 GIF 缩略图；草稿生成后点「打开草稿」能跳转后台。
 - [ ] 源抖动时格子显示「自动重连 / 持续重连中」，恢复后画面自动复原。
 
+## 阶段 7 · 小窗 WebRTC（方案 H，BACKLOG 11.13；纯部署 + 一个 `.env` 开关）
+> 小窗延迟从 ~4.5s 降到 <1s。大窗与截 GIF 仍走 HLS，一行代码不动。
+> 总开关 `GIF_MONITOR_WEBRTC_ENABLED` 默认 **false**：代码先上、mediamtx 后装、最后打开；任何一步不满意把开关关回去重启即回现状。
+> 本地已用 mediamtx v1.21.2 跑通全链路（含 mediamtx 挂掉回退 HLS、WHEP 不通 3 次重试后回退）。
+
+### 7.0 先把代码上去（开关关着，行为 = 现状 + 追帧 + 1s 片）
+```bash
+deploy-gif
+curl -fsS http://127.0.0.1:8001/api/health
+journalctl -u gif-monitor -n 50 --no-pager | grep monitor_latency_config   # 应见 "webrtc_enabled": false
+```
+浏览器 `Cmd+Shift+R`，盯一场确认和之前一样能播、能截。**这一步没问题再往下。**
+
+### 7.1 装 mediamtx（/opt/mediamtx，独立 systemd）
+```bash
+# 1) 二进制（Rocky 9 x86_64）。GitHub 慢就换 ghproxy 之类镜像，或本机下好 scp 上去。
+sudo mkdir -p /opt/mediamtx && cd /opt/mediamtx
+V=v1.21.2
+curl -fL -o mediamtx.tar.gz \
+  https://github.com/bluenviron/mediamtx/releases/download/${V}/mediamtx_${V}_linux_amd64.tar.gz
+tar xzf mediamtx.tar.gz mediamtx && rm -f mediamtx.tar.gz
+./mediamtx --version                       # 应打印 v1.21.2
+
+# 2) 配置：用仓库里的模板，只改一处公网 IP
+sudo cp /opt/gif-monitor/deploy/mediamtx/mediamtx.yml /opt/mediamtx/mediamtx.yml
+PUB_IP=$(curl -fsS https://ifconfig.me)      # 或在腾讯云控制台看
+sudo sed -i "s/PUBLIC_IP_HERE/${PUB_IP}/" /opt/mediamtx/mediamtx.yml
+grep webrtcAdditionalHosts /opt/mediamtx/mediamtx.yml   # 确认已替换
+
+# 3) 专用用户 + systemd
+sudo useradd -r -s /sbin/nologin -d /opt/mediamtx mediamtx 2>/dev/null || true
+sudo chown -R mediamtx:mediamtx /opt/mediamtx
+sudo cp /opt/gif-monitor/deploy/mediamtx/mediamtx.service /etc/systemd/system/mediamtx.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now mediamtx
+sudo systemctl status mediamtx --no-pager
+journalctl -u mediamtx -n 20 --no-pager
+```
+期望日志三行 `started with listeners`：RTSP `127.0.0.1:8554`、WebRTC `127.0.0.1:8889 (TCP/HTTP), :8189 (UDP/ICE), :8189 (TCP/ICE)`、API `127.0.0.1:9997`。**不应有 WAR/ERR。**
+
+本机自检：
+```bash
+curl -s http://127.0.0.1:9997/v3/paths/list       # {"itemCount":0,"pageCount":0,"items":[]}
+ss -lunp | grep 8189 && ss -ltnp | grep 8189       # UDP + TCP 都在 0.0.0.0:8189
+```
+
+### 7.2 安全组（腾讯云控制台）
+入站放行 **UDP 8189** 和 **TCP 8189**，来源 0.0.0.0/0（WebRTC 媒体直连，不经 nginx）。
+9997 / 8554 / 8889 只监听 127.0.0.1，**不要**开。
+
+### 7.3 nginx：WHEP 反代（/etc/nginx/conf.d/matchgif.conf）
+在现有 `location /gif-monitor/ { … }` **之前**加一段（更长前缀优先，顺序其实无所谓，放前面便于阅读）：
+```nginx
+# gif-monitor 小窗 WebRTC：WHEP 信令转给 mediamtx（POST 建会话 / PATCH ICE / DELETE 关会话）
+location /gif-monitor/whep/ {
+    proxy_pass http://127.0.0.1:8889/;   # 尾斜杠必须有：/gif-monitor/whep/<id>/whep → /<id>/whep
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_buffering off;
+    proxy_read_timeout 30s;
+}
+```
+```bash
+sudo cp /etc/nginx/conf.d/matchgif.conf /etc/nginx/conf.d/matchgif.conf.bak-whep-$(date +%Y%m%d)
+sudo nginx -t && sudo systemctl reload nginx
+# 自检：两条都说明请求已经穿过 nginx 到了 mediamtx（nginx 自己的 404 不会带这些）
+curl -s -D - -o /dev/null -X OPTIONS https://matchgif.aisportsapp.com/gif-monitor/whep/x/whep \
+  -H 'Origin: https://matchgif.aisportsapp.com' -H 'Access-Control-Request-Method: POST' \
+  | grep -i 'Access-Control-Allow-Methods'          # 期望: OPTIONS, GET, POST, PATCH, DELETE
+curl -s -X POST https://matchgif.aisportsapp.com/gif-monitor/whep/x/whep \
+  -H 'Content-Type: application/sdp' --data 'v=0'   # 期望: {"status":"error","error":"no stream is available on path 'x'"}
+```
+说明：mediamtx 的 `Location` 头是绝对路径 `/<id>/whep/<session>`，不带 `/gif-monitor/whep/` 前缀；前端已改为只取 session id 拼回自己 POST 的地址，所以反代不需要 `proxy_redirect`。
+
+### 7.4 打开开关（/opt/gif-monitor/.env）
+```bash
+cp /opt/gif-monitor/.env /opt/gif-monitor/.env.bak-webrtc-$(date +%Y%m%d)
+# 追加或修改：
+GIF_MONITOR_WEBRTC_ENABLED=true
+# 下面 6 个保持默认即可（写出来便于以后调）：
+GIF_MONITOR_MEDIAMTX_API=http://127.0.0.1:9997
+GIF_MONITOR_MEDIAMTX_RTSP=rtsp://127.0.0.1:8554
+GIF_MONITOR_WHEP_BASE=whep/
+GIF_MONITOR_MEDIAMTX_TIMEOUT_SECONDS=2
+GIF_MONITOR_MEDIAMTX_READY_SECONDS=6
+sudo systemctl restart gif-monitor
+journalctl -u gif-monitor -n 50 --no-pager | grep monitor_latency_config   # "webrtc_enabled": true
+```
+
+### 7.5 验收（一场比赛）
+浏览器 `Cmd+Shift+R` 后开一场：
+| 看什么 | 期望 |
+|---|---|
+| 小窗状态文字 | 「正在播放直播源（WebRTC）」 |
+| 小窗徽标 | `落后 0.x s`（一位小数） |
+| Console | `[LAG] <id> \| WebRTC 落后 0.xxs \| connected \| …` |
+| 与 VLC 同看 | 相差 <1s |
+| 点放大 | 大窗「正在播放直播源」、徽标 `落后 3s` 左右、可拖；小窗仍在播 |
+| 大窗截 GIF | 10s 原速，状态栏能关联提醒 |
+| `curl -s 127.0.0.1:9997/v3/paths/list` | 每场一个 path，`ready: true`，readers 含 `rtspSession`（ffmpeg）和 `webRTCSession`（浏览器） |
+| 关掉这场 | path 被删除 |
+| `sudo systemctl stop mediamtx` | 小窗 `WebRTC 重连中 (1/3)…` → `WebRTC 不可用，已切回 HLS`，继续播；8901 日志 `webrtc_fallback_hls`。再 `start` 后新开的场重新走 WebRTC |
+
+小窗一直停在「WebRTC 重连中」最后回退 HLS，但 7.3 自检是通的 → 多半是 **8189 没放行**或 `webrtcAdditionalHosts` 没填对（浏览器 F12 → `chrome://webrtc-internals` 看 ICE 候选是否有公网 IP）。
+
+### 7.6 回退
+- 只关功能：`.env` 改 `GIF_MONITOR_WEBRTC_ENABLED=false` → `systemctl restart gif-monitor`。mediamtx 可留着跑（空闲时几乎不占资源）。
+- 彻底卸：`systemctl disable --now mediamtx`；nginx 删 `location /gif-monitor/whep/` 段 reload；安全组关 8189。
+
 ---
 
 ## 附：相关环境变量速查

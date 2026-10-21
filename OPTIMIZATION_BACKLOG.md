@@ -1197,11 +1197,13 @@ command += [
 
 | 步 | 内容 | 验证 |
 |---|---|---|
-| H1 | 本地 `brew install mediamtx`，ffmpeg 推测试源到 mediamtx，浏览器用最小 WHEP 页面播通；量 `getStats` 延迟 | 本地页面看到画面、延迟 <1s |
-| H2 | `webrtc_gateway.py` + 后端接口 + rtsp 分支 + 测试；`GIF_MONITOR_WEBRTC_ENABLED=false` 默认 | 全测试通过；关着时行为与现状一致 |
-| H3 | 前端 `attachWhep` + 小窗切换 + 徽标 + 锚点 + 回退 | 本地开关打开：小窗 WebRTC、大窗 HLS、截 GIF 原速正确 |
-| H4 | 服务器装 mediamtx + systemd + 安全组 + nginx 反代；`.env` 打开开关 | 一场比赛小窗 ≤1s；拔掉 mediamtx 小窗自动回 HLS |
-| H5 | 观察两三场后决定是否做形态 B | — |
+| H1 ✅ | 本地 mediamtx v1.21.2（GitHub 下载极慢，放 `tmp/webrtc_h1/`），ffmpeg 推测试源，API 注册 path 0.32s 就绪，我们的 ffmpeg 从 RTSP 读 1.52s 出首个 m3u8 | 通过 |
+| H2 ✅ `efc03aa` | `webrtc_gateway.py` + `preview/start|status` 返回 `webrtc/whep_url` + rtsp 分支（`-rw_timeout` 在 RTSP demuxer 不认，改 `-timeout`） | 1034 测试；开关关闭态运行时实测：ffmpeg 直拉 RTMP、mediamtx 无 path、0 次网关调用 |
+| H3 ✅ `362f1df` | 前端 `attachWhep`/独立大窗 HLS/徽标/锚点/回退 | 浏览器实测：小窗 WebRTC `落后 0.1s`、大窗独立 HLS 可拖、GIF 10.02s/167 帧原速、mediamtx SIGSTOP 20s 恢复后自动重连、WHEP 死端口 3 次重试后回退 HLS。坑：上次批量编辑丢了 3 处改动（已写进 AGENTS.md）；重连计数每次重置→永不回退（改 `retries` 参数传入） |
+| H4 ✅ 文档 | `DEPLOY_8901.md` 阶段 7 + `deploy/mediamtx/{mediamtx.yml,mediamtx.service}`。生产 yml 已用 1.21.2 实际加载无 WAR/ERR，API 注册→就绪→匿名 WHEP 201→匿名 RTSP describe 全通。坑：mediamtx WHEP `Location` 是绝对路径 `/<id>/whep/<sid>`，经 `/gif-monitor/whep/` 反代会丢前缀 → 前端改为只取 session id 拼回自己 POST 的地址 | 等服务器执行 |
+| H5 | 服务器按阶段 7 执行：`deploy-gif`（开关关）→ 装 mediamtx → 安全组 8189 → nginx → `.env` 开 → 一场验收；观察两三场后决定是否做形态 B | 一场比赛小窗 ≤1s；`systemctl stop mediamtx` 小窗自动回 HLS |
+
+附：延迟相关参数现已全部可从 `.env` 调（`266b037`）：片长、hls.js 同步片数、追帧开关/倍速/阈值、x264 preset、WebRTC 开关；启动日志 `monitor_latency_config` 与 Console `[LATENCY-CONFIG]` 显示生效值与被修正项。
 
 #### 11.13.9 与其他方案的关系
 
