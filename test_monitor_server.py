@@ -1299,6 +1299,57 @@ class LatencyKillSwitchTests(unittest.TestCase):
             command[command.index("-force_key_frames") + 1], "expr:gte(t,n_forced*2)"
         )
 
+    def test_matches_advertises_latency_config(self):
+        app = monitor_server.app.test_client()
+        with mock.patch.object(monitor_server.match_catalog, "snapshot", return_value={"playing": []}):
+            latency = app.get("/api/monitor/matches").get_json()["latency"]
+        for key in (
+            "segment_seconds", "preview_segments", "history_seconds", "x264_preset",
+            "hls_live_sync_count", "hls_target_seconds", "catchup_enabled",
+            "catchup_rate", "catchup_min_lag", "stage_seek_lag", "hard_seek_lag", "adjusted",
+        ):
+            self.assertIn(key, latency)
+        self.assertEqual(
+            latency["hls_target_seconds"], latency["segment_seconds"] * latency["hls_live_sync_count"]
+        )
+
+    def test_latency_defaults_are_unchanged_and_unadjusted(self):
+        cfg = monitor_server._build_latency_config()
+        self.assertEqual(cfg["hls_live_sync_count"], 3)
+        self.assertEqual(cfg["catchup_rate"], 1.5)
+        self.assertEqual(cfg["catchup_min_lag"], 12.0)
+        self.assertEqual(cfg["stage_seek_lag"], 30.0)
+        self.assertEqual(cfg["hard_seek_lag"], 150.0)
+        self.assertEqual(cfg["adjusted"], [])
+
+    def test_latency_config_bounds_unsafe_values(self):
+        env = {
+            "GIF_MONITOR_HLS_LIVE_SYNC_COUNT": "1",   # <2 stalls forever
+            "GIF_MONITOR_CATCHUP_RATE": "5",          # browsers mute/skip above ~2x
+            "GIF_MONITOR_CATCHUP_MIN_LAG": "1",       # below target → constant toggling
+            "GIF_MONITOR_HARD_SEEK_LAG": "9999",      # beyond the ring buffer
+        }
+        with mock.patch.dict(os.environ, env):
+            cfg = monitor_server._build_latency_config()
+        self.assertEqual(cfg["hls_live_sync_count"], 2)
+        self.assertEqual(cfg["catchup_rate"], 2.0)
+        self.assertGreaterEqual(cfg["catchup_min_lag"], cfg["hls_target_seconds"] + 2)
+        self.assertLessEqual(cfg["hard_seek_lag"], cfg["history_seconds"] - 10)
+        self.assertGreaterEqual(cfg["hard_seek_lag"], cfg["stage_seek_lag"])
+        self.assertEqual(len(cfg["adjusted"]), 4)
+
+    def test_x264_preset_env_is_validated(self):
+        with mock.patch.dict(os.environ, {"GIF_PREVIEW_X264_PRESET": "ultrafast"}):
+            self.assertEqual(live_preview.x264_preset_from_env(), "ultrafast")
+        with mock.patch.dict(os.environ, {"GIF_PREVIEW_X264_PRESET": "placebo"}):
+            self.assertEqual(live_preview.x264_preset_from_env(), "veryfast")
+        with TemporaryDirectory() as tmp:
+            manager = live_preview.LivePreviewManager(
+                root=Path(tmp), background_reaper=False, x264_preset="superfast"
+            )
+            command = manager._build_command("rtmp://host/app/s", Path(tmp))
+        self.assertEqual(command[command.index("-preset") + 1], "superfast")
+
 
 if __name__ == "__main__":
     unittest.main()

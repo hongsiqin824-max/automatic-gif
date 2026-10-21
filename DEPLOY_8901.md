@@ -105,11 +105,19 @@
 | `GIF_MONITOR_CLIP_WIDTH` | 440 | GIF 宽 |
 | `GIF_MONITOR_CLIP_FPS` | 16.667 | GIF 帧率（50/3，与 8899 一致） |
 | `GIF_MONITOR_PREVIEW_SEGMENTS` | 180 | 滚动缓冲分片数（1s/片，约 180s） |
-| `GIF_PREVIEW_SEGMENT_SECONDS` | 1 | HLS 分片秒数；改 2 回到旧片长（配合 SEGMENTS=90） |
+| `GIF_PREVIEW_SEGMENT_SECONDS` | 1 | HLS 片长（秒）；改 2 回到旧片长（配合 SEGMENTS=90） |
+| `GIF_MONITOR_HLS_LIVE_SYNC_COUNT` | 3 | hls.js 停在边缘后几片（2~6）；目标延迟 = 片长 × 此值 |
 | `GIF_MONITOR_CATCHUP_ENABLED` | true | 小窗自动追帧/自动回到直播；false 完全关闭 |
+| `GIF_MONITOR_CATCHUP_RATE` | 1.5 | 追帧倍速（1.0~2.0） |
+| `GIF_MONITOR_CATCHUP_MIN_LAG` | 12 | 落后多少秒开始追（下限 目标+2） |
+| `GIF_MONITOR_STAGE_SEEK_LAG` | 30 | 大窗切回前台落后多少秒才跳回直播 |
+| `GIF_MONITOR_HARD_SEEK_LAG` | 150 | 无条件跳回直播阈值（上限 回看秒数−10） |
+| `GIF_PREVIEW_X264_PRESET` | veryfast | x264 预设；仅 CPU 吃紧时调 |
 | `GIF_MONITOR_WEBRTC_ENABLED` | false | 小窗 WebRTC（需 mediamtx）；false=纯 HLS |
 | `GIF_PREVIEW_IDLE_TIMEOUT_SECONDS` | 120 | 预览空闲回收秒数 |
 | `GIF_MONITOR_AUTO_RESTART` | true | 预览断线自愈 |
 | `GIF_MONITOR_PUBLISH_ENABLED` | true | 是否自动建草稿发文 |
 | `GIF_MONITOR_DELIVERY_MODE` | draft | draft / publish |
 | `GIF_MONITOR_MAX_CONCURRENT_ENCODES` | （阶段 5 新增）2~3 | 截取编码并发上限 |
+
+延迟参数生效值核对：启动后 `grep monitor_latency_config gif-monitor.log`（或 journalctl）看一行 JSON；`adjusted` 非空表示有值越界被修正。浏览器 Console 对应 `[LATENCY-CONFIG]`。

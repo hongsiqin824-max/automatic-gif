@@ -329,7 +329,7 @@ function attachHls(video, playlistUrl, onStatus) {
   detachPlayer(video);
   if (window.Hls && window.Hls.isSupported()) {
     const hls = new window.Hls({
-      liveSyncDurationCount: 3,
+      liveSyncDurationCount: LATENCY.hlsLiveSyncCount,
       lowLatencyMode: false,
       manifestLoadingMaxRetry: 8,
       manifestLoadingRetryDelay: 1000,
@@ -1105,6 +1105,7 @@ async function refreshMatches() {
     state.clipBeforeSeconds = data.clip_before_seconds || state.clipBeforeSeconds;
     state.clipRangeMaxSeconds = data.clip_range_max_seconds || state.clipRangeMaxSeconds;
     if (typeof data.catchup_enabled === 'boolean') state.catchupEnabled = data.catchup_enabled;
+    applyLatencyConfig(data.latency);
     syncStageCaptureLabel();
     const playing = Array.isArray(data.playing) ? data.playing : [];
 
@@ -1503,10 +1504,37 @@ function renderLagBadge(node, lag) {
 //   deliberate scrub survives a quick glance at another window.
 // * Rule 4: at HARD_SEEK_LAG, seek unconditionally - 30 s later the server has
 //   deleted that part of the 180 s ring and hls.js would hard-jump on its own.
-const CATCHUP_RATE = 1.5;
-const CATCHUP_RATE_MIN_LAG = 12;
-const STAGE_FOREGROUND_SEEK_LAG = 30;
-const HARD_SEEK_LAG = 150;
+//
+// All thresholds (and hls.js liveSyncDurationCount) are tunable from the
+// server .env; defaults below only cover the first poll before
+// /api/monitor/matches delivers the effective set (applyLatencyConfig).
+const LATENCY = {
+  hlsLiveSyncCount: 3,
+  catchupRate: 1.5,
+  catchupMinLag: 12,
+  stageSeekLag: 30,
+  hardSeekLag: 150,
+};
+let latencyConfigLogged = false;
+
+function applyLatencyConfig(cfg) {
+  if (!cfg || typeof cfg !== 'object') return;
+  const num = (v, prev) => (typeof v === 'number' && v > 0 ? v : prev);
+  LATENCY.hlsLiveSyncCount = num(cfg.hls_live_sync_count, LATENCY.hlsLiveSyncCount);
+  LATENCY.catchupRate = num(cfg.catchup_rate, LATENCY.catchupRate);
+  LATENCY.catchupMinLag = num(cfg.catchup_min_lag, LATENCY.catchupMinLag);
+  LATENCY.stageSeekLag = num(cfg.stage_seek_lag, LATENCY.stageSeekLag);
+  LATENCY.hardSeekLag = num(cfg.hard_seek_lag, LATENCY.hardSeekLag);
+  if (!latencyConfigLogged) {
+    latencyConfigLogged = true;
+    console.log(
+      `[LATENCY-CONFIG] 片长 ${cfg.segment_seconds}s × 同步 ${LATENCY.hlsLiveSyncCount} 片 = 目标 ${cfg.hls_target_seconds}s | ` +
+      `回看 ${cfg.history_seconds}s | x264 ${cfg.x264_preset} | 追帧 ${state.catchupEnabled ? '开' : '关'} ` +
+      `${LATENCY.catchupRate}x@≥${LATENCY.catchupMinLag}s 大窗≥${LATENCY.stageSeekLag}s 硬跳≥${LATENCY.hardSeekLag}s` +
+      (Array.isArray(cfg.adjusted) && cfg.adjusted.length ? ` | 已被服务器修正: ${cfg.adjusted.join(', ')}` : '')
+    );
+  }
+}
 const AUTO_SEEK_NOTE_MS = 3000;
 
 function isStageVideo(video) {
@@ -1552,12 +1580,12 @@ function applyTileCatchupRate(video, lag) {
   const hls = video._hls;
   const target = hls && typeof hls.targetLatency === 'number' && hls.targetLatency > 0
     ? hls.targetLatency
-    : CATCHUP_RATE_MIN_LAG;
+    : LATENCY.catchupMinLag;
   const adrift = lag != null && hls && !isStageVideo(video) && !video.paused
-    && lag >= CATCHUP_RATE_MIN_LAG && bufferedAheadSeconds(video) > 1;
+    && lag >= LATENCY.catchupMinLag && bufferedAheadSeconds(video) > 1;
   const settled = lag == null || lag <= target + 1;
-  if (adrift && video.playbackRate !== CATCHUP_RATE) {
-    video.playbackRate = CATCHUP_RATE;
+  if (adrift && video.playbackRate !== LATENCY.catchupRate) {
+    video.playbackRate = LATENCY.catchupRate;
   } else if (!adrift && video.playbackRate !== 1 && (settled || isStageVideo(video) || !hls)) {
     video.playbackRate = 1;
   }
@@ -1569,7 +1597,7 @@ function onVisibilityRestored() {
     const video = videoForMatch(matchId);
     if (!video || !video._hls) continue;
     const lag = liveLagSeconds(video);
-    if (isStageVideo(video) && !(lag != null && lag > STAGE_FOREGROUND_SEEK_LAG)) continue;
+    if (isStageVideo(video) && !(lag != null && lag > LATENCY.stageSeekLag)) continue;
     autoSeekToLive(matchId, video, 'foreground', lag == null ? 0 : lag);
   }
 }
@@ -1605,7 +1633,7 @@ function startLagMonitoring() {
       if (!video || !video._hls) continue;
       const hls = video._hls;
 
-      if (lag != null && lag >= HARD_SEEK_LAG) {
+      if (lag != null && lag >= LATENCY.hardSeekLag) {
         autoSeekToLive(matchId, video, 'hard-limit', lag);
       } else {
         applyTileCatchupRate(video, lag);

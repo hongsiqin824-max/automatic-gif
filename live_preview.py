@@ -12,6 +12,7 @@ rolling buffer that doubles as the clip source.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import threading
@@ -36,6 +37,19 @@ PREVIEW_IDLE_TIMEOUT_SECONDS = positive_env_float(
 # switch: GIF_PREVIEW_SEGMENT_SECONDS=2 restores the previous behaviour
 # (pair it with GIF_MONITOR_PREVIEW_SEGMENTS=90 to keep ~180s of history).
 PREVIEW_SEGMENT_SECONDS = positive_env_int("GIF_PREVIEW_SEGMENT_SECONDS", 1)
+# x264 speed/quality trade-off. Only a latency lever when the server CPU is
+# saturated (encode slower than real time); otherwise leave it alone.
+X264_PRESETS = (
+    "ultrafast", "superfast", "veryfast", "faster", "fast", "medium",
+)
+
+
+def x264_preset_from_env(default: str = "veryfast") -> str:
+    raw = os.environ.get("GIF_PREVIEW_X264_PRESET", "").strip().lower()
+    return raw if raw in X264_PRESETS else default
+
+
+PREVIEW_X264_PRESET = x264_preset_from_env()
 PREVIEW_LIST_SIZE = 12
 PREVIEW_HEIGHT = 480
 # Previous ffmpeg stderr is kept here across a restart so the exit reason
@@ -85,6 +99,7 @@ class LivePreviewManager:
         segment_seconds: int = PREVIEW_SEGMENT_SECONDS,
         list_size: int = PREVIEW_LIST_SIZE,
         height: int = PREVIEW_HEIGHT,
+        x264_preset: str = PREVIEW_X264_PRESET,
         background_reaper: bool = True,
         auto_restart: bool = False,
         restart_base_delay: float = 5.0,
@@ -98,6 +113,7 @@ class LivePreviewManager:
         self.segment_seconds = int(segment_seconds)
         self.list_size = int(list_size)
         self.height = int(height)
+        self.x264_preset = x264_preset if x264_preset in X264_PRESETS else "veryfast"
         # Called whenever an entry is torn down - explicit stop, idle reap or
         # shutdown - so a sibling resource registered for the same match (the
         # mediamtx WebRTC path, scheme H) is released with it.
@@ -161,7 +177,7 @@ class LivePreviewManager:
         command += [
             "-i", resource,
             "-vf", f"scale=-2:{self.height}",
-            "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
+            "-c:v", "libx264", "-preset", self.x264_preset, "-tune", "zerolatency",
             "-profile:v", "main", "-pix_fmt", "yuv420p",
             "-force_key_frames", f"expr:gte(t,n_forced*{self.segment_seconds})",
             "-sc_threshold", "0",

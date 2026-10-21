@@ -39,6 +39,7 @@ from dqd_api import MATCH_STATUS_LABELS, positive_env_float, positive_env_int, v
 from source_client import classify_source_response, query_source
 from match_catalog import MATCH_CATALOG_EXCLUDED_COMPETITION_NAMES, MatchCatalog
 from live_preview import LivePreviewManager, resolve_ffmpeg
+import live_preview as live_preview_module
 from webrtc_gateway import WebRTCGateway
 from article_draft_queue import (
     ArticleDraftQueue,
@@ -100,6 +101,65 @@ PREVIEW_LIST_SIZE = positive_env_int("GIF_MONITOR_PREVIEW_SEGMENTS", 180)
 CATCHUP_ENABLED = os.environ.get("GIF_MONITOR_CATCHUP_ENABLED", "true").strip().lower() not in {
     "0", "false", "no", "off"
 }
+
+
+def _build_latency_config() -> dict[str, Any]:
+    """Collect every operator-tunable knob that shapes preview latency.
+
+    Values come from .env, are bounded here so a typo cannot produce a
+    player that stalls forever or seeks into deleted segments, and are
+    both logged at start-up and handed to the browser via
+    ``/api/monitor/matches`` so the effective set is visible in one place.
+    Steady-state HLS delay ≈ segment_seconds × hls_live_sync_count (+ ~0.5s);
+    those two are the levers, the rest only shape catch-up behaviour.
+    """
+    adjusted: list[str] = []
+
+    def bound(name: str, value: float, lo: float, hi: float | None) -> float:
+        fixed = max(lo, value if hi is None else min(hi, value))
+        if fixed != value:
+            adjusted.append(f"{name}={value}->{fixed}")
+        return fixed
+
+    segment_seconds = live_preview_module.PREVIEW_SEGMENT_SECONDS
+    list_size = PREVIEW_LIST_SIZE
+    # hls.js parks the playhead this many segments behind the edge. Below 2 it
+    # is forever waiting for the segment ffmpeg is still writing.
+    live_sync = int(bound("hls_live_sync_count",
+                          positive_env_int("GIF_MONITOR_HLS_LIVE_SYNC_COUNT", 3), 2, 6))
+    target = segment_seconds * live_sync
+    catchup_rate = bound("catchup_rate",
+                         positive_env_float("GIF_MONITOR_CATCHUP_RATE", 1.5), 1.0, 2.0)
+    # Start chasing only once clearly past the target, or the tile would be
+    # permanently toggling between 1x and the catch-up rate.
+    catchup_min_lag = bound("catchup_min_lag",
+                            positive_env_float("GIF_MONITOR_CATCHUP_MIN_LAG", 12.0),
+                            target + 2, None)
+    stage_seek_lag = bound("stage_seek_lag",
+                           positive_env_float("GIF_MONITOR_STAGE_SEEK_LAG", 30.0),
+                           catchup_min_lag, None)
+    # The ring buffer only holds list_size × segment_seconds of history; a seek
+    # target beyond it lands on segments that have already been deleted.
+    hard_seek_lag = bound("hard_seek_lag",
+                          positive_env_float("GIF_MONITOR_HARD_SEEK_LAG", 150.0),
+                          stage_seek_lag, max(stage_seek_lag, segment_seconds * list_size - 10))
+    return {
+        "segment_seconds": segment_seconds,
+        "preview_segments": list_size,
+        "history_seconds": segment_seconds * list_size,
+        "x264_preset": live_preview_module.PREVIEW_X264_PRESET,
+        "hls_live_sync_count": live_sync,
+        "hls_target_seconds": target,
+        "catchup_enabled": CATCHUP_ENABLED,
+        "catchup_rate": catchup_rate,
+        "catchup_min_lag": catchup_min_lag,
+        "stage_seek_lag": stage_seek_lag,
+        "hard_seek_lag": hard_seek_lag,
+        "adjusted": adjusted,
+    }
+
+
+LATENCY_CONFIG = _build_latency_config()
 MAX_PREVIEWS = positive_env_int("GIF_MONITOR_MAX_PREVIEWS", 16)
 CLIP_OUTPUT_ROOT = ROOT / "output_gifs" / "monitor"
 
@@ -175,6 +235,7 @@ webrtc_gateway = WebRTCGateway(
 
 live_preview = LivePreviewManager(
     list_size=PREVIEW_LIST_SIZE,
+    x264_preset=live_preview_module.PREVIEW_X264_PRESET,
     idle_timeout_seconds=positive_env_float("GIF_PREVIEW_IDLE_TIMEOUT_SECONDS", 120.0),
     # Auto-recover a preview whose RTMP source briefly drops while an operator is
     # still watching, so the tile reconnects itself instead of showing stale frames.
@@ -894,6 +955,7 @@ def monitor_matches():
             "clip_before_seconds": CLIP_BEFORE_SECONDS,
             "clip_range_max_seconds": CLIP_RANGE_MAX_SECONDS,
             "catchup_enabled": CATCHUP_ENABLED,
+            "latency": LATENCY_CONFIG,
         }
     )
 
@@ -1659,4 +1721,13 @@ def _exit_on_sigterm(signum, frame):
 if __name__ == "__main__":
     signal.signal(signal.SIGTERM, _exit_on_sigterm)
     print(f"Match monitor console: http://{HOST}:{PORT}")
+    # One greppable line with the effective latency knobs (and anything that
+    # was clamped), so a deploy can be checked against .env at a glance.
+    print(
+        json.dumps(
+            {"event": "monitor_latency_config", "webrtc_enabled": webrtc_gateway.enabled, **LATENCY_CONFIG},
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
     app.run(host=HOST, port=PORT, threaded=True, debug=False)
