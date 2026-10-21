@@ -1184,5 +1184,94 @@ class SigtermShutdownTests(unittest.TestCase):
                 proc.wait(timeout=5)
 
 
+class PreviewStartWebRTCTests(unittest.TestCase):
+    """Scheme H wiring: tile gets WHEP only when mediamtx registered the path."""
+
+    def setUp(self):
+        self.app = monitor_server.app.test_client()
+        self.started = []
+
+        def fake_start(match_id, resource):
+            self.started.append((match_id, resource))
+            return {"running": True, "resource": resource}
+
+        self._patches = [
+            mock.patch.object(monitor_server, "_resolve_source", return_value="rtmp://up/live/1"),
+            mock.patch.object(monitor_server.live_preview, "start", side_effect=fake_start),
+            mock.patch.object(
+                monitor_server.live_preview, "status",
+                side_effect=lambda m: {"running": True, "resource": self.started[-1][1]},
+            ),
+            mock.patch.object(monitor_server, "_wait_playlist_ready", return_value=True),
+            mock.patch.object(monitor_server.live_preview, "playlist_url", return_value="preview/1/index.m3u8"),
+        ]
+        for patch in self._patches:
+            patch.start()
+
+    def tearDown(self):
+        for patch in self._patches:
+            patch.stop()
+
+    def _start(self):
+        resp = self.app.post("/api/monitor/preview/start", json={"match_id": "54477889"})
+        self.assertEqual(resp.status_code, 200, resp.get_data(as_text=True))
+        return resp.get_json()
+
+    def test_disabled_gateway_keeps_direct_rtmp_and_no_whep(self):
+        with mock.patch.object(monitor_server.webrtc_gateway, "enabled", False):
+            data = self._start()
+        self.assertEqual(self.started, [("54477889", "rtmp://up/live/1")])
+        self.assertFalse(data["webrtc"])
+        self.assertIsNone(data["whep_url"])
+        self.assertEqual(data["playlist_url"], "preview/1/index.m3u8")
+
+    def test_enabled_gateway_routes_ffmpeg_via_rtsp_and_returns_whep(self):
+        gw = monitor_server.webrtc_gateway
+        with mock.patch.object(gw, "enabled", True), \
+             mock.patch.object(gw, "ensure_path", return_value=True) as ensure, \
+             mock.patch.object(gw, "remove_path") as remove:
+            data = self._start()
+        ensure.assert_called_once_with("54477889", "rtmp://up/live/1")
+        remove.assert_not_called()
+        self.assertEqual(self.started, [("54477889", "rtsp://127.0.0.1:8554/54477889")])
+        self.assertTrue(data["webrtc"])
+        self.assertEqual(data["whep_url"], "whep/54477889/whep")
+        # HLS is still produced for the stage and for capture.
+        self.assertEqual(data["playlist_url"], "preview/1/index.m3u8")
+
+    def test_gateway_failure_falls_back_to_direct_rtmp(self):
+        gw = monitor_server.webrtc_gateway
+        with mock.patch.object(gw, "enabled", True), \
+             mock.patch.object(gw, "ensure_path", return_value=False), \
+             mock.patch.object(gw, "remove_path") as remove:
+            data = self._start()
+        # Half-registered path is cleaned so the upstream is not pulled twice.
+        remove.assert_called_once_with("54477889")
+        self.assertEqual(self.started, [("54477889", "rtmp://up/live/1")])
+        self.assertFalse(data["webrtc"])
+        self.assertIsNone(data["whep_url"])
+
+    def test_status_reports_webrtc_from_running_resource(self):
+        gw = monitor_server.webrtc_gateway
+        with mock.patch.object(gw, "enabled", True), \
+             mock.patch.object(monitor_server.live_preview, "touch"), \
+             mock.patch.object(
+                 monitor_server.live_preview, "status",
+                 return_value={"running": True, "resource": "rtsp://127.0.0.1:8554/54477889"},
+             ):
+            data = self.app.get("/api/monitor/preview/status?match_id=54477889").get_json()
+        self.assertTrue(data["webrtc"])
+        self.assertEqual(data["whep_url"], "whep/54477889/whep")
+        with mock.patch.object(gw, "enabled", True), \
+             mock.patch.object(monitor_server.live_preview, "touch"), \
+             mock.patch.object(
+                 monitor_server.live_preview, "status",
+                 return_value={"running": True, "resource": "rtmp://up/live/1"},
+             ):
+            data = self.app.get("/api/monitor/preview/status?match_id=54477889").get_json()
+        self.assertFalse(data["webrtc"])
+        self.assertIsNone(data["whep_url"])
+
+
 if __name__ == "__main__":
     unittest.main()

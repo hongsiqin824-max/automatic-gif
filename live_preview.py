@@ -19,7 +19,7 @@ import time
 import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from dqd_api import positive_env_float
 
@@ -89,12 +89,17 @@ class LivePreviewManager:
         restart_max_delay: float = 60.0,
         restart_max_retries: int = 6,
         restart_reset_seconds: float = 30.0,
+        on_stop: "Callable[[str], None] | None" = None,
     ) -> None:
         self.root = Path(root)
         self.idle_timeout_seconds = float(idle_timeout_seconds)
         self.segment_seconds = int(segment_seconds)
         self.list_size = int(list_size)
         self.height = int(height)
+        # Called whenever an entry is torn down - explicit stop, idle reap or
+        # shutdown - so a sibling resource registered for the same match (the
+        # mediamtx WebRTC path, scheme H) is released with it.
+        self.on_stop = on_stop
         # When enabled, the reaper restarts an ffmpeg that died while the tile is
         # still being watched (dead/flaky RTMP source), with exponential backoff
         # and a retry ceiling so a permanently-dead source is not hammered.
@@ -138,6 +143,11 @@ class LivePreviewManager:
             # Pace a local file at wall-clock speed so the rolling playlist
             # behaves like a live stream instead of flushing instantly.
             command += ["-re"]
+        elif resource.lower().startswith(("rtsp://", "rtsps://")):
+            # Loopback RTSP from mediamtx (scheme H): TCP interleaving avoids UDP
+            # port negotiation and packet loss on the local hop; the read bound
+            # still fails fast if mediamtx loses the upstream.
+            command += ["-rtsp_transport", "tcp", "-rw_timeout", "40000000"]
         else:
             # Bound a stalled network read so a dead RTMP source fails fast.
             # 40s (not 15s) tolerates brief HD-feed stalls without killing
@@ -303,6 +313,11 @@ class LivePreviewManager:
         entry = self.entries.pop(match_id, None)
         if entry is None:
             return
+        if self.on_stop is not None:
+            try:
+                self.on_stop(match_id)
+            except Exception as exc:  # noqa: BLE001 - never block teardown
+                _log_event("preview_on_stop_error", match_id=match_id, error=str(exc))
         process = entry.process
         if process.poll() is None:
             process.terminate()

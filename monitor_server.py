@@ -39,6 +39,7 @@ from dqd_api import MATCH_STATUS_LABELS, positive_env_float, positive_env_int, v
 from source_client import classify_source_response, query_source
 from match_catalog import MATCH_CATALOG_EXCLUDED_COMPETITION_NAMES, MatchCatalog
 from live_preview import LivePreviewManager, resolve_ffmpeg
+from webrtc_gateway import WebRTCGateway
 from article_draft_queue import (
     ArticleDraftQueue,
     DRAFT_DELIVERY_MODE,
@@ -150,6 +151,22 @@ ALERT_MATCH_WEAK_SECONDS = positive_env_float("GIF_MONITOR_ALERT_MATCH_WEAK_SECO
 EVENT_CN = {"goal": "进球", "red_card": "红牌", "corner": "角球"}
 
 
+# Scheme H (BACKLOG 11.13): when enabled, each match is registered as a
+# mediamtx path; the browser tile plays it over WebRTC (sub-second) while the
+# preview ffmpeg reads the same path over loopback RTSP to keep writing the HLS
+# ring buffer for the stage and for GIF capture. Off by default; any failure
+# falls back to pulling RTMP directly, exactly as before.
+webrtc_gateway = WebRTCGateway(
+    enabled=os.environ.get("GIF_MONITOR_WEBRTC_ENABLED", "false").strip().lower()
+    in {"1", "true", "yes", "on"},
+    api_base=os.environ.get("GIF_MONITOR_MEDIAMTX_API", "http://127.0.0.1:9997"),
+    rtsp_base=os.environ.get("GIF_MONITOR_MEDIAMTX_RTSP", "rtsp://127.0.0.1:8554"),
+    whep_base=os.environ.get("GIF_MONITOR_WHEP_BASE", "whep/"),
+    timeout=positive_env_float("GIF_MONITOR_MEDIAMTX_TIMEOUT_SECONDS", 2.0),
+    ready_timeout=positive_env_float("GIF_MONITOR_MEDIAMTX_READY_SECONDS", 6.0),
+)
+
+
 live_preview = LivePreviewManager(
     list_size=PREVIEW_LIST_SIZE,
     idle_timeout_seconds=positive_env_float("GIF_PREVIEW_IDLE_TIMEOUT_SECONDS", 120.0),
@@ -160,6 +177,7 @@ live_preview = LivePreviewManager(
     restart_base_delay=positive_env_float("GIF_MONITOR_RESTART_BASE_DELAY", 5.0),
     restart_max_delay=positive_env_float("GIF_MONITOR_RESTART_MAX_DELAY", 60.0),
     restart_max_retries=positive_env_int("GIF_MONITOR_RESTART_MAX_RETRIES", 6),
+    on_stop=webrtc_gateway.remove_path,
 )
 match_catalog = MatchCatalog()
 atexit.register(live_preview.shutdown)
@@ -863,8 +881,9 @@ def monitor_preview_start():
         return jsonify({"error": f"查询直播源失败：{exc}", "code": "source_error"}), 502
     if not resource:
         return jsonify({"error": "该比赛暂未配置直播源", "code": "no_source"}), 409
+    ffmpeg_source, webrtc = _preview_sources(match_id, resource)
     try:
-        status = live_preview.start(match_id, resource)
+        status = live_preview.start(match_id, ffmpeg_source)
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
     # Only report ready once the first playlist + segment exist, so the browser
@@ -885,8 +904,51 @@ def monitor_preview_start():
             "playlist_url": live_preview.playlist_url(match_id),
             "playlist_ready": playlist_ready,
             **status,
+            **_webrtc_fields(match_id, webrtc),
         }
     )
+
+
+def _preview_sources(match_id: str, upstream: str) -> tuple[str, bool]:
+    """Pick what the preview ffmpeg should read for ``match_id``.
+
+    With scheme H enabled and mediamtx reachable, the upstream RTMP is pulled
+    once by mediamtx and ffmpeg reads it back over loopback RTSP; the browser
+    tile gets a WHEP URL for the same path. Otherwise (disabled, mediamtx down,
+    source not ready in time) ffmpeg pulls the upstream directly as before and
+    the tile stays on HLS - the operator sees no difference except latency.
+    """
+    if not webrtc_gateway.enabled:
+        return upstream, False
+    if webrtc_gateway.ensure_path(match_id, upstream):
+        return webrtc_gateway.rtsp_url(match_id), True
+    print(
+        json.dumps(
+            {
+                "event": "webrtc_fallback_hls",
+                "match_id": match_id,
+                "error": webrtc_gateway.last_error,
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
+    # Do not leave a half-registered path around pulling the upstream twice.
+    webrtc_gateway.remove_path(match_id)
+    return upstream, False
+
+
+def _webrtc_fields(match_id: str, webrtc: bool) -> dict[str, Any]:
+    return {
+        "webrtc": bool(webrtc),
+        "whep_url": webrtc_gateway.whep_url(match_id) if webrtc else None,
+    }
+
+
+def _preview_is_webrtc(status: dict[str, Any]) -> bool:
+    """A running preview is WebRTC-backed iff ffmpeg reads from mediamtx."""
+    resource = str(status.get("resource") or "")
+    return webrtc_gateway.enabled and resource.startswith(webrtc_gateway.rtsp_base + "/")
 
 
 @app.post("/api/monitor/preview/stop")
@@ -915,6 +977,7 @@ def monitor_preview_status():
     status["playlist_url"] = (
         live_preview.playlist_url(match_id) if status.get("running") else None
     )
+    status.update(_webrtc_fields(match_id, status.get("running") and _preview_is_webrtc(status)))
     return jsonify(status)
 
 

@@ -79,6 +79,45 @@ class LivePreviewCommandTests(unittest.TestCase):
             self.assertIn("-re", command)
             self.assertNotIn("-rw_timeout", command)
 
+    def test_rtsp_command_uses_tcp_interleaving(self):
+        # Scheme H: ffmpeg reads the match back from mediamtx over loopback RTSP.
+        command = self.manager._build_command("rtsp://127.0.0.1:8554/54477889", self.root)
+        self.assertEqual(command[command.index("-rtsp_transport") + 1], "tcp")
+        self.assertIn("-rw_timeout", command)
+        self.assertNotIn("-re", command)
+        self.assertEqual(command[command.index("-i") + 1], "rtsp://127.0.0.1:8554/54477889")
+        # Input options must precede -i for ffmpeg to apply them to the source.
+        self.assertLess(command.index("-rtsp_transport"), command.index("-i"))
+
+    def test_on_stop_fires_for_explicit_stop_idle_reap_and_shutdown(self):
+        stopped = []
+        manager = LivePreviewManager(
+            root=self.root, background_reaper=False, idle_timeout_seconds=1.0,
+            on_stop=stopped.append,
+        )
+        manager._build_command = _stub_command_factory(None)
+        manager.start("a", "rtmp://x/a")
+        manager.start("b", "rtmp://x/b")
+        manager.start("c", "rtmp://x/c")
+        manager.stop("a")
+        self.assertEqual(stopped, ["a"])
+        # Idle reap tears b down and must release its sibling resource too.
+        manager.entries["b"].last_access -= 10
+        manager._reap_tick(time.time())
+        self.assertEqual(stopped, ["a", "b"])
+        manager.shutdown()
+        self.assertEqual(sorted(stopped), ["a", "b", "c"])
+
+    def test_on_stop_error_never_blocks_teardown(self):
+        def boom(_match_id):
+            raise RuntimeError("gateway down")
+
+        manager = LivePreviewManager(root=self.root, background_reaper=False, on_stop=boom)
+        manager._build_command = _stub_command_factory(None)
+        manager.start("a", "rtmp://x/a")
+        manager.stop("a")  # must not raise
+        self.assertFalse(manager.status("a")["running"])
+
 
 class LivePreviewLifecycleTests(unittest.TestCase):
     def setUp(self):
