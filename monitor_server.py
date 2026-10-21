@@ -21,6 +21,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import sqlite3
 import subprocess
 import threading
@@ -1546,6 +1547,19 @@ def clip_file(match_id, filename):
     return send_from_directory(directory, filename, mimetype="image/gif")
 
 
+def _exit_on_sigterm(signum, frame):
+    """Turn SIGTERM into a normal interpreter exit.
+
+    Python's default SIGTERM action kills the process without running ``atexit``
+    handlers, so ``live_preview.shutdown`` never ran on ``systemctl stop`` /
+    ``deploy-gif`` / ``kill -TERM``: the preview ffmpeg children were orphaned,
+    kept writing segments to disk, and the restarted server (which has no
+    entry for them) answered 409 "请先开始预览该场" to every clip request.
+    """
+    raise SystemExit(0)
+
+
 if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, _exit_on_sigterm)
     print(f"Match monitor console: http://{HOST}:{PORT}")
     app.run(host=HOST, port=PORT, threaded=True, debug=False)

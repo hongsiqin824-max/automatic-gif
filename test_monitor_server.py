@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import time
 import unittest
@@ -1125,6 +1126,62 @@ class ClipEndpointAlertMatchTests(unittest.TestCase):
             delivery_mode="draft",
         )
         self.assertEqual(auto["match_event"], 1)
+
+
+class SigtermShutdownTests(unittest.TestCase):
+    def test_handler_raises_system_exit_so_atexit_runs(self):
+        with self.assertRaises(SystemExit) as ctx:
+            monitor_server._exit_on_sigterm(15, None)
+        self.assertEqual(ctx.exception.code, 0)
+
+    def test_real_process_exits_cleanly_on_sigterm(self):
+        # Default SIGTERM would report returncode -15 and skip atexit; with the
+        # handler installed the server exits 0 and its atexit hooks (preview
+        # shutdown) get to run.
+        import socket
+        import sys
+        import urllib.error
+        import urllib.request
+
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        env = dict(os.environ)
+        env.update(
+            {
+                "GIF_MONITOR_PORT": str(port),
+                "GIF_MONITOR_PUBLISH_ENABLED": "false",
+                "GIF_MONITOR_ALERT_DB_PATH": "",
+                "GIF_MONITOR_ALERT_ENABLED": "false",
+                "GIF_SOURCE_SECRET": "test-secret",
+            }
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "monitor_server.py"],
+            cwd=Path(__file__).resolve().parent,
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            deadline = time.time() + 15.0
+            ready = False
+            while time.time() < deadline:
+                if proc.poll() is not None:
+                    self.fail(f"server exited early with {proc.returncode}")
+                try:
+                    urllib.request.urlopen(f"http://127.0.0.1:{port}/api/health", timeout=1).read()
+                    ready = True
+                    break
+                except (urllib.error.URLError, ConnectionError, OSError):
+                    time.sleep(0.2)
+            self.assertTrue(ready, "server did not become healthy")
+            proc.send_signal(signal.SIGTERM)
+            self.assertEqual(proc.wait(timeout=10), 0)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
 
 
 if __name__ == "__main__":

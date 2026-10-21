@@ -1029,11 +1029,36 @@ function keepAlivePreviews() {
         if (!current || !status) return;
         if (status.running === false) {
           markPreviewDown(matchId, status);
+          // resource === null means the server has no entry for this match at
+          // all (process restart, 90s idle reap, or a stop sent by another
+          // tab). The backend auto-restart only covers a *dead* ffmpeg whose
+          // entry still exists, so in this case nobody would ever relaunch it
+          // and "正在自动重连" would be a lie: re-issue preview/start ourselves.
+          if (status.resource == null) restartTilePreview(matchId);
         } else if (status.running && status.playlist_ready && current.down) {
           recoverPreview(matchId, status);
         }
       })
       .catch(() => {});
+  }
+}
+
+async function restartTilePreview(matchId) {
+  const tile = state.tiles.get(matchId);
+  if (!tile || tile.restarting) return;
+  tile.restarting = true;
+  try {
+    const data = await requestJson('api/monitor/preview/start', {
+      method: 'POST', body: JSON.stringify({match_id: matchId}),
+    });
+    if (!state.tiles.get(matchId)) return;
+    tile.playlistUrl = data.playlist_url;
+    recoverPreview(matchId, data);
+  } catch (error) {
+    // Leave the tile in its "down" state; the next keepAlive tick retries.
+    setTileStatus(matchId, '重新拉起直播失败：' + error.message, 'warn');
+  } finally {
+    tile.restarting = false;
   }
 }
 
