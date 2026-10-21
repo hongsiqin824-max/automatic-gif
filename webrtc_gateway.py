@@ -44,6 +44,11 @@ class WebRTCGateway:
         # Upstream URL per registered match, so a path can be re-created after
         # mediamtx restarts (its API-added paths live only in memory).
         self.sources: dict[str, str] = {}
+        # Circuit breaker: after a connection failure/timeout, skip the API for
+        # a short window so a hung mediamtx costs one timeout per window, not
+        # one per match (the reaper calls us under its lock).
+        self.breaker_seconds = 5.0
+        self._down_until = 0.0
 
     # ---- URL helpers -------------------------------------------------------
 
@@ -62,13 +67,16 @@ class WebRTCGateway:
             return False
         return self._request("GET", "/v3/paths/list") is not None
 
-    def ensure_path(self, match_id: str, source: str) -> bool:
+    def ensure_path(self, match_id: str, source: str, *, wait_ready: bool = True) -> bool:
         """Register ``match_id`` pulling ``source``; return True when ready.
 
         Uses ``replace`` so a changed upstream URL simply re-points the path.
         Readiness means mediamtx has connected to the source and sees at least
         one track; without that the browser's WHEP offer would be answered with
         no media and hls.js-style retries would be needed on the client.
+        ``wait_ready=False`` returns right after registration (one API call,
+        bounded by ``timeout``) for callers that hold a lock and can let the
+        consumer retry on its own.
         """
         if not self.enabled:
             return False
@@ -80,6 +88,8 @@ class WebRTCGateway:
         if self._request("POST", f"/v3/config/paths/replace/{match_id}", body) is None:
             return False
         self.sources[match_id] = source
+        if not wait_ready:
+            return True
         deadline = self._clock() + self.ready_timeout
         while True:
             if self.path_ready(match_id):
@@ -90,12 +100,18 @@ class WebRTCGateway:
             self._sleep(0.3)
 
     def reensure_path(self, match_id: str) -> bool:
-        """Re-register a path we created earlier (after a mediamtx restart)."""
+        """Re-register a path we created earlier (after a mediamtx restart).
+
+        Does not wait for readiness: this runs from the preview reaper under
+        its lock, and with many matches restarting at once a 6s wait each
+        would freeze every preview API call for minutes. ffmpeg simply
+        retries (with backoff) until mediamtx has the source up.
+        """
         source = self.sources.get(match_id)
         if not source:
             self.last_error = f"no upstream remembered for {match_id}"
             return False
-        return self.ensure_path(match_id, source)
+        return self.ensure_path(match_id, source, wait_ready=False)
 
     def upstream_for(self, match_id: str) -> str | None:
         return self.sources.get(match_id)
@@ -142,6 +158,9 @@ class WebRTCGateway:
         ignore_404: bool = False,
     ) -> Any:
         url = self.api_base + path
+        if self._clock() < self._down_until:
+            self.last_error = f"mediamtx {method} {path} -> skipped (API unreachable {self.breaker_seconds:g}s ago)"
+            return None
         data = None
         headers = {}
         if body is not None:
@@ -158,8 +177,10 @@ class WebRTCGateway:
             return None
         except (urllib.error.URLError, OSError, TimeoutError) as exc:
             self.last_error = f"mediamtx {method} {path} -> {exc}"
+            self._down_until = self._clock() + self.breaker_seconds
             return None
         self.last_error = None
+        self._down_until = 0.0
         if not raw:
             return {}
         try:

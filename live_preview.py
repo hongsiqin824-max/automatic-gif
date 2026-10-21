@@ -208,9 +208,12 @@ class LivePreviewManager:
                     entry.last_access = time.time()
                     return self._status_locked(match_id)
                 # The live source changed; restart against the new resource.
-                self._stop_entry_locked(match_id)
+                # Replacing is not a stop: the sibling resource (mediamtx
+                # path) was just (re)registered by the caller and the new
+                # ffmpeg is about to read from it, so do not release it.
+                self._stop_entry_locked(match_id, release_sibling=False)
             else:
-                self._stop_entry_locked(match_id)
+                self._stop_entry_locked(match_id, release_sibling=False)
             directory = self.media_dir(match_id)
             shutil.rmtree(directory, ignore_errors=True)
             directory.mkdir(parents=True, exist_ok=True)
@@ -332,11 +335,11 @@ class LivePreviewManager:
         )
         return raw_log
 
-    def _stop_entry_locked(self, match_id: str) -> None:
+    def _stop_entry_locked(self, match_id: str, *, release_sibling: bool = True) -> None:
         entry = self.entries.pop(match_id, None)
         if entry is None:
             return
-        if self.on_stop is not None:
+        if release_sibling and self.on_stop is not None:
             try:
                 self.on_stop(match_id)
             except Exception as exc:  # noqa: BLE001 - never block teardown

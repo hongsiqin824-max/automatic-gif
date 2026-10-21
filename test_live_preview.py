@@ -111,6 +111,36 @@ class LivePreviewCommandTests(unittest.TestCase):
         manager.shutdown()
         self.assertEqual(sorted(stopped), ["a", "b", "c"])
 
+    def test_start_replacing_an_entry_does_not_fire_on_stop(self):
+        # Cross bug between the two hooks: ``preview/start`` registers the
+        # mediamtx path *before* calling ``start()``; when ``start()`` had to
+        # replace an existing entry (dead ffmpeg, or resource changed e.g.
+        # rtmp -> rtsp after a fallback) it reused the teardown helper, which
+        # fired ``on_stop`` and deleted the freshly registered path - the new
+        # ffmpeg then read a path that no longer existed. Replacing is not a
+        # stop; only explicit stop / idle reap / shutdown may release the
+        # sibling resource.
+        stopped = []
+        manager = LivePreviewManager(
+            root=self.root, background_reaper=False, on_stop=stopped.append,
+        )
+        manager._build_command = _stub_command_factory(None)
+        manager.start("a", "rtmp://x/a")
+        # Resource changed (fallback RTMP -> mediamtx RTSP): must not release.
+        manager.start("a", "rtsp://127.0.0.1:8554/a")
+        self.assertEqual(stopped, [])
+        self.assertEqual(manager.entries["a"].resource, "rtsp://127.0.0.1:8554/a")
+        # Dead entry re-started by the operator: must not release either.
+        manager.entries["a"].process.terminate()
+        manager.entries["a"].process.wait(timeout=5)
+        manager.start("a", "rtsp://127.0.0.1:8554/a")
+        self.assertEqual(stopped, [])
+        # The explicit stop afterwards still releases it exactly once.
+        manager.stop("a")
+        self.assertEqual(stopped, ["a"])
+        manager.shutdown()
+        self.assertEqual(stopped, ["a"])
+
     def test_on_stop_error_never_blocks_teardown(self):
         def boom(_match_id):
             raise RuntimeError("gateway down")
@@ -265,6 +295,9 @@ class LivePreviewAutoRestartTests(unittest.TestCase):
         # The relaunch (and every later status) uses the replacement.
         self.assertEqual(manager.entries["m1"].resource, "rtmp://upstream/direct")
         self.assertEqual(manager.status("m1")["resource"], "rtmp://upstream/direct")
+        # ``_make`` rebinds ``self.manager``; shut the first one down explicitly
+        # so its child process never outlives the test.
+        manager.shutdown()
         # A hook that returns None keeps the resource; one that raises never blocks the restart.
         manager2 = self._make(on_restart=lambda m, r: (_ for _ in ()).throw(RuntimeError("boom")))
         manager2.start("m2", "rtmp://host/s")

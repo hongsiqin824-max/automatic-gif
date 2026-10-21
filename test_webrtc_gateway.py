@@ -140,6 +140,23 @@ class WebRTCGatewayTests(unittest.TestCase):
         self.assertTrue(_gateway([(("GET", "/v3/paths/list"), b'{"items":[]}')]).healthy())
         self.assertFalse(_gateway([(("GET", "/v3/paths/list"), TimeoutError("slow"))]).healthy())
 
+    def test_breaker_skips_api_briefly_after_connection_failure(self):
+        gw = _gateway([(("GET", "/v3/paths/list"), TimeoutError("slow"))])
+        self.assertFalse(gw.healthy())                     # 1 real call, trips the breaker
+        self.assertFalse(gw.healthy())                     # skipped
+        self.assertFalse(gw.ensure_path("1", "rtmp://x"))  # skipped too
+        self.assertIn("skipped", gw.last_error)
+        self.assertEqual(len(gw._opener.calls), 1)
+        # Window elapses -> tries the network again.
+        gw._sleep(gw.breaker_seconds + 0.1)
+        self.assertFalse(gw.healthy())
+        self.assertEqual(len(gw._opener.calls), 2)
+        # HTTP errors (mediamtx alive, path missing) never trip it.
+        gw2 = _gateway([(("GET", "/v3/paths/get/"), 404), (("GET", "/v3/paths/list"), b'{"items":[]}')])
+        self.assertFalse(gw2.path_ready("1"))
+        self.assertTrue(gw2.healthy())
+        self.assertEqual(len(gw2._opener.calls), 2)
+
     def test_reensure_path_replays_remembered_upstream(self):
         ready = json.dumps({"ready": True, "tracks": ["H264"]}).encode()
         gw = _gateway([
@@ -149,7 +166,10 @@ class WebRTCGatewayTests(unittest.TestCase):
         self.assertTrue(gw.ensure_path("54477889", "rtmp://up/live/1"))
         self.assertEqual(gw.upstream_for("54477889"), "rtmp://up/live/1")
         # mediamtx restarted and forgot the path: re-register from memory.
+        # No readiness poll here (runs under the reaper lock): exactly one POST.
+        before = len(gw._opener.calls)
         self.assertTrue(gw.reensure_path("54477889"))
+        self.assertEqual(len(gw._opener.calls) - before, 1)
         posts = [c for c in gw._opener.calls if c[0] == "POST"]
         self.assertEqual(len(posts), 2)
         self.assertIn(b"rtmp://up/live/1", posts[1][2])
