@@ -31,6 +31,16 @@ camelCase while API field names remain unchanged. Add deterministic regression
 tests beside the affected module; cover both success and failure paths for OCR,
 event identity, and task state. Run the full unittest command before release.
 
+## Editing Rules for Agents
+
+Never issue two or more edits to the same file in one parallel tool-call
+batch: each edit is applied against the file content as it was when the batch
+started, so the later edit silently discards the earlier one. This has bitten
+this repository twice (lost `startTilePlayback` wiring in `app.js`; lost the
+`CATCHUP_ENABLED` constant in `monitor_server.py`). Edit one file sequentially,
+then grep for every symbol you added before moving on. Parallel edits to
+*different* files are fine.
+
 ## Commits and Reviews
 
 Use short imperative commit subjects, for example `Refine scoreboard OCR
