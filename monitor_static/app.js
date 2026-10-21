@@ -69,11 +69,13 @@ const WHEP_STATS_MS = 1000;
 // function that reads them can run, so attachHls never sees an uninitialised
 // binding. Defaults equal the server defaults.
 const LATENCY = {
-  hlsLiveSyncCount: 3,   // GIF_MONITOR_HLS_LIVE_SYNC_COUNT
-  catchupRate: 1.5,      // GIF_MONITOR_CATCHUP_RATE
-  catchupMinLag: 12,     // GIF_MONITOR_CATCHUP_MIN_LAG
-  stageSeekLag: 30,      // GIF_MONITOR_STAGE_SEEK_LAG
-  hardSeekLag: 150,      // GIF_MONITOR_HARD_SEEK_LAG
+  hlsLiveSyncCount: 3,       // GIF_MONITOR_HLS_LIVE_SYNC_COUNT
+  catchupRateEnabled: true,  // GIF_MONITOR_CATCHUP_RATE_ENABLED
+  catchupRate: 1.5,          // GIF_MONITOR_CATCHUP_RATE
+  catchupMinLag: 12,         // GIF_MONITOR_CATCHUP_MIN_LAG
+  tileSeekLag: 0,            // GIF_MONITOR_TILE_SEEK_LAG (0 = off)
+  stageSeekLag: 30,          // GIF_MONITOR_STAGE_SEEK_LAG
+  hardSeekLag: 150,          // GIF_MONITOR_HARD_SEEK_LAG
 };
 
 // Server-vs-browser clock offset (serverNow − Date.now()), measured once from
@@ -1516,6 +1518,10 @@ function renderLagBadge(node, lag) {
 //   stage video: the operator may have scrubbed back deliberately to capture.
 //   (hls.js has maxLiveSyncPlaybackRate, but in 1.5.x it only engages with
 //   lowLatencyMode on, which changes other loading behaviour we do not want.)
+//   Own switch: GIF_MONITOR_CATCHUP_RATE_ENABLED.
+// * Tile instant jump: at TILE_SEEK_LAG (0 = off) a tile seeks straight to
+//   live instead of waiting for the speed-up to close the gap. Timeliness
+//   over continuity; the stage is excluded for the same reason as above.
 // * Rule 1: when the tab returns to the foreground, seek tiles to live
 //   (Chrome throttles hidden tabs so they fall minutes behind). The stage only
 //   seeks when it is clearly adrift (> STAGE_FOREGROUND_SEEK_LAG) so a
@@ -1532,16 +1538,21 @@ function applyLatencyConfig(cfg) {
   if (!cfg || typeof cfg !== 'object') return;
   const num = (v, prev) => (typeof v === 'number' && v > 0 ? v : prev);
   LATENCY.hlsLiveSyncCount = num(cfg.hls_live_sync_count, LATENCY.hlsLiveSyncCount);
+  if (typeof cfg.catchup_rate_enabled === 'boolean') LATENCY.catchupRateEnabled = cfg.catchup_rate_enabled;
   LATENCY.catchupRate = num(cfg.catchup_rate, LATENCY.catchupRate);
   LATENCY.catchupMinLag = num(cfg.catchup_min_lag, LATENCY.catchupMinLag);
+  // 0 is a legitimate value here (= off), so do not route it through num().
+  if (typeof cfg.tile_seek_lag === 'number' && cfg.tile_seek_lag >= 0) LATENCY.tileSeekLag = cfg.tile_seek_lag;
   LATENCY.stageSeekLag = num(cfg.stage_seek_lag, LATENCY.stageSeekLag);
   LATENCY.hardSeekLag = num(cfg.hard_seek_lag, LATENCY.hardSeekLag);
   if (!latencyConfigLogged) {
     latencyConfigLogged = true;
     console.log(
       `[LATENCY-CONFIG] 片长 ${cfg.segment_seconds}s × 同步 ${LATENCY.hlsLiveSyncCount} 片 = 目标 ${cfg.hls_target_seconds}s | ` +
-      `回看 ${cfg.history_seconds}s | x264 ${cfg.x264_preset} | 追帧 ${state.catchupEnabled ? '开' : '关'} ` +
-      `${LATENCY.catchupRate}x@≥${LATENCY.catchupMinLag}s 大窗≥${LATENCY.stageSeekLag}s 硬跳≥${LATENCY.hardSeekLag}s` +
+      `回看 ${cfg.history_seconds}s | x264 ${cfg.x264_preset} | 追帧总开关 ${state.catchupEnabled ? '开' : '关'} | ` +
+      `倍速 ${LATENCY.catchupRateEnabled ? `${LATENCY.catchupRate}x@≥${LATENCY.catchupMinLag}s` : '关'} | ` +
+      `小窗跳回 ${LATENCY.tileSeekLag > 0 ? `≥${LATENCY.tileSeekLag}s` : '关'} | ` +
+      `大窗前台≥${LATENCY.stageSeekLag}s 硬跳≥${LATENCY.hardSeekLag}s` +
       (Array.isArray(cfg.adjusted) && cfg.adjusted.length ? ` | 已被服务器修正: ${cfg.adjusted.join(', ')}` : '')
     );
   }
@@ -1583,7 +1594,7 @@ function autoSeekToLive(matchId, video, reason, lag) {
 // a segment of the target (or when it is moved into the stage / lag unknown).
 function applyTileCatchupRate(video, lag) {
   if (!video) return;
-  if (!state.catchupEnabled) {
+  if (!state.catchupEnabled || !LATENCY.catchupRateEnabled) {
     // Switch flipped off at runtime: make sure nothing is left running fast.
     if (video.playbackRate !== 1) video.playbackRate = 1;
     return;
@@ -1646,6 +1657,10 @@ function startLagMonitoring() {
 
       if (lag != null && lag >= LATENCY.hardSeekLag) {
         autoSeekToLive(matchId, video, 'hard-limit', lag);
+      } else if (lag != null && LATENCY.tileSeekLag > 0 && lag >= LATENCY.tileSeekLag && !isStageVideo(video)) {
+        // Tile-only instant jump (GIF_MONITOR_TILE_SEEK_LAG). The stage is
+        // excluded: the operator may have scrubbed back on purpose to capture.
+        autoSeekToLive(matchId, video, 'tile-limit', lag);
       } else {
         applyTileCatchupRate(video, lag);
       }

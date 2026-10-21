@@ -1327,18 +1327,33 @@ class LatencyKillSwitchTests(unittest.TestCase):
         for key in (
             "segment_seconds", "preview_segments", "history_seconds", "x264_preset",
             "hls_live_sync_count", "hls_target_seconds", "catchup_enabled",
-            "catchup_rate", "catchup_min_lag", "stage_seek_lag", "hard_seek_lag", "adjusted",
+            "catchup_rate_enabled", "catchup_rate", "catchup_min_lag", "tile_seek_lag",
+            "stage_seek_lag", "hard_seek_lag", "adjusted",
         ):
             self.assertIn(key, latency)
         self.assertEqual(
             latency["hls_target_seconds"], latency["segment_seconds"] * latency["hls_live_sync_count"]
         )
 
+    LATENCY_ENV_KEYS = (
+        "GIF_MONITOR_HLS_LIVE_SYNC_COUNT", "GIF_MONITOR_CATCHUP_RATE_ENABLED",
+        "GIF_MONITOR_CATCHUP_RATE", "GIF_MONITOR_CATCHUP_MIN_LAG", "GIF_MONITOR_TILE_SEEK_LAG",
+        "GIF_MONITOR_STAGE_SEEK_LAG", "GIF_MONITOR_HARD_SEEK_LAG",
+    )
+
+    def _without_latency_env(self):
+        """The local .env may carry experimental values; defaults tests must not see them."""
+        env = {k: v for k, v in os.environ.items() if k not in self.LATENCY_ENV_KEYS}
+        return mock.patch.dict(os.environ, env, clear=True)
+
     def test_latency_defaults_are_unchanged_and_unadjusted(self):
-        cfg = monitor_server._build_latency_config()
+        with self._without_latency_env():
+            cfg = monitor_server._build_latency_config()
         self.assertEqual(cfg["hls_live_sync_count"], 3)
+        self.assertTrue(cfg["catchup_rate_enabled"])
         self.assertEqual(cfg["catchup_rate"], 1.5)
         self.assertEqual(cfg["catchup_min_lag"], 12.0)
+        self.assertEqual(cfg["tile_seek_lag"], 0.0)   # off unless the operator opts in
         self.assertEqual(cfg["stage_seek_lag"], 30.0)
         self.assertEqual(cfg["hard_seek_lag"], 150.0)
         self.assertEqual(cfg["adjusted"], [])
@@ -1349,6 +1364,7 @@ class LatencyKillSwitchTests(unittest.TestCase):
             "GIF_MONITOR_CATCHUP_RATE": "5",          # browsers mute/skip above ~2x
             "GIF_MONITOR_CATCHUP_MIN_LAG": "1",       # below target → constant toggling
             "GIF_MONITOR_HARD_SEEK_LAG": "9999",      # beyond the ring buffer
+            "GIF_MONITOR_TILE_SEEK_LAG": "1",         # below target+2 → jumps every tick
         }
         with mock.patch.dict(os.environ, env):
             cfg = monitor_server._build_latency_config()
@@ -1357,7 +1373,39 @@ class LatencyKillSwitchTests(unittest.TestCase):
         self.assertGreaterEqual(cfg["catchup_min_lag"], cfg["hls_target_seconds"] + 2)
         self.assertLessEqual(cfg["hard_seek_lag"], cfg["history_seconds"] - 10)
         self.assertGreaterEqual(cfg["hard_seek_lag"], cfg["stage_seek_lag"])
-        self.assertEqual(len(cfg["adjusted"]), 4)
+        self.assertEqual(cfg["tile_seek_lag"], cfg["hls_target_seconds"] + 2)
+        self.assertEqual(len(cfg["adjusted"]), 5)
+
+    def test_tile_seek_lag_accepts_value_and_off_spellings(self):
+        with mock.patch.dict(os.environ, {"GIF_MONITOR_TILE_SEEK_LAG": "6"}):
+            cfg = monitor_server._build_latency_config()
+        self.assertEqual(cfg["tile_seek_lag"], 6.0)
+        self.assertNotIn("tile_seek_lag=6.0->6.0", cfg["adjusted"])
+        for off in ("0", "off", "false", ""):
+            with mock.patch.dict(os.environ, {"GIF_MONITOR_TILE_SEEK_LAG": off}):
+                self.assertEqual(monitor_server._build_latency_config()["tile_seek_lag"], 0.0, off)
+        with mock.patch.dict(os.environ, {"GIF_MONITOR_TILE_SEEK_LAG": "abc"}):
+            with self.assertRaises(RuntimeError):
+                monitor_server._build_latency_config()
+
+    def test_tile_seek_lag_is_capped_by_hard_seek_lag(self):
+        env = {"GIF_MONITOR_HARD_SEEK_LAG": "40", "GIF_MONITOR_TILE_SEEK_LAG": "100"}
+        with mock.patch.dict(os.environ, env):
+            cfg = monitor_server._build_latency_config()
+        self.assertEqual(cfg["tile_seek_lag"], 40.0)
+        self.assertIn("tile_seek_lag=100.0->40.0", cfg["adjusted"])
+
+    def test_catchup_rate_switch_is_independent_of_master(self):
+        with mock.patch.dict(os.environ, {"GIF_MONITOR_CATCHUP_RATE_ENABLED": "false"}):
+            cfg = monitor_server._build_latency_config()
+        self.assertFalse(cfg["catchup_rate_enabled"])
+        self.assertEqual(cfg["adjusted"], [])
+        self.assertTrue(monitor_server.env_flag("GIF_MONITOR_NOPE", True))
+        with mock.patch.dict(os.environ, {"GIF_MONITOR_NOPE": "  "}):
+            self.assertTrue(monitor_server.env_flag("GIF_MONITOR_NOPE", True))
+        for off in ("0", "False", "NO", "off"):
+            with mock.patch.dict(os.environ, {"GIF_MONITOR_NOPE": off}):
+                self.assertFalse(monitor_server.env_flag("GIF_MONITOR_NOPE", True), off)
 
     def test_x264_preset_env_is_validated(self):
         with mock.patch.dict(os.environ, {"GIF_PREVIEW_X264_PRESET": "ultrafast"}):

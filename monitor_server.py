@@ -18,6 +18,7 @@ from __future__ import annotations
 import atexit
 import concurrent.futures
 import json
+import math
 import os
 import re
 import shutil
@@ -95,12 +96,35 @@ CLIP_GIF_FPS = positive_env_float("GIF_MONITOR_CLIP_FPS", 50 / 3)
 # history — enough to cover that lag plus the capture window — or the requested
 # frames are already gone.
 PREVIEW_LIST_SIZE = positive_env_int("GIF_MONITOR_PREVIEW_SEGMENTS", 180)
+
+
+def env_flag(name: str, default: bool) -> bool:
+    """Boolean .env switch: 0/false/no/off → False, anything else → True."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _env_seconds_or_off(name: str) -> float:
+    """Seconds threshold where 0 / off / empty means disabled (unlike
+    positive_env_float, which rejects zero)."""
+    raw = os.environ.get(name, "").strip().lower()
+    if raw in {"", "0", "off", "false", "no"}:
+        return 0.0
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} 必须是秒数或 0") from exc
+    if not math.isfinite(value) or value < 0:
+        raise RuntimeError(f"{name} 必须是秒数或 0")
+    return value
+
+
 # Browser-side auto catch-up (tile 1.5x when adrift, auto seek on foreground /
 # hard limit; BACKLOG 11.8). Operator kill switch: false = tiles never change
 # playbackRate and never auto-seek, exactly as before 75493ae.
-CATCHUP_ENABLED = os.environ.get("GIF_MONITOR_CATCHUP_ENABLED", "true").strip().lower() not in {
-    "0", "false", "no", "off"
-}
+CATCHUP_ENABLED = env_flag("GIF_MONITOR_CATCHUP_ENABLED", True)
 
 
 def _build_latency_config() -> dict[str, Any]:
@@ -130,6 +154,9 @@ def _build_latency_config() -> dict[str, Any]:
     target = segment_seconds * live_sync
     catchup_rate = bound("catchup_rate",
                          positive_env_float("GIF_MONITOR_CATCHUP_RATE", 1.5), 1.0, 2.0)
+    # Gentle layer: faster playback instead of a visible jump. Independent of
+    # the master CATCHUP_ENABLED switch so the two layers can be tried alone.
+    catchup_rate_enabled = env_flag("GIF_MONITOR_CATCHUP_RATE_ENABLED", True)
     # Start chasing only once clearly past the target, or the tile would be
     # permanently toggling between 1x and the catch-up rate.
     catchup_min_lag = bound("catchup_min_lag",
@@ -143,6 +170,11 @@ def _build_latency_config() -> dict[str, Any]:
     hard_seek_lag = bound("hard_seek_lag",
                           positive_env_float("GIF_MONITOR_HARD_SEEK_LAG", 150.0),
                           stage_seek_lag, max(stage_seek_lag, segment_seconds * list_size - 10))
+    # Tile-only instant jump (0 / off = disabled). Never applied to the stage,
+    # where the operator may have scrubbed back on purpose to capture.
+    tile_seek_lag_raw = _env_seconds_or_off("GIF_MONITOR_TILE_SEEK_LAG")
+    tile_seek_lag = 0.0 if tile_seek_lag_raw <= 0 else bound(
+        "tile_seek_lag", tile_seek_lag_raw, target + 2, hard_seek_lag)
     return {
         "segment_seconds": segment_seconds,
         "preview_segments": list_size,
@@ -151,8 +183,10 @@ def _build_latency_config() -> dict[str, Any]:
         "hls_live_sync_count": live_sync,
         "hls_target_seconds": target,
         "catchup_enabled": CATCHUP_ENABLED,
+        "catchup_rate_enabled": catchup_rate_enabled,
         "catchup_rate": catchup_rate,
         "catchup_min_lag": catchup_min_lag,
+        "tile_seek_lag": tile_seek_lag,
         "stage_seek_lag": stage_seek_lag,
         "hard_seek_lag": hard_seek_lag,
         "adjusted": adjusted,
