@@ -64,6 +64,18 @@ const WHEP_MAX_RETRIES = 3;
 const WHEP_RETRY_MS = 2000;
 const WHEP_STATS_MS = 1000;
 
+// Latency knobs mirrored from the server .env (see applyLatencyConfig, which
+// overwrites these from /api/monitor/matches). Declared up here, before any
+// function that reads them can run, so attachHls never sees an uninitialised
+// binding. Defaults equal the server defaults.
+const LATENCY = {
+  hlsLiveSyncCount: 3,   // GIF_MONITOR_HLS_LIVE_SYNC_COUNT
+  catchupRate: 1.5,      // GIF_MONITOR_CATCHUP_RATE
+  catchupMinLag: 12,     // GIF_MONITOR_CATCHUP_MIN_LAG
+  stageSeekLag: 30,      // GIF_MONITOR_STAGE_SEEK_LAG
+  hardSeekLag: 150,      // GIF_MONITOR_HARD_SEEK_LAG
+};
+
 // Server-vs-browser clock offset (serverNow − Date.now()), measured once from
 // /api/health so a WebRTC tile can turn "now − playout delay" into a server
 // epoch that lines up with the PDT-stamped HLS segments used for capture.
@@ -1512,15 +1524,8 @@ function renderLagBadge(node, lag) {
 //   deleted that part of the 180 s ring and hls.js would hard-jump on its own.
 //
 // All thresholds (and hls.js liveSyncDurationCount) are tunable from the
-// server .env; defaults below only cover the first poll before
-// /api/monitor/matches delivers the effective set (applyLatencyConfig).
-const LATENCY = {
-  hlsLiveSyncCount: 3,
-  catchupRate: 1.5,
-  catchupMinLag: 12,
-  stageSeekLag: 30,
-  hardSeekLag: 150,
-};
+// server .env; the LATENCY object (declared near the top of this file) only
+// holds defaults until /api/monitor/matches delivers the effective set.
 let latencyConfigLogged = false;
 
 function applyLatencyConfig(cfg) {

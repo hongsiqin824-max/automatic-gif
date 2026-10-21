@@ -41,6 +41,9 @@ class WebRTCGateway:
         self._clock = clock
         self._sleep = sleep
         self.last_error: str | None = None
+        # Upstream URL per registered match, so a path can be re-created after
+        # mediamtx restarts (its API-added paths live only in memory).
+        self.sources: dict[str, str] = {}
 
     # ---- URL helpers -------------------------------------------------------
 
@@ -76,6 +79,7 @@ class WebRTCGateway:
         }
         if self._request("POST", f"/v3/config/paths/replace/{match_id}", body) is None:
             return False
+        self.sources[match_id] = source
         deadline = self._clock() + self.ready_timeout
         while True:
             if self.path_ready(match_id):
@@ -85,10 +89,39 @@ class WebRTCGateway:
                 return False
             self._sleep(0.3)
 
+    def reensure_path(self, match_id: str) -> bool:
+        """Re-register a path we created earlier (after a mediamtx restart)."""
+        source = self.sources.get(match_id)
+        if not source:
+            self.last_error = f"no upstream remembered for {match_id}"
+            return False
+        return self.ensure_path(match_id, source)
+
+    def upstream_for(self, match_id: str) -> str | None:
+        return self.sources.get(match_id)
+
     def remove_path(self, match_id: str) -> None:
+        self.sources.pop(match_id, None)
         if not self.enabled:
             return
         self._request("DELETE", f"/v3/config/paths/delete/{match_id}", ignore_404=True)
+
+    def cleanup_stale_paths(self) -> list[str]:
+        """Delete match paths left behind by a previous 8901 that did not exit
+        cleanly. Only all-digit names are touched (match ids); anything an
+        operator configured by hand in mediamtx.yml is left alone."""
+        if not self.enabled:
+            return []
+        listing = self._request("GET", "/v3/config/paths/list")
+        if not isinstance(listing, dict):
+            return []
+        removed: list[str] = []
+        for item in listing.get("items") or []:
+            name = str((item or {}).get("name") or "")
+            if name.isdigit() and name not in self.sources:
+                self._request("DELETE", f"/v3/config/paths/delete/{name}", ignore_404=True)
+                removed.append(name)
+        return removed
 
     def path_ready(self, match_id: str) -> bool:
         if not self.enabled:

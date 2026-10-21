@@ -139,9 +139,14 @@ curl -s http://127.0.0.1:9997/v3/paths/list       # {"itemCount":0,"pageCount":0
 ss -lunp | grep 8189 && ss -ltnp | grep 8189       # UDP + TCP 都在 0.0.0.0:8189
 ```
 
-### 7.2 安全组（腾讯云控制台）
+### 7.2 安全组 + 本机防火墙
 入站放行 **UDP 8189** 和 **TCP 8189**，来源 0.0.0.0/0（WebRTC 媒体直连，不经 nginx）。
 9997 / 8554 / 8889 只监听 127.0.0.1，**不要**开。
+```bash
+# 腾讯云控制台开安全组之外，Rocky 自带 firewalld 也要放行（不放行的表现：WHEP 201 但画面永远不来，最后回退 HLS）
+sudo firewall-cmd --permanent --add-port=8189/udp --add-port=8189/tcp && sudo firewall-cmd --reload
+sudo firewall-cmd --list-ports      # 应包含 8189/udp 8189/tcp
+```
 
 ### 7.3 nginx：WHEP 反代（/etc/nginx/conf.d/matchgif.conf）
 在现有 `location /gif-monitor/ { … }` **之前**加一段（更长前缀优先，顺序其实无所谓，放前面便于阅读）：
@@ -197,7 +202,9 @@ journalctl -u gif-monitor -n 50 --no-pager | grep monitor_latency_config   # "we
 | 大窗截 GIF | 10s 原速，状态栏能关联提醒 |
 | `curl -s 127.0.0.1:9997/v3/paths/list` | 每场一个 path，`ready: true`，readers 含 `rtspSession`（ffmpeg）和 `webRTCSession`（浏览器） |
 | 关掉这场 | path 被删除 |
-| `sudo systemctl stop mediamtx` | 小窗 `WebRTC 重连中 (1/3)…` → `WebRTC 不可用，已切回 HLS`，继续播；8901 日志 `webrtc_fallback_hls`。再 `start` 后新开的场重新走 WebRTC |
+| `sudo systemctl stop mediamtx` | 小窗 `WebRTC 重连中 (1/3)…` → `WebRTC 不可用，已切回 HLS`，继续播；8901 日志 `webrtc_fallback_hls`（`stage: restart`）+ `preview_resource_switched`，ffmpeg 改为直拉懂球帝 RTMP，大窗/截取不受影响 |
+| `sudo systemctl start mediamtx`（或 `restart`） | 已开着的场：8901 在 ffmpeg 下一次重启时自动把 path 注册回去（日志 `preview_ffmpeg_restarted` 后 `paths/list` 里重新出现），小窗自己重连回 WebRTC；上一步已回退到直拉 RTMP 的场要关掉重开才回 WebRTC |
+| 8901 自己重启（`deploy-gif` / `systemctl restart gif-monitor`） | 日志 `webrtc_gateway_startup`：`healthy: true`，`stale_paths_removed` 列出上次没清掉的 path（正常退出时应为空） |
 
 小窗一直停在「WebRTC 重连中」最后回退 HLS，但 7.3 自检是通的 → 多半是 **8189 没放行**或 `webrtcAdditionalHosts` 没填对（浏览器 F12 → `chrome://webrtc-internals` 看 ICE 候选是否有公网 IP）。
 

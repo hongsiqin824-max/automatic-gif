@@ -140,6 +140,52 @@ class WebRTCGatewayTests(unittest.TestCase):
         self.assertTrue(_gateway([(("GET", "/v3/paths/list"), b'{"items":[]}')]).healthy())
         self.assertFalse(_gateway([(("GET", "/v3/paths/list"), TimeoutError("slow"))]).healthy())
 
+    def test_reensure_path_replays_remembered_upstream(self):
+        ready = json.dumps({"ready": True, "tracks": ["H264"]}).encode()
+        gw = _gateway([
+            (("POST", "/v3/config/paths/replace/"), b""),
+            (("GET", "/v3/paths/get/"), ready),
+        ])
+        self.assertTrue(gw.ensure_path("54477889", "rtmp://up/live/1"))
+        self.assertEqual(gw.upstream_for("54477889"), "rtmp://up/live/1")
+        # mediamtx restarted and forgot the path: re-register from memory.
+        self.assertTrue(gw.reensure_path("54477889"))
+        posts = [c for c in gw._opener.calls if c[0] == "POST"]
+        self.assertEqual(len(posts), 2)
+        self.assertIn(b"rtmp://up/live/1", posts[1][2])
+        # Nothing remembered -> cannot re-register, says why.
+        self.assertFalse(gw.reensure_path("99999999"))
+        self.assertIn("no upstream remembered", gw.last_error)
+
+    def test_remove_path_forgets_upstream(self):
+        gw = _gateway([
+            (("POST", "/v3/config/paths/replace/"), b""),
+            (("GET", "/v3/paths/get/"), json.dumps({"ready": True, "tracks": ["H264"]}).encode()),
+            (("DELETE", "/v3/config/paths/delete/"), b""),
+        ])
+        gw.ensure_path("1", "rtmp://x")
+        gw.remove_path("1")
+        self.assertIsNone(gw.upstream_for("1"))
+
+    def test_cleanup_stale_paths_only_touches_unknown_match_ids(self):
+        listing = json.dumps({"items": [
+            {"name": "54477889"},   # ours (remembered) -> keep
+            {"name": "54000001"},   # stale from a crashed 8901 -> delete
+            {"name": "all_others"}, # operator config -> keep
+        ]}).encode()
+        gw = _gateway([
+            (("POST", "/v3/config/paths/replace/"), b""),
+            (("GET", "/v3/paths/get/"), json.dumps({"ready": True, "tracks": ["H264"]}).encode()),
+            (("GET", "/v3/config/paths/list"), listing),
+            (("DELETE", "/v3/config/paths/delete/"), b""),
+        ])
+        gw.ensure_path("54477889", "rtmp://x")
+        self.assertEqual(gw.cleanup_stale_paths(), ["54000001"])
+        deletes = [c[1] for c in gw._opener.calls if c[0] == "DELETE"]
+        self.assertEqual(deletes, ["/v3/config/paths/delete/54000001"])
+        # API down -> nothing removed, no exception.
+        self.assertEqual(_gateway([(("GET", "/v3/config/paths/list"), TimeoutError("x"))]).cleanup_stale_paths(), [])
+
 
 if __name__ == "__main__":
     unittest.main()

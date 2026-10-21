@@ -233,6 +233,37 @@ webrtc_gateway = WebRTCGateway(
 )
 
 
+def _before_preview_restart(match_id: str, resource: str) -> str | None:
+    """Keep a WebRTC-backed preview alive across a mediamtx restart.
+
+    mediamtx forgets API-added paths when it restarts, so an ffmpeg that was
+    reading ``rtsp://127.0.0.1:8554/<id>`` would otherwise die again on every
+    retry and the tile (HLS included) would stay dark until the operator
+    re-opened the match. Re-register the path first; if mediamtx is really
+    gone, point ffmpeg straight at the upstream RTMP - the tile then runs on
+    plain HLS, exactly like the switch-off state, until the match is reopened.
+    """
+    if not webrtc_gateway.enabled or not resource.startswith(webrtc_gateway.rtsp_base + "/"):
+        return None
+    if webrtc_gateway.reensure_path(match_id):
+        return None
+    upstream = webrtc_gateway.upstream_for(match_id)
+    print(
+        json.dumps(
+            {
+                "event": "webrtc_fallback_hls",
+                "match_id": match_id,
+                "stage": "restart",
+                "error": webrtc_gateway.last_error,
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
+    webrtc_gateway.remove_path(match_id)
+    return upstream
+
+
 live_preview = LivePreviewManager(
     list_size=PREVIEW_LIST_SIZE,
     x264_preset=live_preview_module.PREVIEW_X264_PRESET,
@@ -245,6 +276,7 @@ live_preview = LivePreviewManager(
     restart_max_delay=positive_env_float("GIF_MONITOR_RESTART_MAX_DELAY", 60.0),
     restart_max_retries=positive_env_int("GIF_MONITOR_RESTART_MAX_RETRIES", 6),
     on_stop=webrtc_gateway.remove_path,
+    on_restart=_before_preview_restart,
 )
 match_catalog = MatchCatalog()
 atexit.register(live_preview.shutdown)
@@ -1730,4 +1762,20 @@ if __name__ == "__main__":
         ),
         flush=True,
     )
+    if webrtc_gateway.enabled:
+        # A previous 8901 that crashed (no atexit) leaves its match paths in
+        # mediamtx pulling the upstream for nobody; drop them before serving.
+        stale = webrtc_gateway.cleanup_stale_paths()
+        print(
+            json.dumps(
+                {
+                    "event": "webrtc_gateway_startup",
+                    "healthy": webrtc_gateway.healthy(),
+                    "stale_paths_removed": stale,
+                    "error": webrtc_gateway.last_error,
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
     app.run(host=HOST, port=PORT, threaded=True, debug=False)

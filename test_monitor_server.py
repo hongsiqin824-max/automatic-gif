@@ -1227,6 +1227,27 @@ class PreviewStartWebRTCTests(unittest.TestCase):
         self.assertIsNone(data["whep_url"])
         self.assertEqual(data["playlist_url"], "preview/1/index.m3u8")
 
+    def test_restart_hook_reregisters_or_falls_back(self):
+        gw = monitor_server.webrtc_gateway
+        rtsp = "rtsp://127.0.0.1:8554/54477889"
+        # Switch off, or a plain RTMP resource: hook stays out of the way.
+        with mock.patch.object(gw, "enabled", False):
+            self.assertIsNone(monitor_server._before_preview_restart("54477889", rtsp))
+        with mock.patch.object(gw, "enabled", True):
+            self.assertIsNone(monitor_server._before_preview_restart("54477889", "rtmp://up/live/1"))
+        # mediamtx restarted but is back: path re-created, keep reading RTSP.
+        with mock.patch.object(gw, "enabled", True), \
+             mock.patch.object(gw, "reensure_path", return_value=True) as re:
+            self.assertIsNone(monitor_server._before_preview_restart("54477889", rtsp))
+        re.assert_called_once_with("54477889")
+        # mediamtx really gone: hand ffmpeg the remembered upstream and clean up.
+        with mock.patch.object(gw, "enabled", True), \
+             mock.patch.object(gw, "reensure_path", return_value=False), \
+             mock.patch.object(gw, "upstream_for", return_value="rtmp://up/live/1"), \
+             mock.patch.object(gw, "remove_path") as remove:
+            self.assertEqual(monitor_server._before_preview_restart("54477889", rtsp), "rtmp://up/live/1")
+        remove.assert_called_once_with("54477889")
+
     def test_enabled_gateway_routes_ffmpeg_via_rtsp_and_returns_whep(self):
         gw = monitor_server.webrtc_gateway
         with mock.patch.object(gw, "enabled", True), \

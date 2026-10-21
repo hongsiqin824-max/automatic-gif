@@ -249,6 +249,31 @@ class LivePreviewAutoRestartTests(unittest.TestCase):
         self.assertNotEqual(restarted.process.pid, first_pid)
         self.assertEqual(restarted.restart_count, 1)
 
+    def test_on_restart_hook_can_repoint_resource(self):
+        seen = []
+
+        def hook(match_id, resource):
+            seen.append((match_id, resource))
+            return "rtmp://upstream/direct" if resource.startswith("rtsp://") else None
+
+        manager = self._make(on_restart=hook)
+        manager.start("m1", "rtsp://127.0.0.1:8554/m1")
+        entry = manager.entries["m1"]
+        entry.process.wait(timeout=5)
+        manager._reap_tick(time.time())
+        self.assertEqual(seen, [("m1", "rtsp://127.0.0.1:8554/m1")])
+        # The relaunch (and every later status) uses the replacement.
+        self.assertEqual(manager.entries["m1"].resource, "rtmp://upstream/direct")
+        self.assertEqual(manager.status("m1")["resource"], "rtmp://upstream/direct")
+        # A hook that returns None keeps the resource; one that raises never blocks the restart.
+        manager2 = self._make(on_restart=lambda m, r: (_ for _ in ()).throw(RuntimeError("boom")))
+        manager2.start("m2", "rtmp://host/s")
+        manager2.entries["m2"].process.wait(timeout=5)
+        manager2._reap_tick(time.time())
+        self.assertEqual(manager2.entries["m2"].restart_count, 1)
+        self.assertEqual(manager2.entries["m2"].resource, "rtmp://host/s")
+        manager2.shutdown()
+
     def test_backoff_blocks_restart_until_due(self):
         manager = self._make(
             restart_base_delay=100.0,

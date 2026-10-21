@@ -107,6 +107,7 @@ class LivePreviewManager:
         restart_max_retries: int = 6,
         restart_reset_seconds: float = 30.0,
         on_stop: "Callable[[str], None] | None" = None,
+        on_restart: "Callable[[str, str], str | None] | None" = None,
     ) -> None:
         self.root = Path(root)
         self.idle_timeout_seconds = float(idle_timeout_seconds)
@@ -118,6 +119,10 @@ class LivePreviewManager:
         # shutdown - so a sibling resource registered for the same match (the
         # mediamtx WebRTC path, scheme H) is released with it.
         self.on_stop = on_stop
+        # Called before the reaper relaunches a dead ffmpeg, with the current
+        # resource; may return a different one (e.g. fall back from the
+        # mediamtx RTSP loopback to the upstream RTMP when mediamtx is gone).
+        self.on_restart = on_restart
         # When enabled, the reaper restarts an ffmpeg that died while the tile is
         # still being watched (dead/flaky RTMP source), with exponential backoff
         # and a retry ceiling so a permanently-dead source is not hammered.
@@ -396,6 +401,20 @@ class LivePreviewManager:
                 (directory / PREVIEW_PREV_LOG_NAME).write_bytes(prev_log)
             except OSError:
                 pass
+        if self.on_restart is not None:
+            try:
+                replacement = self.on_restart(match_id, entry.resource)
+            except Exception as exc:  # never let a hook stop the self-heal
+                _log_event("preview_on_restart_error", match_id=match_id, error=str(exc))
+                replacement = None
+            if replacement and replacement != entry.resource:
+                _log_event(
+                    "preview_resource_switched",
+                    match_id=match_id,
+                    old=entry.resource,
+                    new=replacement,
+                )
+                entry.resource = replacement
         command = self._build_command(entry.resource, directory)
         log_file = entry.log_path.open("wb")
         try:
