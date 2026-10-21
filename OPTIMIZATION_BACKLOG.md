@@ -1136,3 +1136,74 @@ command += [
 | 日期 | 比赛 | 第1步 | 第2步 | 第3步 | 第4步 | 结论 |
 |---|---|---|---|---|---|---|
 | 待填 | | | | | | |
+
+### 11.13 方案 H：小窗换 WebRTC（像 VLC 一样近零延迟），大窗与截取仍走 HLS（2026-10-21 立项）
+
+#### 11.13.1 目标与边界
+
+- 目标：小窗画面延迟从 HLS 的 ~4.5s 降到 **≤1s（与 VLC 相差 <1s）**；大窗保留拖动/回看/精确截取；GIF 质量与来源不变。
+- 不解决：源头 F 问题（拉源疑似晚几十秒，11.12）。F 必须先查，否则 H 只是"更快看到晚了的画面"。
+- 产品形态 A：小窗 WebRTC（纯直播、不可拖）；点放大后大窗仍是 HLS（~4.5s，可拖）。大窗等于自带 4 秒回放，顺手回拖即可截。形态 B（全 WebRTC + "截最近 N 秒"）看 A 上线后反馈再定。
+
+#### 11.13.2 为什么是 WebRTC、为什么要媒体服务器
+
+- 延迟差异来自协议：RTMP/WebRTC 是"连续水管"，HLS 是"装瓶上架再取"（装满 1s + 轮询 0.5s + 囤 3 瓶 3s）。VLC 快只因它接 RTMP 水管；浏览器已不支持 RTMP，WebRTC 是浏览器唯一原生支持的水管。
+- ffmpeg 只会装瓶，不会给浏览器接 WebRTC；需要媒体服务器做转接头。选 **mediamtx**（单二进制 + 一份 yaml，brew/apt 均有，1.21.x）。备选 SRS。
+- 截 GIF 需要"过去的画面"，水管里没有，所以 ffmpeg 写 HLS 180s 环形缓冲的链路**保留不动**，仅不再用于小窗显示。
+
+#### 11.13.3 目标架构
+
+```
+懂球帝 RTMP ──► mediamtx（服务器常驻，按场动态 path）
+                 ├─► WHEP (WebRTC) ──► 浏览器小窗 ~0.5s
+                 └─► ffmpeg（现有）从 mediamtx 的 RTSP 本机读 ──► HLS 1s 片 ×180 ──► 大窗显示 + 截 GIF
+```
+
+- ffmpeg 改为从 `rtsp://127.0.0.1:8554/<match_id>` 读而不是直接拉懂球帝，源只拉一次（省上游带宽，两条线画面一致）。若 mediamtx 不可用则回退直拉 RTMP（保留现有路径作兜底）。
+- mediamtx 按需拉源：`paths` 使用 `source: rtmp://…` + `sourceOnDemand: yes`，或由 `monitor_server.py` 通过 mediamtx API（`/v3/config/paths/add`）在 `preview/start` 时注册、`stop` 时删除。倾向后者：path 名 = match_id，源地址来自 `source_client.py`，生命周期与现有 preview 一致。
+
+#### 11.13.4 服务器侧
+
+1. 安装：下载 mediamtx release 二进制到 `/opt/mediamtx/`，`mediamtx.yml` 最小配置：`api: yes`（仅 127.0.0.1:9997）、`rtsp: yes`（127.0.0.1:8554）、`webrtc: yes`（:8889）、`webrtcICEServers2` 留空（内网直连）、`webrtcAdditionalHosts: [服务器公网 IP]`、`webrtcICEUDPMuxAddress: :8189`（单 UDP 端口 mux，便于开安全组）、`webrtcICETCPMuxAddress: :8189`（UDP 不通时回退 TCP）。
+2. systemd 单元 `mediamtx.service`，`Restart=always`。
+3. 腾讯云安全组：放行 **UDP 8189 + TCP 8189**。
+4. nginx：`location /whep/` 反代到 `127.0.0.1:8889/`（WHEP 的 POST/PATCH/DELETE 都要透传，`proxy_http_version 1.1`）。浏览器只跟 443 和 8189 打交道。
+5. 健康：`monitor_server.py` 启动与 keepAlive 时探 `127.0.0.1:9997/v3/paths/list`；不可用则小窗自动回退 HLS 并在接口标 `webrtc: false`。
+
+#### 11.13.5 后端改动（`monitor_server.py` / `live_preview.py` / 新 `webrtc_gateway.py`）
+
+- `webrtc_gateway.py`：封装 mediamtx API：`ensure_path(match_id, rtmp_url)`、`remove_path(match_id)`、`path_ready(match_id)`、`healthy()`。全部 `timeout≤2s`，失败只记日志不影响 HLS。
+- `preview/start`：先 `ensure_path`；成功则 ffmpeg 源改 `rtsp://127.0.0.1:8554/<id>`（`live_preview._build_command` 识别 rtsp 分支，加 `-rtsp_transport tcp`），响应多返回 `whep_url: "whep/<id>/whep"`、`webrtc: true`；失败则按现状直拉 RTMP、`webrtc: false`。
+- `preview/stop` / idle 回收：同步 `remove_path`。
+- `preview/status`：带 `webrtc` 与 `whep_url`，前端据此决定小窗用哪种播放器。
+- 环境变量：`GIF_MONITOR_WEBRTC_ENABLED`(默认 false，灰度开关)、`GIF_MONITOR_MEDIAMTX_API`(`http://127.0.0.1:9997`)、`GIF_MONITOR_MEDIAMTX_RTSP`(`rtsp://127.0.0.1:8554`)、`GIF_MONITOR_WHEP_BASE`(`whep/`)。
+- 测试：`test_webrtc_gateway.py`（API 成功/超时/5xx → 回退）、`test_live_preview.py`（rtsp 分支命令）、`test_monitor_server.py`（start 返回 `webrtc/whep_url`；gateway 不可用时仍能 HLS）。
+
+#### 11.13.6 前端改动（`monitor_static/app.js`）
+
+- 新 `attachWhep(video, whepUrl, onStatus)`：`RTCPeerConnection` → `addTransceiver('video', {direction:'recvonly'})`（小窗静音，不收音频）→ `createOffer` → `POST whepUrl`（`Content-Type: application/sdp`）→ `setRemoteDescription(answer)`；记录 `Location` 供 `DELETE` 关闭；ICE 失败/`connectionState` 为 failed/disconnected → 3 次重试后回退 `attachHls`。
+- 小窗：`status.webrtc` 为 true 时用 `attachWhep`，否则 `attachHls`（现状）。大窗 `openStage` **一律** `attachHls`（新起一路，不复用小窗元素；需调整现有"把小窗元素搬进大窗"的做法为大窗独立 `<video>`，小窗继续播）。
+- 小窗延迟徽标：WebRTC 用 `getStats()` 的 `jitterBufferDelay/jitterBufferEmittedCount` + RTT/2 估算，显示"落后 ~0.6s"；无 hls.js 时 `liveLagSeconds` 返回该估算。追帧逻辑对 WebRTC 小窗跳过（`playbackRate` 不动，无需 seek）。
+- 小窗截取锚点：无 PDT，`anchorMs = Date.now() − 估算延迟 − 服务器时钟差`（`/api/health` 的 `time_unix` 与本地对时一次，取差）。精度 ±0.5s，大窗不受影响。
+- 回退一致性：WebRTC 失败回退 HLS 时徽标/追帧/锚点自动走 hls.js 路径（现有代码）。
+
+#### 11.13.7 利弊与风险
+
+- 利：小窗 ≤1s；小窗不再需要追帧；源只拉一次；大窗/截取零改动。
+- 弊：多一常驻组件（故障点、运维）；要开 8189 端口；前端两套播放器并存；小窗锚点 ±0.5s；WebRTC 在部分公司网络 UDP 被封，需 TCP 回退（已配）。
+- 风险缓解：`GIF_MONITOR_WEBRTC_ENABLED` 灰度；任何环节失败自动回 HLS；mediamtx 独立 systemd 自愈；上线先一场、再全部。
+
+#### 11.13.8 实施步骤（可逐步回退）
+
+| 步 | 内容 | 验证 |
+|---|---|---|
+| H1 | 本地 `brew install mediamtx`，ffmpeg 推测试源到 mediamtx，浏览器用最小 WHEP 页面播通；量 `getStats` 延迟 | 本地页面看到画面、延迟 <1s |
+| H2 | `webrtc_gateway.py` + 后端接口 + rtsp 分支 + 测试；`GIF_MONITOR_WEBRTC_ENABLED=false` 默认 | 全测试通过；关着时行为与现状一致 |
+| H3 | 前端 `attachWhep` + 小窗切换 + 徽标 + 锚点 + 回退 | 本地开关打开：小窗 WebRTC、大窗 HLS、截 GIF 原速正确 |
+| H4 | 服务器装 mediamtx + systemd + 安全组 + nginx 反代；`.env` 打开开关 | 一场比赛小窗 ≤1s；拔掉 mediamtx 小窗自动回 HLS |
+| H5 | 观察两三场后决定是否做形态 B | — |
+
+#### 11.13.9 与其他方案的关系
+
+- 先 F（11.12），再 H。F 若坐实并修复，所有路径同时受益。
+- H 上线后 C（追帧）只对大窗 HLS 有意义，小窗部分自然失效；G（1s 片）继续服务大窗与截取。
