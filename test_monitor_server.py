@@ -1093,14 +1093,30 @@ class ClipEndpointAlertMatchTests(unittest.TestCase):
         self.assertNotIn("manual_match_event", event)
         self.assertEqual(event["alert_match_mode"], "alert")
 
-    def test_red_card_push_prefills_type_4(self):
+    def test_red_card_push_prefills_type_4_without_score(self):
         with mock.patch.object(monitor_server.time, "time", return_value=self.base - 60.0):
             self.store.add({"match_id": "54622319", "event_type": "red_card", "team": "A",
-                            "score": "0-0", "minute": "1H 30", "dedup_key": "r1"})
+                            "score": "1-0", "minute": "1H 30", "dedup_key": "r1"})
         data = self._clip_and_publish(10.0).get_json()
-        self.assertEqual(data["form"]["match_event"], 4)
+        # Only 进球/点球 carry 比分; the push's score is not pre-filled for a red card.
+        self.assertEqual((data["form"]["match_event"], data["form"]["match_score"]), (4, ""))
         event = self.queue.enqueue.call_args.kwargs["event"]
-        self.assertEqual((event["match_event"], event["code"], event["minute"]), (4, "RC", "30"))
+        self.assertEqual((event["match_event"], event["code"], event["minute"], event["score"]), (4, "RC", "30", ""))
+
+    def test_score_is_dropped_for_types_outside_goal_and_penalty(self):
+        with mock.patch.object(monitor_server.time, "time", return_value=self.base - 60.0):
+            self.store.add({"match_id": "54622319", "event_type": "goal", "team": "B",
+                            "score": "1-1", "minute": "2H 68", "dedup_key": "g1"})
+        name = self._clip(10.0).get_json()["name"]
+        for match_event, expected in ((0, ""), (3, ""), (4, ""), (5, ""), (6, ""), (1, "1-1"), (2, "1-1")):
+            self.queue.enqueue.reset_mock()
+            response = self.client.post(
+                "/api/monitor/clip/publish",
+                json={"match_id": "54622319", "name": name, "match_event": match_event,
+                      "match_score": "1-1", "title": "t"},
+            )
+            self.assertEqual(response.status_code, 200, response.get_json())
+            self.assertEqual(self.queue.enqueue.call_args.kwargs["event"]["score"], expected, match_event)
 
     def test_unresolved_side_is_not_forwarded(self):
         with mock.patch.object(monitor_server.time, "time", return_value=self.base - 60.0):

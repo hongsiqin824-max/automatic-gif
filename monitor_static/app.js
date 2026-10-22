@@ -635,6 +635,9 @@ function applyDraftState(draftEl, status, draftUrl, error, retriable) {
 const MATCH_EVENT_OPTIONS = [
   [0, '无'], [1, '进球'], [2, '点球'], [3, '点球不进'], [4, '红牌'], [5, '乌龙球'], [6, '进球无效'],
 ];
+// Only these CMS event types carry 比分; the field is cleared and locked for
+// the rest (the server drops it too).
+const SCORE_EVENT_TYPES = new Set([1, 2]);
 
 function candidateLabel(c) {
   const clock = c.match_time ? `${c.match_time}'` : '?';
@@ -734,8 +737,25 @@ function buildClipForm(item, row) {
     if (!dirty.has('match_event')) typeSel.value = radio.dataset.matchEvent;
     if (!dirty.has('match_time')) timeEl.value = radio.dataset.matchTime;
     if (!dirty.has('match_score')) scoreEl.value = radio.dataset.score;
+    syncScoreField();
     syncPublishButton();
   }
+  // 比分 only applies to 进球/点球: lock and clear it for every other type,
+  // and when the type comes back, restore the picked push's score unless the
+  // operator had typed one.
+  function syncScoreField() {
+    const allowed = SCORE_EVENT_TYPES.has(Number(typeSel.value));
+    scoreEl.disabled = !allowed;
+    scoreEl.title = allowed ? '' : '该事件类型不带比分';
+    if (!allowed) {
+      scoreEl.value = '';
+      dirty.delete('match_score');
+    } else if (!dirty.has('match_score') && !scoreEl.value) {
+      const checked = form.querySelector(`input[name="${radioName}"]:checked`);
+      scoreEl.value = checked ? (checked.dataset.score || '') : '';
+    }
+  }
+  typeSel.addEventListener('change', syncScoreField);
   function syncPublishButton() {
     const ok = titleEl.value.trim().length > 0;
     publish.disabled = !ok;
@@ -761,6 +781,7 @@ function buildClipForm(item, row) {
     timeEl.value = values.match_time || '';
     scoreEl.value = values.match_score || '';
     titleEl.value = values.title || '';
+    syncScoreField();
     syncPublishButton();
   }
   // Append a push that arrived after capture; selection and fields untouched.
@@ -769,7 +790,7 @@ function buildClipForm(item, row) {
     sources.insertBefore(addOption(c, '新', true), sources.firstChild);
   }
   writeForm(initial);
-  form._clip = {readForm, writeForm, addCandidate, dirty};
+  form._clip = {readForm, writeForm, addCandidate, syncScoreField, dirty};
   return form;
 }
 
@@ -845,6 +866,8 @@ async function publishClip(name, formValues, button, row) {
     button.disabled = false;
     button.textContent = '发布';
     row.querySelectorAll('input,select').forEach((el) => { el.disabled = false; });
+    const formEl = row.querySelector('.stage-clip-form');
+    if (formEl && formEl._clip) formEl._clip.syncScoreField();
   }
 }
 
@@ -917,22 +940,33 @@ function offerAlertToClipForms(ev) {
 function startDraftPoll(matchId) {
   if (state.draftPoll && state.draftPoll.matchId === matchId) return;
   stopDraftPoll();
-  state.draftPoll = {matchId, timer: setInterval(() => refreshDraftLinks(matchId), 2000), polls: 0};
+  state.draftPoll = {matchId, timer: setInterval(() => refreshDraftLinks(matchId), DRAFT_POLL_MS), polls: 0};
 }
 
 function stopDraftPoll() {
   if (state.draftPoll) { clearInterval(state.draftPoll.timer); state.draftPoll = null; }
 }
 
+// Publishing a 10+ MB GIF (public-URL check + official upload, each with
+// retries) can legitimately take several minutes, so poll for 10 minutes and
+// then leave a click-to-resume link instead of declaring the state unknown.
+const DRAFT_POLL_MS = 2000;
+const DRAFT_POLL_MAX = 300;
+
 function refreshDraftLinks(matchId) {
   if (state.stageMatchId !== matchId) { stopDraftPoll(); return; }
   if (state.draftPoll) {
     state.draftPoll.polls += 1;
-    if (state.draftPoll.polls > 90) {
+    if (state.draftPoll.polls > DRAFT_POLL_MAX) {
       document.querySelectorAll('#stage-clips .stage-clip-draft').forEach((draftEl) => {
         if (draftEl.classList.contains('ok') || draftEl.classList.contains('fail') || draftEl.classList.contains('warn')) return;
-        draftEl.textContent = '草稿状态未知，请到发文后台查看';
-        draftEl.className = 'stage-clip-draft warn';
+        draftEl.textContent = '';
+        const link = document.createElement('a');
+        link.href = '#';
+        link.textContent = '仍在处理，点此刷新';
+        link.addEventListener('click', (ev) => { ev.preventDefault(); loadStageClips(matchId); });
+        draftEl.appendChild(link);
+        draftEl.className = 'stage-clip-draft';
       });
       stopDraftPoll();
       return;

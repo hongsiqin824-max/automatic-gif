@@ -855,6 +855,8 @@ def _alert_match_public(alert_match: dict[str, Any]) -> dict[str, Any]:
 # the type after picking the goal push (or 跳过 when there was no push at all).
 
 MATCH_EVENT_LABELS = {0: "无", 1: "进球", 2: "点球", 3: "点球不进", 4: "红牌", 5: "乌龙球", 6: "进球无效"}
+# Only these event types carry ``match_score``; it is dropped for the rest.
+SCORE_EVENT_TYPES = frozenset({1, 2})
 _MATCH_TIME_RE = re.compile(r"(\d{1,3})(?:\+(\d{1,2}))?")
 _MATCH_SCORE_RE = re.compile(r"(\d{1,2})\s*[-:：]\s*(\d{1,2})")
 CLIP_TITLE_MAX = 100
@@ -881,11 +883,12 @@ def _default_clip_form(alert_match: dict[str, Any]) -> dict[str, Any]:
     """Initial form values: the matched push, or 跳过 (type 0, clock empty) without one."""
     if alert_match.get("mode") != "alert":
         return {"alert_seq": None, "match_event": 0, "match_time": "", "match_score": "", "title": ""}
+    match_event = _alert_match_event(alert_match)
     return {
         "alert_seq": alert_match.get("alert_seq"),
-        "match_event": _alert_match_event(alert_match),
+        "match_event": match_event,
         "match_time": _join_match_time(alert_match.get("minute"), alert_match.get("minute_extra")),
-        "match_score": str(alert_match.get("score") or "").strip(),
+        "match_score": str(alert_match.get("score") or "").strip() if match_event in SCORE_EVENT_TYPES else "",
         "title": "",
     }
 
@@ -928,6 +931,8 @@ def _normalize_clip_form(body: dict[str, Any], current: dict[str, Any]) -> dict[
     form.setdefault("match_time", "")
     form.setdefault("match_score", "")
     form.setdefault("title", "")
+    if form["match_event"] not in SCORE_EVENT_TYPES:
+        form["match_score"] = ""
     return form
 
 
