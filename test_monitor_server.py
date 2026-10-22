@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import signal
 import subprocess
 import time
@@ -1319,6 +1320,38 @@ class LatencyKillSwitchTests(unittest.TestCase):
         self.assertEqual(
             command[command.index("-force_key_frames") + 1], "expr:gte(t,n_forced*2)"
         )
+
+    def test_dotenv_segment_seconds_reaches_live_preview_module(self):
+        # Regression: live_preview reads GIF_PREVIEW_SEGMENT_SECONDS at import
+        # time, so .env must be loaded before the project imports or the value
+        # silently stays at the default (the server then slices 1s segments
+        # while the browser is told a 2s target).
+        repo = Path(__file__).resolve().parent
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for source in repo.glob("*.py"):
+                shutil.copy(source, root / source.name)
+            (root / ".env").write_text("GIF_PREVIEW_SEGMENT_SECONDS=2\n", encoding="utf-8")
+            env = {
+                k: v for k, v in os.environ.items()
+                if k != "GIF_PREVIEW_SEGMENT_SECONDS"
+            }
+            env.update({
+                "GIF_SOURCE_SECRET": "test-secret",
+                "GIF_MONITOR_PUBLISH_ENABLED": "false",
+                "GIF_MONITOR_ALERT_DB_PATH": "",
+            })
+            completed = subprocess.run(
+                [
+                    "python3", "-c",
+                    "import monitor_server, live_preview;"
+                    "print(live_preview.PREVIEW_SEGMENT_SECONDS,"
+                    " monitor_server.live_preview.segment_seconds)",
+                ],
+                cwd=root, env=env, capture_output=True, text=True, timeout=60,
+            )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.split(), ["2", "2"])
 
     def test_matches_advertises_latency_config(self):
         app = monitor_server.app.test_client()

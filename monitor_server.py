@@ -36,18 +36,6 @@ from typing import Any
 
 from flask import Flask, abort, jsonify, request, send_from_directory
 
-from dqd_api import MATCH_STATUS_LABELS, positive_env_float, positive_env_int, validate_match_id
-from source_client import classify_source_response, query_source
-from match_catalog import MATCH_CATALOG_EXCLUDED_COMPETITION_NAMES, MatchCatalog
-from live_preview import LivePreviewManager, resolve_ffmpeg
-import live_preview as live_preview_module
-from webrtc_gateway import WebRTCGateway
-from article_draft_queue import (
-    ArticleDraftQueue,
-    DRAFT_DELIVERY_MODE,
-    MANUAL_ARTIFACT_KIND,
-)
-
 
 ROOT = Path(__file__).resolve().parent
 
@@ -76,7 +64,23 @@ def _load_dotenv(path: Path) -> None:
         os.environ.setdefault(key, value)
 
 
+# Must run before the project modules below are imported: live_preview and
+# match_catalog read GIF_PREVIEW_* / catalog settings at import time, so a
+# later dotenv load would leave them on their defaults.
 _load_dotenv(ROOT / ".env")
+
+from dqd_api import MATCH_STATUS_LABELS, positive_env_float, positive_env_int, validate_match_id  # noqa: E402
+from source_client import classify_source_response, query_source
+from match_catalog import MATCH_CATALOG_EXCLUDED_COMPETITION_NAMES, MatchCatalog
+from live_preview import LivePreviewManager, resolve_ffmpeg
+import live_preview as live_preview_module
+from webrtc_gateway import WebRTCGateway
+from article_draft_queue import (
+    ArticleDraftQueue,
+    DRAFT_DELIVERY_MODE,
+    MANUAL_ARTIFACT_KIND,
+)
+
 
 HOST = os.environ.get("GIF_MONITOR_HOST", "127.0.0.1")
 PORT = int(os.environ.get("GIF_MONITOR_PORT", "8901"))
