@@ -13,7 +13,6 @@ const state = {
   stageVideoNode: null,      // the tile <video> DOM node currently relocated into the stage
   stageVideoHomeWrap: null,  // the .tile-video-wrap to move that node back into on close
   maxPreviews: 16,
-  clipBeforeSeconds: 10,
   clipRangeMaxSeconds: 30,
   // Mirrors GIF_MONITOR_CATCHUP_ENABLED; false disables tile speed-up and auto seek.
   catchupEnabled: true,
@@ -470,7 +469,6 @@ function createTile(data) {
       <div class="tile-teams">${teamsText(data)}</div>
       <div class="tile-meta">${metaText(data)}</div>
       <div class="tile-actions">
-        <button class="button primary" data-role="capture" type="button">截取 ${state.clipBeforeSeconds} 秒</button>
         <span class="lag-badge na" data-role="lag" title="当前画面比服务器最新画面晚多少秒">落后 —</span>
         <button class="button ghost tile-live" data-role="live" type="button" title="跳到直播最新位置">回到直播</button>
         <button class="tile-clips-badge hidden" data-role="clips" type="button" title="查看本场已截取的 GIF">GIF ×0</button>
@@ -481,10 +479,6 @@ function createTile(data) {
   el.querySelector('[data-role="clips"]').addEventListener('click', (ev) => {
     ev.stopPropagation();
     openStage(data.match_id);
-  });
-  el.querySelector('[data-role="capture"]').addEventListener('click', (ev) => {
-    ev.stopPropagation();
-    captureClip(data.match_id, ev.currentTarget);
   });
   el.querySelector('[data-role="live"]').addEventListener('click', (ev) => {
     ev.stopPropagation();
@@ -535,28 +529,19 @@ async function startTilePreview(matchId) {
 }
 
 // ---- clip / stage / draft ----
-// ``range`` = {pinId, startMs, endMs} switches the request into range mode.
-// Returns true on success so range callers know whether to reset their state.
+// ``range`` = {pinId, startMs, endMs} from 「开始/结束」; this is the only way
+// to capture now (the fixed "last N seconds" buttons were removed as unused).
+// Returns true on success so the range caller knows whether to reset its state.
 async function captureClip(matchId, button, range) {
   const prevLabel = button ? button.textContent : '';
   if (button) { button.disabled = true; button.textContent = '截取中…'; }
-  setTileStatus(matchId, range ? '正在截取所选区间…' : '正在回捞最近画面…');
+  setTileStatus(matchId, '正在截取所选区间…');
   try {
-    const payload = {match_id: matchId};
-    if (range) {
-      payload.pin_id = range.pinId;
-      payload.end_epoch_ms = Math.round(range.endMs);
-    } else {
-      const anchorMs = frameAnchorMs(videoForMatch(matchId));
-      if (anchorMs != null) payload.anchor_epoch_ms = Math.round(anchorMs);
-    }
-    if (state.stageMatchId === matchId && !range) {
-      const secondsEl = $('stage-seconds');
-      if (secondsEl && secondsEl.value.trim()) {
-        const secs = Number(secondsEl.value);
-        if (Number.isFinite(secs) && secs > 0 && secs <= 120) payload.before_seconds = secs;
-      }
-    }
+    const payload = {
+      match_id: matchId,
+      pin_id: range.pinId,
+      end_epoch_ms: Math.round(range.endMs),
+    };
     const data = await requestJson('api/monitor/clip', {
       method: 'POST', body: JSON.stringify(payload),
     });
@@ -970,21 +955,6 @@ function refreshDraftLinks(matchId) {
     .catch(() => {});
 }
 
-function stageCaptureSeconds() {
-  const secondsEl = $('stage-seconds');
-  if (secondsEl && secondsEl.value.trim()) {
-    const secs = Number(secondsEl.value);
-    if (Number.isFinite(secs) && secs > 0 && secs <= 120) return secs;
-  }
-  return state.clipBeforeSeconds;
-}
-
-function syncStageCaptureLabel() {
-  const button = $('stage-capture');
-  if (!button || button.disabled) return;
-  button.textContent = `截取最近 ${stageCaptureSeconds()} 秒`;
-}
-
 // ---- stage range capture (operator-chosen start/end) ----
 //
 // Two clicks: 「开始」 pins the frame on screen as the start (server hard-links
@@ -1134,9 +1104,6 @@ function openStage(matchId) {
   $('stage-notes').innerHTML = '';
   $('stage-clips').innerHTML = '<div class="stage-clip-empty">正在读取 GIF 列表…</div>';
   loadStageClips(matchId);
-  const secondsInput = $('stage-seconds');
-  if (secondsInput) secondsInput.value = '';
-  syncStageCaptureLabel();
   clearRange();
   const stageStatus = (text, cls) => {
     $('stage-status').textContent = text;
@@ -1399,11 +1366,9 @@ async function refreshMatches() {
   try {
     const data = await requestJson('api/monitor/matches?with_sources=1');
     state.maxPreviews = data.max_previews || state.maxPreviews;
-    state.clipBeforeSeconds = data.clip_before_seconds || state.clipBeforeSeconds;
     state.clipRangeMaxSeconds = data.clip_range_max_seconds || state.clipRangeMaxSeconds;
     if (typeof data.catchup_enabled === 'boolean') state.catchupEnabled = data.catchup_enabled;
     applyLatencyConfig(data.latency);
-    syncStageCaptureLabel();
     const playing = Array.isArray(data.playing) ? data.playing : [];
 
     if (state.view === 'list') {
@@ -1441,10 +1406,6 @@ $('enter-workshop-btn').addEventListener('click', enterWorkshop);
 $('refresh-btn-2').addEventListener('click', refreshMatches);
 $('back-to-list-btn').addEventListener('click', leaveWorkshop);
 $('stage-close').addEventListener('click', closeStage);
-$('stage-capture').addEventListener('click', (ev) => {
-  if (state.stageMatchId) captureClip(state.stageMatchId, ev.currentTarget);
-});
-$('stage-seconds').addEventListener('input', syncStageCaptureLabel);
 $('stage-range-start').addEventListener('click', setRangeStart);
 $('stage-range-end').addEventListener('click', (ev) => setRangeEndAndCapture(ev.currentTarget));
 $('stage-live').addEventListener('click', () => {

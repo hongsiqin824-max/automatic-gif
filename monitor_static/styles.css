@@ -58,11 +58,9 @@ body{
 .lag-badge.na{color:var(--muted)}
 .lag-badge.na::before{box-shadow:none}
 .stage-actions .lag-badge{font-size:12px;padding:8px 12px}
-.stage-fields{display:flex;gap:8px;margin:8px 0}
-.stage-range{display:flex;align-items:center;gap:8px;margin:10px 0 0}
+.stage-range{display:flex;align-items:center;gap:8px;margin:10px 0 8px}
 .stage-input{flex:1;min-width:0;padding:8px 10px;border-radius:8px;border:1px solid rgba(255,255,255,.14);background:rgba(255,255,255,.05);color:inherit;font-size:13px}
 .stage-input::placeholder{color:var(--muted)}
-.stage-seconds{flex:0 0 150px}
 .tile-clip-link{font-size:11px;color:var(--cyan);text-decoration:none}
 .tile-clips-badge{font:600 11px inherit;color:var(--cyan);background:rgba(94,234,212,.08);border:1px solid rgba(94,234,212,.35);border-radius:999px;padding:4px 9px;cursor:pointer;white-space:nowrap;font-variant-numeric:tabular-nums;transition:background .2s,transform .2s}
 .tile-clips-badge:hover{background:rgba(94,234,212,.18)}

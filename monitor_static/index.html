@@ -69,7 +69,6 @@
         <div class="stage-actions">
           <span id="stage-lag" class="lag-badge na" title="当前画面比服务器最新画面晚多少秒">落后 —</span>
           <button id="stage-live" class="button secondary" type="button">回到直播</button>
-          <button id="stage-capture" class="button primary" type="button">截取最近 10 秒</button>
           <button id="stage-close" class="button ghost" type="button">关闭</button>
         </div>
       </div>
@@ -77,9 +76,6 @@
       <div class="stage-range">
         <button id="stage-range-start" class="button secondary" type="button" title="把当前画面设为 GIF 起点">开始</button>
         <button id="stage-range-end" class="button primary" type="button" disabled title="把当前画面设为终点并生成 GIF（不发布，发布在下方列表）">结束</button>
-      </div>
-      <div class="stage-fields">
-        <input id="stage-seconds" class="stage-input stage-seconds" type="number" min="1" max="120" step="1" placeholder="截取秒数（默认 10）">
       </div>
       <div id="stage-status" class="stage-status muted"></div>
       <div id="stage-notes" class="stage-notes"></div>
