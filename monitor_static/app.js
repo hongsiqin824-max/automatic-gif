@@ -596,10 +596,9 @@ function alertMatchNote(am) {
       : am.ambiguous
       ? '（候选多条，请核对）'
       : '';
-    return ` · 已关联提醒 ${clock}${flag}`;
+    return ` · 已关联推送 ${clock}${flag}`;
   }
-  if (am.mode === 'catalog') return ` · 未匹配提醒，用当前比分 ${clock}`;
-  return ' · 未匹配提醒，时间/比分留空';
+  return ' · 未匹配到推送，已按「跳过」预填，请在列表里选推送或手填';
 }
 
 function addStageNote(text, cls) {
@@ -744,7 +743,9 @@ function buildClipForm(item, row) {
   form.appendChild(titleRow);
 
   function applySource(radio) {
-    // Re-fill only the fields the operator has not touched.
+    // The pick itself counts as an edit (so a list rebuild keeps it); re-fill
+    // only the fields the operator has not touched.
+    dirty.add('alert_seq');
     if (!dirty.has('match_event')) typeSel.value = radio.dataset.matchEvent;
     if (!dirty.has('match_time')) timeEl.value = radio.dataset.matchTime;
     if (!dirty.has('match_score')) scoreEl.value = radio.dataset.score;
