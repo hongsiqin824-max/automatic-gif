@@ -1118,6 +1118,32 @@ class ClipEndpointAlertMatchTests(unittest.TestCase):
             self.assertEqual(response.status_code, 200, response.get_json())
             self.assertEqual(self.queue.enqueue.call_args.kwargs["event"]["score"], expected, match_event)
 
+    def test_score_event_types_are_configurable(self):
+        parse = monitor_server._parse_score_event_types
+        self.assertEqual(parse("1,2"), frozenset({1, 2}))
+        self.assertEqual(parse(" 1, 2 ,5,"), frozenset({1, 2, 5}))
+        self.assertEqual(parse(""), frozenset())
+        for bad in ("7", "a", "1;2", "-1"):
+            with self.assertRaises(RuntimeError, msg=bad):
+                parse(bad)
+        # The override drives both the pre-fill and the publish filter, and is
+        # reported to the page so the 比分 lock follows the same rule.
+        with mock.patch.object(monitor_server, "SCORE_EVENT_TYPES", frozenset({4})):
+            with mock.patch.object(monitor_server.time, "time", return_value=self.base - 60.0):
+                self.store.add({"match_id": "54622319", "event_type": "red_card", "team": "A",
+                                "score": "2-0", "minute": "1H 30", "dedup_key": "r1"})
+            data = self._clip(10.0).get_json()
+            self.assertEqual(data["form"]["match_score"], "2-0")
+            self.queue.records_by_source_name.return_value = {}
+            listing = self.client.get("/api/monitor/clips?match_id=54622319").get_json()
+            self.assertEqual(listing["score_event_types"], [4])
+            response = self.client.post(
+                "/api/monitor/clip/publish",
+                json={"match_id": "54622319", "name": data["name"], "match_event": 1, "match_score": "2-0", "title": "t"},
+            )
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(self.queue.enqueue.call_args.kwargs["event"]["score"], "")
+
     def test_unresolved_side_is_not_forwarded(self):
         with mock.patch.object(monitor_server.time, "time", return_value=self.base - 60.0):
             self.store.add({"match_id": "54622319", "event_type": "goal", "team": "?",

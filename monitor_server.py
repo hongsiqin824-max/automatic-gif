@@ -855,8 +855,29 @@ def _alert_match_public(alert_match: dict[str, Any]) -> dict[str, Any]:
 # the type after picking the goal push (or 跳过 when there was no push at all).
 
 MATCH_EVENT_LABELS = {0: "无", 1: "进球", 2: "点球", 3: "点球不进", 4: "红牌", 5: "乌龙球", 6: "进球无效"}
-# Only these event types carry ``match_score``; it is dropped for the rest.
-SCORE_EVENT_TYPES = frozenset({1, 2})
+
+
+def _parse_score_event_types(raw: str) -> frozenset[int]:
+    """``GIF_MONITOR_SCORE_EVENT_TYPES``: which CMS event types carry ``match_score``.
+
+    Comma-separated codes from ``MATCH_EVENT_LABELS``; the page locks the 比分
+    field and the server drops the value for every other type. Default ``1,2``
+    (进球, 点球). Invalid input fails startup rather than silently reverting.
+    """
+    parsed: set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if not part.isdigit() or int(part) not in MATCH_EVENT_LABELS:
+            raise RuntimeError(
+                "GIF_MONITOR_SCORE_EVENT_TYPES 必须是逗号分隔的事件类型编号（0~6），例如 1,2"
+            )
+        parsed.add(int(part))
+    return frozenset(parsed)
+
+
+SCORE_EVENT_TYPES = _parse_score_event_types(os.environ.get("GIF_MONITOR_SCORE_EVENT_TYPES", "1,2"))
 _MATCH_TIME_RE = re.compile(r"(\d{1,3})(?:\+(\d{1,2}))?")
 _MATCH_SCORE_RE = re.compile(r"(\d{1,2})\s*[-:：]\s*(\d{1,2})")
 CLIP_TITLE_MAX = 100
@@ -2009,6 +2030,7 @@ def monitor_clips():
         {
             "match_id": match_id,
             "publish_enabled": manual_draft_queue is not None,
+            "score_event_types": sorted(SCORE_EVENT_TYPES),
             "clips": _list_clips(match_id),
         }
     )

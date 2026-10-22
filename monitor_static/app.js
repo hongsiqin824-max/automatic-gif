@@ -635,9 +635,10 @@ function applyDraftState(draftEl, status, draftUrl, error, retriable) {
 const MATCH_EVENT_OPTIONS = [
   [0, '无'], [1, '进球'], [2, '点球'], [3, '点球不进'], [4, '红牌'], [5, '乌龙球'], [6, '进球无效'],
 ];
-// Only these CMS event types carry 比分; the field is cleared and locked for
-// the rest (the server drops it too).
-const SCORE_EVENT_TYPES = new Set([1, 2]);
+// Which CMS event types carry 比分 comes from the server
+// (GIF_MONITOR_SCORE_EVENT_TYPES in .env, read via /api/monitor/clips); the
+// field is cleared and locked for the rest and the server drops it too.
+let scoreEventTypes = new Set([1, 2]);
 
 function candidateLabel(c) {
   const clock = c.match_time ? `${c.match_time}'` : '?';
@@ -744,7 +745,7 @@ function buildClipForm(item, row) {
   // and when the type comes back, restore the picked push's score unless the
   // operator had typed one.
   function syncScoreField() {
-    const allowed = SCORE_EVENT_TYPES.has(Number(typeSel.value));
+    const allowed = scoreEventTypes.has(Number(typeSel.value));
     scoreEl.disabled = !allowed;
     scoreEl.title = allowed ? '' : '该事件类型不带比分';
     if (!allowed) {
@@ -882,6 +883,7 @@ async function loadStageClips(matchId) {
     return;
   }
   if (state.stageMatchId !== matchId) return;
+  if (Array.isArray(data.score_event_types)) scoreEventTypes = new Set(data.score_event_types.map(Number));
   const clips = Array.isArray(data.clips) ? data.clips : [];
   // The list is rebuilt after every capture; keep whatever the operator had
   // already changed in an unpublished row's form.
