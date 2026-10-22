@@ -75,9 +75,9 @@ body{
 .stage-status.ok{color:var(--green)}
 .stage-status.warn{color:var(--amber)}
 .stage-status.fail{color:var(--red,#ff6b6b)}
-.stage-notes{padding:0 16px;display:flex;flex-direction:column;gap:6px}
+.stage-notes{padding:0 16px;display:flex;flex-direction:column;gap:4px}
 .stage-notes:empty{display:none}
-.stage-note{font-size:12px;color:var(--muted);border:1px solid var(--line);border-radius:6px;padding:6px 10px}
+.stage-note{font-size:12px;color:var(--muted);border:1px solid var(--line);border-radius:6px;padding:4px 10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .stage-note.fail{color:var(--red,#ff6b6b);border-color:var(--red,#ff6b6b)}
 .stage-note.warn{color:var(--yellow,#f5c542);border-color:var(--yellow,#f5c542)}
 .stage-note.ok{color:var(--green,#4cd964);border-color:var(--green,#4cd964)}

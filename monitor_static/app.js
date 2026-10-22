@@ -591,14 +591,29 @@ function alertMatchNote(am) {
   return ' · 未匹配到推送，已按「跳过」预填，请在列表里选推送或手填';
 }
 
-function addStageNote(text, cls) {
+const STAGE_NOTES_MAX = 3;
+
+// ``key``: repeated notes of the same kind (auto-seek fires every second on a
+// laggy stream) collapse into the newest line with a counter instead of
+// stacking up and pushing the GIF list below the fold.
+function addStageNote(text, cls, key) {
   const wrap = $('stage-notes');
   if (!wrap) return;
+  const stamp = new Date().toLocaleTimeString();
+  const top = wrap.firstElementChild;
+  if (key && top && top.dataset.key === key) {
+    const count = (parseInt(top.dataset.count || '1', 10) || 1) + 1;
+    top.dataset.count = String(count);
+    top.textContent = `${text} · ${stamp}（${count} 次）`;
+    top.className = `stage-note ${cls || ''}`;
+    return;
+  }
   const note = document.createElement('div');
   note.className = `stage-note ${cls || ''}`;
-  note.textContent = `${text} · ${new Date().toLocaleTimeString()}`;
+  if (key) note.dataset.key = key;
+  note.textContent = `${text} · ${stamp}`;
   wrap.prepend(note);
-  while (wrap.children.length > 5) wrap.removeChild(wrap.lastChild);
+  while (wrap.children.length > STAGE_NOTES_MAX) wrap.removeChild(wrap.lastChild);
 }
 
 // ---- stage clip list (server-backed; every GIF of this match, any window) ----
@@ -1890,7 +1905,7 @@ function noteAutoSeek(matchId, reason, lag) {
   console.log(`[AUTO-SEEK] ${matchId} | ${reason} | 落后 ${lag.toFixed(1)}s`);
   setTileStatus(matchId, text, 'warn', true);
   if (state.stageMatchId === matchId) {
-    addStageNote(text, 'warn');
+    addStageNote(text, 'warn', 'auto-seek');
     const status = $('stage-status');
     if (status) {
       status.textContent = text;
