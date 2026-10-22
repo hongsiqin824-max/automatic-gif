@@ -47,7 +47,12 @@ function escapeHtml(value) {
 async function requestJson(url, options = {}) {
   const response = await fetch(url, {headers: {'Content-Type': 'application/json'}, ...options});
   const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(data.error || `请求失败 ${response.status}`);
+  if (!response.ok) {
+    const error = new Error(data.error || `请求失败 ${response.status}`);
+    error.status = response.status;
+    error.data = data;
+    throw error;
+  }
   return data;
 }
 
@@ -848,27 +853,43 @@ function renderClipRow(item, publishEnabled) {
   return row;
 }
 
-async function publishClip(name, formValues, button, row) {
+async function publishClip(name, formValues, button, row, force) {
   const matchId = state.stageMatchId;
   if (!matchId) return;
   if (!formValues.title) { addStageNote('请填写标题后再发布', 'warn'); return; }
   button.disabled = true;
   button.textContent = '发布中…';
   row.querySelectorAll('input,select').forEach((el) => { el.disabled = true; });
-  try {
-    const data = await requestJson('api/monitor/clip/publish', {
-      method: 'POST',
-      body: JSON.stringify({match_id: matchId, name, ...formValues}),
-    });
-    addStageNote(data.delivery_mode === 'publish' ? '已提交发布' : '已提交建草稿', 'ok');
-    if (state.stageMatchId === matchId) loadStageClips(matchId);
-  } catch (error) {
-    addStageNote('发布失败：' + error.message, 'fail');
+  const restore = () => {
     button.disabled = false;
     button.textContent = '发布';
     row.querySelectorAll('input,select').forEach((el) => { el.disabled = false; });
     const formEl = row.querySelector('.stage-clip-form');
     if (formEl && formEl._clip) formEl._clip.syncScoreField();
+  };
+  try {
+    const data = await requestJson('api/monitor/clip/publish', {
+      method: 'POST',
+      body: JSON.stringify({match_id: matchId, name, ...formValues, ...(force ? {force: true} : {})}),
+    });
+    addStageNote(data.delivery_mode === 'publish' ? '已提交发布' : '已提交建草稿', 'ok');
+    if (state.stageMatchId === matchId) loadStageClips(matchId);
+  } catch (error) {
+    const dup = error.data && error.data.code === 'duplicate_match_time' ? error.data : null;
+    if (dup) {
+      // The CMS rejects a second gif article with the same match_time
+      // (code=3 创建失败). Same-minute events do happen, so ask instead of block.
+      restore();
+      const when = dup.match_time ? `${dup.match_time}'` : '同一时间';
+      const ok = window.confirm(
+        `本场 ${when} 已有一篇文章（id ${dup.article_id || '?'}）。\n` +
+        '懂球帝后台通常会拒绝相同比赛时间的第二篇。\n\n确定仍要发布吗？'
+      );
+      if (ok) publishClip(name, formValues, button, row, true);
+      return;
+    }
+    addStageNote('发布失败：' + error.message, 'fail');
+    restore();
   }
 }
 
@@ -950,34 +971,40 @@ function stopDraftPoll() {
 }
 
 // Publishing a 10+ MB GIF (public-URL check + official upload, each with
-// retries) can legitimately take several minutes, so poll for 10 minutes and
-// then leave a click-to-resume link instead of declaring the state unknown.
+// retries) can legitimately take several minutes, so poll for 10 minutes of
+// *answered* polls and then leave a click-to-resume link instead of declaring
+// the state unknown. A poll that fails or times out (8901 busy) is not
+// counted: the 凌晨 "状态未知" row was exactly that - the article had been
+// published in 3 s, the page just never got an answer for 3 minutes.
 const DRAFT_POLL_MS = 2000;
 const DRAFT_POLL_MAX = 300;
 
+function giveUpDraftPoll(matchId) {
+  document.querySelectorAll('#stage-clips .stage-clip-draft').forEach((draftEl) => {
+    if (draftEl.classList.contains('ok') || draftEl.classList.contains('fail') || draftEl.classList.contains('warn')) return;
+    draftEl.textContent = '';
+    const link = document.createElement('a');
+    link.href = '#';
+    link.textContent = '仍在处理，点此刷新';
+    link.addEventListener('click', (ev) => { ev.preventDefault(); loadStageClips(matchId); });
+    draftEl.appendChild(link);
+    draftEl.className = 'stage-clip-draft';
+  });
+  stopDraftPoll();
+}
+
 function refreshDraftLinks(matchId) {
   if (state.stageMatchId !== matchId) { stopDraftPoll(); return; }
-  if (state.draftPoll) {
-    state.draftPoll.polls += 1;
-    if (state.draftPoll.polls > DRAFT_POLL_MAX) {
-      document.querySelectorAll('#stage-clips .stage-clip-draft').forEach((draftEl) => {
-        if (draftEl.classList.contains('ok') || draftEl.classList.contains('fail') || draftEl.classList.contains('warn')) return;
-        draftEl.textContent = '';
-        const link = document.createElement('a');
-        link.href = '#';
-        link.textContent = '仍在处理，点此刷新';
-        link.addEventListener('click', (ev) => { ev.preventDefault(); loadStageClips(matchId); });
-        draftEl.appendChild(link);
-        draftEl.className = 'stage-clip-draft';
-      });
-      stopDraftPoll();
-      return;
-    }
-  }
+  if (state.draftPoll && state.draftPoll.inFlight) return;
+  if (state.draftPoll) state.draftPoll.inFlight = true;
   fetch(`api/monitor/publish/status?match_id=${encodeURIComponent(matchId)}`)
     .then((response) => (response.ok ? response.json() : null))
     .then((data) => {
       if (!data || !data.enabled || !data.records) return;
+      if (state.draftPoll) {
+        state.draftPoll.polls += 1;
+        if (state.draftPoll.polls > DRAFT_POLL_MAX) { giveUpDraftPoll(matchId); return; }
+      }
       const rows = document.querySelectorAll('#stage-clips .stage-clip-row[data-event-key]');
       let pending = 0;
       rows.forEach((row) => {
@@ -988,7 +1015,8 @@ function refreshDraftLinks(matchId) {
       });
       if (pending === 0) stopDraftPoll();
     })
-    .catch(() => {});
+    .catch(() => {})
+    .finally(() => { if (state.draftPoll) state.draftPoll.inFlight = false; });
 }
 
 // ---- stage range capture (operator-chosen start/end) ----

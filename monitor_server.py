@@ -979,6 +979,34 @@ def _clip_candidates(match_id: str) -> list[dict[str, Any]]:
     return options
 
 
+def _published_clip_with_match_time(
+    match_id: str, match_time: str, *, exclude_event_key: str
+) -> dict[str, Any] | None:
+    """A published/drafted manual article of this match that already carries ``match_time``."""
+    if manual_draft_queue is None:
+        return None
+    try:
+        records = manual_draft_queue.records_for_match(match_id, artifact_kind=MANUAL_ARTIFACT_KIND)
+    except Exception:  # noqa: BLE001 - the check is advisory, never block publishing on it
+        return None
+    if not isinstance(records, dict):
+        return None
+    for key, record in records.items():
+        if key == exclude_event_key or not isinstance(record, dict):
+            continue
+        if record.get("status") not in {"published", "drafted"}:
+            continue
+        final_event = record.get("final_event") if isinstance(record.get("final_event"), dict) else {}
+        sent = _join_match_time(final_event.get("minute"), final_event.get("minute_extra"))
+        if not sent:
+            diagnostics = record.get("diagnostics") if isinstance(record.get("diagnostics"), dict) else {}
+            summary = diagnostics.get("request_summary") if isinstance(diagnostics.get("request_summary"), dict) else {}
+            sent = str(summary.get("match_time") or "").strip()
+        if sent == match_time:
+            return record
+    return None
+
+
 def _list_clips(match_id: str) -> list[dict[str, Any]]:
     """Newest-first GIFs for a match, joined to their draft records when any."""
     directory = _clip_dir(match_id)
@@ -1935,6 +1963,25 @@ def monitor_clip_publish():
     if not isinstance(match_detail, dict) or not match_detail:
         match_detail = _match_detail_for(match_id)
     minute, minute_extra = _split_match_time(form["match_time"])
+    # The CMS rejects a second gif article with the same match_time (platform
+    # code=3 创建失败, seen 2026-10-22 02:08 on 54493251). Same-minute events do
+    # happen, so report the clash and let the page ask; ``force`` bypasses.
+    if form["match_time"] and not body.get("force"):
+        clash = _published_clip_with_match_time(match_id, form["match_time"], exclude_event_key=event_key)
+        if clash is not None:
+            return (
+                jsonify(
+                    {
+                        "error": f"本场 {form['match_time']}' 已有文章（id {clash.get('article_id')}），懂球帝后台通常会拒绝重复",
+                        "code": "duplicate_match_time",
+                        "match_time": form["match_time"],
+                        "article_id": clash.get("article_id"),
+                        "draft_url": clash.get("draft_url"),
+                        "event_key": clash.get("event_key"),
+                    }
+                ),
+                409,
+            )
     event = {
         "event_key": event_key,
         "code": "RC" if form["match_event"] == 4 else "G",

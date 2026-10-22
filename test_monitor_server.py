@@ -1316,6 +1316,56 @@ class ClipPublishEndpointTests(ClipEndpointAlertMatchTests):
         keys = {call.kwargs["event"]["event_key"] for call in self.queue.enqueue.call_args_list}
         self.assertEqual(len(keys), 1)
 
+    def test_publish_warns_when_match_time_already_published_unless_forced(self):
+        # 2026-10-22 02:08 on 54493251: two clips with match_time=5 eight seconds
+        # apart, the CMS rejected the second with code=3. Surface it before sending.
+        name = self._clip(10.0).get_json()["name"]
+        self.queue.records_for_match.return_value = {
+            "manual_1": {"event_key": "manual_1", "status": "published", "article_id": "6529989",
+                         "draft_url": "https://d/6529989",
+                         "final_event": {"minute": "5", "minute_extra": ""}},
+            "manual_2": {"event_key": "manual_2", "status": "failed", "article_id": None,
+                         "final_event": {"minute": "7", "minute_extra": ""}},
+        }
+        clash = self.client.post(
+            "/api/monitor/clip/publish",
+            json={"match_id": "54622319", "name": name, "match_time": "5", "match_event": 1, "title": "t"},
+        )
+        self.assertEqual(clash.status_code, 409, clash.get_json())
+        body = clash.get_json()
+        self.assertEqual(body["code"], "duplicate_match_time")
+        self.assertEqual((body["article_id"], body["match_time"], body["draft_url"]), ("6529989", "5", "https://d/6529989"))
+        self.queue.enqueue.assert_not_called()
+        # A failed record does not count; a different minute does not clash.
+        ok = self.client.post(
+            "/api/monitor/clip/publish",
+            json={"match_id": "54622319", "name": name, "match_time": "7", "match_event": 1, "title": "t"},
+        )
+        self.assertEqual(ok.status_code, 200, ok.get_json())
+        # ``force`` publishes despite the clash (same-minute events are real).
+        forced = self.client.post(
+            "/api/monitor/clip/publish",
+            json={"match_id": "54622319", "name": name, "match_time": "5", "match_event": 1, "title": "t", "force": True},
+        )
+        self.assertEqual(forced.status_code, 200, forced.get_json())
+        self.assertEqual(self.queue.enqueue.call_args.kwargs["event"]["minute"], "5")
+        # Empty match_time never clashes; a broken records call never blocks.
+        self.queue.records_for_match.side_effect = RuntimeError("db")
+        skip = self.client.post(
+            "/api/monitor/clip/publish",
+            json={"match_id": "54622319", "name": name, "match_time": "5", "match_event": 1, "title": "t"},
+        )
+        self.assertEqual(skip.status_code, 200, skip.get_json())
+
+    def test_code_3_rejection_message_explains_duplicate(self):
+        from article_draft_queue import _friendly_draft_error
+
+        text = _friendly_draft_error("platform_publish", "创建失败", platform_code=3, publishing=True)
+        self.assertIn("被平台拒绝", text)
+        self.assertIn("相同比赛时间", text)
+        other = _friendly_draft_error("platform_publish", "boom", platform_code=5, publishing=True)
+        self.assertIn("没有接受请求", other)
+
     def test_publish_rejects_missing_or_malformed_clip(self):
         missing = self.client.post(
             "/api/monitor/clip/publish",

@@ -1761,6 +1761,15 @@ class ArticleDraftQueue:
         final_event_json = json.dumps(
             event, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         )
+        _log_task_event(
+            "article_published",
+            task,
+            article_id=result.get("article_id"),
+            attempt=int(task.get("attempt_count") or 0),
+            publish_reason=publish_reason,
+            elapsed_ms=_diagnostic_value(result.get("diagnostics"), "elapsed_ms"),
+            gif_bytes=gif.get("bytes"),
+        )
         with self._connect() as connection:
             updated = connection.execute(
                 """
@@ -1818,6 +1827,13 @@ class ArticleDraftQueue:
         gif = result.get("gif") if isinstance(result.get("gif"), dict) else {}
         final_event_json = json.dumps(
             event, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        _log_task_event(
+            "article_drafted",
+            task,
+            article_id=result.get("article_id"),
+            attempt=int(task.get("attempt_count") or 0),
+            elapsed_ms=_diagnostic_value(result.get("diagnostics"), "elapsed_ms"),
         )
         with self._connect() as connection:
             updated = connection.execute(
@@ -1886,6 +1902,19 @@ class ArticleDraftQueue:
             str(exc),
             platform_code=exc.platform_code,
             publishing=str(task.get("status") or "") == "publishing",
+        )
+        _log_task_event(
+            "article_publish_failed",
+            task,
+            status=status,
+            stage=exc.stage,
+            attempt=attempts,
+            retriable=retriable,
+            next_attempt_in_seconds=None if next_attempt is None else round(next_attempt - now, 1),
+            error_code=exc.code,
+            platform_code=exc.platform_code,
+            http_status=_diagnostic_value(exc.diagnostics, "http_status"),
+            error=friendly_error,
         )
         with self._connect() as connection:
             connection.execute(
@@ -2028,6 +2057,23 @@ def _diagnostic_value(value: Any, key: str) -> Any:
     return value.get(key) if isinstance(value, dict) else None
 
 
+def _log_task_event(event: str, task: dict[str, Any], **fields: Any) -> None:
+    """One JSON line per terminal outcome so ``journalctl | grep event_key`` shows
+    the whole delivery story (the table only keeps the latest state)."""
+    record = {
+        "event": event,
+        "match_id": task.get("match_id"),
+        "event_key": task.get("event_key"),
+        "artifact_kind": task.get("artifact_kind"),
+        "delivery_mode": task.get("delivery_mode"),
+        **fields,
+    }
+    try:
+        print(json.dumps(record, ensure_ascii=False, default=str), flush=True)
+    except (OSError, ValueError):
+        pass
+
+
 def _friendly_draft_error(
     stage: str,
     detail: str,
@@ -2047,6 +2093,14 @@ def _friendly_draft_error(
             else ""
         )
         action = "正式发布" if publishing else "草稿创建"
+        # code=3 is the CMS's own publish validation. Every observed case was
+        # a second gif article with the same match_time (or title) of a match
+        # the platform already had, so say that instead of the bare "创建失败".
+        if str(platform_code) == "3":
+            return (
+                f"懂球帝{action}被平台拒绝{code_text}：{cleaned or '创建失败'}。"
+                "通常是与本场已发布的文章重复（相同比赛时间或标题），请核对后再发。"
+            )
         return (
             f"OCR GIF 已生成，但懂球帝{action}接口没有接受请求"
             f"{code_text}：{cleaned or '未说明原因'}"
