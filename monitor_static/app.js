@@ -612,6 +612,7 @@ function addStageNote(text, cls, key) {
   note.className = `stage-note ${cls || ''}`;
   if (key) note.dataset.key = key;
   note.textContent = `${text} · ${stamp}`;
+  note.title = text; // single-line rows ellipsize; hover shows the full message
   wrap.prepend(note);
   while (wrap.children.length > STAGE_NOTES_MAX) wrap.removeChild(wrap.lastChild);
 }
