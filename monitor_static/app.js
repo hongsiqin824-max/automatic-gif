@@ -997,7 +997,11 @@ function refreshDraftLinks(matchId) {
   if (state.stageMatchId !== matchId) { stopDraftPoll(); return; }
   if (state.draftPoll && state.draftPoll.inFlight) return;
   if (state.draftPoll) state.draftPoll.inFlight = true;
-  fetch(`api/monitor/publish/status?match_id=${encodeURIComponent(matchId)}`)
+  // Hard timeout: a hung request must not leave ``inFlight`` set forever and
+  // silently stop the poll.
+  const abort = new AbortController();
+  const timer = setTimeout(() => abort.abort(), 10000);
+  fetch(`api/monitor/publish/status?match_id=${encodeURIComponent(matchId)}`, {signal: abort.signal})
     .then((response) => (response.ok ? response.json() : null))
     .then((data) => {
       if (!data || !data.enabled || !data.records) return;
@@ -1016,7 +1020,7 @@ function refreshDraftLinks(matchId) {
       if (pending === 0) stopDraftPoll();
     })
     .catch(() => {})
-    .finally(() => { if (state.draftPoll) state.draftPoll.inFlight = false; });
+    .finally(() => { clearTimeout(timer); if (state.draftPoll) state.draftPoll.inFlight = false; });
 }
 
 // ---- stage range capture (operator-chosen start/end) ----
