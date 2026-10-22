@@ -566,11 +566,9 @@ async function captureClip(matchId, button, range) {
     });
     const sizeMb = (data.bytes / (1024 * 1024)).toFixed(2);
     const warn = data.anchored === false;
-    const publishNote = data.publish_error
-      ? ' · 发文失败：' + data.publish_error
-      : data.draft
-      ? ' · 已建草稿'
-      : '';
+    // Capture never publishes: the operator reviews the GIF in the stage
+    // list, fills in player/title there, and clicks 「发布」.
+    const publishNote = data.publish_enabled ? ' · 核对后在下方列表点「发布」' : ' · 仅本地保存';
     const alertNote = alertMatchNote(data.alert_match);
     const prefix = warn ? '⚠ 未锚定，画面可能不准' : '已生成 GIF';
     setTileStatus(matchId, `${prefix}（${sizeMb} MB）${publishNote}${alertNote}`, warn ? 'warn' : 'ok', true);
@@ -646,7 +644,7 @@ function applyDraftState(draftEl, status, draftUrl, error, retriable) {
   return true;
 }
 
-function renderClipRow(item) {
+function renderClipRow(item, publishEnabled) {
   const row = document.createElement('div');
   row.className = 'stage-clip-row';
   if (item.event_key) row.dataset.eventKey = item.event_key;
@@ -657,19 +655,69 @@ function renderClipRow(item) {
   link.textContent = '打开 GIF';
   const label = document.createElement('span');
   label.className = 'stage-clip-label';
-  label.textContent = `${fmtClipTime(item.created_unix)} · ${sizeMb} MB`;
-  const draftEl = document.createElement('span');
-  draftEl.className = 'stage-clip-draft';
-  if (item.event_key) {
-    applyDraftState(draftEl, item.draft_status, item.draft_url, item.draft_error, item.draft_retriable);
-  } else {
-    draftEl.textContent = '仅本地保存';
-    draftEl.className = 'stage-clip-draft warn';
+  const clock = item.alert_match && item.alert_match.match_time ? ` · ${item.alert_match.match_time}'` : '';
+  label.textContent = `${fmtClipTime(item.created_unix)} · ${sizeMb} MB${clock}`;
+  if (item.anchored === false) {
+    label.textContent += ' · ⚠未锚定';
+    label.title = '截取时没有时间戳，画面可能不准，发布前请打开核对';
   }
   row.appendChild(label);
   row.appendChild(link);
-  row.appendChild(draftEl);
+  if (!publishEnabled) {
+    const note = document.createElement('span');
+    note.className = 'stage-clip-draft warn';
+    note.textContent = '仅本地保存';
+    row.appendChild(note);
+    return row;
+  }
+  if (item.event_key) {
+    // Already sent: show the draft/article state exactly as before.
+    const draftEl = document.createElement('span');
+    draftEl.className = 'stage-clip-draft';
+    applyDraftState(draftEl, item.draft_status, item.draft_url, item.draft_error, item.draft_retriable);
+    row.appendChild(draftEl);
+    return row;
+  }
+  // Not sent yet: editable player/title (prefilled from the stage inputs at
+  // capture time) and the one button that actually publishes.
+  const person = document.createElement('input');
+  person.className = 'stage-input stage-clip-input';
+  person.type = 'text'; person.maxLength = 40;
+  person.placeholder = '球员（选填）'; person.value = item.person || '';
+  const title = document.createElement('input');
+  title.className = 'stage-input stage-clip-input stage-clip-title';
+  title.type = 'text'; title.maxLength = 100;
+  title.placeholder = '标题（留空自动生成）'; title.value = item.title || '';
+  const publish = document.createElement('button');
+  publish.className = 'button primary stage-clip-publish';
+  publish.type = 'button';
+  publish.textContent = '发布';
+  publish.addEventListener('click', () => publishClip(item.name, person.value, title.value, publish, row));
+  row.appendChild(person);
+  row.appendChild(title);
+  row.appendChild(publish);
   return row;
+}
+
+async function publishClip(name, person, title, button, row) {
+  const matchId = state.stageMatchId;
+  if (!matchId) return;
+  button.disabled = true;
+  button.textContent = '发布中…';
+  row.querySelectorAll('input').forEach((el) => { el.disabled = true; });
+  try {
+    const data = await requestJson('api/monitor/clip/publish', {
+      method: 'POST',
+      body: JSON.stringify({match_id: matchId, name, person: person.trim(), title: title.trim()}),
+    });
+    addStageNote(data.delivery_mode === 'publish' ? '已提交发布' : '已提交建草稿', 'ok');
+    if (state.stageMatchId === matchId) loadStageClips(matchId);
+  } catch (error) {
+    addStageNote('发布失败：' + error.message, 'fail');
+    button.disabled = false;
+    button.textContent = '发布';
+    row.querySelectorAll('input').forEach((el) => { el.disabled = false; });
+  }
 }
 
 async function loadStageClips(matchId) {
@@ -684,6 +732,13 @@ async function loadStageClips(matchId) {
   }
   if (state.stageMatchId !== matchId) return;
   const clips = Array.isArray(data.clips) ? data.clips : [];
+  // The list is rebuilt after every capture; keep whatever the operator was
+  // typing into an unpublished row's inputs.
+  const typed = new Map();
+  list.querySelectorAll('.stage-clip-row[data-name]').forEach((row) => {
+    const inputs = row.querySelectorAll('input');
+    if (inputs.length === 2) typed.set(row.dataset.name, [inputs[0].value, inputs[1].value]);
+  });
   list.innerHTML = '';
   if (!clips.length) {
     const empty = document.createElement('div');
@@ -691,7 +746,14 @@ async function loadStageClips(matchId) {
     empty.textContent = '本场还没有截取过 GIF';
     list.appendChild(empty);
   } else {
-    clips.forEach((item) => list.appendChild(renderClipRow(item)));
+    clips.forEach((item) => {
+      const row = renderClipRow(item, !!data.publish_enabled);
+      row.dataset.name = item.name;
+      const kept = typed.get(item.name);
+      const inputs = row.querySelectorAll('input');
+      if (kept && inputs.length === 2) { inputs[0].value = kept[0]; inputs[1].value = kept[1]; }
+      list.appendChild(row);
+    });
   }
   setTileClipCount(matchId, clips.length);
   const pending = clips.some((c) => c.event_key && !(

@@ -76,12 +76,12 @@
       <div id="stage-video-host" class="stage-video-host"></div>
       <div class="stage-range">
         <button id="stage-range-start" class="button secondary" type="button" title="把当前画面设为 GIF 起点">开始</button>
-        <button id="stage-range-end" class="button primary" type="button" disabled title="把当前画面设为终点并立即截取">结束</button>
+        <button id="stage-range-end" class="button primary" type="button" disabled title="把当前画面设为终点并生成 GIF（不发布，发布在下方列表）">结束</button>
       </div>
       <div class="stage-fields">
         <input id="stage-seconds" class="stage-input stage-seconds" type="number" min="1" max="120" step="1" placeholder="截取秒数（默认 10）">
-        <input id="stage-person" class="stage-input" type="text" maxlength="40" placeholder="进球球员（选填，填了标题更准）">
-        <input id="stage-title-input" class="stage-input" type="text" maxlength="100" placeholder="自定义标题（选填，留空自动生成）">
+        <input id="stage-person" class="stage-input" type="text" maxlength="40" placeholder="进球球员（选填，发布前还可在列表里改）">
+        <input id="stage-title-input" class="stage-input" type="text" maxlength="100" placeholder="自定义标题（选填，发布前还可在列表里改）">
       </div>
       <div id="stage-status" class="stage-status muted"></div>
       <div id="stage-notes" class="stage-notes"></div>

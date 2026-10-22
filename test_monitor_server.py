@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import json
 import shutil
 import signal
 import subprocess
@@ -1054,12 +1055,23 @@ class ClipEndpointAlertMatchTests(unittest.TestCase):
             json={"match_id": "54622319", "anchor_epoch_ms": round((self.base + anchor_offset) * 1000), "before_seconds": 5},
         )
 
+    def _clip_and_publish(self, anchor_offset: float, **extra):
+        """Capture, then publish: the queue is only reached by the second call."""
+        response = self._clip(anchor_offset)
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.queue.enqueue.assert_not_called()
+        name = response.get_json()["name"]
+        published = self.client.post(
+            "/api/monitor/clip/publish", json={"match_id": "54622319", "name": name, **extra}
+        )
+        self.assertEqual(published.status_code, 200, published.get_json())
+        return response
+
     def test_matched_alert_fills_minute_score_and_leaves_match_event_manual(self):
         with mock.patch.object(monitor_server.time, "time", return_value=self.base - 60.0):
             self.store.add({"match_id": "54622319", "event_type": "goal", "team": "B",
                             "score": "1-1", "minute": "2H 68", "dedup_key": "g1"})
-        response = self._clip(10.0)
-        self.assertEqual(response.status_code, 200, response.get_json())
+        response = self._clip_and_publish(10.0)
         data = response.get_json()
         self.assertEqual(data["alert_match"]["mode"], "alert")
         self.assertEqual(data["alert_match"]["match_time"], "68")
@@ -1082,7 +1094,7 @@ class ClipEndpointAlertMatchTests(unittest.TestCase):
         with mock.patch.object(monitor_server.time, "time", return_value=self.base - 60.0):
             self.store.add({"match_id": "54622319", "event_type": "goal", "team": "?",
                             "score": "1-1", "minute": "2H 68", "dedup_key": "g?"})
-        self._clip(10.0)
+        self._clip_and_publish(10.0)
         event = self.queue.enqueue.call_args.kwargs["event"]
         self.assertEqual(event["team"], "")
 
@@ -1090,13 +1102,13 @@ class ClipEndpointAlertMatchTests(unittest.TestCase):
         with mock.patch.object(monitor_server.time, "time", return_value=self.base - 60.0):
             self.store.add({"match_id": "54622319", "event_type": "goal", "team": "A",
                             "score": "2-1", "minute": "1H 45+3", "dedup_key": "g2"})
-        data = self._clip(10.0).get_json()
+        data = self._clip_and_publish(10.0).get_json()
         self.assertEqual(data["alert_match"]["match_time"], "45+3")
         event = self.queue.enqueue.call_args.kwargs["event"]
         self.assertEqual((event["minute"], event["minute_extra"]), ("45", "3"))
 
     def test_no_alert_falls_back_to_catalog_clock(self):
-        data = self._clip(10.0).get_json()
+        data = self._clip_and_publish(10.0).get_json()
         self.assertEqual(data["alert_match"]["mode"], "catalog")
         self.assertEqual(data["alert_match"]["match_time"], "70")
         self.assertEqual(data["alert_match"]["score"], "1-1")
@@ -1129,6 +1141,89 @@ class ClipEndpointAlertMatchTests(unittest.TestCase):
             delivery_mode="draft",
         )
         self.assertEqual(auto["match_event"], 1)
+
+
+class ClipPublishEndpointTests(ClipEndpointAlertMatchTests):
+    """Capture and publish are two steps; ``/api/monitor/clip/publish`` is the only path to the queue."""
+
+    def test_capture_writes_sidecar_and_does_not_enqueue(self):
+        data = self._clip(10.0).get_json()
+        self.queue.enqueue.assert_not_called()
+        self.assertNotIn("draft", data)
+        self.assertTrue(data["event_key"].startswith("manual_"))
+        meta = json.loads((self.dir / "clips" / data["name"]).with_suffix(".json").read_text(encoding="utf-8"))
+        self.assertEqual(meta["event_key"], data["event_key"])
+        self.assertEqual(meta["alert_match"]["mode"], "catalog")
+        self.assertEqual(meta["match_detail"]["team_A_name"], "甲")
+
+    def test_publish_uses_row_inputs_over_capture_inputs(self):
+        # Player/title typed at capture are only defaults; the row wins.
+        response = self.client.post(
+            "/api/monitor/clip",
+            json={"match_id": "54622319", "anchor_epoch_ms": round((self.base + 10.0) * 1000),
+                  "before_seconds": 5, "person": "旧名", "title": "旧标题"},
+        )
+        name = response.get_json()["name"]
+        self.queue.records_by_source_name.return_value = {}
+        body = self.client.get("/api/monitor/clips?match_id=54622319").get_json()
+        row = next(c for c in body["clips"] if c["name"] == name)
+        self.assertEqual((row["person"], row["title"]), ("旧名", "旧标题"))
+        self.assertIsNone(row["event_key"])
+        published = self.client.post(
+            "/api/monitor/clip/publish",
+            json={"match_id": "54622319", "name": name, "person": "新名", "title": ""},
+        )
+        self.assertEqual(published.status_code, 200, published.get_json())
+        event = self.queue.enqueue.call_args.kwargs["event"]
+        self.assertEqual((event["person"], event["title_override"]), ("新名", ""))
+        self.assertEqual(self.queue.enqueue.call_args.kwargs["source_path"], self.dir / "clips" / name)
+        # The sidecar now reflects what was sent.
+        meta = json.loads((self.dir / "clips" / name).with_suffix(".json").read_text(encoding="utf-8"))
+        self.assertEqual((meta["person"], meta["title"]), ("新名", ""))
+
+    def test_publish_twice_reuses_the_same_event_key(self):
+        name = self._clip(10.0).get_json()["name"]
+        for _ in range(2):
+            self.client.post("/api/monitor/clip/publish", json={"match_id": "54622319", "name": name})
+        keys = {call.kwargs["event"]["event_key"] for call in self.queue.enqueue.call_args_list}
+        self.assertEqual(len(keys), 1)
+
+    def test_publish_rejects_missing_or_malformed_clip(self):
+        missing = self.client.post(
+            "/api/monitor/clip/publish",
+            json={"match_id": "54622319", "name": "clip_20260101-000000_abcdef.gif"},
+        )
+        self.assertEqual(missing.status_code, 404)
+        self.assertEqual(missing.get_json()["code"], "clip_missing")
+        bad = self.client.post("/api/monitor/clip/publish", json={"match_id": "54622319", "name": "../x.gif"})
+        self.assertEqual(bad.status_code, 400)
+        self.queue.enqueue.assert_not_called()
+
+    def test_publish_without_queue_is_409(self):
+        name = self._clip(10.0).get_json()["name"]
+        with mock.patch.object(monitor_server, "manual_draft_queue", None):
+            response = self.client.post("/api/monitor/clip/publish", json={"match_id": "54622319", "name": name})
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.get_json()["code"], "publish_disabled")
+
+    def test_publish_surfaces_queue_error(self):
+        name = self._clip(10.0).get_json()["name"]
+        self.queue.enqueue.side_effect = RuntimeError("DB locked")
+        response = self.client.post("/api/monitor/clip/publish", json={"match_id": "54622319", "name": name})
+        self.assertEqual(response.status_code, 500)
+        self.assertIn("DB locked", response.get_json()["error"])
+
+    def test_publish_pre_sidecar_clip_falls_back_to_mtime(self):
+        clips = self.dir / "clips"
+        clips.mkdir(parents=True, exist_ok=True)
+        legacy = clips / "clip_20260101-000000_abcdef.gif"
+        legacy.write_bytes(b"GIF")
+        os.utime(legacy, (self.base + 10.0, self.base + 10.0))
+        response = self.client.post("/api/monitor/clip/publish", json={"match_id": "54622319", "name": legacy.name})
+        self.assertEqual(response.status_code, 200, response.get_json())
+        event = self.queue.enqueue.call_args.kwargs["event"]
+        self.assertEqual(event["event_key"], f"manual_{int(self.base + 10.0)}")
+        self.assertEqual(event["alert_match_mode"], "catalog")
 
 
 class SigtermShutdownTests(unittest.TestCase):

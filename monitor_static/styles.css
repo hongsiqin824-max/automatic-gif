@@ -95,6 +95,9 @@ body{
 .stage-clip-draft.fail{color:var(--red,#ff6b6b)}
 .stage-clip-draft.warn{color:var(--muted)}
 .stage-clip-draft a{color:var(--cyan);text-decoration:none;font-weight:600}
+.stage-clip-input{flex:1 1 90px;min-width:70px;padding:5px 8px;font-size:12px;border-radius:6px}
+.stage-clip-title{flex:2 1 140px}
+.stage-clip-publish{padding:5px 12px;font-size:12px}
 
 /* ---- Real-time goal/red-card alerts: collapsible launcher + panel + toasts ---- */
 .alert-launcher{position:fixed;right:18px;bottom:18px;z-index:55;display:inline-flex;align-items:center;gap:8px;padding:10px 15px;border:1px solid var(--line);border-radius:22px;background:rgba(17,27,40,.94);color:var(--text);font:600 13px inherit;cursor:pointer;box-shadow:var(--shadow)}

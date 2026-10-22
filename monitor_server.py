@@ -792,6 +792,59 @@ def _clip_dir(match_id: str) -> Path:
 CLIP_LIST_LIMIT = positive_env_int("GIF_MONITOR_CLIP_LIST_LIMIT", 50)
 
 
+# ---- clip sidecar metadata ----
+#
+# Capture and publish are two separate operator actions. The GIF alone cannot
+# carry what the publish step needs (the alert the clip was matched to, the
+# anchor time that forms the event key, the player/title typed at capture), so
+# ``/api/monitor/clip`` writes it to ``<clip>.json`` beside the GIF and
+# ``/api/monitor/clip/publish`` reads it back. A missing sidecar (clips from
+# before this change) degrades to a catalog-clock match on the file mtime.
+
+_CLIP_NAME_RE = re.compile(r"clip_\d{8}-\d{6}_[0-9a-f]{6}\.gif")
+
+
+def _clip_meta_path(gif_path: Path) -> Path:
+    return gif_path.with_suffix(".json")
+
+
+def _write_clip_meta(gif_path: Path, meta: dict[str, Any]) -> None:
+    try:
+        _clip_meta_path(gif_path).write_text(
+            json.dumps(meta, ensure_ascii=False, sort_keys=True), encoding="utf-8"
+        )
+    except OSError as exc:
+        print(
+            json.dumps(
+                {"event": "clip_meta_write_error", "clip": gif_path.name, "error": str(exc)},
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+
+
+def _read_clip_meta(gif_path: Path) -> dict[str, Any]:
+    try:
+        loaded = json.loads(_clip_meta_path(gif_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def _alert_match_public(alert_match: dict[str, Any]) -> dict[str, Any]:
+    """The subset of a clip→alert match that the browser displays."""
+    minute = alert_match.get("minute")
+    extra = alert_match.get("minute_extra")
+    return {
+        "mode": alert_match.get("mode"),
+        "candidates": alert_match.get("candidates"),
+        "ambiguous": alert_match.get("ambiguous"),
+        "weak": alert_match.get("weak"),
+        "match_time": f"{minute}+{extra}" if minute and extra not in ("", "0", None) else minute,
+        "score": alert_match.get("score"),
+    }
+
+
 def _list_clips(match_id: str) -> list[dict[str, Any]]:
     """Newest-first GIFs for a match, joined to their draft records when any."""
     directory = _clip_dir(match_id)
@@ -809,12 +862,17 @@ def _list_clips(match_id: str) -> list[dict[str, Any]]:
     for gif in gifs:
         stat = stats[gif]
         record = drafts.get(gif.name)
+        meta = _read_clip_meta(gif)
         items.append(
             {
                 "name": gif.name,
                 "clip_url": f"clips/{match_id}/{gif.name}",
                 "bytes": stat.st_size,
                 "created_unix": stat.st_mtime,
+                "person": str(meta.get("person") or ""),
+                "title": str(meta.get("title") or ""),
+                "anchored": meta.get("anchored"),
+                "alert_match": meta.get("alert_match_public"),
                 "event_key": record.get("event_key") if record else None,
                 "draft_status": record.get("status") if record else None,
                 "draft_url": record.get("draft_url") if record else None,
@@ -1662,77 +1720,135 @@ def monitor_clip():
         ),
         flush=True,
     )
-    draft: dict[str, Any] | None = None
-    publish_error: str | None = None
-    if manual_draft_queue is not None:
-        event_key = f"manual_{int(anchor_epoch if anchor_epoch is not None else time.time())}"
-        event = {
+    # Capture only. Publishing is a separate operator action
+    # (``/api/monitor/clip/publish``) taken after they have seen the GIF and
+    # filled in the player/title, so persist everything that step needs.
+    event_key = f"manual_{int(anchor_epoch if anchor_epoch is not None else time.time())}"
+    _write_clip_meta(
+        output_path,
+        {
             "event_key": event_key,
-            # ``code`` only drives the generated title's wording; the CMS
-            # ``match_event`` is left for the operator (see manual_match_event).
-            "code": alert_match["code"] or "G",
-            "manual_match_event": True,
+            "anchored": anchored,
+            "anchor_epoch_ms": None if anchor_epoch is None else round(anchor_epoch * 1000),
+            "start_epoch_ms": None if start_epoch is None else round(start_epoch * 1000),
+            "before_seconds": before_seconds,
             "person": person,
-            "title_override": title,
-            "team": alert_match["team"],
-            "minute": alert_match["minute"],
-            "minute_extra": alert_match["minute_extra"],
-            "score": alert_match["score"],
-            "alert_match_mode": alert_match["mode"],
-        }
-        try:
-            task = manual_draft_queue.enqueue(
-                match_id=match_id,
-                event=event,
-                match_detail=_match_detail_for(match_id),
-                source_path=output_path,
-                artifact_kind=MANUAL_ARTIFACT_KIND,
-                delivery_mode=DRAFT_DELIVERY_MODE,
-                artifact_result=None,
-            )
-            draft = {"event_key": event_key, "status": task.get("status")}
-        except Exception as exc:  # noqa: BLE001 - GIF is already saved locally
-            publish_error = str(exc)
-        print(
-            json.dumps(
-                {
-                    "event": "manual_draft_enqueue",
-                    "match_id": match_id,
-                    "event_key": event_key,
-                    "person": bool(person),
-                    "title_override": bool(title),
-                    "delivery_mode": _manual_delivery_mode(),
-                    "status": (draft or {}).get("status"),
-                    "error": publish_error,
-                },
-                ensure_ascii=False,
-            ),
-            flush=True,
-        )
+            "title": title,
+            "alert_match": alert_match,
+            "alert_match_public": _alert_match_public(alert_match),
+            "match_detail": _match_detail_for(match_id),
+        },
+    )
     return jsonify(
         {
             "ok": True,
             "match_id": match_id,
+            "name": output_path.name,
             "before_seconds": before_seconds,
             "anchored": anchored,
             "clip_url": f"clips/{match_id}/{output_path.name}",
             "bytes": output_path.stat().st_size,
             "publish_enabled": manual_draft_queue is not None,
             "delivery_mode": _manual_delivery_mode(),
-            "draft": draft,
-            "publish_error": publish_error,
-            "alert_match": {
-                "mode": alert_match["mode"],
-                "candidates": alert_match["candidates"],
-                "ambiguous": alert_match["ambiguous"],
-                "weak": alert_match["weak"],
-                "match_time": (
-                    f"{alert_match['minute']}+{alert_match['minute_extra']}"
-                    if alert_match["minute"] and alert_match["minute_extra"] not in ("", "0")
-                    else alert_match["minute"]
-                ),
-                "score": alert_match["score"],
+            "event_key": event_key,
+            "alert_match": _alert_match_public(alert_match),
+        }
+    )
+
+
+@app.post("/api/monitor/clip/publish")
+def monitor_clip_publish():
+    """Send an already-captured GIF to the CMS (draft or publish per .env).
+
+    Idempotent per clip: the event key is fixed at capture time, and the draft
+    queue returns the existing task for a repeated key, so a double click or a
+    retry after a network blip never creates a second article.
+    """
+    body = request.get_json(silent=True) or {}
+    try:
+        match_id = validate_match_id(str(body.get("match_id") or ""))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    name = str(body.get("name") or "").strip()
+    if not _CLIP_NAME_RE.fullmatch(name):
+        return jsonify({"error": "无效的 GIF 文件名"}), 400
+    gif_path = _clip_dir(match_id) / name
+    if not gif_path.is_file():
+        return jsonify({"error": "GIF 不存在或已被清理", "code": "clip_missing"}), 404
+    if manual_draft_queue is None:
+        return jsonify({"error": "发文未启用（GIF 仅本地保存）", "code": "publish_disabled"}), 409
+    meta = _read_clip_meta(gif_path)
+    person = str(body.get("person") if body.get("person") is not None else meta.get("person") or "").strip()[:40]
+    title = str(body.get("title") if body.get("title") is not None else meta.get("title") or "").strip()[:100]
+    alert_match = meta.get("alert_match")
+    if not isinstance(alert_match, dict):
+        # Pre-sidecar clip: best effort from the file's own timestamp.
+        alert_match = _match_clip_alert(match_id, gif_path.stat().st_mtime)
+    event_key = str(meta.get("event_key") or f"manual_{int(gif_path.stat().st_mtime)}")
+    match_detail = meta.get("match_detail")
+    if not isinstance(match_detail, dict) or not match_detail:
+        match_detail = _match_detail_for(match_id)
+    event = {
+        "event_key": event_key,
+        # ``code`` only drives the generated title's wording; the CMS
+        # ``match_event`` is left for the operator (see manual_match_event).
+        "code": alert_match.get("code") or "G",
+        "manual_match_event": True,
+        "person": person,
+        "title_override": title,
+        "team": alert_match.get("team") or "",
+        "minute": alert_match.get("minute") or "",
+        "minute_extra": alert_match.get("minute_extra") or "",
+        "score": alert_match.get("score") or "",
+        "alert_match_mode": alert_match.get("mode"),
+    }
+    status: str | None = None
+    publish_error: str | None = None
+    try:
+        task = manual_draft_queue.enqueue(
+            match_id=match_id,
+            event=event,
+            match_detail=match_detail,
+            source_path=gif_path,
+            artifact_kind=MANUAL_ARTIFACT_KIND,
+            delivery_mode=DRAFT_DELIVERY_MODE,
+            artifact_result=None,
+        )
+        status = task.get("status")
+    except Exception as exc:  # noqa: BLE001 - GIF stays on disk, operator can retry
+        publish_error = str(exc)
+    # Remember what was actually sent so the list row shows it after reload.
+    if meta:
+        meta["person"] = person
+        meta["title"] = title
+        _write_clip_meta(gif_path, meta)
+    print(
+        json.dumps(
+            {
+                "event": "manual_draft_enqueue",
+                "match_id": match_id,
+                "clip": name,
+                "event_key": event_key,
+                "person": bool(person),
+                "title_override": bool(title),
+                "delivery_mode": _manual_delivery_mode(),
+                "status": status,
+                "error": publish_error,
             },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
+    if publish_error:
+        return jsonify({"error": publish_error, "event_key": event_key}), 500
+    return jsonify(
+        {
+            "ok": True,
+            "match_id": match_id,
+            "name": name,
+            "event_key": event_key,
+            "status": status,
+            "delivery_mode": _manual_delivery_mode(),
         }
     )
 
