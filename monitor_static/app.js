@@ -550,13 +550,9 @@ async function captureClip(matchId, button, range) {
       const anchorMs = frameAnchorMs(videoForMatch(matchId));
       if (anchorMs != null) payload.anchor_epoch_ms = Math.round(anchorMs);
     }
-    if (state.stageMatchId === matchId) {
-      const personEl = $('stage-person');
-      const titleEl = $('stage-title-input');
+    if (state.stageMatchId === matchId && !range) {
       const secondsEl = $('stage-seconds');
-      if (personEl && personEl.value.trim()) payload.person = personEl.value.trim();
-      if (titleEl && titleEl.value.trim()) payload.title = titleEl.value.trim();
-      if (!range && secondsEl && secondsEl.value.trim()) {
+      if (secondsEl && secondsEl.value.trim()) {
         const secs = Number(secondsEl.value);
         if (Number.isFinite(secs) && secs > 0 && secs <= 120) payload.before_seconds = secs;
       }
@@ -567,7 +563,7 @@ async function captureClip(matchId, button, range) {
     const sizeMb = (data.bytes / (1024 * 1024)).toFixed(2);
     const warn = data.anchored === false;
     // Capture never publishes: the operator reviews the GIF in the stage
-    // list, fills in player/title there, and clicks 「发布」.
+    // list, checks the pre-filled CMS fields there, and clicks 「发布」.
     const publishNote = data.publish_enabled ? ' · 核对后在下方列表点「发布」' : ' · 仅本地保存';
     const alertNote = alertMatchNote(data.alert_match);
     const prefix = warn ? '⚠ 未锚定，画面可能不准' : '已生成 GIF';
@@ -644,10 +640,170 @@ function applyDraftState(draftEl, status, draftUrl, error, retriable) {
   return true;
 }
 
+// ---- publish form (mirrors the CMS gif-article fields) ----
+//
+// An unpublished row is a small form: the push the clip belongs to (radio,
+// server pre-selects the most likely one), then 事件类型 / 比赛时间 / 比分 /
+// 标题. Picking a push re-fills type/time/score; 跳过 clears them. A field the
+// operator has typed into is never overwritten by the radio again. Title is
+// never pre-filled (it is always rewritten by hand) and gates the button.
+
+const MATCH_EVENT_OPTIONS = [
+  [0, '无'], [1, '进球'], [2, '点球'], [3, '点球不进'], [4, '红牌'], [5, '乌龙球'], [6, '进球无效'],
+];
+
+function candidateLabel(c) {
+  const clock = c.match_time ? `${c.match_time}'` : '?';
+  const team = c.team_name || (c.team === 'A' ? '主队' : c.team === 'B' ? '客队' : '');
+  return [clock, c.event_cn || c.event_type, team, c.score].filter(Boolean).join(' ');
+}
+
+function buildClipForm(item, row) {
+  const form = document.createElement('div');
+  form.className = 'stage-clip-form';
+  const initial = item.form || {};
+  const am = item.alert_match || {};
+  const candidates = Array.isArray(item.candidates) ? item.candidates : [];
+  const radioName = `clip-src-${item.name.replace(/\W/g, '')}`;
+  const dirty = new Set();
+
+  const sources = document.createElement('div');
+  sources.className = 'stage-clip-sources';
+  const addOption = (c, flagText, isNew) => {
+    const label = document.createElement('label');
+    label.className = 'stage-clip-source';
+    const radio = document.createElement('input');
+    radio.type = 'radio'; radio.name = radioName;
+    radio.value = c ? String(c.seq) : '';
+    radio.dataset.matchEvent = c ? String(c.match_event) : '0';
+    radio.dataset.matchTime = c ? (c.match_time || '') : '';
+    radio.dataset.score = c ? (c.score || '') : '';
+    radio.addEventListener('change', () => applySource(radio));
+    label.appendChild(radio);
+    label.appendChild(document.createTextNode(' ' + (c ? candidateLabel(c) : '跳过（没有对应推送）')));
+    if (flagText) {
+      const flag = document.createElement('span');
+      flag.className = 'stage-clip-flag';
+      flag.textContent = ' ' + flagText;
+      flag.title = flagText.startsWith('⚠') ? '程序自动关联的，可信度不高，请核对' : '截取后新到的推送';
+      label.appendChild(flag);
+    }
+    if (isNew) label.classList.add('new');
+    return label;
+  };
+  candidates.forEach((c) => {
+    const picked = initial.alert_seq != null && c.seq === initial.alert_seq;
+    const flag = picked && (am.weak || am.ambiguous) ? '⚠ 请核对' : '';
+    sources.appendChild(addOption(c, flag, false));
+  });
+  const skip = addOption(null, '', false);
+  sources.appendChild(skip);
+  form.appendChild(sources);
+
+  const fields = document.createElement('div');
+  fields.className = 'stage-clip-fields';
+  const mk = (container, key, el, labelText) => {
+    const wrap = document.createElement('label');
+    wrap.className = 'stage-clip-field';
+    wrap.appendChild(document.createTextNode(labelText));
+    el.addEventListener('input', () => { dirty.add(key); syncPublishButton(); });
+    el.addEventListener('change', () => { dirty.add(key); syncPublishButton(); });
+    wrap.appendChild(el);
+    container.appendChild(wrap);
+  };
+  const typeSel = document.createElement('select');
+  typeSel.className = 'stage-input stage-clip-select';
+  MATCH_EVENT_OPTIONS.forEach(([value, text]) => {
+    const opt = document.createElement('option');
+    opt.value = String(value); opt.textContent = text;
+    typeSel.appendChild(opt);
+  });
+  mk(fields, 'match_event', typeSel, '类型');
+  const timeEl = document.createElement('input');
+  timeEl.className = 'stage-input stage-clip-input stage-clip-time';
+  timeEl.type = 'text'; timeEl.placeholder = '19 / 90+3'; timeEl.maxLength = 7;
+  mk(fields, 'match_time', timeEl, '时间');
+  const scoreEl = document.createElement('input');
+  scoreEl.className = 'stage-input stage-clip-input stage-clip-score';
+  scoreEl.type = 'text'; scoreEl.placeholder = '3-1 主队在前'; scoreEl.maxLength = 7;
+  mk(fields, 'match_score', scoreEl, '比分');
+  form.appendChild(fields);
+
+  const titleRow = document.createElement('div');
+  titleRow.className = 'stage-clip-fields';
+  const titleEl = document.createElement('input');
+  titleEl.className = 'stage-input stage-clip-input stage-clip-title';
+  titleEl.type = 'text'; titleEl.maxLength = 100; titleEl.placeholder = '标题（必填）';
+  mk(titleRow, 'title', titleEl, '标题');
+  const publish = document.createElement('button');
+  publish.className = 'button primary stage-clip-publish';
+  publish.type = 'button';
+  publish.textContent = '发布';
+  publish.addEventListener('click', () => publishClip(item.name, readForm(), publish, row));
+  titleRow.appendChild(publish);
+  form.appendChild(titleRow);
+
+  function applySource(radio) {
+    // Re-fill only the fields the operator has not touched.
+    if (!dirty.has('match_event')) typeSel.value = radio.dataset.matchEvent;
+    if (!dirty.has('match_time')) timeEl.value = radio.dataset.matchTime;
+    if (!dirty.has('match_score')) scoreEl.value = radio.dataset.score;
+    syncPublishButton();
+  }
+  function syncPublishButton() {
+    const ok = titleEl.value.trim().length > 0;
+    publish.disabled = !ok;
+    publish.title = ok ? '' : '请填写标题后再发布';
+  }
+  function readForm() {
+    const checked = form.querySelector(`input[name="${radioName}"]:checked`);
+    return {
+      alert_seq: checked && checked.value ? Number(checked.value) : null,
+      match_event: Number(typeSel.value),
+      match_time: timeEl.value.trim(),
+      match_score: scoreEl.value.trim(),
+      title: titleEl.value.trim(),
+    };
+  }
+  function writeForm(values) {
+    const seq = values.alert_seq;
+    const radio = seq == null
+      ? skip.querySelector('input')
+      : form.querySelector(`input[name="${radioName}"][value="${seq}"]`);
+    (radio || skip.querySelector('input')).checked = true;
+    typeSel.value = String(values.match_event ?? 0);
+    timeEl.value = values.match_time || '';
+    scoreEl.value = values.match_score || '';
+    titleEl.value = values.title || '';
+    syncPublishButton();
+  }
+  // Append a push that arrived after capture; selection and fields untouched.
+  function addCandidate(c) {
+    if (form.querySelector(`input[name="${radioName}"][value="${c.seq}"]`)) return;
+    sources.insertBefore(addOption(c, '新', true), sources.firstChild);
+  }
+  writeForm(initial);
+  form._clip = {readForm, writeForm, addCandidate, dirty};
+  return form;
+}
+
+function buildPublishedSummary(item) {
+  const f = item.form || {};
+  const type = (MATCH_EVENT_OPTIONS.find(([v]) => v === Number(f.match_event)) || [0, '无'])[1];
+  const parts = [type, f.match_time ? `${f.match_time}'` : '', f.match_score || '', f.title || ''].filter(Boolean);
+  const el = document.createElement('span');
+  el.className = 'stage-clip-summary';
+  el.textContent = parts.join(' · ');
+  el.title = '已发布内容（只读）';
+  return el;
+}
+
 function renderClipRow(item, publishEnabled) {
   const row = document.createElement('div');
   row.className = 'stage-clip-row';
   if (item.event_key) row.dataset.eventKey = item.event_key;
+  const head = document.createElement('div');
+  head.className = 'stage-clip-head';
   const sizeMb = (item.bytes / (1024 * 1024)).toFixed(2);
   const link = document.createElement('a');
   link.className = 'stage-clip-open';
@@ -655,60 +811,46 @@ function renderClipRow(item, publishEnabled) {
   link.textContent = '打开 GIF';
   const label = document.createElement('span');
   label.className = 'stage-clip-label';
-  const clock = item.alert_match && item.alert_match.match_time ? ` · ${item.alert_match.match_time}'` : '';
-  label.textContent = `${fmtClipTime(item.created_unix)} · ${sizeMb} MB${clock}`;
+  label.textContent = `${fmtClipTime(item.created_unix)} · ${sizeMb} MB`;
   if (item.anchored === false) {
     label.textContent += ' · ⚠未锚定';
     label.title = '截取时没有时间戳，画面可能不准，发布前请打开核对';
   }
-  row.appendChild(label);
-  row.appendChild(link);
+  head.appendChild(label);
+  head.appendChild(link);
+  row.appendChild(head);
   if (!publishEnabled) {
     const note = document.createElement('span');
     note.className = 'stage-clip-draft warn';
     note.textContent = '仅本地保存';
-    row.appendChild(note);
+    head.appendChild(note);
     return row;
   }
   if (item.event_key) {
-    // Already sent: show the draft/article state exactly as before.
+    // Already sent: what went out (read-only) plus the draft/article link.
+    head.appendChild(buildPublishedSummary(item));
     const draftEl = document.createElement('span');
     draftEl.className = 'stage-clip-draft';
     applyDraftState(draftEl, item.draft_status, item.draft_url, item.draft_error, item.draft_retriable);
-    row.appendChild(draftEl);
+    head.appendChild(draftEl);
     return row;
   }
-  // Not sent yet: editable player/title (prefilled from the stage inputs at
-  // capture time) and the one button that actually publishes.
-  const person = document.createElement('input');
-  person.className = 'stage-input stage-clip-input';
-  person.type = 'text'; person.maxLength = 40;
-  person.placeholder = '球员（选填）'; person.value = item.person || '';
-  const title = document.createElement('input');
-  title.className = 'stage-input stage-clip-input stage-clip-title';
-  title.type = 'text'; title.maxLength = 100;
-  title.placeholder = '标题（留空自动生成）'; title.value = item.title || '';
-  const publish = document.createElement('button');
-  publish.className = 'button primary stage-clip-publish';
-  publish.type = 'button';
-  publish.textContent = '发布';
-  publish.addEventListener('click', () => publishClip(item.name, person.value, title.value, publish, row));
-  row.appendChild(person);
-  row.appendChild(title);
-  row.appendChild(publish);
+  row.classList.add('editing');
+  row.appendChild(buildClipForm(item, row));
   return row;
 }
 
-async function publishClip(name, person, title, button, row) {
+async function publishClip(name, formValues, button, row) {
   const matchId = state.stageMatchId;
   if (!matchId) return;
+  if (!formValues.title) { addStageNote('请填写标题后再发布', 'warn'); return; }
   button.disabled = true;
   button.textContent = '发布中…';
-  row.querySelectorAll('input').forEach((el) => { el.disabled = true; });
+  row.querySelectorAll('input,select').forEach((el) => { el.disabled = true; });
   try {
     const data = await requestJson('api/monitor/clip/publish', {
       method: 'POST',
-      body: JSON.stringify({match_id: matchId, name, person: person.trim(), title: title.trim()}),
+      body: JSON.stringify({match_id: matchId, name, ...formValues}),
     });
     addStageNote(data.delivery_mode === 'publish' ? '已提交发布' : '已提交建草稿', 'ok');
     if (state.stageMatchId === matchId) loadStageClips(matchId);
@@ -716,7 +858,7 @@ async function publishClip(name, person, title, button, row) {
     addStageNote('发布失败：' + error.message, 'fail');
     button.disabled = false;
     button.textContent = '发布';
-    row.querySelectorAll('input').forEach((el) => { el.disabled = false; });
+    row.querySelectorAll('input,select').forEach((el) => { el.disabled = false; });
   }
 }
 
@@ -732,12 +874,12 @@ async function loadStageClips(matchId) {
   }
   if (state.stageMatchId !== matchId) return;
   const clips = Array.isArray(data.clips) ? data.clips : [];
-  // The list is rebuilt after every capture; keep whatever the operator was
-  // typing into an unpublished row's inputs.
+  // The list is rebuilt after every capture; keep whatever the operator had
+  // already changed in an unpublished row's form.
   const typed = new Map();
-  list.querySelectorAll('.stage-clip-row[data-name]').forEach((row) => {
-    const inputs = row.querySelectorAll('input');
-    if (inputs.length === 2) typed.set(row.dataset.name, [inputs[0].value, inputs[1].value]);
+  list.querySelectorAll('.stage-clip-row[data-name] .stage-clip-form').forEach((formEl) => {
+    const api = formEl._clip;
+    if (api && api.dirty.size) typed.set(formEl.closest('.stage-clip-row').dataset.name, {values: api.readForm(), dirty: api.dirty});
   });
   list.innerHTML = '';
   if (!clips.length) {
@@ -750,8 +892,11 @@ async function loadStageClips(matchId) {
       const row = renderClipRow(item, !!data.publish_enabled);
       row.dataset.name = item.name;
       const kept = typed.get(item.name);
-      const inputs = row.querySelectorAll('input');
-      if (kept && inputs.length === 2) { inputs[0].value = kept[0]; inputs[1].value = kept[1]; }
+      const formEl = row.querySelector('.stage-clip-form');
+      if (kept && formEl && formEl._clip) {
+        formEl._clip.writeForm(kept.values);
+        kept.dirty.forEach((k) => formEl._clip.dirty.add(k));
+      }
       list.appendChild(row);
     });
   }
@@ -761,6 +906,26 @@ async function loadStageClips(matchId) {
     || (c.draft_status === 'failed' && !c.draft_retriable)
   ));
   if (pending) startDraftPoll(matchId); else stopDraftPoll();
+}
+
+// A push for the stage match arrived after capture: offer it on every
+// unpublished row as a new radio option, without changing the selection.
+function offerAlertToClipForms(ev) {
+  if (!state.stageMatchId || String(ev.match_id) !== String(state.stageMatchId)) return;
+  const m = /(\d{1,3})(?:\s*\+\s*(\d{1,2}))?\s*'?\s*$/.exec(String(ev.minute || ''));
+  const candidate = {
+    seq: ev.seq,
+    event_type: ev.event_type,
+    event_cn: ev.event_cn,
+    team: ev.team,
+    team_name: ev.team_name || '',
+    match_event: ev.event_type === 'red_card' ? 4 : 1,
+    match_time: m ? (m[2] ? `${m[1]}+${m[2]}` : m[1]) : '',
+    score: ev.score || '',
+  };
+  document.querySelectorAll('#stage-clips .stage-clip-form').forEach((formEl) => {
+    if (formEl._clip) formEl._clip.addCandidate(candidate);
+  });
 }
 
 function startDraftPoll(matchId) {
@@ -968,11 +1133,7 @@ function openStage(matchId) {
   $('stage-notes').innerHTML = '';
   $('stage-clips').innerHTML = '<div class="stage-clip-empty">正在读取 GIF 列表…</div>';
   loadStageClips(matchId);
-  const personInput = $('stage-person');
-  const titleInput = $('stage-title-input');
   const secondsInput = $('stage-seconds');
-  if (personInput) personInput.value = '';
-  if (titleInput) titleInput.value = '';
   if (secondsInput) secondsInput.value = '';
   syncStageCaptureLabel();
   clearRange();
@@ -1576,6 +1737,7 @@ async function pollAlerts() {
     // 游标之内的事件已经渲染过，再收到一次（并发轮询/重复响应）直接丢弃。
     if (typeof ev.seq === 'number' && ev.seq <= state.alertSeq) continue;
     pushAlert(ev);
+    offerAlertToClipForms(ev);
     state.alertSeq = Math.max(state.alertSeq, ev.seq || 0);
   }
   if (typeof data.seq === 'number') state.alertSeq = Math.max(state.alertSeq, data.seq);

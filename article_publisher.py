@@ -1836,9 +1836,14 @@ def build_article_fields(
     match_time = _match_time(event)
     if match_time:
         fields["match_time"] = match_time
-    # Operator clips (8901) cannot tell a penalty/own goal/disallowed goal from
-    # a normal one, so they leave match_event for the CMS editor to pick.
-    if code in EVENT_TYPES and not event.get("manual_match_event"):
+    # Operator clips (8901) pick the CMS event type on the page and send it
+    # explicitly (0 = 无 is sent too, so 跳过 lands as "no event"); OCR events
+    # derive it from the event code. ``manual_match_event`` is the legacy
+    # "leave it to the CMS editor" flag from before the page had the picker.
+    explicit_match_event = event.get("match_event")
+    if explicit_match_event is not None and str(explicit_match_event).strip() != "":
+        fields["match_event"] = int(explicit_match_event)
+    elif code in EVENT_TYPES and not event.get("manual_match_event"):
         fields["match_event"] = EVENT_TYPES[code]
     score = _match_score(event.get("score"))
     if score:

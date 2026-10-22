@@ -833,16 +833,124 @@ def _read_clip_meta(gif_path: Path) -> dict[str, Any]:
 
 def _alert_match_public(alert_match: dict[str, Any]) -> dict[str, Any]:
     """The subset of a clip→alert match that the browser displays."""
-    minute = alert_match.get("minute")
-    extra = alert_match.get("minute_extra")
     return {
         "mode": alert_match.get("mode"),
         "candidates": alert_match.get("candidates"),
         "ambiguous": alert_match.get("ambiguous"),
         "weak": alert_match.get("weak"),
-        "match_time": f"{minute}+{extra}" if minute and extra not in ("", "0", None) else minute,
+        "match_time": _join_match_time(alert_match.get("minute"), alert_match.get("minute_extra")),
         "score": alert_match.get("score"),
+        "alert_seq": alert_match.get("alert_seq"),
     }
+
+
+# ---- operator form for the CMS gif-article fields ----
+#
+# The publish row on the page is a small form mirroring the CMS editor:
+# ``match_event`` (0 无 / 1 进球 / 2 点球 / 3 点球不进 / 4 红牌 / 5 乌龙球 /
+# 6 进球无效), ``match_time`` (``19`` / ``90+3``), ``match_score`` (``3-1``) and
+# ``title``. The server pre-fills it from the alert the clip was matched to and
+# the operator can change any field before publishing. Pushes only carry
+# goal/red card, so a penalty/own goal/disallowed goal is the operator changing
+# the type after picking the goal push (or 跳过 when there was no push at all).
+
+MATCH_EVENT_LABELS = {0: "无", 1: "进球", 2: "点球", 3: "点球不进", 4: "红牌", 5: "乌龙球", 6: "进球无效"}
+_MATCH_TIME_RE = re.compile(r"(\d{1,3})(?:\+(\d{1,2}))?")
+_MATCH_SCORE_RE = re.compile(r"(\d{1,2})\s*[-:：]\s*(\d{1,2})")
+CLIP_TITLE_MAX = 100
+
+
+def _join_match_time(minute: Any, extra: Any) -> str:
+    minute = str(minute or "").strip()
+    extra = str(extra or "").strip()
+    if not minute:
+        return ""
+    return f"{minute}+{extra}" if extra not in ("", "0") else minute
+
+
+def _split_match_time(value: str) -> tuple[str, str]:
+    match = _MATCH_TIME_RE.fullmatch(value)
+    return (match.group(1), match.group(2) or "") if match else ("", "")
+
+
+def _alert_match_event(alert: dict[str, Any]) -> int:
+    return 4 if str(alert.get("event_type") or alert.get("code") or "").upper() in {"RED_CARD", "RC"} else 1
+
+
+def _default_clip_form(alert_match: dict[str, Any]) -> dict[str, Any]:
+    """Initial form values: the matched push, or 跳过 (type 0, clock empty) without one."""
+    if alert_match.get("mode") != "alert":
+        return {"alert_seq": None, "match_event": 0, "match_time": "", "match_score": "", "title": ""}
+    return {
+        "alert_seq": alert_match.get("alert_seq"),
+        "match_event": _alert_match_event(alert_match),
+        "match_time": _join_match_time(alert_match.get("minute"), alert_match.get("minute_extra")),
+        "match_score": str(alert_match.get("score") or "").strip(),
+        "title": "",
+    }
+
+
+def _normalize_clip_form(body: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
+    """Merge the request's form fields over ``current`` and validate; ``ValueError`` on bad input."""
+    form = dict(current)
+    if "alert_seq" in body:
+        seq = body.get("alert_seq")
+        if seq in (None, ""):
+            form["alert_seq"] = None
+        else:
+            try:
+                form["alert_seq"] = int(seq)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("alert_seq 必须是数字") from exc
+    if "match_event" in body:
+        try:
+            match_event = int(body.get("match_event"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("事件类型无效") from exc
+        if match_event not in MATCH_EVENT_LABELS:
+            raise ValueError("事件类型无效")
+        form["match_event"] = match_event
+    if "match_time" in body:
+        text = str(body.get("match_time") or "").strip().replace(" ", "").rstrip("'")
+        if text and not _MATCH_TIME_RE.fullmatch(text):
+            raise ValueError("比赛时间格式应为 19 或 90+3")
+        form["match_time"] = text
+    if "match_score" in body:
+        text = str(body.get("match_score") or "").strip()
+        match = _MATCH_SCORE_RE.fullmatch(text) if text else None
+        if text and not match:
+            raise ValueError("比分格式应为 3-1（主队在前）")
+        form["match_score"] = f"{match.group(1)}-{match.group(2)}" if match else ""
+    if "title" in body:
+        form["title"] = str(body.get("title") or "").strip()[:CLIP_TITLE_MAX]
+    form.setdefault("alert_seq", None)
+    form.setdefault("match_event", 0)
+    form.setdefault("match_time", "")
+    form.setdefault("match_score", "")
+    form.setdefault("title", "")
+    return form
+
+
+def _clip_candidates(match_id: str) -> list[dict[str, Any]]:
+    """Every goal/red-card push of this match, newest first, as the page's radio options."""
+    items = alert_store.for_match(match_id, 0.0, float("inf"))
+    options: list[dict[str, Any]] = []
+    for item in reversed(items):
+        minute, extra = _alert_minute_parts(item.get("minute"))
+        options.append(
+            {
+                "seq": item.get("seq"),
+                "ts_unix": item.get("ts_unix"),
+                "event_type": item.get("event_type"),
+                "event_cn": item.get("event_cn") or EVENT_CN.get(str(item.get("event_type") or ""), ""),
+                "team": item.get("team"),
+                "team_name": item.get("team_name") or "",
+                "match_event": _alert_match_event(item),
+                "match_time": _join_match_time(minute, extra),
+                "score": str(item.get("score") or "").strip(),
+            }
+        )
+    return options
 
 
 def _list_clips(match_id: str) -> list[dict[str, Any]]:
@@ -859,27 +967,34 @@ def _list_clips(match_id: str) -> list[dict[str, Any]]:
     if manual_draft_queue is not None and gifs:
         drafts = manual_draft_queue.records_by_source_name(match_id, artifact_kind=MANUAL_ARTIFACT_KIND)
     items: list[dict[str, Any]] = []
+    candidates: list[dict[str, Any]] | None = None
     for gif in gifs:
         stat = stats[gif]
         record = drafts.get(gif.name)
         meta = _read_clip_meta(gif)
-        items.append(
-            {
-                "name": gif.name,
-                "clip_url": f"clips/{match_id}/{gif.name}",
-                "bytes": stat.st_size,
-                "created_unix": stat.st_mtime,
-                "person": str(meta.get("person") or ""),
-                "title": str(meta.get("title") or ""),
-                "anchored": meta.get("anchored"),
-                "alert_match": meta.get("alert_match_public"),
-                "event_key": record.get("event_key") if record else None,
-                "draft_status": record.get("status") if record else None,
-                "draft_url": record.get("draft_url") if record else None,
-                "draft_error": record.get("error") if record else None,
-                "draft_retriable": bool(record.get("retriable")) if record else False,
-            }
-        )
+        alert_match = meta.get("alert_match") if isinstance(meta.get("alert_match"), dict) else {}
+        form = meta.get("form") if isinstance(meta.get("form"), dict) else _default_clip_form(alert_match)
+        item = {
+            "name": gif.name,
+            "clip_url": f"clips/{match_id}/{gif.name}",
+            "bytes": stat.st_size,
+            "created_unix": stat.st_mtime,
+            "title": str(form.get("title") or ""),
+            "form": form,
+            "anchored": meta.get("anchored"),
+            "alert_match": meta.get("alert_match_public"),
+            "event_key": record.get("event_key") if record else None,
+            "draft_status": record.get("status") if record else None,
+            "draft_url": record.get("draft_url") if record else None,
+            "draft_error": record.get("error") if record else None,
+            "draft_retriable": bool(record.get("retriable")) if record else False,
+        }
+        if record is None and manual_draft_queue is not None:
+            # Unpublished rows get the radio options; computed once per listing.
+            if candidates is None:
+                candidates = _clip_candidates(match_id)
+            item["candidates"] = candidates
+        items.append(item)
     return items
 
 
@@ -1650,8 +1765,6 @@ def monitor_clip():
                 400,
             )
         before_seconds = range_seconds
-    person = str(body.get("person") or "").strip()[:40]
-    title = str(body.get("title") or "").strip()[:100]
     if not live_preview.status(match_id).get("running"):
         return jsonify({"error": "请先开始预览该场，才能回捞画面", "code": "preview_not_running"}), 409
     segments = _read_playlist_segments(live_preview.media_dir(match_id))
@@ -1722,8 +1835,9 @@ def monitor_clip():
     )
     # Capture only. Publishing is a separate operator action
     # (``/api/monitor/clip/publish``) taken after they have seen the GIF and
-    # filled in the player/title, so persist everything that step needs.
+    # checked the pre-filled CMS fields, so persist everything that step needs.
     event_key = f"manual_{int(anchor_epoch if anchor_epoch is not None else time.time())}"
+    form = _default_clip_form(alert_match)
     _write_clip_meta(
         output_path,
         {
@@ -1732,8 +1846,7 @@ def monitor_clip():
             "anchor_epoch_ms": None if anchor_epoch is None else round(anchor_epoch * 1000),
             "start_epoch_ms": None if start_epoch is None else round(start_epoch * 1000),
             "before_seconds": before_seconds,
-            "person": person,
-            "title": title,
+            "form": form,
             "alert_match": alert_match,
             "alert_match_public": _alert_match_public(alert_match),
             "match_detail": _match_detail_for(match_id),
@@ -1752,6 +1865,7 @@ def monitor_clip():
             "delivery_mode": _manual_delivery_mode(),
             "event_key": event_key,
             "alert_match": _alert_match_public(alert_match),
+            "form": form,
         }
     )
 
@@ -1778,29 +1892,35 @@ def monitor_clip_publish():
     if manual_draft_queue is None:
         return jsonify({"error": "发文未启用（GIF 仅本地保存）", "code": "publish_disabled"}), 409
     meta = _read_clip_meta(gif_path)
-    person = str(body.get("person") if body.get("person") is not None else meta.get("person") or "").strip()[:40]
-    title = str(body.get("title") if body.get("title") is not None else meta.get("title") or "").strip()[:100]
     alert_match = meta.get("alert_match")
     if not isinstance(alert_match, dict):
         # Pre-sidecar clip: best effort from the file's own timestamp.
         alert_match = _match_clip_alert(match_id, gif_path.stat().st_mtime)
+    current = meta.get("form") if isinstance(meta.get("form"), dict) else _default_clip_form(alert_match)
+    try:
+        form = _normalize_clip_form(body, current)
+    except ValueError as exc:
+        return jsonify({"error": str(exc), "code": "form_invalid"}), 400
+    if not form["title"]:
+        # The CMS rejects an empty title (code=1); fail here so nothing is queued.
+        return jsonify({"error": "请填写标题后再发布", "code": "title_required"}), 400
     event_key = str(meta.get("event_key") or f"manual_{int(gif_path.stat().st_mtime)}")
     match_detail = meta.get("match_detail")
     if not isinstance(match_detail, dict) or not match_detail:
         match_detail = _match_detail_for(match_id)
+    minute, minute_extra = _split_match_time(form["match_time"])
     event = {
         "event_key": event_key,
-        # ``code`` only drives the generated title's wording; the CMS
-        # ``match_event`` is left for the operator (see manual_match_event).
-        "code": alert_match.get("code") or "G",
-        "manual_match_event": True,
-        "person": person,
-        "title_override": title,
+        "code": "RC" if form["match_event"] == 4 else "G",
+        # The operator picked the CMS event type on the page; send it as-is.
+        "match_event": form["match_event"],
+        "title_override": form["title"],
         "team": alert_match.get("team") or "",
-        "minute": alert_match.get("minute") or "",
-        "minute_extra": alert_match.get("minute_extra") or "",
-        "score": alert_match.get("score") or "",
+        "minute": minute,
+        "minute_extra": minute_extra,
+        "score": form["match_score"],
         "alert_match_mode": alert_match.get("mode"),
+        "alert_seq": form.get("alert_seq"),
     }
     status: str | None = None
     publish_error: str | None = None
@@ -1817,10 +1937,9 @@ def monitor_clip_publish():
         status = task.get("status")
     except Exception as exc:  # noqa: BLE001 - GIF stays on disk, operator can retry
         publish_error = str(exc)
-    # Remember what was actually sent so the list row shows it after reload.
+    # Remember what was actually sent so the published row shows it after reload.
     if meta:
-        meta["person"] = person
-        meta["title"] = title
+        meta["form"] = form
         _write_clip_meta(gif_path, meta)
     print(
         json.dumps(
@@ -1829,8 +1948,7 @@ def monitor_clip_publish():
                 "match_id": match_id,
                 "clip": name,
                 "event_key": event_key,
-                "person": bool(person),
-                "title_override": bool(title),
+                "form": form,
                 "delivery_mode": _manual_delivery_mode(),
                 "status": status,
                 "error": publish_error,
