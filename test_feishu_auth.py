@@ -189,7 +189,9 @@ class LoginWallTests(unittest.TestCase):
         matches = self.client.get("/api/monitor/matches")
         self.assertEqual(matches.status_code, 200)
         me = self.client.get("/api/auth/me").get_json()
-        self.assertEqual(me["user"], {"open_id": "ou_1", "name": "运营甲", "is_admin": False})
+        self.assertEqual(
+            me["user"], {"open_id": "ou_1", "name": "运营甲", "is_admin": False, "kind": "feishu"}
+        )
 
     def test_callback_rejects_bad_state(self):
         with mock.patch("feishu_auth._http_json", side_effect=AssertionError("must not be called")):
@@ -603,6 +605,41 @@ class ApprovalModeTests(unittest.TestCase):
         self.assertEqual(response.headers["Location"], feishu_auth.PENDING_PAGE_PATH)
         self.assertEqual(fresh.get("/api/monitor/matches").status_code, 401)
 
+    def test_revoke_kicks_approved_user_immediately(self):
+        """Revocation must not wait for the 72h cookie to expire."""
+        stranger = self.app.test_client()
+        self.login_and_apply(stranger, self.STRANGER)
+        admin = self.app.test_client()
+        self.login(admin, self.ADMIN)
+        admin.post(feishu_auth.ADMIN_API_PATH + "/decide",
+                   json={"open_id": "ou_new", "action": "approve"})
+        stranger.get(feishu_auth.PENDING_API_PATH)
+        self.assertEqual(stranger.get("/api/monitor/matches").status_code, 200)
+        self.assertEqual(stranger.get("/api/auth/check").status_code, 204)
+        admin.post(feishu_auth.ADMIN_API_PATH + "/decide",
+                   json={"open_id": "ou_new", "action": "reject"})
+        # Same cookie, next request: locked out, including the nginx subrequest.
+        self.assertEqual(stranger.get("/api/monitor/matches").status_code, 401)
+        self.assertEqual(stranger.get("/api/auth/check").status_code, 401)
+        self.assertIsNone(stranger.get("/api/auth/me").get_json()["user"])
+        # Admin and allowlist sessions are not store-backed and keep working.
+        self.assertEqual(admin.get("/api/monitor/matches").status_code, 200)
+        static = self.app.test_client()
+        self.login(static, {"open_id": "ou_static", "name": "老人"})
+        self.assertEqual(static.get("/api/monitor/matches").status_code, 200)
+
+    def test_legacy_session_without_via_is_store_checked(self):
+        """Sessions issued before ``via`` existed: admins pass, others need approval."""
+        client = self.app.test_client()
+        with client.session_transaction() as flask_session:
+            flask_session[SESSION_KEY] = {"open_id": "ou_new", "name": "新人",
+                                          "exp": time.time() + 3600}
+        self.assertEqual(client.get("/api/monitor/matches").status_code, 401)
+        with client.session_transaction() as flask_session:
+            flask_session[SESSION_KEY] = {"open_id": "ou_admin", "name": "管理员",
+                                          "exp": time.time() + 3600}
+        self.assertEqual(client.get("/api/monitor/matches").status_code, 200)
+
     def test_non_admin_cannot_use_admin_api(self):
         client = self.app.test_client()
         self.login(client, {"open_id": "ou_static", "name": "老人"})
@@ -711,6 +748,209 @@ class ApprovalDisabledTests(unittest.TestCase):
             second = feishu_auth.AccessStore(path)
             self.assertEqual(second.get("ou_new")["status"], "approved")
             self.assertEqual(second.pending_count(), 0)
+
+
+class GuestLinkTests(unittest.TestCase):
+    """External visitors: shared link → name/note form → same approval queue."""
+
+    ADMIN = {"open_id": "ou_admin", "name": "管理员"}
+
+    def setUp(self):
+        self.config = make_config(admin_users=frozenset({"ou_admin"}), access_db_path=":memory:",
+                                  notify_webhook="https://hook/test")
+        self.app = build_app(self.config)
+        self.notify = mock.patch("feishu_auth._notify_webhook", return_value=True)
+        self.notify_mock = self.notify.start()
+        self.addCleanup(self.notify.stop)
+        self.admin = self.app.test_client()
+        state = _encode_state(SECRET, "/")
+        with mock.patch("feishu_auth._http_json", side_effect=fake_feishu_http(self.ADMIN)):
+            self.admin.get(f"{CALLBACK_PATH}?code=c&state={urllib.parse.quote(state)}")
+
+    def reset_link(self) -> str:
+        data = self.admin.post(feishu_auth.ADMIN_API_PATH + "/guest-link/reset").get_json()
+        return data["guest_link"]
+
+    @staticmethod
+    def key_of(link: str) -> str:
+        return urllib.parse.parse_qs(urllib.parse.urlparse(link).query)["k"][0]
+
+    def apply(self, client, key: str, name="张三", note="XX 公司 · 运营"):
+        return client.post(feishu_auth.GUEST_REQUEST_API_PATH,
+                           json={"key": key, "name": name, "note": note})
+
+    def decide(self, guest_id: str, action: str):
+        return self.admin.post(feishu_auth.ADMIN_API_PATH + "/decide",
+                               json={"open_id": guest_id, "action": action})
+
+    def test_no_link_until_admin_generates_one(self):
+        self.assertIsNone(self.admin.get(feishu_auth.ADMIN_API_PATH).get_json()["guest_link"])
+        guest = self.app.test_client()
+        self.assertEqual(guest.get(feishu_auth.GUEST_PAGE_PATH + "?k=anything").status_code, 403)
+        self.assertEqual(self.apply(guest, "anything").status_code, 403)
+        link = self.reset_link()
+        self.assertTrue(link.startswith("https://monitor.example.com/guest?k="))
+        self.assertEqual(self.admin.get(feishu_auth.ADMIN_API_PATH).get_json()["guest_link"], link)
+
+    def test_link_page_is_public_and_shows_form(self):
+        key = self.key_of(self.reset_link())
+        guest = self.app.test_client()
+        page = guest.get(feishu_auth.GUEST_PAGE_PATH + "?k=" + key, headers={"Accept": "text/html"})
+        self.assertEqual(page.status_code, 200)
+        self.assertIn(b"/api/auth/guest/request", page.data)
+        self.assertEqual(guest.get(feishu_auth.GUEST_PAGE_PATH + "?k=wrong").status_code, 403)
+        self.assertEqual(guest.get(feishu_auth.GUEST_PAGE_PATH).status_code, 403)
+
+    def test_apply_validates_name_and_note(self):
+        key = self.key_of(self.reset_link())
+        guest = self.app.test_client()
+        self.assertEqual(self.apply(guest, key, name="  ").status_code, 400)
+        self.assertEqual(self.apply(guest, key, note="").status_code, 400)
+        self.notify_mock.assert_not_called()
+
+    def test_full_guest_flow_apply_approve_enter_revoke(self):
+        key = self.key_of(self.reset_link())
+        guest = self.app.test_client()
+        response = self.apply(guest, key, name="  张  三 ", note="XX 公司 · 运营")
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertEqual(data["status"], "pending")
+        self.assertEqual(data["kind"], "guest")
+        self.assertEqual(data["name"], "张 三")
+        guest_id = data["open_id"]
+        self.assertTrue(guest_id.startswith("guest_"))
+        self.assertEqual(data["next"], feishu_auth.PENDING_PAGE_PATH)
+        self.assertIn(feishu_auth.GUEST_COOKIE_NAME, response.headers.get("Set-Cookie", ""))
+        # Notified once with name + note.
+        self.notify_mock.assert_called_once()
+        text = self.notify_mock.call_args[0][1]
+        self.assertIn("访客", text)
+        self.assertIn("张 三", text)
+        self.assertIn("XX 公司 · 运营", text)
+        self.assertIn(guest_id, text)
+        # Waiting page poll reports pending as a guest; console locked.
+        status = guest.get(feishu_auth.PENDING_API_PATH).get_json()
+        self.assertEqual(status, {"status": "pending", "name": "张 三",
+                                  "open_id": guest_id, "kind": "guest"})
+        self.assertEqual(guest.get("/api/monitor/matches").status_code, 401)
+        # Guests cannot use the Feishu-only apply endpoint.
+        self.assertEqual(guest.post(feishu_auth.REQUEST_API_PATH).status_code, 401)
+        # Admin sees kind/note in the list.
+        listing = self.admin.get(feishu_auth.ADMIN_API_PATH).get_json()["requests"]
+        self.assertEqual(listing[0]["kind"], "guest")
+        self.assertEqual(listing[0]["note"], "XX 公司 · 运营")
+        # Approve → next poll promotes to a session.
+        self.assertTrue(self.decide(guest_id, "approve").get_json()["ok"])
+        status = guest.get(feishu_auth.PENDING_API_PATH).get_json()
+        self.assertEqual(status["status"], "approved")
+        self.assertEqual(status["next"], "/")
+        self.assertEqual(guest.get("/api/monitor/matches").status_code, 200)
+        me = guest.get("/api/auth/me").get_json()["user"]
+        self.assertEqual(me["kind"], "guest")
+        self.assertFalse(me["is_admin"])
+        # Revoke → locked out on the very next request.
+        self.decide(guest_id, "reject")
+        self.assertEqual(guest.get("/api/monitor/matches").status_code, 401)
+        self.assertEqual(guest.get("/api/auth/check").status_code, 401)
+
+    def test_approved_guest_reenters_via_link_without_reapplying(self):
+        key = self.key_of(self.reset_link())
+        guest = self.app.test_client()
+        guest_id = self.apply(guest, key).get_json()["open_id"]
+        self.decide(guest_id, "approve")
+        # Simulate the 72h session expiring: drop the Flask session, keep cookies.
+        with guest.session_transaction() as flask_session:
+            flask_session.clear()
+        self.assertEqual(guest.get("/api/monitor/matches").status_code, 401)
+        response = guest.get(feishu_auth.GUEST_PAGE_PATH + "?k=" + key)
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.headers["Location"], "/")
+        self.assertEqual(guest.get("/api/monitor/matches").status_code, 200)
+        self.assertEqual(self.notify_mock.call_count, 1)
+
+    def test_rotated_link_keeps_approved_guest_but_blocks_new_applicants(self):
+        old_key = self.key_of(self.reset_link())
+        guest = self.app.test_client()
+        guest_id = self.apply(guest, old_key).get_json()["open_id"]
+        self.decide(guest_id, "approve")
+        new_link = self.reset_link()
+        self.assertNotEqual(self.key_of(new_link), old_key)
+        # Old link no longer opens the form for newcomers.
+        newcomer = self.app.test_client()
+        self.assertEqual(newcomer.get(feishu_auth.GUEST_PAGE_PATH + "?k=" + old_key).status_code, 403)
+        self.assertEqual(self.apply(newcomer, old_key).status_code, 403)
+        # Approved guest still gets in through either link (cookie wins).
+        with guest.session_transaction() as flask_session:
+            flask_session.clear()
+        response = guest.get(feishu_auth.GUEST_PAGE_PATH + "?k=" + old_key)
+        self.assertEqual(response.headers["Location"], "/")
+        self.assertEqual(guest.get("/api/monitor/matches").status_code, 200)
+
+    def test_rejected_guest_sees_rejected_and_resubmit_reuses_record(self):
+        key = self.key_of(self.reset_link())
+        guest = self.app.test_client()
+        guest_id = self.apply(guest, key).get_json()["open_id"]
+        self.decide(guest_id, "reject")
+        self.assertEqual(guest.get(feishu_auth.PENDING_API_PATH).get_json()["status"], "rejected")
+        # Re-opening the link parks them on the waiting page (not the form).
+        response = guest.get(feishu_auth.GUEST_PAGE_PATH + "?k=" + key)
+        self.assertEqual(response.headers["Location"], feishu_auth.PENDING_PAGE_PATH)
+        # Re-submitting the form keeps the same id, no new row, no re-notify.
+        again = self.apply(guest, key, name="张三改名").get_json()
+        self.assertEqual(again["open_id"], guest_id)
+        self.assertEqual(again["status"], "rejected")
+        self.assertEqual(len(self.admin.get(feishu_auth.ADMIN_API_PATH).get_json()["requests"]), 1)
+        self.assertEqual(self.notify_mock.call_count, 1)
+
+    def test_forged_guest_cookie_is_ignored(self):
+        key = self.key_of(self.reset_link())
+        guest = self.app.test_client()
+        guest_id = self.apply(guest, key).get_json()["open_id"]
+        self.decide(guest_id, "approve")
+        forger = self.app.test_client()
+        forger.set_cookie(feishu_auth.GUEST_COOKIE_NAME, guest_id + ".deadbeef")
+        response = forger.get(feishu_auth.GUEST_PAGE_PATH + "?k=" + key)
+        self.assertEqual(response.status_code, 200)  # plain form, not a session
+        self.assertEqual(forger.get("/api/monitor/matches").status_code, 401)
+
+    def test_non_admin_cannot_reset_link(self):
+        key = self.key_of(self.reset_link())
+        guest = self.app.test_client()
+        guest_id = self.apply(guest, key).get_json()["open_id"]
+        self.decide(guest_id, "approve")
+        guest.get(feishu_auth.PENDING_API_PATH)
+        self.assertEqual(guest.post(feishu_auth.ADMIN_API_PATH + "/guest-link/reset").status_code, 403)
+        self.assertEqual(guest.get(feishu_auth.ADMIN_API_PATH).status_code, 403)
+
+    def test_guest_routes_hidden_in_static_mode(self):
+        app = build_app(make_config())
+        client = app.test_client()
+        self.assertEqual(client.get(feishu_auth.GUEST_PAGE_PATH + "?k=x").status_code, 404)
+        self.assertEqual(client.post(feishu_auth.GUEST_REQUEST_API_PATH, json={}).status_code, 404)
+
+    def test_store_migrates_first_release_schema(self):
+        with TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "access.sqlite3")
+            import sqlite3
+            conn = sqlite3.connect(path)
+            conn.execute(
+                "CREATE TABLE access_requests (open_id TEXT PRIMARY KEY, name TEXT NOT NULL DEFAULT '',"
+                " status TEXT NOT NULL, requested_at REAL NOT NULL, updated_at REAL NOT NULL,"
+                " decided_by TEXT NOT NULL DEFAULT '', last_login_at REAL)"
+            )
+            conn.execute(
+                "INSERT INTO access_requests VALUES ('ou_old', '老人', 'approved', 1, 1, 'ou_admin', NULL)"
+            )
+            conn.commit()
+            conn.close()
+            store = feishu_auth.AccessStore(path)
+            record = store.get("ou_old")
+            self.assertEqual(record["kind"], "feishu")
+            self.assertEqual(record["note"], "")
+            self.assertTrue(store.is_approved("ou_old"))
+            self.assertEqual(store.guest_key(), "")
+            key = store.reset_guest_key()
+            self.assertEqual(feishu_auth.AccessStore(path).guest_key(), key)
 
 
 if __name__ == "__main__":

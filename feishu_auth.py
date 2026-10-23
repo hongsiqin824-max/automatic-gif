@@ -31,7 +31,14 @@ Access control has two modes, chosen by ``GIF_MONITOR_FEISHU_ADMIN_USERS``:
   an "apply" button. Clicking it records a *pending* access request in
   ``data/monitor_access.sqlite3`` and pings the admins through the group bot
   webhook; the page then polls for a decision. An admin approves/rejects on
-  ``/admin/access``; the decision takes effect immediately without a restart.
+  ``/admin/access``; the decision takes effect immediately without a restart
+  because every request re-checks the store for approval-backed sessions.
+* **External guests** (approval mode only): the admin generates a shared
+  ``/guest?k=…`` link. Anyone opening it fills in a name and a note, which
+  files a request in the same queue (``kind=guest``). A signed year-long
+  cookie remembers the guest so an approved visitor re-enters after session
+  expiry without re-applying; rotating the link never affects approved
+  guests, revoking a guest locks them out on the next request.
 """
 
 from __future__ import annotations
@@ -65,12 +72,19 @@ CALLBACK_PATH = "/api/auth/feishu/callback"
 PENDING_PAGE_PATH = "/auth/pending"
 PENDING_API_PATH = "/api/auth/pending"
 REQUEST_API_PATH = "/api/auth/request"
+GUEST_PAGE_PATH = "/guest"
+GUEST_REQUEST_API_PATH = "/api/auth/guest/request"
 ADMIN_PAGE_PATH = "/admin/access"
 ADMIN_API_PATH = "/api/admin/access"
 SESSION_KEY = "feishu_user"
 # Identity of a user whose access request is still undecided; lets the
 # waiting page poll for a decision without a second OAuth round-trip.
 PENDING_SESSION_KEY = "feishu_pending"
+# Long-lived signed cookie remembering an external guest's record id, so an
+# approved guest who re-opens the link after the session expired gets in
+# without filing (and the admin approving) a second request.
+GUEST_COOKIE_NAME = "gif_monitor_guest"
+GUEST_COOKIE_MAX_AGE = 365 * 24 * 3600
 # A login attempt must round-trip the Feishu consent page within this window.
 STATE_TTL_SECONDS = 600
 HTTP_TIMEOUT_SECONDS = 8.0
@@ -84,10 +98,16 @@ STATUS_REJECTED = "rejected"
 # Pseudo-status for the waiting page: identity known, no request filed yet.
 STATUS_ELIGIBLE = "eligible"
 
+KIND_FEISHU = "feishu"
+KIND_GUEST = "guest"
+GUEST_NAME_MAX = 40
+GUEST_NOTE_MAX = 200
+
 # Reachable without a login session. Prefixes end with "/" on purpose so
 # "/static/x" matches but a hypothetical "/staticfoo" does not.
 EXEMPT_PATHS = frozenset(
-    {"/api/health", "/api/monitor/events/ingest", "/favicon.ico", PENDING_PAGE_PATH}
+    {"/api/health", "/api/monitor/events/ingest", "/favicon.ico", PENDING_PAGE_PATH,
+     GUEST_PAGE_PATH}
 )
 EXEMPT_PREFIXES = ("/static/", "/api/auth/")
 
@@ -232,11 +252,15 @@ class FeishuAuthConfig:
 
 
 class AccessStore:
-    """SQLite-backed table of access requests keyed by Feishu open_id.
+    """SQLite-backed table of access requests keyed by subject id.
 
-    A single connection guarded by a lock is plenty: writes happen only on
-    login and on admin decisions, reads only on the waiting-page poll.
+    The id is a Feishu ``open_id`` for employees and a generated ``guest_…``
+    for external visitors (``kind`` tells them apart). A single connection
+    guarded by a lock is plenty: writes happen only on apply and on admin
+    decisions; the per-request revocation check is a primary-key lookup.
     """
+
+    GUEST_KEY_SETTING = "guest_key"
 
     def __init__(self, path: str) -> None:
         self.path = path
@@ -255,9 +279,26 @@ class AccessStore:
                     requested_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
                     decided_by TEXT NOT NULL DEFAULT '',
-                    last_login_at REAL
+                    last_login_at REAL,
+                    kind TEXT NOT NULL DEFAULT 'feishu',
+                    note TEXT NOT NULL DEFAULT ''
                 )
                 """
+            )
+            # Tables created by the first release lack kind/note; add them in place.
+            existing = {
+                row["name"] for row in self._conn.execute("PRAGMA table_info(access_requests)")
+            }
+            if "kind" not in existing:
+                self._conn.execute(
+                    "ALTER TABLE access_requests ADD COLUMN kind TEXT NOT NULL DEFAULT 'feishu'"
+                )
+            if "note" not in existing:
+                self._conn.execute(
+                    "ALTER TABLE access_requests ADD COLUMN note TEXT NOT NULL DEFAULT ''"
+                )
+            self._conn.execute(
+                "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
             )
             self._conn.commit()
 
@@ -268,6 +309,8 @@ class AccessStore:
         return {
             "open_id": row["open_id"],
             "name": row["name"],
+            "kind": row["kind"],
+            "note": row["note"],
             "status": row["status"],
             "requested_at": row["requested_at"],
             "updated_at": row["updated_at"],
@@ -282,7 +325,9 @@ class AccessStore:
             ).fetchone()
         return self._row_to_dict(row)
 
-    def request(self, open_id: str, name: str) -> tuple[dict[str, Any], bool]:
+    def request(
+        self, open_id: str, name: str, *, kind: str = KIND_FEISHU, note: str = ""
+    ) -> tuple[dict[str, Any], bool]:
         """Create a pending request, or refresh the name of an existing row.
 
         Returns ``(record, created)`` so the caller only notifies on first
@@ -295,9 +340,10 @@ class AccessStore:
             ).fetchone()
             if row is None:
                 self._conn.execute(
-                    "INSERT INTO access_requests (open_id, name, status, requested_at, updated_at)"
-                    " VALUES (?, ?, ?, ?, ?)",
-                    (open_id, name, STATUS_PENDING, now, now),
+                    "INSERT INTO access_requests"
+                    " (open_id, name, status, requested_at, updated_at, kind, note)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (open_id, name, STATUS_PENDING, now, now, kind, note),
                 )
                 created = True
             else:
@@ -331,6 +377,13 @@ class AccessStore:
             ).fetchone()
         return self._row_to_dict(row)
 
+    def is_approved(self, open_id: str) -> bool:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT status FROM access_requests WHERE open_id = ?", (open_id,)
+            ).fetchone()
+        return bool(row) and row["status"] == STATUS_APPROVED
+
     def touch_login(self, open_id: str) -> None:
         with self._lock:
             self._conn.execute(
@@ -354,6 +407,25 @@ class AccessStore:
                 "SELECT COUNT(*) AS n FROM access_requests WHERE status = ?", (STATUS_PENDING,)
             ).fetchone()
         return int(row["n"]) if row else 0
+
+    def guest_key(self) -> str:
+        """Current shared guest-link key, or "" when none has been generated."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM settings WHERE key = ?", (self.GUEST_KEY_SETTING,)
+            ).fetchone()
+        return str(row["value"]) if row else ""
+
+    def reset_guest_key(self) -> str:
+        """Rotate the guest-link key; old links stop working, approved guests stay."""
+        key = secrets.token_urlsafe(24)
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                (self.GUEST_KEY_SETTING, key),
+            )
+            self._conn.commit()
+        return key
 
 
 # ---- Feishu HTTP calls (kept module-level so tests can monkeypatch) ----
@@ -573,7 +645,7 @@ function render(data) {
     location.replace(data.next || (PREFIX + '/'));
     return;
   }
-  hintEl.textContent = '飞书身份：' + (data.open_id || '');
+  hintEl.textContent = (data.kind === 'guest' ? '访客 ID：' : '飞书身份：') + (data.open_id || '');
   if (data.status === 'eligible') {
     titleEl.textContent = name + '您还没有监控台的访问权限';
     detailEl.textContent = '点击下方按钮向管理员提交访问申请；管理员批准后本页会自动进入监控台。';
@@ -593,9 +665,9 @@ function render(data) {
     return;
   }
   titleEl.textContent = '登录状态已失效';
-  detailEl.textContent = '请重新通过飞书登录。';
+  detailEl.textContent = '公司员工请重新通过飞书登录；外部访客请重新打开管理员发给你的访客链接。';
   hintEl.textContent = '';
-  retryEl.style.display = '';
+  if (data.kind !== 'guest') retryEl.style.display = '';
 }
 function poll() {
   fetch(PREFIX + '/api/auth/pending', {headers: {'Accept': 'application/json'}, credentials: 'same-origin'})
@@ -627,23 +699,46 @@ _ADMIN_PAGE_HTML = """<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>访问审批 · GIF 监控台</title>
-<style>__STYLE__ .wrap { max-width: 960px; } .actions button { margin-right: 6px; }</style></head>
+<style>__STYLE__ .wrap { max-width: 1080px; } .actions button { margin-right: 6px; }
+  .box { background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 8px; padding: 12px 16px; margin: 12px 0 4px; }
+  .box code { word-break: break-all; }
+  .kind { font-size: 11px; padding: 1px 6px; border-radius: 4px; background: #eef2ff; color: #3730a3; }
+  .kind.guest { background: #fdf2f8; color: #9d174d; }
+  .note { color: #4b5563; font-size: 13px; }
+</style></head>
 <body><div class="wrap"><div class="card">
 <h1>GIF 监控台 · 访问审批</h1>
 <p class="muted">当前管理员：<span id="admin"></span> · <a href="__PREFIX_LINK__/">返回监控台</a> · <a href="#" onclick="load();return false;">刷新</a></p>
+<div class="box">
+  <strong>外部访客链接</strong>
+  <span class="muted">— 发给公司外的人；点开后填姓名/备注提交申请，你在下方批准。链接可转发，谁点都要经你审批。</span>
+  <p id="guestLink" style="margin: 8px 0 6px"></p>
+  <button id="copyBtn" onclick="copyLink()" style="display:none">复制链接</button>
+  <button id="resetBtn" class="danger" onclick="resetLink()">生成链接</button>
+  <span class="muted" style="margin-left:8px">重置后旧链接立即失效，已批准的访客不受影响。</span>
+</div>
 <p id="msg" class="muted"></p>
-<table><thead><tr><th>申请人</th><th>open_id</th><th>状态</th><th>申请时间</th><th>最近登录</th><th>操作</th></tr></thead>
-<tbody id="rows"><tr><td colspan="6" class="muted">加载中…</td></tr></tbody></table>
+<table><thead><tr><th>申请人</th><th>类型</th><th>备注</th><th>身份</th><th>状态</th><th>申请时间</th><th>最近登录</th><th>操作</th></tr></thead>
+<tbody id="rows"><tr><td colspan="8" class="muted">加载中…</td></tr></tbody></table>
 </div></div>
 <script>
 var PREFIX = __PREFIX__;
 var API = PREFIX + '/api/admin/access';
 var LABEL = {pending: '待审批', approved: '已批准', rejected: '已拒绝'};
+var KIND = {feishu: '飞书', guest: '访客'};
+var currentLink = '';
 function fmt(ts) { if (!ts) return '—'; var d = new Date(ts * 1000);
   return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0')
     + ' ' + String(d.getHours()).padStart(2,'0') + ':' + String(d.getMinutes()).padStart(2,'0'); }
 function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, function (c) {
   return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
+function renderLink(link) {
+  currentLink = link || '';
+  var el = document.getElementById('guestLink');
+  el.innerHTML = link ? '<code>' + esc(link) + '</code>' : '<span class="muted">尚未生成</span>';
+  document.getElementById('copyBtn').style.display = link ? '' : 'none';
+  document.getElementById('resetBtn').textContent = link ? '重置链接' : '生成链接';
+}
 function load() {
   fetch(API, {headers: {'Accept': 'application/json'}, credentials: 'same-origin'})
     .then(function (r) { if (r.status === 401) { location.href = PREFIX + '/api/auth/feishu/login?next=' + encodeURIComponent(location.pathname); return null; } return r.json(); })
@@ -651,14 +746,19 @@ function load() {
       if (!data) return;
       if (data.error) { document.getElementById('msg').textContent = data.error; return; }
       document.getElementById('admin').textContent = data.admin.name + ' (' + data.admin.open_id + ')';
+      renderLink(data.guest_link);
       var rows = data.requests;
       var tbody = document.getElementById('rows');
-      if (!rows.length) { tbody.innerHTML = '<tr><td colspan="6" class="muted">暂无申请</td></tr>'; return; }
+      if (!rows.length) { tbody.innerHTML = '<tr><td colspan="8" class="muted">暂无申请</td></tr>'; return; }
       tbody.innerHTML = rows.map(function (r) {
         var approve = '<button class="primary" onclick="decide(\\'' + esc(r.open_id) + '\\',\\'approve\\')">' + (r.status === 'rejected' ? '改为批准' : '批准') + '</button>';
         var reject = '<button class="danger" onclick="decide(\\'' + esc(r.open_id) + '\\',\\'reject\\')">' + (r.status === 'approved' ? '撤销' : '拒绝') + '</button>';
         var actions = r.status === 'approved' ? reject : (r.status === 'rejected' ? approve : approve + reject);
-        return '<tr><td>' + esc(r.name || '（未知）') + '</td><td><code>' + esc(r.open_id) + '</code></td>'
+        var kind = r.kind || 'feishu';
+        return '<tr><td>' + esc(r.name || '（未知）') + '</td>'
+          + '<td><span class="kind ' + kind + '">' + (KIND[kind] || kind) + '</span></td>'
+          + '<td class="note">' + esc(r.note || '—') + '</td>'
+          + '<td><code>' + esc(r.open_id) + '</code></td>'
           + '<td><span class="pill ' + r.status + '">' + LABEL[r.status] + '</span></td>'
           + '<td>' + fmt(r.requested_at) + '</td><td>' + fmt(r.last_login_at) + '</td>'
           + '<td class="actions">' + actions + '</td></tr>';
@@ -674,18 +774,87 @@ function decide(openId, action) {
     .then(function (data) { document.getElementById('msg').textContent = data.error || ''; load(); })
     .catch(function (e) { document.getElementById('msg').textContent = '操作失败：' + e; });
 }
+function resetLink() {
+  if (currentLink && !confirm('重置后旧链接立即失效，确定？')) return;
+  fetch(API + '/guest-link/reset', {method: 'POST', credentials: 'same-origin',
+    headers: {'Accept': 'application/json'}})
+    .then(function (r) { return r.json(); })
+    .then(function (data) { document.getElementById('msg').textContent = data.error || ''; if (data.guest_link) renderLink(data.guest_link); })
+    .catch(function (e) { document.getElementById('msg').textContent = '操作失败：' + e; });
+}
+function copyLink() {
+  if (!currentLink) return;
+  var done = function () { document.getElementById('msg').textContent = '已复制链接'; };
+  if (navigator.clipboard && navigator.clipboard.writeText) { navigator.clipboard.writeText(currentLink).then(done, function () { prompt('复制链接：', currentLink); }); }
+  else { prompt('复制链接：', currentLink); }
+}
 load();
 </script></body></html>
 """
 
+_GUEST_PAGE_HTML = """<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>访客申请 · GIF 监控台</title>
+<style>__STYLE__
+  label { display: block; margin: 14px 0 4px; font-size: 13px; color: #374151; }
+  input, textarea { width: 100%; box-sizing: border-box; font: inherit; padding: 8px 10px; border: 1px solid #d1d5db; border-radius: 8px; }
+  textarea { min-height: 72px; resize: vertical; }
+</style></head>
+<body><div class="wrap"><div class="card">
+<h1>申请访问 GIF 监控台</h1>
+<p class="muted">你正在通过管理员发放的访客链接申请访问。填写姓名和备注后提交，管理员批准后本页会自动进入监控台。</p>
+<form id="form" onsubmit="submitForm(event)">
+  <label for="name">姓名 <span class="muted">（必填，让管理员认出你）</span></label>
+  <input id="name" maxlength="__NAME_MAX__" autocomplete="name" required>
+  <label for="note">备注 <span class="muted">（必填，例如：XX 公司 · 赛事运营）</span></label>
+  <textarea id="note" maxlength="__NOTE_MAX__" required></textarea>
+  <p id="msg" class="muted"></p>
+  <p><button type="submit" class="primary" id="submitBtn">申请访问</button></p>
+</form>
+</div></div>
+<script>
+var PREFIX = __PREFIX__;
+var KEY = new URLSearchParams(location.search).get('k') || '';
+function submitForm(ev) {
+  ev.preventDefault();
+  var btn = document.getElementById('submitBtn');
+  var msg = document.getElementById('msg');
+  btn.disabled = true; btn.textContent = '提交中…'; msg.textContent = '';
+  fetch(PREFIX + '/api/auth/guest/request', {method: 'POST', credentials: 'same-origin',
+    headers: {'Content-Type': 'application/json', 'Accept': 'application/json'},
+    body: JSON.stringify({key: KEY, name: document.getElementById('name').value, note: document.getElementById('note').value})})
+    .then(function (r) { return r.json(); })
+    .then(function (data) {
+      if (data.error) { msg.textContent = data.error; btn.disabled = false; btn.textContent = '申请访问'; return; }
+      location.replace(data.next || (PREFIX + '/auth/pending'));
+    })
+    .catch(function () { msg.textContent = '提交失败，请重试。'; btn.disabled = false; btn.textContent = '申请访问'; });
+}
+</script></body></html>
+"""
 
-def _render_page(template: str, public_prefix: str) -> Response:
+_GUEST_INVALID_HTML = """<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>链接已失效 · GIF 监控台</title>
+<style>__STYLE__</style></head>
+<body><div class="wrap"><div class="card">
+<h1>访客链接已失效</h1>
+<p class="muted">这条链接已被管理员重置或不存在。请联系管理员获取新的访客链接。</p>
+</div></div></body></html>
+"""
+
+
+def _render_page(template: str, public_prefix: str, status: int = 200) -> Response:
     html = (
         template.replace("__STYLE__", _PAGE_STYLE)
         .replace("__PREFIX__", json.dumps(public_prefix))
         .replace("__PREFIX_LINK__", public_prefix)
+        .replace("__NAME_MAX__", str(GUEST_NAME_MAX))
+        .replace("__NOTE_MAX__", str(GUEST_NOTE_MAX))
     )
-    response = Response(html, mimetype="text/html; charset=utf-8")
+    response = Response(html, status=status, mimetype="text/html; charset=utf-8")
     response.headers["Cache-Control"] = "no-store"
     return response
 
@@ -753,12 +922,26 @@ def install_feishu_auth(app: Flask, config: FeishuAuthConfig) -> FeishuAuthConfi
             return None
         if expires_at <= time.time():
             return None
+        # Approval-mode sessions stay valid only while the store still says
+        # "approved", so an admin's revoke takes effect on the next request
+        # instead of at cookie expiry. Admins and the static allowlist never
+        # go through the store. Sessions issued before ``via`` existed are
+        # treated as approval-backed unless the identity is an admin.
+        if store is not None:
+            via = user.get("via")
+            if via is None:
+                via = "admin" if _is_admin(user) else "approved"
+            if via in ("approved", "guest") and not store.is_approved(
+                str(user.get("open_id") or "")
+            ):
+                session.pop(SESSION_KEY, None)
+                return None
         return user
 
     def _is_admin(user: dict[str, Any] | None) -> bool:
         return user is not None and _user_in(config.admin_users, user)
 
-    def _grant_session(user_info: dict[str, Any]) -> None:
+    def _grant_session(user_info: dict[str, Any], via: str) -> None:
         session.permanent = True
         session.pop(PENDING_SESSION_KEY, None)
         session[SESSION_KEY] = {
@@ -766,13 +949,22 @@ def install_feishu_auth(app: Flask, config: FeishuAuthConfig) -> FeishuAuthConfi
             "union_id": str(user_info.get("union_id") or ""),
             "user_id": str(user_info.get("user_id") or ""),
             "name": str(user_info.get("name") or ""),
+            "via": via,
             "exp": time.time() + config.session_hours * 3600.0,
         }
         _log(
-            "feishu_login_ok",
+            "guest_login_ok" if via == "guest" else "feishu_login_ok",
             open_id=str(user_info.get("open_id") or ""),
             name=str(user_info.get("name") or ""),
+            via=via,
         )
+
+    def _login_via(user_info: dict[str, Any]) -> str:
+        if _is_admin(user_info):
+            return "admin"
+        if _user_in(config.allowed_users, user_info):
+            return "allowlist"
+        return "approved"
 
     def _pending_identity() -> dict[str, Any] | None:
         pending = session.get(PENDING_SESSION_KEY)
@@ -784,6 +976,60 @@ def install_feishu_auth(app: Flask, config: FeishuAuthConfig) -> FeishuAuthConfi
         except (TypeError, ValueError):
             return None
         return pending
+
+    def _set_pending(open_id: str, name: str, next_target: str, kind: str) -> None:
+        session.permanent = True
+        session[PENDING_SESSION_KEY] = {
+            "open_id": open_id,
+            "name": name,
+            "next": next_target,
+            "kind": kind,
+            "exp": time.time() + config.session_hours * 3600.0,
+        }
+
+    # -- guest cookie: signed "<guest_id>.<hmac>" remembered for a year --
+
+    def _guest_cookie_value(guest_id: str) -> str:
+        return f"{guest_id}.{_sign(config.secret, 'guest:' + guest_id)}"
+
+    def _read_guest_cookie() -> str:
+        raw = request.cookies.get(GUEST_COOKIE_NAME, "")
+        guest_id, _, digest = raw.rpartition(".")
+        if not guest_id or not digest:
+            return ""
+        if not hmac.compare_digest(_sign(config.secret, "guest:" + guest_id), digest):
+            return ""
+        return guest_id
+
+    def _attach_guest_cookie(response: Response, guest_id: str) -> Response:
+        response.set_cookie(
+            GUEST_COOKIE_NAME,
+            _guest_cookie_value(guest_id),
+            max_age=GUEST_COOKIE_MAX_AGE,
+            httponly=True,
+            samesite="Lax",
+            secure=config.resolve_cookie_secure(),
+            path=(config.public_prefix or "") + "/",
+        )
+        return response
+
+    def _notify_new_request(record: dict[str, Any]) -> None:
+        is_guest = record.get("kind") == KIND_GUEST
+        lines = [
+            "【GIF 监控台】新的访客访问申请" if is_guest else "【GIF 监控台】新的访问申请",
+            f"申请人：{record.get('name') or '（未知）'}",
+        ]
+        if is_guest:
+            lines.append(f"备注：{record.get('note') or '—'}")
+            lines.append(f"访客 ID：{record['open_id']}")
+        else:
+            lines.append(f"open_id：{record['open_id']}")
+        lines.append(f"时间：{time.strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append(f"审批页面：{_public_base_url()}{ADMIN_PAGE_PATH}")
+        _log("feishu_access_requested", open_id=record["open_id"], name=record.get("name", ""),
+             kind=record.get("kind", KIND_FEISHU))
+        notified = _notify_webhook(config.notify_webhook, "\n".join(lines))
+        _log("feishu_access_notified", open_id=record["open_id"], delivered=notified)
 
     @app.before_request
     def _feishu_auth_guard():  # pragma: no cover - exercised via test client
@@ -839,16 +1085,10 @@ def install_feishu_auth(app: Flask, config: FeishuAuthConfig) -> FeishuAuthConfi
             return jsonify({"error": "飞书未返回用户 open_id，无法提交访问申请"}), 502
         record = store.get(open_id)
         if record is not None and record["status"] == STATUS_APPROVED:
-            _grant_session(user_info)
+            _grant_session(user_info, "approved")
             store.touch_login(open_id)
             return redirect(config.public_prefix + next_target)
-        session.permanent = True
-        session[PENDING_SESSION_KEY] = {
-            "open_id": open_id,
-            "name": name,
-            "next": next_target,
-            "exp": time.time() + config.session_hours * 3600.0,
-        }
+        _set_pending(open_id, name, next_target, KIND_FEISHU)
         _log(
             "feishu_login_pending",
             open_id=open_id,
@@ -877,8 +1117,9 @@ def install_feishu_auth(app: Flask, config: FeishuAuthConfig) -> FeishuAuthConfi
             _log("feishu_auth_error", error=str(exc))
             return jsonify({"error": str(exc)}), 502
         if config.approval_enabled:
-            if _is_admin(user_info) or _user_in(config.allowed_users, user_info):
-                _grant_session(user_info)
+            via = _login_via(user_info)
+            if via != "approved":
+                _grant_session(user_info, via)
                 return redirect(config.public_prefix + next_target)
             return _approval_flow(user_info, next_target)
         if not _user_allowed(config, user_info):
@@ -889,7 +1130,7 @@ def install_feishu_auth(app: Flask, config: FeishuAuthConfig) -> FeishuAuthConfi
                 name=str(user_info.get("name") or ""),
             )
             return jsonify({"error": "该飞书账号不在监控台允许名单内"}), 403
-        _grant_session(user_info)
+        _grant_session(user_info, _login_via(user_info))
         return redirect(config.public_prefix + next_target)
 
     @app.get(PENDING_PAGE_PATH)
@@ -905,22 +1146,30 @@ def install_feishu_auth(app: Flask, config: FeishuAuthConfig) -> FeishuAuthConfi
         if not config.approval_enabled:
             return jsonify({"error": "飞书审批模式未启用"}), 404
         assert store is not None
-        if _session_user() is not None:
-            user = _session_user() or {}
+        user = _session_user()
+        if user is not None:
             return jsonify({"status": STATUS_APPROVED, "name": user.get("name", ""),
                             "open_id": user.get("open_id", ""),
+                            "kind": KIND_GUEST if user.get("via") == "guest" else KIND_FEISHU,
                             "next": config.public_prefix + "/"})
         pending = _pending_identity()
         if pending is None:
             return jsonify({"status": "none"})
+        kind = str(pending.get("kind") or KIND_FEISHU)
         record = store.get(pending["open_id"])
         if record is None:
+            if kind == KIND_GUEST:
+                # Guest records are created at form submit; a missing row means
+                # the identity is stale (e.g. database reset).
+                session.pop(PENDING_SESSION_KEY, None)
+                return jsonify({"status": "none", "kind": KIND_GUEST})
             return jsonify({"status": STATUS_ELIGIBLE, "name": pending.get("name", ""),
-                            "open_id": pending["open_id"]})
+                            "open_id": pending["open_id"], "kind": kind})
         payload = {"status": record["status"], "name": record["name"] or pending.get("name", ""),
-                   "open_id": record["open_id"]}
+                   "open_id": record["open_id"], "kind": record["kind"]}
         if record["status"] == STATUS_APPROVED:
-            _grant_session({"open_id": record["open_id"], "name": payload["name"]})
+            via = "guest" if record["kind"] == KIND_GUEST else "approved"
+            _grant_session({"open_id": record["open_id"], "name": payload["name"]}, via)
             store.touch_login(record["open_id"])
             payload["next"] = config.public_prefix + _sanitize_next(pending.get("next"))
         return jsonify(payload)
@@ -938,25 +1187,74 @@ def install_feishu_auth(app: Flask, config: FeishuAuthConfig) -> FeishuAuthConfi
         if _session_user() is not None:
             return jsonify({"status": STATUS_APPROVED, "next": config.public_prefix + "/"})
         pending = _pending_identity()
-        if pending is None:
+        if pending is None or pending.get("kind") == KIND_GUEST:
             return jsonify({"error": "登录状态已失效，请重新通过飞书登录",
                             "login_url": config.login_path}), 401
         open_id = pending["open_id"]
         name = str(pending.get("name") or "")
         record, created = store.request(open_id, name)
         if created:
-            _log("feishu_access_requested", open_id=open_id, name=name)
-            notified = _notify_webhook(
-                config.notify_webhook,
-                "【GIF 监控台】新的访问申请\n"
-                f"申请人：{name or '（未知）'}\n"
-                f"open_id：{open_id}\n"
-                f"时间：{time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                f"审批页面：{_public_base_url()}{ADMIN_PAGE_PATH}",
-            )
-            _log("feishu_access_notified", open_id=open_id, delivered=notified)
+            _notify_new_request(record)
         return jsonify({"status": record["status"], "name": record["name"] or name,
-                        "open_id": open_id})
+                        "open_id": open_id, "kind": KIND_FEISHU})
+
+    # -- external guests: shared link → name/note form → same approval queue --
+
+    def _guest_key_valid(key: str) -> bool:
+        assert store is not None
+        current = store.guest_key()
+        return bool(current) and bool(key) and hmac.compare_digest(current, key)
+
+    @app.get(GUEST_PAGE_PATH)
+    def guest_page():
+        if not config.approval_enabled:
+            return jsonify({"error": "飞书审批模式未启用"}), 404
+        assert store is not None
+        # A returning guest is recognised by the long-lived cookie even when
+        # the shared link has since been rotated.
+        guest_id = _read_guest_cookie()
+        if guest_id:
+            record = store.get(guest_id)
+            if record is not None and record["kind"] == KIND_GUEST:
+                if record["status"] == STATUS_APPROVED:
+                    _grant_session({"open_id": guest_id, "name": record["name"]}, "guest")
+                    store.touch_login(guest_id)
+                    return redirect(config.public_prefix + "/")
+                _set_pending(guest_id, record["name"], "/", KIND_GUEST)
+                return redirect(config.public_prefix + PENDING_PAGE_PATH)
+        if not _guest_key_valid((request.args.get("k") or "").strip()):
+            _log("guest_link_rejected")
+            return _render_page(_GUEST_INVALID_HTML, config.public_prefix, status=403)
+        return _render_page(_GUEST_PAGE_HTML, config.public_prefix)
+
+    @app.post(GUEST_REQUEST_API_PATH)
+    def guest_request_access():
+        if not config.approval_enabled:
+            return jsonify({"error": "飞书审批模式未启用"}), 404
+        assert store is not None
+        body = request.get_json(silent=True) or {}
+        if not _guest_key_valid(str(body.get("key") or "").strip()):
+            return jsonify({"error": "访客链接已失效，请联系管理员获取新链接"}), 403
+        name = " ".join(str(body.get("name") or "").split())[:GUEST_NAME_MAX]
+        note = str(body.get("note") or "").strip()[:GUEST_NOTE_MAX]
+        if not name:
+            return jsonify({"error": "请填写姓名"}), 400
+        if not note:
+            return jsonify({"error": "请填写备注"}), 400
+        # Reuse the existing record for a returning guest (cookie present)
+        # so a re-submit after rejection doesn't spawn a duplicate row.
+        guest_id = _read_guest_cookie()
+        existing = store.get(guest_id) if guest_id else None
+        if existing is None or existing["kind"] != KIND_GUEST:
+            guest_id = "guest_" + secrets.token_hex(6)
+        record, created = store.request(guest_id, name, kind=KIND_GUEST, note=note)
+        if created:
+            _notify_new_request(record)
+        _set_pending(guest_id, name, "/", KIND_GUEST)
+        response = jsonify({"status": record["status"], "name": record["name"],
+                            "open_id": guest_id, "kind": KIND_GUEST,
+                            "next": config.public_prefix + PENDING_PAGE_PATH})
+        return _attach_guest_cookie(response, guest_id)
 
     def _require_admin():
         user = _session_user()
@@ -978,6 +1276,13 @@ def install_feishu_auth(app: Flask, config: FeishuAuthConfig) -> FeishuAuthConfi
             return error
         return _render_page(_ADMIN_PAGE_HTML, config.public_prefix)
 
+    def _guest_link() -> str | None:
+        assert store is not None
+        key = store.guest_key()
+        if not key:
+            return None
+        return f"{_public_base_url()}{GUEST_PAGE_PATH}?k={urllib.parse.quote(key, safe='')}"
+
     @app.get(ADMIN_API_PATH)
     def feishu_admin_list():
         if not config.approval_enabled:
@@ -989,7 +1294,20 @@ def install_feishu_auth(app: Flask, config: FeishuAuthConfig) -> FeishuAuthConfi
         return jsonify({
             "admin": {"open_id": user.get("open_id", ""), "name": user.get("name", "")},
             "requests": store.list(),
+            "guest_link": _guest_link(),
         })
+
+    @app.post(ADMIN_API_PATH + "/guest-link/reset")
+    def feishu_admin_reset_guest_link():
+        if not config.approval_enabled:
+            return jsonify({"error": "飞书审批模式未启用"}), 404
+        assert store is not None
+        user, error = _require_admin()
+        if error is not None:
+            return error
+        store.reset_guest_key()
+        _log("guest_link_reset", by=user.get("open_id", ""))
+        return jsonify({"ok": True, "guest_link": _guest_link()})
 
     @app.post(ADMIN_API_PATH + "/decide")
     def feishu_admin_decide():
@@ -1012,6 +1330,7 @@ def install_feishu_auth(app: Flask, config: FeishuAuthConfig) -> FeishuAuthConfi
             "feishu_access_decided",
             open_id=open_id,
             name=record["name"],
+            kind=record["kind"],
             status=status,
             decided_by=user.get("open_id", ""),
         )
@@ -1026,6 +1345,7 @@ def install_feishu_auth(app: Flask, config: FeishuAuthConfig) -> FeishuAuthConfi
                 "open_id": user.get("open_id", ""),
                 "name": user.get("name", ""),
                 "is_admin": _is_admin(user),
+                "kind": KIND_GUEST if user.get("via") == "guest" else KIND_FEISHU,
             }
         payload: dict[str, Any] = {"enabled": config.enabled, "user": public}
         if store is not None and public is not None and public["is_admin"]:
