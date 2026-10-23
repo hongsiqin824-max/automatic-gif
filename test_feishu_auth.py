@@ -861,12 +861,44 @@ class GuestLinkTests(unittest.TestCase):
         # Simulate the 72h session expiring: drop the Flask session, keep cookies.
         with guest.session_transaction() as flask_session:
             flask_session.clear()
-        self.assertEqual(guest.get("/api/monitor/matches").status_code, 401)
         response = guest.get(feishu_auth.GUEST_PAGE_PATH + "?k=" + key)
         self.assertEqual(response.status_code, 302)
         self.assertEqual(response.headers["Location"], "/")
         self.assertEqual(guest.get("/api/monitor/matches").status_code, 200)
         self.assertEqual(self.notify_mock.call_count, 1)
+
+    def test_approved_guest_reenters_via_bookmarked_console_after_session_expiry(self):
+        """A guest who bookmarked the console root (not the /guest link) must not
+        be bounced to the Feishu login they cannot pass."""
+        key = self.key_of(self.reset_link())
+        guest = self.app.test_client()
+        guest_id = self.apply(guest, key).get_json()["open_id"]
+        self.decide(guest_id, "approve")
+        with guest.session_transaction() as flask_session:
+            flask_session.clear()
+        page = guest.get("/", headers={"Accept": "text/html"})
+        self.assertNotEqual(page.status_code, 302, "guest cookie should resume the session")
+        self.assertEqual(guest.get("/api/monitor/matches").status_code, 200)
+        self.assertEqual(guest.get("/api/auth/check").status_code, 204)
+        self.assertEqual(guest.get(feishu_auth.PENDING_API_PATH).get_json()["status"], "approved")
+        # Revoked guests never resume, even with the cookie.
+        self.decide(guest_id, "reject")
+        with guest.session_transaction() as flask_session:
+            flask_session.clear()
+        self.assertEqual(guest.get("/api/monitor/matches").status_code, 401)
+        self.assertEqual(guest.get("/api/auth/check").status_code, 401)
+        self.assertEqual(guest.get("/", headers={"Accept": "text/html"}).status_code, 302)
+
+    def test_logout_clears_guest_cookie(self):
+        key = self.key_of(self.reset_link())
+        guest = self.app.test_client()
+        guest_id = self.apply(guest, key).get_json()["open_id"]
+        self.decide(guest_id, "approve")
+        guest.get(feishu_auth.PENDING_API_PATH)
+        self.assertEqual(guest.get("/api/monitor/matches").status_code, 200)
+        response = guest.post("/api/auth/logout")
+        self.assertIn(feishu_auth.GUEST_COOKIE_NAME + "=;", response.headers.get("Set-Cookie", ""))
+        self.assertEqual(guest.get("/api/monitor/matches").status_code, 401)
 
     def test_rotated_link_keeps_approved_guest_but_blocks_new_applicants(self):
         old_key = self.key_of(self.reset_link())

@@ -1013,6 +1013,26 @@ def install_feishu_auth(app: Flask, config: FeishuAuthConfig) -> FeishuAuthConfi
         )
         return response
 
+    def _resume_guest_session() -> bool:
+        """Re-issue a session for an approved guest whose 72h session lapsed.
+
+        Lets a guest who bookmarked the console (rather than the /guest link)
+        get back in silently; without this they would be bounced to the
+        Feishu login they cannot pass. The cookie is HMAC-signed and the
+        store is consulted, so a revoked or forged guest never resumes.
+        """
+        if store is None:
+            return False
+        guest_id = _read_guest_cookie()
+        if not guest_id:
+            return False
+        record = store.get(guest_id)
+        if record is None or record["kind"] != KIND_GUEST or record["status"] != STATUS_APPROVED:
+            return False
+        _grant_session({"open_id": guest_id, "name": record["name"]}, "guest")
+        store.touch_login(guest_id)
+        return True
+
     def _notify_new_request(record: dict[str, Any]) -> None:
         is_guest = record.get("kind") == KIND_GUEST
         lines = [
@@ -1039,6 +1059,8 @@ def install_feishu_auth(app: Flask, config: FeishuAuthConfig) -> FeishuAuthConfi
         if path in EXEMPT_PATHS or any(path.startswith(prefix) for prefix in EXEMPT_PREFIXES):
             return None
         if _session_user() is not None:
+            return None
+        if _resume_guest_session():
             return None
         accepts_html = "text/html" in (request.headers.get("Accept") or "")
         if request.method == "GET" and accepts_html:
@@ -1147,6 +1169,8 @@ def install_feishu_auth(app: Flask, config: FeishuAuthConfig) -> FeishuAuthConfi
             return jsonify({"error": "飞书审批模式未启用"}), 404
         assert store is not None
         user = _session_user()
+        if user is None and _resume_guest_session():
+            user = _session_user()
         if user is not None:
             return jsonify({"status": STATUS_APPROVED, "name": user.get("name", ""),
                             "open_id": user.get("open_id", ""),
@@ -1212,14 +1236,12 @@ def install_feishu_auth(app: Flask, config: FeishuAuthConfig) -> FeishuAuthConfi
         assert store is not None
         # A returning guest is recognised by the long-lived cookie even when
         # the shared link has since been rotated.
+        if _resume_guest_session():
+            return redirect(config.public_prefix + "/")
         guest_id = _read_guest_cookie()
         if guest_id:
             record = store.get(guest_id)
             if record is not None and record["kind"] == KIND_GUEST:
-                if record["status"] == STATUS_APPROVED:
-                    _grant_session({"open_id": guest_id, "name": record["name"]}, "guest")
-                    store.touch_login(guest_id)
-                    return redirect(config.public_prefix + "/")
                 _set_pending(guest_id, record["name"], "/", KIND_GUEST)
                 return redirect(config.public_prefix + PENDING_PAGE_PATH)
         if not _guest_key_valid((request.args.get("k") or "").strip()):
@@ -1354,10 +1376,13 @@ def install_feishu_auth(app: Flask, config: FeishuAuthConfig) -> FeishuAuthConfi
 
     @app.post("/api/auth/logout")
     def feishu_logout():
+        response = jsonify({"ok": True})
         if config.enabled:
             session.pop(SESSION_KEY, None)
             session.pop(PENDING_SESSION_KEY, None)
-        return jsonify({"ok": True})
+            if request.cookies.get(GUEST_COOKIE_NAME):
+                response.delete_cookie(GUEST_COOKIE_NAME, path=(config.public_prefix or "") + "/")
+        return response
 
     @app.route("/api/auth/check")
     def feishu_auth_check():
@@ -1366,7 +1391,7 @@ def install_feishu_auth(app: Flask, config: FeishuAuthConfig) -> FeishuAuthConfi
         if not config.enabled:
             return "", 204
         user = _session_user()
-        if user is not None:
+        if user is not None or _resume_guest_session():
             return "", 204
         return "", 401
 
