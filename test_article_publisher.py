@@ -1,4 +1,5 @@
 import json
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -11,6 +12,8 @@ from article_publisher import (
     PublishedGifStore,
     RemoteGifUploadClient,
     _check_public_cover_url,
+    _official_gif_litpic,
+    article_litpic_source,
     build_article_fields,
     build_article_title,
     inspect_animated_gif,
@@ -148,7 +151,11 @@ class ArticlePublisherTests(unittest.TestCase):
                 "https://img1.qunliao.info/fastdfs8/M00/gif-event.gif",
                 platform.calls[0]["body"],
             )
-            self.assertEqual(platform.calls[0]["litpic"], "/fastdfs8/M00/cover-event.jpg")
+            # The GIF's own FastDFS path is the cover; the second call reuses
+            # the persisted mapping, which only keeps img1_url, so the path
+            # must be derived from it.
+            self.assertEqual(platform.calls[0]["litpic"], "/fastdfs8/M00/gif-event.gif")
+            self.assertEqual(platform.calls[1]["litpic"], "/fastdfs8/M00/gif-event.gif")
             self.assertEqual(platform.calls[1]["archive_id"], 3801234)
             self.assertEqual(updated["gif"]["url"], created["gif"]["url"])
             self.assertEqual(
@@ -570,6 +577,96 @@ class ArticlePublisherTests(unittest.TestCase):
                     event_key="goal-19",
                     artifact_kind="scoreboard",
                 )
+
+    def test_litpic_source_cover_keeps_first_frame_jpeg(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "ocr.gif"
+            source.write_bytes(animated_gif_bytes())
+            platform = FakePlatformClient()
+            publisher = ArticlePublisher(
+                platform_client=platform,
+                gif_store=PublishedGifStore(
+                    root / "published", "https://matchgif.aisportsapp.com"
+                ),
+                database_path=root / "publish.sqlite3",
+                verify_public_url=False,
+                ocr_image_upload_client=FakeOfficialImageClient(),
+            )
+            with patch.dict(os.environ, {"ARTICLE_LITPIC_SOURCE": "cover"}):
+                publisher.create_or_update_draft(
+                    match_id="54478914",
+                    event={"event_key": "goal-19", "code": "G", "minute": "19"},
+                    match_detail={},
+                    source_path=source,
+                )
+            self.assertEqual(platform.calls[0]["litpic"], "/fastdfs8/M00/cover-event.jpg")
+
+    def test_litpic_source_rejects_unknown_value(self):
+        with patch.dict(os.environ, {"ARTICLE_LITPIC_SOURCE": "png"}):
+            with self.assertRaisesRegex(RuntimeError, "ARTICLE_LITPIC_SOURCE"):
+                article_litpic_source()
+        with patch.dict(os.environ, {"ARTICLE_LITPIC_SOURCE": " GIF "}):
+            self.assertEqual(article_litpic_source(), "gif")
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(article_litpic_source(), "gif")
+
+    def test_official_gif_litpic_prefers_direct_path_then_derives_from_url(self):
+        self.assertEqual(
+            _official_gif_litpic(
+                {
+                    "official_gif_path": "/fastdfs8/M00/a.gif",
+                    "url": "https://img1.qunliao.info/fastdfs8/M00/other.gif",
+                }
+            ),
+            "/fastdfs8/M00/a.gif",
+        )
+        # A mapping reused from the database only carries img1_url.
+        self.assertEqual(
+            _official_gif_litpic(
+                {"url": "https://img1.qunliao.info/fastdfs8/M00/b.gif?x=1"}
+            ),
+            "/fastdfs8/M00/b.gif",
+        )
+        self.assertEqual(_official_gif_litpic({"url": "/relative-only.gif"}), "")
+        self.assertEqual(_official_gif_litpic({"url": "https://host/"}), "")
+        self.assertEqual(_official_gif_litpic({}), "")
+
+    def test_fields_keep_jpeg_cover_when_litpic_is_not_official(self):
+        base = {
+            "match_id": "54478914",
+            "event": {"code": "G", "minute": "19"},
+            "title": "自动标题",
+        }
+        # Legacy HTTPS uploader: GIF path is never used as cover.
+        fields = build_article_fields(
+            **base,
+            gif_url="https://matchgif.aisportsapp.com/publish-gifs/a.gif",
+            cover_url="https://matchgif.aisportsapp.com/publish-gif-covers/a.jpg",
+            litpic_url="/publish-gifs/a.gif",
+        )
+        self.assertEqual(
+            fields["litpic"],
+            "https://matchgif.aisportsapp.com/publish-gif-covers/a.jpg",
+        )
+        # Official path without a usable GIF path falls back to the JPEG.
+        fields = build_article_fields(
+            **base,
+            gif_url="https://img1.qunliao.info/fastdfs8/M00/a.gif",
+            cover_url="/fastdfs8/M00/a.jpg",
+            litpic_url="",
+            allow_relative_media=True,
+        )
+        self.assertEqual(fields["litpic"], "/fastdfs8/M00/a.jpg")
+        # Official path with the GIF path uses it.
+        fields = build_article_fields(
+            **base,
+            gif_url="https://img1.qunliao.info/fastdfs8/M00/a.gif",
+            cover_url="/fastdfs8/M00/a.jpg",
+            litpic_url="/fastdfs8/M00/a.gif",
+            allow_relative_media=True,
+        )
+        self.assertEqual(fields["litpic"], "/fastdfs8/M00/a.gif")
 
     def test_gif_validation_requires_animation(self):
         info = inspect_animated_gif(animated_gif_bytes())

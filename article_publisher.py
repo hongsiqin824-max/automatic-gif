@@ -59,6 +59,25 @@ def article_channelsnew() -> str:
         if not re.fullmatch(r"\d{1,20}", item):
             raise RuntimeError("ARTICLE_CHANNELSNEW 必须是逗号分隔的数字标签 id")
     return ",".join(ids)
+
+
+LITPIC_SOURCES = frozenset({"gif", "cover"})
+
+
+def article_litpic_source() -> str:
+    """Which upload becomes the article cover (``litpic``).
+
+    ``gif`` (default) sends the GIF's own FastDFS path so the platform shows the
+    animation as the thumbnail, matching its native gif-collection articles.
+    ``cover`` keeps the legacy first-frame JPEG. The JPEG is generated and
+    uploaded either way because the official image endpoint pairs both files.
+    """
+    value = os.environ.get("ARTICLE_LITPIC_SOURCE", "gif").strip().lower()
+    if value not in LITPIC_SOURCES:
+        raise RuntimeError("ARTICLE_LITPIC_SOURCE 必须是 gif 或 cover")
+    return value
+
+
 RELIABLE_PERSON_PLACEHOLDERS = frozenset(
     {
         "0",
@@ -1235,6 +1254,7 @@ class ArticlePublisher:
                 event=event,
                 gif_url=str(gif["url"]),
                 cover_url=str(gif["cover_url"]),
+                litpic_url=_official_gif_litpic(gif),
                 title=title,
                 publish_account=publish_account,
                 allow_relative_media=bool(
@@ -1410,6 +1430,7 @@ class ArticlePublisher:
                 event=event,
                 gif_url=str(gif["url"]),
                 cover_url=str(gif["cover_url"]),
+                litpic_url=_official_gif_litpic(gif),
                 title=title,
                 delivery_mode=delivery_mode,
                 archive_id=archive_id,
@@ -1747,6 +1768,7 @@ def build_article_fields(
     archive_id: str | int | None = None,
     publish_account: dict[str, Any] | None = None,
     allow_relative_media: bool = False,
+    litpic_url: str = "",
 ) -> dict[str, Any]:
     if delivery_mode not in {"publish", "draft"}:
         raise ArticlePublishError(
@@ -1786,6 +1808,16 @@ def build_article_fields(
             stage="cover_public_url_check",
             status_code=503,
         )
+    # The GIF itself becomes the cover only on the official FastDFS path: the
+    # legacy remote uploader still requires an HTTPS JPEG cover.
+    normalized_litpic = normalized_cover_url
+    candidate_litpic = str(litpic_url or "").strip()
+    if (
+        article_litpic_source() == "gif"
+        and allow_relative_media
+        and _is_relative_media_reference(candidate_litpic)
+    ):
+        normalized_litpic = candidate_litpic
     normalized_archive_id: int | None = None
     if archive_id is not None:
         archive_id_text = str(archive_id).strip()
@@ -1808,7 +1840,7 @@ def build_article_fields(
         "status": 0 if is_draft else 1,
         "type": "article",
         "style": "gif",
-        "litpic": normalized_cover_url,
+        "litpic": normalized_litpic,
         "match_id": match_id,
         "add_to_tab": article_add_to_tab(),
     }
@@ -2000,6 +2032,31 @@ def _is_media_reference(value: Any, *, allow_relative: bool = False) -> bool:
 def _is_relative_media_reference(value: Any) -> bool:
     text = str(value or "").strip()
     return bool(text) and _is_media_reference(text, allow_relative=True) and not _is_absolute_http_url(text)
+
+
+def _official_gif_litpic(gif: dict[str, Any]) -> str:
+    """FastDFS path of the uploaded GIF, for use as the article ``litpic``.
+
+    A fresh official upload carries ``official_gif_path``. A mapping reused
+    from ``article_uploaded_gifs`` only persists the full ``img1_url``, which
+    the platform documents as ``image domain + url``; its path component is
+    therefore the same FastDFS path. Returns ``""`` when neither applies so
+    the caller falls back to the JPEG cover.
+    """
+    direct = str(gif.get("official_gif_path") or "").strip()
+    if _is_relative_media_reference(direct):
+        return direct
+    url = str(gif.get("url") or "").strip()
+    if not _is_absolute_http_url(url):
+        return ""
+    try:
+        path = urllib.parse.urlsplit(url).path
+    except ValueError:
+        return ""
+    # A bare "/" or directory-only path is not a file reference.
+    if not Path(path).name or not _is_relative_media_reference(path):
+        return ""
+    return path
 
 
 def _find_official_image_result(results: list[Any] | tuple[Any, ...], *, kind: str) -> dict[str, Any] | None:
