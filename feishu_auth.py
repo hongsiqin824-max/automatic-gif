@@ -27,11 +27,11 @@ Access control has two modes, chosen by ``GIF_MONITOR_FEISHU_ADMIN_USERS``:
   whole allowlist; empty allowlist means anyone inside the app's Feishu
   availability scope may log in.
 * **Approval** (admin list set): admins and the static allowlist always get
-  in. Anyone else is recorded as a *pending* access request in
-  ``data/monitor_access.sqlite3``, shown a waiting page that polls for a
-  decision, and the admins are notified through the group bot webhook. An
-  admin approves/rejects on ``/admin/access``; the decision takes effect
-  immediately without a restart.
+  in. Anyone else lands on a page explaining they have no access yet, with
+  an "apply" button. Clicking it records a *pending* access request in
+  ``data/monitor_access.sqlite3`` and pings the admins through the group bot
+  webhook; the page then polls for a decision. An admin approves/rejects on
+  ``/admin/access``; the decision takes effect immediately without a restart.
 """
 
 from __future__ import annotations
@@ -64,6 +64,7 @@ LOGIN_PATH = "/api/auth/feishu/login"
 CALLBACK_PATH = "/api/auth/feishu/callback"
 PENDING_PAGE_PATH = "/auth/pending"
 PENDING_API_PATH = "/api/auth/pending"
+REQUEST_API_PATH = "/api/auth/request"
 ADMIN_PAGE_PATH = "/admin/access"
 ADMIN_API_PATH = "/api/admin/access"
 SESSION_KEY = "feishu_user"
@@ -80,6 +81,8 @@ ACCESS_DB_FILENAME = "monitor_access.sqlite3"
 STATUS_PENDING = "pending"
 STATUS_APPROVED = "approved"
 STATUS_REJECTED = "rejected"
+# Pseudo-status for the waiting page: identity known, no request filed yet.
+STATUS_ELIGIBLE = "eligible"
 
 # Reachable without a login session. Prefixes end with "/" on purpose so
 # "/static/x" matches but a hypothetical "/staticfoo" does not.
@@ -542,46 +545,79 @@ _PENDING_PAGE_HTML = """<!doctype html>
 <title>等待审批 · GIF 监控台</title>
 <style>__STYLE__</style></head>
 <body><div class="wrap"><div class="card">
-<h1 id="title">正在提交访问申请…</h1>
+<h1 id="title">正在检查访问权限…</h1>
 <p id="detail" class="muted"></p>
 <p class="muted" id="hint"></p>
-<p><button id="retry" style="display:none" onclick="location.href=PREFIX + '/api/auth/feishu/login'">重新登录飞书</button></p>
+<p id="actions">
+<button id="apply" class="primary" style="display:none" onclick="apply()">申请访问</button>
+<button id="retry" style="display:none" onclick="location.href=PREFIX + '/api/auth/feishu/login'">重新登录飞书</button>
+</p>
 </div></div>
 <script>
 var PREFIX = __PREFIX__;
 var titleEl = document.getElementById('title');
 var detailEl = document.getElementById('detail');
 var hintEl = document.getElementById('hint');
+var applyEl = document.getElementById('apply');
 var retryEl = document.getElementById('retry');
+var pollTimer = null;
+function schedule(ms) { clearTimeout(pollTimer); pollTimer = setTimeout(poll, ms); }
 function render(data) {
   var name = data.name ? data.name + '，' : '';
+  applyEl.style.display = 'none';
+  retryEl.style.display = 'none';
   if (data.status === 'approved') {
     titleEl.textContent = '审批已通过，正在进入…';
+    detailEl.textContent = '';
     hintEl.textContent = '';
     location.replace(data.next || (PREFIX + '/'));
+    return;
+  }
+  hintEl.textContent = '飞书身份：' + (data.open_id || '');
+  if (data.status === 'eligible') {
+    titleEl.textContent = name + '您还没有监控台的访问权限';
+    detailEl.textContent = '点击下方按钮向管理员提交访问申请；管理员批准后本页会自动进入监控台。';
+    applyEl.style.display = '';
+    applyEl.disabled = false;
+    applyEl.textContent = '申请访问';
     return;
   }
   if (data.status === 'pending') {
     titleEl.textContent = name + '您的访问申请已提交';
     detailEl.textContent = '管理员已收到通知。审批通过后本页会自动进入监控台，请保持页面打开或稍后再回来。';
-    hintEl.textContent = '申请身份：' + (data.open_id || '');
     return;
   }
   if (data.status === 'rejected') {
     titleEl.textContent = name + '访问申请未通过';
     detailEl.textContent = '管理员拒绝了本次申请。如需访问请联系管理员，批准后刷新本页即可进入。';
-    hintEl.textContent = '申请身份：' + (data.open_id || '');
     return;
   }
   titleEl.textContent = '登录状态已失效';
   detailEl.textContent = '请重新通过飞书登录。';
+  hintEl.textContent = '';
   retryEl.style.display = '';
 }
 function poll() {
   fetch(PREFIX + '/api/auth/pending', {headers: {'Accept': 'application/json'}, credentials: 'same-origin'})
     .then(function (r) { return r.json(); })
-    .then(function (data) { render(data); if (data.status === 'pending' || data.status === 'rejected') setTimeout(poll, 5000); })
-    .catch(function () { setTimeout(poll, 8000); });
+    .then(function (data) {
+      render(data);
+      if (data.status === 'pending' || data.status === 'rejected') schedule(5000);
+    })
+    .catch(function () { schedule(8000); });
+}
+function apply() {
+  applyEl.disabled = true;
+  applyEl.textContent = '提交中…';
+  fetch(PREFIX + '/api/auth/request', {method: 'POST', credentials: 'same-origin',
+    headers: {'Accept': 'application/json'}})
+    .then(function (r) { return r.json(); })
+    .then(function (data) {
+      if (data.error) { detailEl.textContent = data.error; applyEl.disabled = false; applyEl.textContent = '申请访问'; return; }
+      render(data);
+      if (data.status === 'pending' || data.status === 'rejected') schedule(5000);
+    })
+    .catch(function () { detailEl.textContent = '提交失败，请重试。'; applyEl.disabled = false; applyEl.textContent = '申请访问'; });
 }
 poll();
 </script></body></html>
@@ -788,7 +824,13 @@ def install_feishu_auth(app: Flask, config: FeishuAuthConfig) -> FeishuAuthConfi
         return redirect(f"{AUTHORIZE_URL}?{params}")
 
     def _approval_flow(user_info: dict[str, Any], next_target: str):
-        """Approval-mode decision for a user who is neither admin nor allowlisted."""
+        """Approval-mode decision for a user who is neither admin nor allowlisted.
+
+        Nothing is filed here: the user is parked on the waiting page, which
+        shows an "apply" button unless a request already exists. Only an
+        explicit click (``POST /api/auth/request``) creates the record and
+        notifies the admins.
+        """
         assert store is not None
         open_id = str(user_info.get("open_id") or "")
         name = str(user_info.get("name") or "")
@@ -800,7 +842,6 @@ def install_feishu_auth(app: Flask, config: FeishuAuthConfig) -> FeishuAuthConfi
             _grant_session(user_info)
             store.touch_login(open_id)
             return redirect(config.public_prefix + next_target)
-        record, created = store.request(open_id, name)
         session.permanent = True
         session[PENDING_SESSION_KEY] = {
             "open_id": open_id,
@@ -808,19 +849,12 @@ def install_feishu_auth(app: Flask, config: FeishuAuthConfig) -> FeishuAuthConfi
             "next": next_target,
             "exp": time.time() + config.session_hours * 3600.0,
         }
-        if created:
-            _log("feishu_access_requested", open_id=open_id, name=name)
-            notified = _notify_webhook(
-                config.notify_webhook,
-                "【GIF 监控台】新的访问申请\n"
-                f"申请人：{name or '（未知）'}\n"
-                f"open_id：{open_id}\n"
-                f"时间：{time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                f"审批页面：{_public_base_url()}{ADMIN_PAGE_PATH}",
-            )
-            _log("feishu_access_notified", open_id=open_id, delivered=notified)
-        else:
-            _log("feishu_login_pending", open_id=open_id, name=name, status=record["status"])
+        _log(
+            "feishu_login_pending",
+            open_id=open_id,
+            name=name,
+            status=record["status"] if record else STATUS_ELIGIBLE,
+        )
         return redirect(config.public_prefix + PENDING_PAGE_PATH)
 
     @app.get(CALLBACK_PATH)
@@ -881,7 +915,8 @@ def install_feishu_auth(app: Flask, config: FeishuAuthConfig) -> FeishuAuthConfi
             return jsonify({"status": "none"})
         record = store.get(pending["open_id"])
         if record is None:
-            return jsonify({"status": "none"})
+            return jsonify({"status": STATUS_ELIGIBLE, "name": pending.get("name", ""),
+                            "open_id": pending["open_id"]})
         payload = {"status": record["status"], "name": record["name"] or pending.get("name", ""),
                    "open_id": record["open_id"]}
         if record["status"] == STATUS_APPROVED:
@@ -889,6 +924,39 @@ def install_feishu_auth(app: Flask, config: FeishuAuthConfig) -> FeishuAuthConfi
             store.touch_login(record["open_id"])
             payload["next"] = config.public_prefix + _sanitize_next(pending.get("next"))
         return jsonify(payload)
+
+    @app.post(REQUEST_API_PATH)
+    def feishu_request_access():
+        """The "apply" button: file the access request and notify admins.
+
+        Idempotent — a second click (or a re-login while pending/rejected)
+        returns the current status without re-notifying.
+        """
+        if not config.approval_enabled:
+            return jsonify({"error": "飞书审批模式未启用"}), 404
+        assert store is not None
+        if _session_user() is not None:
+            return jsonify({"status": STATUS_APPROVED, "next": config.public_prefix + "/"})
+        pending = _pending_identity()
+        if pending is None:
+            return jsonify({"error": "登录状态已失效，请重新通过飞书登录",
+                            "login_url": config.login_path}), 401
+        open_id = pending["open_id"]
+        name = str(pending.get("name") or "")
+        record, created = store.request(open_id, name)
+        if created:
+            _log("feishu_access_requested", open_id=open_id, name=name)
+            notified = _notify_webhook(
+                config.notify_webhook,
+                "【GIF 监控台】新的访问申请\n"
+                f"申请人：{name or '（未知）'}\n"
+                f"open_id：{open_id}\n"
+                f"时间：{time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"审批页面：{_public_base_url()}{ADMIN_PAGE_PATH}",
+            )
+            _log("feishu_access_notified", open_id=open_id, delivered=notified)
+        return jsonify({"status": record["status"], "name": record["name"] or name,
+                        "open_id": open_id})
 
     def _require_admin():
         user = _session_user()

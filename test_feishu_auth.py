@@ -452,6 +452,13 @@ class ApprovalModeTests(unittest.TestCase):
         with mock.patch("feishu_auth._http_json", side_effect=fake_feishu_http(user)):
             return client.get(f"{CALLBACK_PATH}?code=c&state={urllib.parse.quote(state)}")
 
+    def apply(self, client):
+        return client.post(feishu_auth.REQUEST_API_PATH)
+
+    def login_and_apply(self, client, user: dict, next_path: str = "/"):
+        self.login(client, user, next_path)
+        return self.apply(client)
+
     def test_admin_logs_in_directly(self):
         client = self.app.test_client()
         response = self.login(client, self.ADMIN, "/deep")
@@ -469,38 +476,57 @@ class ApprovalModeTests(unittest.TestCase):
         self.assertEqual(client.get("/api/monitor/matches").status_code, 200)
         self.assertFalse(client.get("/api/auth/me").get_json()["user"]["is_admin"])
 
-    def test_stranger_is_queued_notified_and_parked_on_pending_page(self):
+    def test_stranger_is_parked_as_eligible_without_filing_anything(self):
         client = self.app.test_client()
         response = self.login(client, self.STRANGER, "/deep?x=1")
         self.assertEqual(response.status_code, 302)
         self.assertEqual(response.headers["Location"], feishu_auth.PENDING_PAGE_PATH)
         # No real session yet: APIs stay locked.
         self.assertEqual(client.get("/api/monitor/matches").status_code, 401)
-        # Waiting page is reachable without a session and polls pending status.
+        # Waiting page is reachable without a session and shows the apply button.
         page = client.get(feishu_auth.PENDING_PAGE_PATH, headers={"Accept": "text/html"})
         self.assertEqual(page.status_code, 200)
         self.assertIn(b"/api/auth/pending", page.data)
+        self.assertIn(b"/api/auth/request", page.data)
         status = client.get(feishu_auth.PENDING_API_PATH).get_json()
-        self.assertEqual(status["status"], "pending")
+        self.assertEqual(status["status"], "eligible")
         self.assertEqual(status["open_id"], "ou_new")
         self.assertEqual(status["name"], "新人")
-        # Admin notified exactly once, with the approval page URL.
+        # Nothing filed, nobody notified until the button is clicked.
+        self.notify_mock.assert_not_called()
+        admin = self.app.test_client()
+        self.login(admin, self.ADMIN)
+        self.assertEqual(admin.get(feishu_auth.ADMIN_API_PATH).get_json()["requests"], [])
+
+    def test_clicking_apply_files_request_and_notifies_once(self):
+        client = self.app.test_client()
+        self.login(client, self.STRANGER, "/deep?x=1")
+        result = self.apply(client).get_json()
+        self.assertEqual(result["status"], "pending")
+        self.assertEqual(result["open_id"], "ou_new")
+        self.assertEqual(client.get(feishu_auth.PENDING_API_PATH).get_json()["status"], "pending")
         self.notify_mock.assert_called_once()
         url, text = self.notify_mock.call_args[0]
         self.assertEqual(url, self.config.notify_webhook)
         self.assertIn("新人", text)
         self.assertIn("ou_new", text)
         self.assertIn("https://monitor.example.com" + feishu_auth.ADMIN_PAGE_PATH, text)
-
-    def test_repeat_login_while_pending_does_not_renotify(self):
-        client = self.app.test_client()
+        # Second click and re-login do not re-notify.
+        self.assertEqual(self.apply(client).get_json()["status"], "pending")
         self.login(client, self.STRANGER)
-        self.login(client, self.STRANGER)
+        self.assertEqual(client.get(feishu_auth.PENDING_API_PATH).get_json()["status"], "pending")
         self.assertEqual(self.notify_mock.call_count, 1)
+
+    def test_apply_without_identity_is_401(self):
+        client = self.app.test_client()
+        response = self.apply(client)
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.get_json()["login_url"], LOGIN_PATH)
+        self.notify_mock.assert_not_called()
 
     def test_approval_promotes_waiting_page_to_session(self):
         stranger = self.app.test_client()
-        self.login(stranger, self.STRANGER, "/deep?x=1")
+        self.login_and_apply(stranger, self.STRANGER, "/deep?x=1")
         admin = self.app.test_client()
         self.login(admin, self.ADMIN)
         listing = admin.get(feishu_auth.ADMIN_API_PATH).get_json()
@@ -529,7 +555,7 @@ class ApprovalModeTests(unittest.TestCase):
 
     def test_approved_user_logs_in_directly_next_time(self):
         stranger = self.app.test_client()
-        self.login(stranger, self.STRANGER)
+        self.login_and_apply(stranger, self.STRANGER)
         admin = self.app.test_client()
         self.login(admin, self.ADMIN)
         admin.post(feishu_auth.ADMIN_API_PATH + "/decide",
@@ -543,7 +569,7 @@ class ApprovalModeTests(unittest.TestCase):
 
     def test_rejected_user_stays_out_and_can_be_reapproved(self):
         stranger = self.app.test_client()
-        self.login(stranger, self.STRANGER)
+        self.login_and_apply(stranger, self.STRANGER)
         admin = self.app.test_client()
         self.login(admin, self.ADMIN)
         admin.post(feishu_auth.ADMIN_API_PATH + "/decide",
@@ -551,9 +577,11 @@ class ApprovalModeTests(unittest.TestCase):
         status = stranger.get(feishu_auth.PENDING_API_PATH).get_json()
         self.assertEqual(status["status"], "rejected")
         self.assertEqual(stranger.get("/api/monitor/matches").status_code, 401)
-        # Logging in again lands back on the waiting page, no new notification.
+        # Logging in again lands back on the waiting page; re-applying does
+        # not reopen the request or re-notify.
         again = self.login(stranger, self.STRANGER)
         self.assertEqual(again.headers["Location"], feishu_auth.PENDING_PAGE_PATH)
+        self.assertEqual(self.apply(stranger).get_json()["status"], "rejected")
         self.assertEqual(self.notify_mock.call_count, 1)
         admin.post(feishu_auth.ADMIN_API_PATH + "/decide",
                    json={"open_id": "ou_new", "action": "approve"})
@@ -563,7 +591,7 @@ class ApprovalModeTests(unittest.TestCase):
 
     def test_revoking_approved_user_blocks_next_login(self):
         stranger = self.app.test_client()
-        self.login(stranger, self.STRANGER)
+        self.login_and_apply(stranger, self.STRANGER)
         admin = self.app.test_client()
         self.login(admin, self.ADMIN)
         admin.post(feishu_auth.ADMIN_API_PATH + "/decide",
@@ -610,11 +638,13 @@ class ApprovalModeTests(unittest.TestCase):
         client = self.app.test_client()
         self.assertEqual(client.get(feishu_auth.PENDING_API_PATH).get_json(), {"status": "none"})
 
-    def test_webhook_failure_does_not_break_login(self):
+    def test_webhook_failure_does_not_break_apply(self):
         self.notify_mock.return_value = False
         client = self.app.test_client()
-        response = self.login(client, self.STRANGER)
-        self.assertEqual(response.status_code, 302)
+        self.login(client, self.STRANGER)
+        response = self.apply(client)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["status"], "pending")
         self.assertEqual(client.get(feishu_auth.PENDING_API_PATH).get_json()["status"], "pending")
 
     def test_logout_clears_pending_identity(self):
@@ -622,6 +652,7 @@ class ApprovalModeTests(unittest.TestCase):
         self.login(client, self.STRANGER)
         client.post("/api/auth/logout")
         self.assertEqual(client.get(feishu_auth.PENDING_API_PATH).get_json(), {"status": "none"})
+        self.assertEqual(self.apply(client).status_code, 401)
 
     def test_pending_page_with_prefix_embeds_prefix(self):
         config = make_config(admin_users=frozenset({"ou_admin"}), access_db_path=":memory:",
@@ -632,6 +663,7 @@ class ApprovalModeTests(unittest.TestCase):
         self.assertEqual(response.headers["Location"], "/gif-monitor" + feishu_auth.PENDING_PAGE_PATH)
         page = client.get(feishu_auth.PENDING_PAGE_PATH)
         self.assertIn(b'var PREFIX = "/gif-monitor";', page.data)
+        self.apply(client)
         admin = app.test_client()
         self.login(admin, self.ADMIN)
         admin.post(feishu_auth.ADMIN_API_PATH + "/decide",
@@ -646,6 +678,7 @@ class ApprovalDisabledTests(unittest.TestCase):
         client = app.test_client()
         self.assertEqual(client.get(feishu_auth.PENDING_PAGE_PATH).status_code, 404)
         self.assertEqual(client.get(feishu_auth.PENDING_API_PATH).status_code, 404)
+        self.assertEqual(client.post(feishu_auth.REQUEST_API_PATH).status_code, 404)
         self.assertFalse(make_config().approval_enabled)
 
     def test_admin_env_parsed(self):
