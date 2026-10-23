@@ -65,12 +65,14 @@ body{
 .tile-clips-badge{font:600 11px inherit;color:var(--cyan);background:rgba(94,234,212,.08);border:1px solid rgba(94,234,212,.35);border-radius:999px;padding:4px 9px;cursor:pointer;white-space:nowrap;font-variant-numeric:tabular-nums;transition:background .2s,transform .2s}
 .tile-clips-badge:hover{background:rgba(94,234,212,.18)}
 .tile-clips-badge.flash{background:rgba(98,217,145,.3);border-color:var(--green);color:var(--green);transform:scale(1.08)}
-/* ---- Stage: full-viewport dialog, video left / GIF work panel right ----
-   The panel is the operator's main surface during a match, so it gets a fixed
-   column that never scrolls out of view, 14px controls and 40px tap targets.
-   Below 1100px it falls back to the old stacked layout. */
-.stage{position:fixed;inset:0;background:rgba(3,7,12,.86);display:flex;align-items:stretch;justify-content:center;z-index:50;padding:12px}
-.stage-inner{width:100%;height:100%;display:flex;flex-direction:column;background:#0d1723;border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow);overflow:hidden}
+/* ---- Stage: centred dialog, video left / GIF work panel right ----
+   The dialog takes ~93% × 92% of the viewport (capped at 1500×900) so a
+   little backdrop shows around it. The video is sized from the dialog
+   *height* (``--stage-h``) so the buttons / status / notes below it always
+   fit without scrolling; ``--stage-reserve`` is the vertical space those
+   rows plus header and padding need. Below 1100px it stacks again. */
+.stage{--stage-h:min(900px,92vh);--stage-reserve:232px;position:fixed;inset:0;background:rgba(3,7,12,.86);display:flex;align-items:center;justify-content:center;z-index:50;padding:0}
+.stage-inner{width:min(1500px,93vw);height:var(--stage-h);display:flex;flex-direction:column;background:#0d1723;border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow);overflow:hidden}
 .stage-head{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:12px 18px;border-bottom:1px solid var(--line);flex-shrink:0}
 .stage-head strong{font-size:18px}
 .stage-actions{display:flex;gap:10px;align-items:center}
@@ -79,7 +81,7 @@ body{
 .stage-left{flex:1 1 60%;min-width:0;display:flex;flex-direction:column;padding:14px 18px;overflow:auto;border-right:1px solid var(--line)}
 .stage-right{flex:0 0 40%;max-width:560px;min-width:380px;display:flex;flex-direction:column;min-height:0;background:rgba(255,255,255,.02)}
 .stage-video-host{flex-shrink:0}
-.stage-video{width:100%;aspect-ratio:16/9;max-height:calc(100vh - 220px);object-fit:contain;background:#000;display:block;border-radius:8px}
+.stage-video{display:block;width:min(100%,calc((var(--stage-h) - var(--stage-reserve)) * 16 / 9));margin:0 auto;aspect-ratio:16/9;object-fit:contain;background:#000;border-radius:8px}
 .stage-range{display:flex;align-items:center;gap:12px;margin:14px 0 10px;flex-wrap:wrap}
 .stage-range .button{padding:12px 22px;font-size:16px;min-height:44px;display:inline-flex;align-items:center;gap:8px}
 .stage-range kbd{font:600 11px/1 ui-monospace,Menlo,monospace;padding:3px 6px;border-radius:4px;border:1px solid rgba(255,255,255,.3);background:rgba(0,0,0,.25);color:inherit;opacity:.85}
@@ -111,6 +113,11 @@ body{
 .stage-clip-draft a{color:var(--cyan);text-decoration:none;font-weight:600}
 .stage-clip-summary{font-size:13px;color:var(--muted);flex:1 1 100%;min-width:0;overflow-wrap:anywhere}
 .stage-clip-form{display:flex;flex-direction:column;gap:10px;border-top:1px dashed var(--line);padding-top:10px}
+/* Per-clip note about the auto push match (was a stage-wide line under the
+   video, where it was easy to miss and did not say which clip it meant). */
+.stage-clip-hint{font-size:13px;color:var(--muted);border:1px solid var(--line);border-radius:6px;padding:6px 10px;overflow-wrap:anywhere}
+.stage-clip-hint.warn{color:var(--amber);border-color:rgba(245,185,76,.5);background:rgba(245,185,76,.08)}
+.stage-clip-hint.ok{color:var(--green);border-color:rgba(98,217,145,.4)}
 .stage-clip-sources{display:flex;flex-direction:column;gap:4px}
 .stage-clip-source{font-size:14px;color:var(--text);display:flex;align-items:center;gap:8px;cursor:pointer;padding:6px 8px;border-radius:6px;border:1px solid transparent}
 .stage-clip-source:hover{background:rgba(255,255,255,.05)}
@@ -129,12 +136,12 @@ body{
 .stage-clip-publish:disabled{opacity:.45;cursor:not-allowed}
 @media (max-width:1100px){
   .stage{padding:0}
-  .stage-inner{border-radius:0;border:none;overflow:auto}
+  .stage-inner{width:100%;height:100%;border-radius:0;border:none;overflow:auto}
   .stage-body{flex-direction:column}
   .stage-left{overflow:visible;border-right:none;border-bottom:1px solid var(--line)}
   .stage-right{flex:none;max-width:none;min-width:0}
   .stage-clips{overflow:visible}
-  .stage-video{max-height:52vh}
+  .stage-video{width:100%;max-height:52vh}
   .stage-range-hint{display:none}
 }
 

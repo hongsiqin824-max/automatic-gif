@@ -572,10 +572,8 @@ async function captureClip(matchId, button, range) {
     const alertNote = alertMatchNote(data.alert_match);
     const prefix = warn ? '⚠ 未锚定，画面可能不准' : '已生成 GIF';
     setTileStatus(matchId, `${prefix}（${sizeMb} MB）${publishNote}${alertNote}`, warn ? 'warn' : 'ok', true);
-    if (state.stageMatchId === matchId && alertNote) {
-      const am = data.alert_match || {};
-      addStageNote(alertNote.replace(/^ · /, ''), am.mode === 'alert' && !am.ambiguous ? 'ok' : 'warn');
-    }
+    // The push-match note is shown on the clip's own row (buildClipForm);
+    // the stage notes under the video are kept for errors only.
     const tile = state.tiles.get(matchId);
     setTileClipCount(matchId, ((tile && tile.clipCount) || 0) + 1, true);
     // Jump straight to the new row's title so the operator can type without
@@ -691,6 +689,16 @@ function buildClipForm(item, row) {
   const candidates = Array.isArray(item.candidates) ? item.candidates : [];
   const radioName = `clip-src-${item.name.replace(/\W/g, '')}`;
   const dirty = new Set();
+
+  // What the server tied this clip to, shown on the row itself so the
+  // operator sees it next to the radio it is about.
+  const hintText = alertMatchNote(am).replace(/^ · /, '');
+  if (hintText) {
+    const hint = document.createElement('div');
+    hint.className = 'stage-clip-hint ' + (am.mode === 'alert' && !am.ambiguous && !am.weak ? 'ok' : 'warn');
+    hint.textContent = hintText;
+    form.appendChild(hint);
+  }
 
   const sources = document.createElement('div');
   sources.className = 'stage-clip-sources';
@@ -978,8 +986,15 @@ async function loadStageClips(matchId, options = {}) {
       : '';
   }
   if (options.focusTitle) {
+    // Newest row is first: show it whole, then focus without re-scrolling.
+    // In the stacked (<1100px) layout the list itself does not scroll, so
+    // also bring the row into the dialog's view.
+    list.scrollTop = 0;
     const title = list.querySelector('.stage-clip-row.editing .stage-clip-title');
-    if (title) { title.focus(); title.closest('.stage-clip-row').scrollIntoView({block: 'nearest'}); }
+    if (title) {
+      title.focus({preventScroll: true});
+      title.closest('.stage-clip-row').scrollIntoView({block: 'nearest'});
+    }
   }
   setTileClipCount(matchId, clips.length);
   const pending = clips.some((c) => c.event_key && !(
