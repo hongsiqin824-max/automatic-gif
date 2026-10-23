@@ -1230,6 +1230,30 @@ class ClipPublishEndpointTests(ClipEndpointAlertMatchTests):
         self.assertEqual(meta["form"]["match_event"], 0)
         self.assertEqual(meta["match_detail"]["team_A_name"], "甲")
 
+    def test_publish_backfills_team_ids_into_old_clip_match_detail(self):
+        """Clips captured before the catalog carried team ids get them from the
+        live directory at publish time so the publisher can pick the exact tag."""
+        name = self._clip(10.0).get_json()["name"]
+        meta_path = (self.dir / "clips" / name).with_suffix(".json")
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        self.assertIsNone(meta["match_detail"].get("team_A_id"))
+        with mock.patch.object(
+            monitor_server.match_catalog,
+            "snapshot",
+            return_value={"playing": [{"match_id": "54622319", "team_A_name": "甲", "team_B_name": "乙",
+                                       "team_A_id": "50000001", "team_B_id": "50000002"}]},
+        ):
+            published = self.client.post(
+                "/api/monitor/clip/publish", json={"match_id": "54622319", "name": name, "title": "t"}
+            )
+        self.assertEqual(published.status_code, 200, published.get_json())
+        detail = self.queue.enqueue.call_args.kwargs["match_detail"]
+        self.assertEqual(detail["team_A_id"], "50000001")
+        self.assertEqual(detail["team_B_id"], "50000002")
+        self.assertEqual(detail["team_A_name"], "甲")
+        # The sidecar itself is not rewritten with the ids; only the publish payload.
+        self.assertIsNone(json.loads(meta_path.read_text(encoding="utf-8"))["match_detail"].get("team_A_id"))
+
     def test_list_returns_form_and_candidates_for_unpublished_rows(self):
         with mock.patch.object(monitor_server.time, "time", return_value=self.base - 300.0):
             first = self.store.add({"match_id": "54622319", "event_type": "goal", "team": "A",

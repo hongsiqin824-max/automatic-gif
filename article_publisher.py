@@ -78,6 +78,241 @@ def article_litpic_source() -> str:
     return value
 
 
+CHANNELS_SOURCES = frozenset({"teams", "off"})
+TEAM_CHANNEL_CACHE_TTL_SECONDS = 6 * 60 * 60
+# Misses (platform error or no usable tag) are remembered briefly so an outage
+# costs one search per team per window instead of two timeouts per article.
+TEAM_CHANNEL_NEGATIVE_TTL_SECONDS = 120.0
+TEAM_CHANNEL_TAG_TYPE = "球队"
+# Match-directory team ids are the CMS tag row ``id`` plus this offset
+# (verified on 18/18 teams: 50016400 → row id 16400 for 辽宁铁人, including
+# teams whose name appears twice in the tag library).
+TEAM_ID_TAG_OFFSET = 50_000_000
+
+
+def article_channels_source() -> str:
+    """Where the primary tags (``channels``) come from.
+
+    ``teams`` (default) resolves the home and away teams to CMS tag ids and
+    sends both. The platform merges these with the tags it derives from
+    ``match_id`` and de-duplicates by tag id (verified with drafts), so a
+    match that already had both teams is unchanged and one that had 0/1 gets
+    filled in. ``off`` sends nothing, restoring the old behaviour.
+    """
+    value = os.environ.get("ARTICLE_CHANNELS_SOURCE", "teams").strip().lower()
+    if value not in CHANNELS_SOURCES:
+        raise RuntimeError("ARTICLE_CHANNELS_SOURCE 必须是 teams 或 off")
+    return value
+
+
+def _positive_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, str) and re.fullmatch(r"[1-9]\d{0,19}", value.strip()):
+        return int(value.strip())
+    return None
+
+
+def team_tag_row_id(team_id: Any) -> int | None:
+    """Expected tag-library row ``id`` for a directory ``team_A_id``/``team_B_id``."""
+    numeric = _positive_int(team_id)
+    if numeric is None or numeric <= TEAM_ID_TAG_OFFSET:
+        return None
+    return numeric - TEAM_ID_TAG_OFFSET
+
+
+def pick_team_channel(
+    rows: list[dict[str, Any]], team_name: str, team_id: Any = None
+) -> tuple[int, str] | None:
+    """Pick the tag ``value`` for one team; returns ``(value, matched_by)``.
+
+    1. ``id``: a 球队 row whose ``id`` equals ``team_id − 50000000``. This is
+       the row the platform itself attaches for the match, so it is always
+       the right one even when the library holds two tags with the same name
+       (10 of 26 live teams on 2026-10-23 did), and it tolerates small name
+       differences between the directory and the CMS.
+    2. ``name``: only when no usable ``team_id`` or the id row is absent from
+       the results. A 球队 row whose ``name`` equals the team exactly, and
+       only if there is exactly one such row. Two same-name rows mean we
+       cannot tell which the platform uses; sending the wrong one leaves the
+       article with the team tagged twice, which is worse than not tagging.
+    """
+    team_rows = [
+        row
+        for row in rows
+        if isinstance(row, dict)
+        and str(row.get("type") or "").strip() == TEAM_CHANNEL_TAG_TYPE
+        and _positive_int(row.get("value")) is not None
+    ]
+    expected_row_id = team_tag_row_id(team_id)
+    if expected_row_id is not None:
+        for row in team_rows:
+            if _positive_int(row.get("id")) == expected_row_id:
+                return _positive_int(row.get("value")), "id"
+    wanted = str(team_name or "").strip()
+    if not wanted:
+        return None
+    by_name = [
+        row for row in team_rows if str(row.get("name") or "").strip() == wanted
+    ]
+    if len(by_name) != 1:
+        return None
+    return _positive_int(by_name[0].get("value")), "name"
+
+
+class TeamChannelResolver:
+    """Resolve teams to CMS tag ids with an in-process TTL cache.
+
+    One match produces many articles, so each team is searched once per TTL.
+    The cache key is the directory team id when present (it is the team's
+    identity; the display name may differ between sources) and the name
+    otherwise. Misses (platform error or no usable tag) are remembered for the
+    short negative TTL and never raised: a missing tag is simply left out, and
+    the article goes out with whatever the platform derives on its own.
+    """
+
+    def __init__(
+        self,
+        search: Callable[[str], list[dict[str, Any]]],
+        *,
+        ttl_seconds: float = TEAM_CHANNEL_CACHE_TTL_SECONDS,
+        negative_ttl_seconds: float = TEAM_CHANNEL_NEGATIVE_TTL_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._search = search
+        self._ttl = float(ttl_seconds)
+        self._negative_ttl = float(negative_ttl_seconds)
+        self._clock = clock
+        self._lock = threading.Lock()
+        # value None = cached miss (search failed or no usable tag); it expires
+        # on the shorter negative TTL so a platform outage or a late-added tag
+        # is retried without pinning every article behind two timeouts.
+        self._cache: dict[str, tuple[int | None, float, str]] = {}
+
+    def _remember(self, cache_key: str, value: int | None, now: float, reason: str) -> None:
+        ttl = self._ttl if value is not None else self._negative_ttl
+        with self._lock:
+            self._cache[cache_key] = (value, now + ttl, reason)
+
+    def resolve(self, team_name: str, team_id: Any = None) -> int | None:
+        name = str(team_name or "").strip()
+        if not name:
+            return None
+        numeric_team_id = _positive_int(team_id)
+        cache_key = f"id:{numeric_team_id}" if numeric_team_id else f"name:{name}"
+        now = self._clock()
+        with self._lock:
+            cached = self._cache.get(cache_key)
+        if cached and cached[1] > now:
+            value, _, reason = cached
+            if value is None:
+                print(
+                    json.dumps(
+                        {
+                            "event": "team_channel_skipped_cached_miss",
+                            "team": name,
+                            "team_id": numeric_team_id,
+                            "reason": reason,
+                            "retry_in_seconds": round(cached[1] - now, 1),
+                        },
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
+            return value
+        try:
+            rows = self._search(name)
+        except Exception as exc:  # noqa: BLE001 - lookup must not block publishing
+            print(
+                json.dumps(
+                    {
+                        "event": "team_channel_search_failed",
+                        "team": name,
+                        "team_id": numeric_team_id,
+                        "error": str(exc),
+                        "platform_code": getattr(exc, "code", None),
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+            self._remember(cache_key, None, now, "search_failed")
+            return None
+        if not isinstance(rows, list):
+            rows = []
+        picked = pick_team_channel(rows, name, numeric_team_id)
+        if picked is None:
+            same_name = sum(
+                1
+                for row in rows
+                if isinstance(row, dict)
+                and str(row.get("type") or "").strip() == TEAM_CHANNEL_TAG_TYPE
+                and str(row.get("name") or "").strip() == name
+            )
+            print(
+                json.dumps(
+                    {
+                        "event": "team_channel_not_found",
+                        "team": name,
+                        "team_id": numeric_team_id,
+                        "rows": len(rows),
+                        "same_name_team_rows": same_name,
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+            self._remember(cache_key, None, now, "not_found")
+            return None
+        value, matched_by = picked
+        print(
+            json.dumps(
+                {
+                    "event": "team_channel_resolved",
+                    "team": name,
+                    "team_id": numeric_team_id,
+                    "value": value,
+                    "matched_by": matched_by,
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+        self._remember(cache_key, value, now, matched_by)
+        return value
+
+    def channels_for(self, match_detail: dict[str, Any]) -> str:
+        """Comma-joined tag ids for home then away; empty when none resolved."""
+        # Tagging is best-effort end to end, so a misspelt switch must not stop
+        # publishing. It is still loud: logged per article here, and status()
+        # keeps raising so the dashboard shows the bad value.
+        try:
+            source = article_channels_source()
+        except RuntimeError as exc:
+            print(
+                json.dumps(
+                    {"event": "team_channel_config_invalid", "error": str(exc)},
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+            return ""
+        if source == "off":
+            return ""
+        detail = match_detail if isinstance(match_detail, dict) else {}
+        ids: list[int] = []
+        for side in ("A", "B"):
+            value = self.resolve(
+                str(detail.get(f"team_{side}_name") or ""),
+                detail.get(f"team_{side}_id"),
+            )
+            if value is not None and value not in ids:
+                ids.append(value)
+        return ",".join(str(item) for item in ids)
+
+
 RELIABLE_PERSON_PLACEHOLDERS = frozenset(
     {
         "0",
@@ -674,6 +909,11 @@ class ArticlePublisher:
         self.ocr_image_upload_client = ocr_image_upload_client
         self.account_pool = account_pool
         self._lock = threading.RLock()
+        search = getattr(platform_client, "search_channels", None)
+        if not callable(search):
+            def search(keyword: str) -> list[dict[str, Any]]:
+                raise OpenPlatformError("当前开放平台客户端不支持标签搜索")
+        self.team_channels = TeamChannelResolver(search)
 
     def status(self) -> dict[str, Any]:
         try:
@@ -709,6 +949,7 @@ class ArticlePublisher:
             "archive_level": "B",
             "add_to_tab": article_add_to_tab(),
             "channelsnew": article_channelsnew() or None,
+            "channels_source": article_channels_source(),
             "type": "article",
             "style": "gif",
             "default_account": self.account_pool is None,
@@ -1257,6 +1498,7 @@ class ArticlePublisher:
                 litpic_url=_official_gif_litpic(gif),
                 title=title,
                 publish_account=publish_account,
+                channels=self.team_channels.channels_for(match_detail),
                 allow_relative_media=bool(
                     artifact_kind == "ocr_window"
                     and (
@@ -1435,6 +1677,7 @@ class ArticlePublisher:
                 delivery_mode=delivery_mode,
                 archive_id=archive_id,
                 publish_account=publish_account,
+                channels=self.team_channels.channels_for(match_detail),
                 # A reused DB mapping predates the in-memory marker, so infer
                 # official mode from its persisted upload source marker.
                 allow_relative_media=bool(
@@ -1769,6 +2012,7 @@ def build_article_fields(
     publish_account: dict[str, Any] | None = None,
     allow_relative_media: bool = False,
     litpic_url: str = "",
+    channels: str = "",
 ) -> dict[str, Any]:
     if delivery_mode not in {"publish", "draft"}:
         raise ArticlePublishError(
@@ -1847,6 +2091,16 @@ def build_article_fields(
     channelsnew = article_channelsnew()
     if channelsnew:
         fields["channelsnew"] = channelsnew
+    normalized_channels = str(channels or "").strip()
+    if normalized_channels:
+        if not re.fullmatch(r"\d{1,20}(,\d{1,20})*", normalized_channels):
+            raise ArticlePublishError(
+                "主标签 channels 必须是逗号分隔的数字标签 id",
+                code="publish_channels_invalid",
+                stage="request_validation",
+                status_code=400,
+            )
+        fields["channels"] = normalized_channels
     if publish_account is not None:
         user_id_text = str(publish_account.get("user_id") or "").strip()
         user_name = str(publish_account.get("user_name") or "").strip()
@@ -1903,6 +2157,7 @@ def _draft_diagnostics(
             "match_event",
             "match_score",
             "add_to_tab",
+            "channels",
             "channelsnew",
             "archive_id",
             "litpic",

@@ -267,7 +267,8 @@ AUTO_ADMISSION_PRIORITY_COMPETITIONS = {
     "16": "芬超",
 }
 MATCH_CATALOG_CARD_FIELDS = (
-    "match_id", "team_A_name", "team_A_logo", "team_B_name", "team_B_logo",
+    "match_id", "team_A_id", "team_A_name", "team_A_logo",
+    "team_B_id", "team_B_name", "team_B_logo",
     "competition_id", "competition_name", "round_name", "status", "start_play",
     "sort_timestamp", "fs_A", "fs_B", "minute", "minute_extra", "minute_period",
     "cmp_type",
@@ -4818,6 +4819,17 @@ class Dashboard:
                             str(session.detail.get("team_B_name") or ""),
                         ]
                     )
+                    # Team ids let the publisher pick the exact CMS tag even
+                    # when the tag library has two teams with the same name.
+                    # Omitted when the detail API did not provide them so the
+                    # worker never sees a literal "None".
+                    for flag, key in (
+                        ("--ocr-draft-team-a-id", "team_A_id"),
+                        ("--ocr-draft-team-b-id", "team_B_id"),
+                    ):
+                        team_id = str(session.detail.get(key) or "").strip()
+                        if team_id:
+                            command.extend([flag, team_id])
             session.worker_command = command
             session.worker_mode = "demo" if demo else "live"
             previous_lifecycle_state = session.lifecycle_state

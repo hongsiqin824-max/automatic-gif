@@ -3840,6 +3840,28 @@ def build_ocr_draft_queue(
     )
 
 
+def build_draft_match_detail(args: argparse.Namespace) -> dict[str, str]:
+    """Match detail handed to the article publisher for OCR drafts.
+
+    Names feed the title; ids let the publisher resolve the exact CMS team
+    tag (the tag library often has two same-name teams). Ids are optional:
+    the dashboard omits the flags when the detail API has none, and the
+    publisher then falls back to an unambiguous name match.
+    """
+    detail = {
+        "team_A_name": str(getattr(args, "ocr_draft_team_a_name", "") or "").strip(),
+        "team_B_name": str(getattr(args, "ocr_draft_team_b_name", "") or "").strip(),
+    }
+    for key, attribute in (
+        ("team_A_id", "ocr_draft_team_a_id"),
+        ("team_B_id", "ocr_draft_team_b_id"),
+    ):
+        team_id = str(getattr(args, attribute, "") or "").strip()
+        if team_id:
+            detail[key] = team_id
+    return detail
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", help="RTMP URL or local MP4 path")
@@ -3948,6 +3970,8 @@ def main() -> None:
     )
     parser.add_argument("--ocr-draft-team-a-name", default="")
     parser.add_argument("--ocr-draft-team-b-name", default="")
+    parser.add_argument("--ocr-draft-team-a-id", default="")
+    parser.add_argument("--ocr-draft-team-b-id", default="")
     parser.add_argument(
         "--event-log",
         type=Path,
@@ -4173,10 +4197,7 @@ def main() -> None:
         args.ocr_draft_db,
         staging_directory=args.ocr_draft_staging_dir,
     )
-    draft_match_detail = {
-        "team_A_name": str(args.ocr_draft_team_a_name or "").strip(),
-        "team_B_name": str(args.ocr_draft_team_b_name or "").strip(),
-    }
+    draft_match_detail = build_draft_match_detail(args)
     try:
         heavy_task_coordinator = HeavyTaskCoordinator.from_environment(
             heavy_task_coordinator_database(args.output_dir)

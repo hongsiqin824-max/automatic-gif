@@ -22,6 +22,10 @@ from typing import Any
 PLATFORM_ORIGIN = "https://platform.dongqiudi.com"
 DEFAULT_API_NAME = "admin-archive-createarticle"
 IMAGE_UPLOAD_API_NAME = "image-uploadimage-ai"
+CHANNEL_SEARCH_API_NAME = "admin-archive-channelsearch"
+# Tag lookup is best-effort and runs inside the publisher lock right before
+# create_article, so it must give up quickly instead of holding publishing.
+CHANNEL_SEARCH_TIMEOUT_SECONDS = 5.0
 TOKEN_REFRESH_LEEWAY_SECONDS = 5 * 60
 OAUTH_STATE_TTL_SECONDS = 10 * 60
 DEFAULT_IMAGE_UPLOAD_TIMEOUT_SECONDS = 120.0
@@ -439,6 +443,51 @@ class OpenPlatformClient:
             "message": str(result.get("message") or "ok"),
             "http_status": payload.get("__http_status"),
         }
+
+    def search_channels(self, keyword: str) -> list[dict[str, Any]]:
+        """Search the CMS tag library (``admin-archive-channelsearch``).
+
+        The endpoint needs no login (``need_login=0``) but still goes through
+        the gateway signature, and ``keyword`` must be part of the signed query
+        (verified: leaving it out of the signature yields ``10002``). Returns
+        the platform rows as-is, ordered by platform weight; callers pick.
+        """
+        self._require_configuration()
+        normalized = str(keyword or "").strip()
+        if not normalized:
+            raise OpenPlatformError("标签搜索关键词不能为空", status_code=400)
+        query = {
+            "api_name": CHANNEL_SEARCH_API_NAME,
+            "appid": self.config.appid,
+            "nonce": secrets.token_hex(16),
+            "timestamp": int(time.time()),
+            "keyword": normalized,
+        }
+        query["sign"] = sign_query(query, self.config.app_secret)
+        url = f"{PLATFORM_ORIGIN}/open/v1/do?{urllib.parse.urlencode(query)}"
+        payload = self._request_json(
+            "GET",
+            url,
+            body=b"",
+            content_type="application/x-www-form-urlencoded",
+            timeout_seconds=CHANNEL_SEARCH_TIMEOUT_SECONDS,
+        )
+        result = _business_result(payload)
+        if not result:
+            raise OpenPlatformError("开放平台返回了无法解析的标签搜索结果")
+        code = result.get("code")
+        if code != 0:
+            raise OpenPlatformError(
+                str(result.get("message") or payload.get("message") or "标签搜索失败"),
+                code=code,
+                status_code=502,
+                retriable=code in (5,),
+                http_status=payload.get("__http_status"),
+            )
+        rows = result.get("data")
+        if not isinstance(rows, list):
+            return []
+        return [row for row in rows if isinstance(row, dict)]
 
     def upload_images(
         self,

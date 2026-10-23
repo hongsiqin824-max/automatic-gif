@@ -32,7 +32,8 @@ MATCH_CATALOG_UPCOMING_SECONDS = 15 * 60
 # monitor alert drop-reason) keep working without a code change.
 MATCH_CATALOG_EXCLUDED_COMPETITION_NAMES = frozenset()
 MATCH_CATALOG_CARD_FIELDS = (
-    "match_id", "team_A_name", "team_A_logo", "team_B_name", "team_B_logo",
+    "match_id", "team_A_id", "team_A_name", "team_A_logo",
+    "team_B_id", "team_B_name", "team_B_logo",
     "competition_id", "competition_name", "round_name", "status", "start_play",
     "sort_timestamp", "fs_A", "fs_B", "minute", "minute_extra", "minute_period",
     "cmp_type",

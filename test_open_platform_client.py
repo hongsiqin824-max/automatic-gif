@@ -271,5 +271,74 @@ class OpenPlatformImageUploadTests(unittest.TestCase):
             request_json.assert_not_called()
 
 
+class OpenPlatformChannelSearchTests(unittest.TestCase):
+    def make_client(self, root: Path) -> OpenPlatformClient:
+        return OpenPlatformClient(
+            OpenPlatformConfig(
+                appid="app-1",
+                app_secret="secret-1",
+                api_name="admin-archive-createarticle",
+                redirect_uri="",
+                token_path=root / "token.json",
+            )
+        )
+
+    def test_search_signs_keyword_and_unwraps_gateway_envelope(self):
+        rows = [
+            {"value": 1108, "name": "皇家马德里", "type": "球队", "en_type": "Team"},
+            {"value": 2299, "name": "皇家马德里卡斯蒂亚", "type": "球队"},
+        ]
+        request_json = Mock(
+            return_value={"code": 0, "data": {"code": 0, "message": "ok", "data": rows}}
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            client = self.make_client(Path(directory))
+            with patch.object(client, "_request_json", request_json):
+                result = client.search_channels(" 皇马 ")
+
+        self.assertEqual(result, rows)
+        args = request_json.call_args
+        self.assertEqual(args.args[0], "GET")
+        parsed = urllib.parse.urlsplit(args.args[1])
+        self.assertEqual(parsed.path, "/open/v1/do")
+        query = urllib.parse.parse_qs(parsed.query)
+        self.assertEqual(query["api_name"], ["admin-archive-channelsearch"])
+        self.assertEqual(query["keyword"], ["皇马"])
+        # need_login=0: no OAuth token is attached, but the gateway signature
+        # must cover keyword too (the platform answers 10002 otherwise).
+        self.assertIsNone(args.kwargs.get("authorization"))
+        # Best-effort lookup inside the publisher lock: short timeout, not 15s.
+        self.assertEqual(args.kwargs["timeout_seconds"], 5.0)
+        unsigned = {key: values[0] for key, values in query.items() if key != "sign"}
+        self.assertEqual(query["sign"], [sign_query(unsigned, "secret-1")])
+
+    def test_search_rejects_empty_keyword_without_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client = self.make_client(Path(directory))
+            with patch.object(client, "_request_json") as request_json:
+                with self.assertRaises(OpenPlatformError):
+                    client.search_channels("   ")
+        request_json.assert_not_called()
+
+    def test_search_raises_on_business_error_and_tolerates_missing_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client = self.make_client(Path(directory))
+            with patch.object(
+                client,
+                "_request_json",
+                return_value={"code": 0, "data": {"code": 5, "message": "服务异常"}},
+            ):
+                with self.assertRaises(OpenPlatformError) as context:
+                    client.search_channels("皇马")
+            self.assertEqual(context.exception.code, 5)
+            self.assertTrue(context.exception.retriable)
+            with patch.object(
+                client,
+                "_request_json",
+                return_value={"code": 0, "data": {"code": 0, "message": "ok", "data": None}},
+            ):
+                self.assertEqual(client.search_channels("皇马"), [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -4,19 +4,23 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from article_publisher import (
     ArticlePublishError,
     ArticlePublisher,
     PublishedGifStore,
     RemoteGifUploadClient,
+    TeamChannelResolver,
     _check_public_cover_url,
     _official_gif_litpic,
+    article_channels_source,
     article_litpic_source,
     build_article_fields,
     build_article_title,
     inspect_animated_gif,
+    pick_team_channel,
+    team_tag_row_id,
 )
 from open_platform_client import ImageUploadResults, OpenPlatformError
 from publish_account_pool import PublishAccountPool
@@ -40,6 +44,8 @@ def animated_gif_bytes():
 class FakePlatformClient:
     def __init__(self):
         self.calls = []
+        self.search_calls = []
+        self.search_rows = {}
 
     def status(self):
         return {"configured": True, "authorized": True}
@@ -47,6 +53,10 @@ class FakePlatformClient:
     def create_article(self, fields):
         self.calls.append(fields)
         return {"article_id": "3801234", "duplicate": False, "code": 0}
+
+    def search_channels(self, keyword):
+        self.search_calls.append(keyword)
+        return list(self.search_rows.get(keyword, []))
 
 
 class FakeOfficialImageClient:
@@ -750,6 +760,92 @@ class ArticlePublisherTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 article_publisher.article_channelsnew()
 
+    def test_channels_field_validated_and_omitted_when_empty(self):
+        common = {
+            "match_id": "54478914",
+            "event": {"code": "G", "minute": "19"},
+            "gif_url": "https://matchgif.aisportsapp.com/publish-gifs/a.gif",
+            "cover_url": "https://matchgif.aisportsapp.com/publish-gif-covers/a.jpg",
+            "title": "t",
+        }
+        self.assertNotIn("channels", build_article_fields(**common))
+        self.assertNotIn("channels", build_article_fields(**common, channels="  "))
+        fields = build_article_fields(**common, channels="14284455,15498503")
+        self.assertEqual(fields["channels"], "14284455,15498503")
+        with self.assertRaisesRegex(ArticlePublishError, "channels"):
+            build_article_fields(**common, channels="14284455,abc")
+
+    def test_channels_source_env_accepts_teams_or_off(self):
+        import os
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("ARTICLE_CHANNELS_SOURCE", None)
+            self.assertEqual(article_channels_source(), "teams")
+        with patch.dict(os.environ, {"ARTICLE_CHANNELS_SOURCE": "OFF"}):
+            self.assertEqual(article_channels_source(), "off")
+        with patch.dict(os.environ, {"ARTICLE_CHANNELS_SOURCE": "match"}):
+            with self.assertRaises(RuntimeError):
+                article_channels_source()
+
+    def test_ocr_draft_sends_both_team_channels_from_match_detail(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "ocr.gif"
+            source.write_bytes(animated_gif_bytes())
+            platform = FakePlatformClient()
+            platform.search_rows = {
+                "上海海港B队": [
+                    {"id": 125618, "value": 14284455, "name": "上海海港B队", "type": "球队"},
+                ],
+                "杭州临平吴越": [
+                    {"id": 9, "value": 9, "name": "临平", "type": "球员"},
+                    {"id": 129034, "value": 15498503, "name": "杭州临平吴越", "type": "球队"},
+                ],
+            }
+            publisher = ArticlePublisher(
+                platform_client=platform,
+                gif_store=PublishedGifStore(
+                    root / "published", "https://matchgif.aisportsapp.com"
+                ),
+                database_path=root / "publish.sqlite3",
+                verify_public_url=False,
+                ocr_image_upload_client=FakeOfficialImageClient(),
+            )
+            # Shape of monitor_server._match_detail_for / dashboard session.detail.
+            detail = {
+                "team_A_id": "50125618",
+                "team_A_name": "上海海港B队",
+                "team_B_id": "50129034",
+                "team_B_name": "杭州临平吴越",
+            }
+            event = {"event_key": "goal-19", "code": "G", "minute": "19"}
+            publisher.create_or_update_draft(
+                match_id="54591935", event=event, match_detail=detail, source_path=source
+            )
+            publisher.create_or_update_draft(
+                match_id="54591935",
+                event={"event_key": "goal-40", "code": "G", "minute": "40"},
+                match_detail=detail,
+                source_path=source,
+            )
+            self.assertEqual(platform.calls[0]["channels"], "14284455,15498503")
+            self.assertEqual(platform.calls[1]["channels"], "14284455,15498503")
+            # Second article of the same match hits the cache: one search per team.
+            self.assertEqual(platform.search_calls, ["上海海港B队", "杭州临平吴越"])
+            self.assertEqual(platform.calls[0]["channelsnew"], "12039035")
+            # A bad switch value still publishes (without channels) but is
+            # surfaced loudly through status(), like the other .env fields.
+            with patch.dict(os.environ, {"ARTICLE_CHANNELS_SOURCE": "bogus"}):
+                publisher.create_or_update_draft(
+                    match_id="54591935",
+                    event={"event_key": "goal-77", "code": "G", "minute": "77"},
+                    match_detail=detail,
+                    source_path=source,
+                )
+                self.assertNotIn("channels", platform.calls[2])
+                with self.assertRaises(RuntimeError):
+                    publisher.status()
+
     def test_draft_fields_reject_invalid_delivery_mode_and_archive_id(self):
         common = {
             "match_id": "54478914",
@@ -1170,6 +1266,225 @@ class ArticlePublisherTests(unittest.TestCase):
             self.assertTrue(caught.exception.retriable)
             self.assertEqual(caught.exception.platform_code, 50001)
             self.assertEqual(caught.exception.diagnostics["gif_bytes"], len(animated_gif_bytes()))
+
+
+class TeamChannelResolverTests(unittest.TestCase):
+    # Real shape from admin-archive-channelsearch for 根特: a player first,
+    # then the club, then a reserve side.
+    ROWS = [
+        {"id": 51240, "value": 51240, "name": "特尔施特根", "type": "球员"},
+        {"id": 138, "value": 1652, "name": "根特", "type": "球队", "status": 0},
+        {"id": 9289077, "value": 9289077, "name": "根特预备队", "type": "球队"},
+    ]
+    # Real shape for 胡志明市女足: two 球队 rows with the identical name.
+    DUP_ROWS = [
+        {"id": 14473, "value": 10728022, "name": "胡志明市女足", "type": "球队"},
+        {"id": 71037, "value": 10732023, "name": "胡志明市女足二队", "type": "球队"},
+        {"id": 37537, "value": 10753811, "name": "胡志明市女足", "type": "球队"},
+    ]
+
+    def test_team_tag_row_id_requires_directory_offset(self):
+        self.assertEqual(team_tag_row_id("50014473"), 14473)
+        self.assertEqual(team_tag_row_id(50000138), 138)
+        self.assertIsNone(team_tag_row_id(None))
+        self.assertIsNone(team_tag_row_id(""))
+        self.assertIsNone(team_tag_row_id("abc"))
+        self.assertIsNone(team_tag_row_id(138))  # already a row id, not a team id
+        self.assertIsNone(team_tag_row_id(50000000))
+        self.assertIsNone(team_tag_row_id(True))
+
+    def test_pick_prefers_id_and_tolerates_name_drift(self):
+        self.assertEqual(pick_team_channel(self.ROWS, "根特", "50000138"), (1652, "id"))
+        # Directory name differs from the CMS label: id still resolves it.
+        self.assertEqual(pick_team_channel(self.ROWS, "根特队", 50000138), (1652, "id"))
+        # id never matches a non-球队 row.
+        self.assertIsNone(pick_team_channel(self.ROWS, "特尔施特根", 50051240))
+
+    def test_pick_with_duplicates_uses_id_or_gives_up(self):
+        self.assertEqual(
+            pick_team_channel(self.DUP_ROWS, "胡志明市女足", "50014473"), (10728022, "id")
+        )
+        self.assertEqual(
+            pick_team_channel(self.DUP_ROWS, "胡志明市女足", "50037537"), (10753811, "id")
+        )
+        # No id, or an id that is not in the results: two same-name rows are
+        # ambiguous, so neither is sent.
+        self.assertIsNone(pick_team_channel(self.DUP_ROWS, "胡志明市女足"))
+        self.assertIsNone(pick_team_channel(self.DUP_ROWS, "胡志明市女足", "50099999"))
+        # The unique name still resolves.
+        self.assertEqual(
+            pick_team_channel(self.DUP_ROWS, "胡志明市女足二队"), (10732023, "name")
+        )
+
+    def test_pick_name_fallback_requires_exact_unique_team_row(self):
+        self.assertEqual(pick_team_channel(self.ROWS, "根特"), (1652, "name"))
+        self.assertEqual(pick_team_channel(self.ROWS, "根特", "bad-id"), (1652, "name"))
+        self.assertEqual(pick_team_channel(self.ROWS, "根特", "50099999"), (1652, "name"))
+        self.assertIsNone(pick_team_channel(self.ROWS, "根特U19"))
+        self.assertIsNone(pick_team_channel(self.ROWS, "特尔施特根"))
+        self.assertIsNone(pick_team_channel([], "根特"))
+        self.assertIsNone(pick_team_channel(self.ROWS, ""))
+        self.assertEqual(
+            pick_team_channel(
+                [{"id": "138", "value": "1652", "name": "根特", "type": "球队"}], "根特", "50000138"
+            ),
+            (1652, "id"),
+        )
+        self.assertIsNone(
+            pick_team_channel([{"id": 1, "value": True, "name": "根特", "type": "球队"}], "根特")
+        )
+
+    def test_resolver_caches_by_team_id_then_name_and_never_caches_misses(self):
+        clock = {"now": 100.0}
+        search = Mock(return_value=self.ROWS)
+        resolver = TeamChannelResolver(
+            search, ttl_seconds=60, negative_ttl_seconds=0, clock=lambda: clock["now"]
+        )
+        self.assertEqual(resolver.resolve("根特", "50000138"), 1652)
+        # Same team id, different display name: cache hit, no new search.
+        self.assertEqual(resolver.resolve("根特队", "50000138"), 1652)
+        self.assertEqual(search.call_count, 1)
+        # No id is a separate cache entry keyed by name.
+        self.assertEqual(resolver.resolve("根特"), 1652)
+        self.assertEqual(search.call_count, 2)
+        self.assertEqual(resolver.resolve("根特"), 1652)
+        self.assertEqual(search.call_count, 2)
+        clock["now"] = 161.0
+        self.assertEqual(resolver.resolve("根特", "50000138"), 1652)
+        self.assertEqual(search.call_count, 3)
+        # negative_ttl=0: misses are not remembered.
+        self.assertIsNone(resolver.resolve("斯图拉德", "50137800"))
+        self.assertIsNone(resolver.resolve("斯图拉德", "50137800"))
+        self.assertEqual(search.call_count, 5)
+
+    def test_resolver_negative_cache_limits_retries_during_outage(self):
+        clock = {"now": 1000.0}
+        calls = {"n": 0}
+
+        def failing(_keyword):
+            calls["n"] += 1
+            raise OpenPlatformError("无法连接开放平台", retriable=True)
+
+        resolver = TeamChannelResolver(
+            failing, negative_ttl_seconds=120, clock=lambda: clock["now"]
+        )
+        detail = {
+            "team_A_id": "50014473",
+            "team_A_name": "胡志明市女足",
+            "team_B_id": "50014474",
+            "team_B_name": "丰富府里女足",
+        }
+        # First article: one failed search per team.
+        self.assertEqual(resolver.channels_for(detail), "")
+        self.assertEqual(calls["n"], 2)
+        # Next articles inside the window: no searches at all.
+        clock["now"] = 1060.0
+        self.assertEqual(resolver.channels_for(detail), "")
+        self.assertEqual(resolver.channels_for(detail), "")
+        self.assertEqual(calls["n"], 2)
+        # Window over: retried once per team.
+        clock["now"] = 1121.0
+        self.assertEqual(resolver.channels_for(detail), "")
+        self.assertEqual(calls["n"], 4)
+
+        # not_found is also negatively cached, and a positive hit after the
+        # window replaces it with the long TTL.
+        rows = {"n": 0}
+
+        def search(_keyword):
+            rows["n"] += 1
+            return [] if rows["n"] == 1 else self.ROWS
+
+        clock["now"] = 2000.0
+        resolver = TeamChannelResolver(
+            search, ttl_seconds=3600, negative_ttl_seconds=120, clock=lambda: clock["now"]
+        )
+        self.assertIsNone(resolver.resolve("根特", "50000138"))
+        self.assertIsNone(resolver.resolve("根特", "50000138"))
+        self.assertEqual(rows["n"], 1)
+        clock["now"] = 2121.0
+        self.assertEqual(resolver.resolve("根特", "50000138"), 1652)
+        clock["now"] = 2121.0 + 3000
+        self.assertEqual(resolver.resolve("根特", "50000138"), 1652)
+        self.assertEqual(rows["n"], 2)
+
+    def test_resolver_swallows_search_errors_and_skips_off_switch(self):
+        def failing(_keyword):
+            raise OpenPlatformError("服务异常", code=5)
+
+        resolver = TeamChannelResolver(failing)
+        detail = {"team_A_id": "50000138", "team_A_name": "根特", "team_B_name": "波鸿"}
+        self.assertEqual(resolver.channels_for(detail), "")
+        self.assertIsNone(resolver.resolve("根特", "50000138"))
+
+        search = Mock(return_value=self.ROWS)
+        resolver = TeamChannelResolver(search)
+        self.assertEqual(
+            resolver.channels_for({"team_A_name": "根特", "team_B_name": "根特"}), "1652"
+        )
+        self.assertEqual(resolver.channels_for({"team_B_name": "根特"}), "1652")
+        self.assertEqual(resolver.channels_for({}), "")
+        with patch.dict(os.environ, {"ARTICLE_CHANNELS_SOURCE": "off"}):
+            self.assertEqual(resolver.channels_for({"team_A_name": "根特"}), "")
+        # A misspelt switch degrades to "no tags" instead of failing the article.
+        search.reset_mock()
+        with patch.dict(os.environ, {"ARTICLE_CHANNELS_SOURCE": "bogus"}):
+            self.assertEqual(
+                resolver.channels_for({"team_A_id": "50000138", "team_A_name": "根特"}), ""
+            )
+        search.assert_not_called()
+        # Non-list payloads (e.g. a bare Mock client) are treated as no rows.
+        resolver = TeamChannelResolver(Mock(return_value=Mock()))
+        self.assertIsNone(resolver.resolve("根特"))
+
+    def test_channels_for_passes_each_side_id_to_the_search(self):
+        rows_by_keyword = {
+            "胡志明市女足": self.DUP_ROWS,
+            "丰富府里女足": [
+                {"id": 14474, "value": 10728023, "name": "丰富府里女足", "type": "球队"},
+                {"id": 41888, "value": 10758183, "name": "丰富府里女足", "type": "球队"},
+            ],
+        }
+        resolver = TeamChannelResolver(lambda keyword: rows_by_keyword[keyword])
+        detail = {
+            "team_A_id": "50014473",
+            "team_A_name": "胡志明市女足",
+            "team_B_id": "50014474",
+            "team_B_name": "丰富府里女足",
+        }
+        self.assertEqual(resolver.channels_for(detail), "10728022,10728023")
+        # Without ids both teams are ambiguous and nothing is sent.
+        bare = TeamChannelResolver(lambda keyword: rows_by_keyword[keyword])
+        self.assertEqual(
+            bare.channels_for({"team_A_name": "胡志明市女足", "team_B_name": "丰富府里女足"}),
+            "",
+        )
+
+    def test_monitor_catalog_snapshot_keeps_team_ids_for_channel_lookup(self):
+        """8901 builds match_detail from match_catalog; without the ids in the
+        card the resolver would silently fall back to name matching."""
+        import match_catalog
+
+        raw = {
+            "match_id": "54476694",
+            "cmp_type": "soccer",
+            "status": "Playing",
+            "sort_timestamp": 1_700_000_000,
+            "start_play": "2026-10-23 16:00:00",
+            "team_A_id": "50014473",
+            "team_A_name": "胡志明市女足",
+            "team_B_id": "50014474",
+            "team_B_name": "丰富府里女足",
+            "large_unused_payload": {"must_not_reach_browser": True},
+        }
+        catalog = match_catalog.MatchCatalog()
+        with patch.object(match_catalog, "request_json", return_value={"list": [raw]}), patch.object(
+            match_catalog, "match_user", return_value="u"
+        ):
+            playing = catalog.snapshot()["playing"]
+        self.assertEqual(playing[0]["team_A_id"], "50014473")
+        self.assertEqual(playing[0]["team_B_id"], "50014474")
+        self.assertNotIn("large_unused_payload", playing[0])
 
 
 if __name__ == "__main__":

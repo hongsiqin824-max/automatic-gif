@@ -1,3 +1,4 @@
+import argparse
 import json
 import io
 import os
@@ -348,6 +349,60 @@ class DashboardPublishRoutesTests(unittest.TestCase):
         self.assertIn("--ocr-draft-staging-dir", command)
         self.assertIn("--ocr-draft-team-a-name", command)
         self.assertIn("--ocr-draft-team-b-name", command)
+        # No ids in the detail: the flags are omitted, never sent as "None".
+        self.assertNotIn("--ocr-draft-team-a-id", command)
+        self.assertNotIn("--ocr-draft-team-b-id", command)
+        self.assertNotIn("None", command)
+
+    def test_dashboard_worker_passes_team_ids_for_exact_tag_lookup(self):
+        manager = dashboard_server.Dashboard(background_monitors=False)
+        session = manager.get("54476694")
+        session.source = {"resource": "rtmp://example/live"}
+        session.detail = {
+            "team_A_id": "50014473",
+            "team_A_name": "胡志明市女足",
+            "team_B_id": "50014474",
+            "team_B_name": "丰富府里女足",
+        }
+        worker = Mock(pid=123, returncode=None)
+        worker.poll.return_value = None
+
+        with patch.object(dashboard_server.subprocess, "Popen", return_value=worker) as popen:
+            manager.start(session)
+
+        command = popen.call_args.args[0]
+        self.assertEqual(command[command.index("--ocr-draft-team-a-id") + 1], "50014473")
+        self.assertEqual(command[command.index("--ocr-draft-team-b-id") + 1], "50014474")
+        # The worker turns those flags into the detail the publisher receives.
+        import event_driven_pipeline
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--ocr-draft-team-a-name", default="")
+        parser.add_argument("--ocr-draft-team-b-name", default="")
+        parser.add_argument("--ocr-draft-team-a-id", default="")
+        parser.add_argument("--ocr-draft-team-b-id", default="")
+        args = parser.parse_args(
+            [
+                "--ocr-draft-team-a-name", "胡志明市女足",
+                "--ocr-draft-team-b-name", "丰富府里女足",
+                "--ocr-draft-team-a-id", "50014473",
+                "--ocr-draft-team-b-id", "50014474",
+            ]
+        )
+        self.assertEqual(
+            event_driven_pipeline.build_draft_match_detail(args),
+            {
+                "team_A_name": "胡志明市女足",
+                "team_B_name": "丰富府里女足",
+                "team_A_id": "50014473",
+                "team_B_id": "50014474",
+            },
+        )
+        bare = parser.parse_args(["--ocr-draft-team-a-name", "主队", "--ocr-draft-team-b-name", "客队"])
+        self.assertEqual(
+            event_driven_pipeline.build_draft_match_detail(bare),
+            {"team_A_name": "主队", "team_B_name": "客队"},
+        )
 
     def test_reconcile_registers_only_existing_encoded_unsuppressed_ocr(self):
         manager = dashboard_server.Dashboard(background_monitors=False)

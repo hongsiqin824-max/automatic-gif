@@ -1972,6 +1972,15 @@ def monitor_clip_publish():
     match_detail = meta.get("match_detail")
     if not isinstance(match_detail, dict) or not match_detail:
         match_detail = _match_detail_for(match_id)
+    elif not (match_detail.get("team_A_id") and match_detail.get("team_B_id")):
+        # Clips captured before the catalog card carried team ids: fill them
+        # from the live directory so the publisher can pick the exact tag.
+        # A finished match is no longer in the directory; name fallback then.
+        live_detail = _match_detail_for(match_id)
+        match_detail = dict(match_detail)
+        for key in ("team_A_id", "team_B_id"):
+            if not match_detail.get(key) and live_detail.get(key):
+                match_detail[key] = live_detail[key]
     minute, minute_extra = _split_match_time(form["match_time"])
     # The CMS rejects a second gif article with the same match_time (platform
     # code=3 创建失败, seen 2026-10-22 02:08 on 54493251). Same-minute events do
