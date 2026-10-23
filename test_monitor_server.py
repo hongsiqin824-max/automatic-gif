@@ -19,6 +19,10 @@ os.environ.setdefault("GIF_SOURCE_SECRET", "test-secret")
 os.environ.setdefault("GIF_MONITOR_PUBLISH_ENABLED", "false")
 # Do not touch the real alert database; persistence has its own temp-dir tests.
 os.environ.setdefault("GIF_MONITOR_ALERT_DB_PATH", "")
+# A developer .env with real Feishu credentials would turn on the login wall
+# and 401 every endpoint test; feishu_auth has its own test module.
+os.environ["GIF_MONITOR_FEISHU_APP_ID"] = ""
+os.environ["GIF_MONITOR_FEISHU_APP_SECRET"] = ""
 
 import monitor_server
 import live_preview
@@ -1762,6 +1766,20 @@ class LatencyKillSwitchTests(unittest.TestCase):
             )
             command = manager._build_command("rtmp://host/app/s", Path(tmp))
         self.assertEqual(command[command.index("-preset") + 1], "superfast")
+
+
+class FeishuAuthIntegrationTests(unittest.TestCase):
+    """The login wall ships disabled: no credentials in the test env."""
+
+    def test_auth_disabled_without_credentials(self):
+        self.assertFalse(monitor_server.FEISHU_AUTH.enabled)
+        client = monitor_server.app.test_client()
+        me = client.get("/api/auth/me").get_json()
+        self.assertEqual(me, {"enabled": False, "user": None})
+        # Core routes stay reachable exactly as before the wall existed.
+        health = client.get("/api/health").get_json()
+        self.assertTrue(health["ok"])
+        self.assertEqual(client.get("/api/auth/feishu/login").status_code, 404)
 
 
 if __name__ == "__main__":

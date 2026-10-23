@@ -161,9 +161,25 @@ location /gif-monitor/whep/ {
     proxy_set_header X-Forwarded-Proto $scheme;
     proxy_buffering off;
     proxy_read_timeout 30s;
+    # 飞书登录墙：未登录用户不能拉 WHEP 流（8901 未配 GIF_MONITOR_FEISHU_APP_ID/SECRET 时 check 恒 204，等于不拦）
+    auth_request /gif-monitor/api/auth/check;
+}
+
+# auth_request 专用子请求 location：必须关掉 body 转发并清空 Content-Length，
+# 否则 WHEP POST 的 SDP body 长度会被带给 Flask 而 body 不发，后端会等 body 超时。
+# internal 表示只允许 nginx 内部子请求访问；原始 Cookie 头会自动带过去。
+location = /gif-monitor/api/auth/check {
+    internal;
+    proxy_pass http://127.0.0.1:8001/api/auth/check;
+    proxy_http_version 1.1;
+    proxy_pass_request_body off;
+    proxy_set_header Content-Length "";
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
 }
 ```
 ```bash
+nginx -V 2>&1 | grep -o with-http_auth_request_module   # 必须有输出，否则 auth_request 指令会让 nginx -t 报错
 sudo cp /etc/nginx/conf.d/matchgif.conf /etc/nginx/conf.d/matchgif.conf.bak-whep-$(date +%Y%m%d)
 sudo nginx -t && sudo systemctl reload nginx
 # 自检：两条都说明请求已经穿过 nginx 到了 mediamtx（nginx 自己的 404 不会带这些）

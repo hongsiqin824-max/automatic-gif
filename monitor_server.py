@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import atexit
 import concurrent.futures
+import hmac
 import json
 import math
 import os
@@ -80,6 +81,7 @@ from article_draft_queue import (
     DRAFT_DELIVERY_MODE,
     MANUAL_ARTIFACT_KIND,
 )
+from feishu_auth import FeishuAuthConfig, install_feishu_auth
 
 
 HOST = os.environ.get("GIF_MONITOR_HOST", "127.0.0.1")
@@ -559,6 +561,12 @@ if manual_draft_queue is not None:
     atexit.register(manual_draft_queue.close)
 
 app = Flask(__name__, static_folder="monitor_static", static_url_path="/static")
+
+# Feishu OAuth login wall for the whole console. Enabled only when the app
+# credentials are configured in .env; /api/health, /static/ and the ingest
+# endpoint (which keeps its own X-Monitor-Token check) stay exempt. See
+# feishu_auth.py for the full contract.
+FEISHU_AUTH = install_feishu_auth(app, FeishuAuthConfig.from_env(ROOT / "data"))
 
 
 def _batch_query_sources(match_ids: list[str]) -> dict[str, str]:
@@ -1618,7 +1626,9 @@ def _send_feishu_text(text: str) -> bool:
 @app.post("/api/monitor/events/ingest")
 def monitor_events_ingest():
     """Receive a goal/red-card event from the external push monitor (loopback)."""
-    if ALERT_INGEST_TOKEN and request.headers.get("X-Monitor-Token", "") != ALERT_INGEST_TOKEN:
+    if ALERT_INGEST_TOKEN and not hmac.compare_digest(
+        request.headers.get("X-Monitor-Token", ""), ALERT_INGEST_TOKEN
+    ):
         return jsonify({"error": "unauthorized"}), 401
     if not ALERT_ENABLED:
         return jsonify({"ok": True, "accepted": False, "reason": "alerts_disabled"})

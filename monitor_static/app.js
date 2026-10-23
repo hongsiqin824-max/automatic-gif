@@ -44,9 +44,23 @@ function escapeHtml(value) {
   ));
 }
 
+let feishuLoginRedirecting = false;
+
 async function requestJson(url, options = {}) {
   const response = await fetch(url, {headers: {'Content-Type': 'application/json'}, ...options});
   const data = await response.json().catch(() => ({}));
+  if (response.status === 401 && data.login_url) {
+    // 飞书登录态缺失/过期：整页走一次 OAuth，登录后回到当前页面。
+    if (!feishuLoginRedirecting) {
+      feishuLoginRedirecting = true;
+      const next = encodeURIComponent(location.pathname + location.search);
+      window.location.assign(`${data.login_url}?next=${next}`);
+    }
+    const error = new Error('登录已过期，正在跳转飞书登录…');
+    error.status = 401;
+    error.data = data;
+    throw error;
+  }
   if (!response.ok) {
     const error = new Error(data.error || `请求失败 ${response.status}`);
     error.status = response.status;
