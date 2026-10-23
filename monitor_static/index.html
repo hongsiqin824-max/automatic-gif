@@ -72,15 +72,22 @@
           <button id="stage-close" class="button ghost" type="button">关闭</button>
         </div>
       </div>
-      <div id="stage-video-host" class="stage-video-host"></div>
-      <div class="stage-range">
-        <button id="stage-range-start" class="button secondary" type="button" title="把当前画面设为 GIF 起点">开始</button>
-        <button id="stage-range-end" class="button primary" type="button" disabled title="把当前画面设为终点并生成 GIF（不发布，发布在下方列表）">结束</button>
+      <div class="stage-body">
+        <div class="stage-left">
+          <div id="stage-video-host" class="stage-video-host"></div>
+          <div class="stage-range">
+            <button id="stage-range-start" class="button secondary" type="button" title="把当前画面设为 GIF 起点（快捷键 S）">开始 <kbd>S</kbd></button>
+            <button id="stage-range-end" class="button primary" type="button" disabled title="把当前画面设为终点并生成 GIF（快捷键 E；不发布，发布在右侧面板）">结束 <kbd>E</kbd></button>
+            <span class="stage-range-hint muted">快捷键：S 起点 · E 终点并截取 · Enter 发布 · Esc 关闭</span>
+          </div>
+          <div id="stage-status" class="stage-status muted"></div>
+          <div id="stage-notes" class="stage-notes"></div>
+        </div>
+        <div class="stage-right">
+          <div class="stage-clips-head">本场已截取的 GIF <span id="stage-clips-count" class="stage-clips-count"></span></div>
+          <div id="stage-clips" class="stage-clips"></div>
+        </div>
       </div>
-      <div id="stage-status" class="stage-status muted"></div>
-      <div id="stage-notes" class="stage-notes"></div>
-      <div class="stage-clips-head">本场已截取的 GIF</div>
-      <div id="stage-clips" class="stage-clips"></div>
     </div>
   </div>
 

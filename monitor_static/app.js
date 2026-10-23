@@ -552,7 +552,7 @@ async function startTilePreview(matchId) {
 // to capture now (the fixed "last N seconds" buttons were removed as unused).
 // Returns true on success so the range caller knows whether to reset its state.
 async function captureClip(matchId, button, range) {
-  const prevLabel = button ? button.textContent : '';
+  const prevLabel = button ? button.innerHTML : '';
   if (button) { button.disabled = true; button.textContent = '截取中…'; }
   setTileStatus(matchId, '正在截取所选区间…');
   try {
@@ -578,14 +578,16 @@ async function captureClip(matchId, button, range) {
     }
     const tile = state.tiles.get(matchId);
     setTileClipCount(matchId, ((tile && tile.clipCount) || 0) + 1, true);
-    if (state.stageMatchId === matchId) loadStageClips(matchId);
+    // Jump straight to the new row's title so the operator can type without
+    // reaching for the mouse (S → E → type title → Enter).
+    if (state.stageMatchId === matchId) loadStageClips(matchId, {focusTitle: true});
     return true;
   } catch (error) {
     setTileStatus(matchId, error.message, 'warn');
     if (state.stageMatchId === matchId) addStageNote('截取失败：' + error.message, 'fail');
     return false;
   } finally {
-    if (button) { button.disabled = false; button.textContent = prevLabel; }
+    if (button) { button.disabled = false; button.innerHTML = prevLabel; }
   }
 }
 
@@ -756,13 +758,19 @@ function buildClipForm(item, row) {
   titleRow.className = 'stage-clip-fields';
   const titleEl = document.createElement('input');
   titleEl.className = 'stage-input stage-clip-input stage-clip-title';
-  titleEl.type = 'text'; titleEl.maxLength = 100; titleEl.placeholder = '标题（必填）';
+  titleEl.type = 'text'; titleEl.maxLength = 100; titleEl.placeholder = '标题（必填）· 回车发布';
   mk(titleRow, 'title', titleEl, '标题');
   const publish = document.createElement('button');
   publish.className = 'button primary stage-clip-publish';
   publish.type = 'button';
   publish.textContent = '发布';
   publish.addEventListener('click', () => publishClip(item.name, readForm(), publish, row));
+  // Enter in the title = click 发布 (only when the button is enabled).
+  titleEl.addEventListener('keydown', (ev) => {
+    if (ev.key !== 'Enter' || ev.isComposing) return;
+    ev.preventDefault();
+    if (!publish.disabled) publish.click();
+  });
   titleRow.appendChild(publish);
   form.appendChild(titleRow);
 
@@ -923,7 +931,7 @@ async function publishClip(name, formValues, button, row, force) {
   }
 }
 
-async function loadStageClips(matchId) {
+async function loadStageClips(matchId, options = {}) {
   const list = $('stage-clips');
   if (!list) return;
   let data;
@@ -961,6 +969,17 @@ async function loadStageClips(matchId) {
       }
       list.appendChild(row);
     });
+  }
+  const countEl = $('stage-clips-count');
+  if (countEl) {
+    const unpublished = data.publish_enabled ? clips.filter((c) => !c.event_key).length : 0;
+    countEl.textContent = clips.length
+      ? (unpublished ? `${unpublished} 条待发布 / 共 ${clips.length} 条` : `共 ${clips.length} 条`)
+      : '';
+  }
+  if (options.focusTitle) {
+    const title = list.querySelector('.stage-clip-row.editing .stage-clip-title');
+    if (title) { title.focus(); title.closest('.stage-clip-row').scrollIntoView({block: 'nearest'}); }
   }
   setTileClipCount(matchId, clips.length);
   const pending = clips.some((c) => c.event_key && !(
@@ -1066,7 +1085,8 @@ function renderRange() {
   const endBtn = $('stage-range-end');
   if (!startBtn || !endBtn) return;
   const hasStart = r.pinId != null && r.startMs != null;
-  startBtn.textContent = hasStart ? '重新开始' : '开始';
+  // The button keeps its <kbd> hint; only the leading text node changes.
+  startBtn.firstChild.textContent = hasStart ? '重新开始 ' : '开始 ';
   startBtn.disabled = r.busy;
   endBtn.disabled = !hasStart || r.busy;
 }
@@ -1201,6 +1221,7 @@ function openStage(matchId) {
   $('stage-status').className = 'stage-status ok';
   $('stage-notes').innerHTML = '';
   $('stage-clips').innerHTML = '<div class="stage-clip-empty">正在读取 GIF 列表…</div>';
+  $('stage-clips-count').textContent = '';
   loadStageClips(matchId);
   clearRange();
   const stageStatus = (text, cls) => {
@@ -1516,9 +1537,26 @@ $('stage-live').addEventListener('click', () => {
   });
 });
 document.addEventListener('keydown', (ev) => {
-  if (ev.key !== 'Escape') return;
-  if (state.alertPanelOpen) { closeAlertPanel(); return; }
-  closeStage();
+  if (ev.key === 'Escape') {
+    if (state.alertPanelOpen) { closeAlertPanel(); return; }
+    closeStage();
+    return;
+  }
+  // S / E drive the capture buttons while the stage is open and the operator
+  // is not typing in a form field (the title input handles Enter itself).
+  if (!state.stageMatchId || ev.metaKey || ev.ctrlKey || ev.altKey || ev.isComposing) return;
+  const tag = (ev.target && ev.target.tagName) || '';
+  if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA' || (ev.target && ev.target.isContentEditable)) return;
+  const key = ev.key.toLowerCase();
+  if (key === 's') {
+    ev.preventDefault();
+    const btn = $('stage-range-start');
+    if (btn && !btn.disabled) btn.click();
+  } else if (key === 'e') {
+    ev.preventDefault();
+    const btn = $('stage-range-end');
+    if (btn && !btn.disabled) btn.click();
+  }
 });
 window.addEventListener('beforeunload', () => {
   for (const matchId of state.tiles.keys()) {
