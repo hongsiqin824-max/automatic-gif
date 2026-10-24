@@ -10,6 +10,21 @@ Clock-only OCR lives in `scoreboard_ocr.py` and `scoreboard_ocr_worker.py`;
 optional vision refinement lives in `vision_runtime.py` and
 `vision_locator.py`. Tests use the `test_*.py` naming pattern.
 
+## Default Target: the 8901 Monitor (用户约定)
+
+There are two UIs. **Unless the user explicitly says 8899 / Dashboard /
+工作台(dashboard), every UI, feature, or fix request refers to the 8901
+Monitor (`monitor_server.py`, `monitor_static/`, `feishu_auth.py`), which is
+what the user looks at day-to-day at `matchgif.aisportsapp.com/gif-monitor/`.**
+The 8899 Dashboard (`dashboard_server.py`, `dashboard_static/`) is the
+pipeline operator console and is only touched when named. When the user says
+"工作台" without qualification, they mean the 8901 list page and its
+"进入工作台" workshop view, not 8899. If in doubt, ask once; do not build the
+change on 8899 by default.
+
+Deployment differs too: 8901 updates with `deploy-gif` on the server; 8899
+follows the fixed pull + restart workflow at the end of this file.
+
 ## Development Commands
 
 ```bash
