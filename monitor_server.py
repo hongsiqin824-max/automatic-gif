@@ -33,7 +33,7 @@ import uuid
 from collections import deque
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from flask import Flask, abort, jsonify, request, send_from_directory
 
@@ -348,13 +348,29 @@ FINISHED_GRACE_SECONDS = positive_env_float("GIF_MONITOR_FINISHED_GRACE_SECONDS"
 
 
 class _FinishedMatchMemory:
-    """Remember matches that recently disappeared from the Playing catalog."""
+    """Remember matches that recently disappeared from the Playing catalog.
 
-    def __init__(self, grace_seconds: float) -> None:
+    ``retain(match_id)`` lets a record outlive the grace period for as long as
+    the callback says so (the monitor passes "still has unpublished GIFs"), so
+    an operator who is mid-edit at full time + 10 min does not lose the match.
+    """
+
+    def __init__(self, grace_seconds: float, retain: Callable[[str], bool] | None = None) -> None:
         self.grace_seconds = float(grace_seconds)
+        self.retain = retain
         self._lock = threading.Lock()
         self._last_playing: dict[str, dict[str, Any]] | None = None
         self._finished: dict[str, dict[str, Any]] = {}
+
+    def _alive(self, match_id: str, record: dict[str, Any], now: float) -> bool:
+        if now - record["finished_at"] <= self.grace_seconds:
+            return True
+        if self.retain is None:
+            return False
+        try:
+            return bool(self.retain(match_id))
+        except Exception:  # noqa: BLE001 - a disk hiccup must not break the list
+            return False
 
     def observe(self, playing: list[dict[str, Any]], now: float) -> None:
         """Diff this catalog snapshot against the previous one."""
@@ -372,14 +388,19 @@ class _FinishedMatchMemory:
             for match_id in current:
                 self._finished.pop(match_id, None)
             for match_id, record in list(self._finished.items()):
-                if now - record["finished_at"] > self.grace_seconds:
+                if not self._alive(match_id, record, now):
                     del self._finished[match_id]
             self._last_playing = current
+
+    def remember(self, match_id: str, item: dict[str, Any], finished_at: float) -> None:
+        """Seed a finished match (process restart: rebuilt from clip sidecars)."""
+        with self._lock:
+            self._finished.setdefault(str(match_id), {"item": dict(item), "finished_at": finished_at})
 
     def get(self, match_id: str, now: float) -> dict[str, Any] | None:
         with self._lock:
             record = self._finished.get(str(match_id))
-            if record is None or now - record["finished_at"] > self.grace_seconds:
+            if record is None or not self._alive(str(match_id), record, now):
                 return None
             return {"item": dict(record["item"]), "finished_at": record["finished_at"]}
 
@@ -387,14 +408,37 @@ class _FinishedMatchMemory:
         with self._lock:
             live = [
                 {"item": dict(record["item"]), "finished_at": record["finished_at"]}
-                for record in self._finished.values()
-                if now - record["finished_at"] <= self.grace_seconds
+                for match_id, record in self._finished.items()
+                if self._alive(match_id, record, now)
             ]
         live.sort(key=lambda record: (record["finished_at"], str(record["item"].get("match_id") or "")))
         return live
 
 
-finished_matches = _FinishedMatchMemory(FINISHED_GRACE_SECONDS)
+def _pending_clip_count(match_id: str) -> int:
+    """GIFs of a match that are neither published (have a draft record) nor 放弃'd.
+
+    Defined before the helpers it uses are bound; it only runs on requests, by
+    which time ``_clip_dir`` / ``manual_draft_queue`` exist.
+    """
+    directory = _clip_dir(match_id)
+    try:
+        gifs = [p for p in directory.iterdir() if p.is_file() and p.suffix == ".gif" and p.name.startswith("clip_")]
+    except OSError:
+        return 0
+    if not gifs:
+        return 0
+    drafts: dict[str, Any] = {}
+    if manual_draft_queue is not None:
+        drafts = manual_draft_queue.records_by_source_name(match_id, artifact_kind=MANUAL_ARTIFACT_KIND)
+    return sum(
+        1 for gif in gifs if gif.name not in drafts and not _read_clip_meta(gif).get("discarded")
+    )
+
+
+finished_matches = _FinishedMatchMemory(
+    FINISHED_GRACE_SECONDS, retain=lambda match_id: _pending_clip_count(match_id) > 0
+)
 
 
 def _catalog_playing() -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -1289,6 +1333,44 @@ _ClipPinStore.sweep_orphans(CLIP_OUTPUT_ROOT)
 clip_pins.start_reaper()
 
 
+def _seed_finished_matches_from_clips(memory: _FinishedMatchMemory, root: Path, now: float) -> list[str]:
+    """After a restart, re-list finished matches that still have unpublished GIFs.
+
+    ``_FinishedMatchMemory`` is in-process, so ``deploy-gif`` would otherwise
+    forget a match the operator was still publishing from. The sidecar written
+    at capture carries the team names, which is all the list row needs. The
+    record is dated ``now`` so it also gets the normal grace window; after that
+    the pending-clip retain rule keeps it exactly as long as needed.
+    """
+    seeded: list[str] = []
+    try:
+        match_dirs = [p for p in root.iterdir() if p.is_dir() and p.name.isdigit()]
+    except OSError:
+        return seeded
+    for match_dir in match_dirs:
+        match_id = match_dir.name
+        if _pending_clip_count(match_id) == 0:
+            continue
+        detail: dict[str, Any] = {}
+        for sidecar in sorted(match_dir.glob("clip_*.json"), reverse=True):
+            meta = _read_clip_meta(sidecar.with_suffix(".gif"))
+            candidate = meta.get("match_detail")
+            if isinstance(candidate, dict) and candidate.get("team_A_name"):
+                detail = candidate
+                break
+        memory.remember(match_id, {"match_id": match_id, **detail}, now)
+        seeded.append(match_id)
+    if seeded:
+        print(
+            json.dumps({"event": "finished_matches_seeded_from_clips", "match_ids": seeded}, ensure_ascii=False),
+            flush=True,
+        )
+    return seeded
+
+
+_seed_finished_matches_from_clips(finished_matches, CLIP_OUTPUT_ROOT, time.time())
+
+
 @app.get("/")
 def index():
     return send_from_directory(ROOT / "monitor_static", "index.html")
@@ -1327,17 +1409,24 @@ def monitor_matches():
     # Matches that left the catalog within FINISHED_GRACE_SECONDS stay listed
     # while someone still holds their preview: that preview's (frozen) buffer
     # is where the final minutes live, so the tile must not be torn down the
-    # moment the feed says Played. Nobody watching -> nothing to offer -> hidden.
+    # moment the feed says Played. A match with GIFs still waiting to be
+    # published also stays (even past the grace, see _FinishedMatchMemory):
+    # the publish form lives in this match's stage window, so dropping the row
+    # would strand those GIFs with no UI to send them.
     now = time.time()
     for record in finished_matches.rows(now):
         item = record["item"]
         match_id = str(item.get("match_id") or "")
-        if match_id in match_ids or live_preview.status(match_id).get("resource") is None:
+        if match_id in match_ids:
+            continue
+        pending = _pending_clip_count(match_id)
+        if pending == 0 and live_preview.status(match_id).get("resource") is None:
             continue
         row = _match_row(item, "Played")
         row["finished"] = True
         row["finished_at_unix"] = record["finished_at"]
         row["finished_until_unix"] = record["finished_at"] + FINISHED_GRACE_SECONDS
+        row["pending_clips"] = pending
         playing.append(row)
         match_ids.append(match_id)
     if os.environ.get("GIF_MONITOR_SOURCE_OVERRIDE", "").strip() and not playing:

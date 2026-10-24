@@ -1865,10 +1865,17 @@ class FinishedMatchGraceTests(unittest.TestCase):
 
     def setUp(self):
         self.client = monitor_server.app.test_client()
-        self.memory = monitor_server._FinishedMatchMemory(600.0)
+        self.real_pending = monitor_server._pending_clip_count
+        # Same retain rule as the module-level instance (pending GIFs keep a row).
+        self.memory = monitor_server._FinishedMatchMemory(
+            600.0, retain=lambda mid: monitor_server._pending_clip_count(mid) > 0
+        )
         self._patches = [
             mock.patch.object(monitor_server, "finished_matches", self.memory),
             mock.patch.object(monitor_server, "_batch_query_sources", return_value={}),
+            # Default: no GIFs on disk, so the pre-existing expectations
+            # ("not listed without a preview", "gone after grace") still hold.
+            mock.patch.object(monitor_server, "_pending_clip_count", return_value=0),
         ]
         for patch in self._patches:
             patch.start()
@@ -1876,6 +1883,9 @@ class FinishedMatchGraceTests(unittest.TestCase):
     def tearDown(self):
         for patch in self._patches:
             patch.stop()
+
+    def _real_pending(self):
+        return mock.patch.object(monitor_server, "_pending_clip_count", self.real_pending)
 
     def test_memory_tracks_departure_expiry_and_return(self):
         memory = monitor_server._FinishedMatchMemory(600.0)
@@ -1931,6 +1941,122 @@ class FinishedMatchGraceTests(unittest.TestCase):
              mock.patch.object(monitor_server.live_preview, "status",
                                return_value={"running": False, "resource": "rtmp://x"}):
             self.assertEqual(self._matches(), [])
+
+    def _write_clip(self, directory, name, meta=None):
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / name).write_bytes(b"GIF")
+        if meta is not None:
+            (directory / name).with_suffix(".json").write_text(json.dumps(meta), encoding="utf-8")
+
+    def test_finished_match_with_unpublished_gifs_outlives_grace_and_preview(self):
+        """Editing past full time + grace must not strand the GIFs.
+
+        The publish form lives in the match's stage window; once the row is
+        gone from the list nothing in the UI can send those GIFs. So a finished
+        match stays listed - without a preview and past the grace - for as long
+        as it has GIFs that are neither published nor 放弃'd.
+        """
+        with TemporaryDirectory() as tmp:
+            clips = Path(tmp) / "54622319"
+            self._write_clip(clips, "clip_20261024-220000_aaaaaa.gif", {"event_key": "manual_1"})
+            gone = {"running": False, "resource": None, "playlist_ready": False}
+            drafts = {}
+            queue = mock.Mock()
+            queue.records_by_source_name.side_effect = lambda *a, **k: dict(drafts)
+            with self._real_pending(), \
+                 mock.patch.object(monitor_server, "_clip_dir", side_effect=lambda mid: Path(tmp) / mid), \
+                 mock.patch.object(monitor_server, "manual_draft_queue", queue), \
+                 mock.patch.object(monitor_server.live_preview, "status", return_value=gone):
+                with mock.patch.object(monitor_server.match_catalog, "snapshot", return_value={"playing": [dict(self.PLAYING)]}):
+                    self._matches()
+                # Final whistle, nobody holds a preview, but one GIF awaits publishing.
+                with mock.patch.object(monitor_server.match_catalog, "snapshot", return_value={"playing": []}):
+                    rows = self._matches()
+                    self.assertEqual([r["match_id"] for r in rows], ["54622319"])
+                    self.assertTrue(rows[0]["finished"])
+                    self.assertEqual(rows[0]["pending_clips"], 1)
+                    self.assertEqual(rows[0]["team_A_name"], "伊尔韦斯")
+                    # Grace long over: still there, and the detail lookup used by
+                    # publish still resolves the teams.
+                    with mock.patch.object(self.memory, "grace_seconds", -1.0):
+                        rows = self._matches()
+                        self.assertEqual([r["match_id"] for r in rows], ["54622319"])
+                        self.assertEqual(monitor_server._match_detail_for("54622319")["team_B_name"], "里耶卡")
+                        # 放弃 the only GIF -> nothing pending -> row and memory go.
+                        self._write_clip(clips, "clip_20261024-220000_aaaaaa.gif", {"event_key": "manual_1", "discarded": True})
+                        self.assertEqual(self._matches(), [])
+                        self.assertIsNone(self.memory.get("54622319", time.time()))
+
+    def test_published_gif_does_not_keep_finished_match(self):
+        with TemporaryDirectory() as tmp:
+            clips = Path(tmp) / "54622319"
+            self._write_clip(clips, "clip_20261024-220000_aaaaaa.gif", {"event_key": "manual_1"})
+            self._write_clip(clips, "clip_20261024-220100_bbbbbb.gif", {"event_key": "manual_2"})
+            queue = mock.Mock()
+            queue.records_by_source_name.return_value = {"clip_20261024-220000_aaaaaa.gif": {"status": "published"}}
+            gone = {"running": False, "resource": None, "playlist_ready": False}
+            with self._real_pending(), \
+                 mock.patch.object(monitor_server, "_clip_dir", side_effect=lambda mid: Path(tmp) / mid), \
+                 mock.patch.object(monitor_server, "manual_draft_queue", queue), \
+                 mock.patch.object(monitor_server.live_preview, "status", return_value=gone), \
+                 mock.patch.object(self.memory, "grace_seconds", -1.0):
+                with mock.patch.object(monitor_server.match_catalog, "snapshot", return_value={"playing": [dict(self.PLAYING)]}):
+                    self._matches()
+                with mock.patch.object(monitor_server.match_catalog, "snapshot", return_value={"playing": []}):
+                    rows = self._matches()
+                    self.assertEqual(rows[0]["pending_clips"], 1)
+                    queue.records_by_source_name.return_value = {
+                        "clip_20261024-220000_aaaaaa.gif": {"status": "published"},
+                        "clip_20261024-220100_bbbbbb.gif": {"status": "queued"},
+                    }
+                    self.assertEqual(self._matches(), [])
+
+    def test_restart_reseeds_finished_matches_from_clip_sidecars(self):
+        """``deploy-gif`` restarts the process; the memory must come back from disk."""
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_clip(root / "54622319", "clip_20261024-215900_000000.gif", {"event_key": "manual_0"})
+            self._write_clip(
+                root / "54622319", "clip_20261024-220000_aaaaaa.gif",
+                {"event_key": "manual_1", "match_detail": {"team_A_name": "伊尔韦斯", "team_B_name": "里耶卡",
+                                                           "team_A_id": 1, "team_B_id": 2, "competition_name": "哥伦杯"}},
+            )
+            # Fully published match: nothing to re-list.
+            self._write_clip(root / "11111111", "clip_20261024-220000_cccccc.gif", {"event_key": "manual_9"})
+            # Not a match directory.
+            (root / "pins").mkdir()
+            queue = mock.Mock()
+            queue.records_by_source_name.side_effect = lambda mid, **k: (
+                {"clip_20261024-220000_cccccc.gif": {"status": "published"}} if mid == "11111111" else {}
+            )
+            memory = monitor_server._FinishedMatchMemory(600.0, retain=lambda mid: monitor_server._pending_clip_count(mid) > 0)
+            with self._real_pending(), \
+                 mock.patch.object(monitor_server, "_clip_dir", side_effect=lambda mid: root / mid), \
+                 mock.patch.object(monitor_server, "manual_draft_queue", queue):
+                seeded = monitor_server._seed_finished_matches_from_clips(memory, root, 5000.0)
+                self.assertEqual(seeded, ["54622319"])
+                record = memory.get("54622319", 5000.0)
+                self.assertEqual(record["item"]["team_A_name"], "伊尔韦斯")
+                self.assertEqual(record["item"]["competition_name"], "哥伦杯")
+                self.assertIsNone(memory.get("11111111", 5000.0))
+                # Listed via the normal endpoint, teams restored, no preview needed.
+                gone = {"running": False, "resource": None, "playlist_ready": False}
+                with mock.patch.object(monitor_server, "finished_matches", memory), \
+                     mock.patch.object(monitor_server.live_preview, "status", return_value=gone), \
+                     mock.patch.object(monitor_server.match_catalog, "snapshot", return_value={"playing": []}):
+                    rows = self._matches()
+                self.assertEqual([r["match_id"] for r in rows], ["54622319"])
+                self.assertEqual(rows[0]["team_B_name"], "里耶卡")
+                self.assertEqual(rows[0]["pending_clips"], 2)
+            # Missing root: silently nothing.
+            self.assertEqual(monitor_server._seed_finished_matches_from_clips(memory, root / "nope", 1.0), [])
+
+    def test_memory_retain_callback_errors_do_not_leak_rows(self):
+        memory = monitor_server._FinishedMatchMemory(10.0, retain=mock.Mock(side_effect=OSError("disk")))
+        memory.observe([{"match_id": "1"}], 0.0)
+        memory.observe([], 1.0)
+        self.assertEqual(len(memory.rows(5.0)), 1)
+        self.assertEqual(memory.rows(100.0), [])
 
     def test_detail_and_clock_resolve_for_finished_match(self):
         with mock.patch.object(monitor_server.match_catalog, "snapshot", return_value={"playing": [dict(self.PLAYING)]}):

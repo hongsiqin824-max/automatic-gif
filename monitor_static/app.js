@@ -457,8 +457,14 @@ function metaText(data) {
   const minute = data.minute ? `${escapeHtml(data.minute)}' ${escapeHtml(data.minute_period || '')}` : '--';
   // A match that just left the Playing catalog is kept for a grace period so
   // the operator can still scrub back and clip the final minutes; say so
-  // instead of showing a clock that will never move again.
-  const clock = data.finished ? '<span class="finished-tag">已完赛 · 可回看截取</span>' : minute;
+  // instead of showing a clock that will never move again. Past the grace it
+  // only stays while GIFs await publishing - show that count so the operator
+  // knows why it is still here and what is left to do.
+  const pending = Number(data.pending_clips) || 0;
+  const finishedLabel = pending
+    ? `已完赛 · ${pending} 条 GIF 待发布`
+    : '已完赛 · 可回看截取';
+  const clock = data.finished ? `<span class="finished-tag">${finishedLabel}</span>` : minute;
   return `<span>${escapeHtml(data.competition_name || '未知赛事')}</span><span>${clock}</span>`;
 }
 
