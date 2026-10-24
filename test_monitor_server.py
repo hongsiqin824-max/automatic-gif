@@ -2015,6 +2015,45 @@ class FinishedMatchGraceTests(unittest.TestCase):
                     }
                     self.assertEqual(self._matches(), [])
 
+    def test_stale_unpublished_gifs_stop_keeping_finished_match(self):
+        """A GIF nobody sent within PENDING_CLIP_MAX_AGE no longer lists the match.
+
+        Otherwise the collapsed 已完赛待发布 section only ever grows. The file
+        stays; it just stops counting. Age is the GIF's mtime.
+        """
+        with TemporaryDirectory() as tmp:
+            clips = Path(tmp) / "54622319"
+            self._write_clip(clips, "clip_20261023-220000_aaaaaa.gif", {"event_key": "manual_1"})
+            self._write_clip(clips, "clip_20261024-220000_bbbbbb.gif", {"event_key": "manual_2"})
+            now = time.time()
+            stale = now - monitor_server.PENDING_CLIP_MAX_AGE_SECONDS - 60
+            os.utime(clips / "clip_20261023-220000_aaaaaa.gif", (stale, stale))
+            queue = mock.Mock()
+            queue.records_by_source_name.return_value = {}
+            with mock.patch.object(monitor_server, "_clip_dir", side_effect=lambda mid: Path(tmp) / mid), \
+                 mock.patch.object(monitor_server, "manual_draft_queue", queue):
+                self.assertEqual(self.real_pending("54622319"), 1)
+                # A restart does not resurrect it either.
+                memory = monitor_server._FinishedMatchMemory(600.0, retain=lambda mid: self.real_pending(mid) > 0)
+                with self._real_pending():
+                    self.assertEqual(monitor_server._seed_finished_matches_from_clips(memory, Path(tmp), now), ["54622319"])
+                # Once the last one ages out the match drops from the list.
+                fresh = clips / "clip_20261024-220000_bbbbbb.gif"
+                os.utime(fresh, (stale, stale))
+                self.assertEqual(self.real_pending("54622319"), 0)
+                with self._real_pending():
+                    self.assertEqual(monitor_server._seed_finished_matches_from_clips(memory, Path(tmp), now), [])
+                    gone = {"running": False, "resource": None, "playlist_ready": False}
+                    with mock.patch.object(monitor_server.live_preview, "status", return_value=gone), \
+                         mock.patch.object(self.memory, "grace_seconds", -1.0):
+                        with mock.patch.object(monitor_server.match_catalog, "snapshot", return_value={"playing": [dict(self.PLAYING)]}):
+                            self._matches()
+                        with mock.patch.object(monitor_server.match_catalog, "snapshot", return_value={"playing": []}):
+                            self.assertEqual(self._matches(), [])
+                # The clock passed explicitly wins over the wall clock.
+                self.assertEqual(self.real_pending("54622319", now=stale + 1), 2)
+                self.assertEqual(self.real_pending("54622319", now=now + 3600), 0)
+
     def test_restart_reseeds_finished_matches_from_clip_sidecars(self):
         """``deploy-gif`` restarts the process; the memory must come back from disk."""
         with TemporaryDirectory() as tmp:
@@ -2052,6 +2091,9 @@ class FinishedMatchGraceTests(unittest.TestCase):
                 self.assertEqual([r["match_id"] for r in rows], ["54622319"])
                 self.assertEqual(rows[0]["team_B_name"], "里耶卡")
                 self.assertEqual(rows[0]["pending_clips"], 2)
+                # Re-seeded after a restart: no preview buffer to protect, so it
+                # is filed straight under the collapsed finished section.
+                self.assertFalse(rows[0]["grace_active"])
             # Missing root: silently nothing.
             self.assertEqual(monitor_server._seed_finished_matches_from_clips(memory, root / "nope", 1.0), [])
 

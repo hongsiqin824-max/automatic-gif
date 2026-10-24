@@ -346,6 +346,11 @@ atexit.register(live_preview.shutdown)
 # tile (and so its preview and frozen history) and its alerts are accepted.
 FINISHED_GRACE_SECONDS = positive_env_float("GIF_MONITOR_FINISHED_GRACE_SECONDS", 600.0)
 
+# How long an unpublished GIF keeps its finished match on the list page. Past
+# this the match drops out of the collapsed "已完赛待发布" section on its own;
+# the GIF itself is never deleted here.
+PENDING_CLIP_MAX_AGE_SECONDS = positive_env_float("GIF_MONITOR_PENDING_CLIP_MAX_AGE_HOURS", 24.0) * 3600.0
+
 
 class _FinishedMatchMemory:
     """Remember matches that recently disappeared from the Playing catalog.
@@ -415,15 +420,26 @@ class _FinishedMatchMemory:
         return live
 
 
-def _pending_clip_count(match_id: str) -> int:
+def _pending_clip_count(match_id: str, now: float | None = None) -> int:
     """GIFs of a match that are neither published (have a draft record) nor 放弃'd.
+
+    Clips older than ``PENDING_CLIP_MAX_AGE_SECONDS`` no longer count: a goal
+    GIF nobody sent within a day will not be sent, so the finished match stops
+    being listed instead of sitting in the collapsed section forever. The
+    files stay on disk; only the list entry goes. Age comes from the GIF's
+    mtime (the encode finishes the file and nothing rewrites it afterwards).
 
     Defined before the helpers it uses are bound; it only runs on requests, by
     which time ``_clip_dir`` / ``manual_draft_queue`` exist.
     """
     directory = _clip_dir(match_id)
+    cutoff = (time.time() if now is None else now) - PENDING_CLIP_MAX_AGE_SECONDS
     try:
-        gifs = [p for p in directory.iterdir() if p.is_file() and p.suffix == ".gif" and p.name.startswith("clip_")]
+        gifs = [
+            p
+            for p in directory.iterdir()
+            if p.is_file() and p.suffix == ".gif" and p.name.startswith("clip_") and p.stat().st_mtime >= cutoff
+        ]
     except OSError:
         return 0
     if not gifs:
@@ -1339,8 +1355,10 @@ def _seed_finished_matches_from_clips(memory: _FinishedMatchMemory, root: Path, 
     ``_FinishedMatchMemory`` is in-process, so ``deploy-gif`` would otherwise
     forget a match the operator was still publishing from. The sidecar written
     at capture carries the team names, which is all the list row needs. The
-    record is dated ``now`` so it also gets the normal grace window; after that
-    the pending-clip retain rule keeps it exactly as long as needed.
+    record is dated as already past the grace: nothing survives a restart that
+    the grace protects (the preview buffer is gone), so it goes straight to the
+    collapsed finished section instead of crowding the live list for 10 min.
+    The pending-clip retain rule then keeps it exactly as long as needed.
     """
     seeded: list[str] = []
     try:
@@ -1358,7 +1376,7 @@ def _seed_finished_matches_from_clips(memory: _FinishedMatchMemory, root: Path, 
             if isinstance(candidate, dict) and candidate.get("team_A_name"):
                 detail = candidate
                 break
-        memory.remember(match_id, {"match_id": match_id, **detail}, now)
+        memory.remember(match_id, {"match_id": match_id, **detail}, now - memory.grace_seconds - 1.0)
         seeded.append(match_id)
     if seeded:
         print(
