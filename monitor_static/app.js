@@ -455,7 +455,11 @@ function teamsText(data) {
 
 function metaText(data) {
   const minute = data.minute ? `${escapeHtml(data.minute)}' ${escapeHtml(data.minute_period || '')}` : '--';
-  return `<span>${escapeHtml(data.competition_name || '未知赛事')}</span><span>${minute}</span>`;
+  // A match that just left the Playing catalog is kept for a grace period so
+  // the operator can still scrub back and clip the final minutes; say so
+  // instead of showing a clock that will never move again.
+  const clock = data.finished ? '<span class="finished-tag">已完赛 · 可回看截取</span>' : minute;
+  return `<span>${escapeHtml(data.competition_name || '未知赛事')}</span><span>${clock}</span>`;
 }
 
 // ``sticky`` pins the line for TILE_STATUS_STICKY_MS; while pinned, routine
@@ -528,6 +532,7 @@ function createTile(data) {
 function updateTileInfo(el, data) {
   el.querySelector('.tile-teams').innerHTML = teamsText(data);
   el.querySelector('.tile-meta').innerHTML = metaText(data);
+  el.classList.toggle('finished', !!data.finished);
 }
 
 async function startTilePreview(matchId) {
@@ -700,12 +705,32 @@ function applyDraftState(draftEl, rec, matchId, eventKey) {
     return false;
   }
   if (status === 'failed' && !retriable) {
-    draftEl.textContent = '草稿失败：' + (error || '未知错误');
+    draftEl.textContent = `发布失败（${draftStageLabel(stage)}）：${error || '未知错误'}`;
     draftEl.className = 'stage-clip-draft fail';
+    appendRetryButton(draftEl, matchId, eventKey);
     return false;
   }
-  if (status === 'failed') {
-    draftEl.textContent = '草稿重试中：' + (error || '未知错误');
+  if (status === 'failed' || status === 'retry_wait') {
+    // A transient error: the worker backs off before trying again. Show
+    // what failed and when it comes back, so a stalled row is never a mystery.
+    const waitSeconds = rec.next_attempt_at_unix
+      ? Math.max(0, Math.round(rec.next_attempt_at_unix - Date.now() / 1000))
+      : null;
+    const when = waitSeconds === null ? '稍后重试' : (waitSeconds > 0 ? `${waitSeconds}s 后重试` : '即将重试');
+    const nth = attempt > 0 ? `，已试 ${attempt} 次` : '';
+    draftEl.textContent = `${draftStageLabel(stage) || '发布'}失败：${error || '未知错误'}（${when}${nth}）`;
+    draftEl.className = 'stage-clip-draft warn';
+    appendRetryButton(draftEl, matchId, eventKey);
+    return true;
+  }
+  if (status === 'queued') {
+    draftEl.textContent = attempt > 0 ? `排队中（第 ${attempt + 1} 次）…` : '排队中…';
+    draftEl.className = 'stage-clip-draft';
+    return true;
+  }
+  if (status === 'creating' || status === 'creating_draft' || status === 'publishing') {
+    const step = draftStageLabel(stage);
+    draftEl.textContent = step && step !== draftStageLabel(status) ? `${step}…` : '发布中…';
     draftEl.className = 'stage-clip-draft';
     return true;
   }
@@ -1644,7 +1669,7 @@ function renderMatchGrid() {
     const srcState = data.source_state || state.sourceCache[mid] || 'unknown';
     const noSource = srcState !== 'available';
     const card = document.createElement('div');
-    card.className = 'match-card' + (noSource ? ' no-source' : '');
+    card.className = 'match-card' + (noSource ? ' no-source' : '') + (data.finished ? ' finished' : '');
     card.dataset.matchId = mid;
     card.innerHTML =
       `<div class="match-card-check"><input type="checkbox" class="match-checkbox" data-match-id="${escapeHtml(mid)}" ${checked}></div>` +
@@ -1891,9 +1916,18 @@ function markPreviewDown(matchId, status) {
   const tile = state.tiles.get(matchId);
   if (tile) tile.down = true;
   const cooling = !!(status && status.auto_restart_cooling);
-  let message = cooling ? '直播源中断，后台持续重连中…' : '直播源中断，正在自动重连…';
+  const finished = !!(tile && tile.data && tile.data.finished);
+  let message = finished
+    ? '比赛已结束，直播源已停止'
+    : cooling ? '直播源中断，后台持续重连中…' : '直播源中断，正在自动重连…';
   const reason = describeExitReason(status);
-  if (reason) message += `（${reason}）`;
+  if (reason && !finished) message += `（${reason}）`;
+  // The server keeps the dead run's playlist frozen on disk, so the operator
+  // can still scrub back into and clip the last minutes (a stoppage-time goal
+  // right before the source stops at full time is the typical case).
+  // playlist_ready covers "died, not relaunched yet"; history_frozen covers
+  // "relaunched, replacement has not produced a playlist yet".
+  if (status && (status.history_frozen || status.playlist_ready)) message += '，已缓存画面仍可回看、截取';
   const el = document.querySelector(`.tile[data-match-id="${matchId}"]`);
   if (el) {
     const overlay = el.querySelector('.tile-overlay');
@@ -1947,7 +1981,11 @@ function keepAlivePreviews() {
       .then((status) => {
         const current = state.tiles.get(matchId);
         if (!current || !status) return;
-        if (status.running === false) {
+        if (status.running === false || status.history_frozen) {
+          // history_frozen: a relaunched ffmpeg is alive but has not produced
+          // a playlist yet (still connecting, or the source is gone for good);
+          // the tile is being served the previous run's frozen history, so
+          // keep it marked down until the replacement actually delivers.
           markPreviewDown(matchId, status);
           // resource === null means the server has no entry for this match at
           // all (process restart, 90s idle reap, or a stop sent by another
@@ -2427,7 +2465,12 @@ function startLagMonitoring() {
       if (!video || !video._hls) continue;
       const hls = video._hls;
       const onStage = isStageVideo(video);
-      const edge = onStage ? bufferEdgeDistanceSeconds(video) : null;
+      // While the preview is down the server serves a frozen playlist and
+      // deletes nothing, so there is no buffer edge to fall off. The stale
+      // playlist's growing age would otherwise fake a shrinking buffer and
+      // yank the operator away from the very history they are scrubbing.
+      const previewDown = !!(state.tiles.get(matchId) || {}).down;
+      const edge = onStage && !previewDown ? bufferEdgeDistanceSeconds(video) : null;
 
       if (onStage && edge != null && edge <= STAGE_EDGE_SEEK_SECONDS) {
         // About to fall off the ring buffer: nothing can save this position,

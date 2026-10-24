@@ -52,8 +52,8 @@ def x264_preset_from_env(default: str = "veryfast") -> str:
 PREVIEW_X264_PRESET = x264_preset_from_env()
 PREVIEW_LIST_SIZE = 12
 PREVIEW_HEIGHT = 480
-# Previous ffmpeg stderr is kept here across a restart so the exit reason
-# survives the directory wipe and can be inspected after the fact.
+# Previous ffmpeg stderr is copied here into the replacement's generation
+# directory on restart so the exit reason can be inspected after the fact.
 PREVIEW_PREV_LOG_NAME = "ffmpeg.prev.log"
 
 
@@ -86,6 +86,15 @@ class _PreviewEntry:
     last_exit_code: int | None = None
     last_exit_reason: str | None = None
     last_exit_at: float | None = None
+    # Relaunch bookkeeping. Each ffmpeg run writes into its own generation
+    # directory (``directory``). After a crash the dead run's files are *not*
+    # wiped: ``serve_dir`` keeps pointing at that frozen playlist so the
+    # operator can still scrub and clip the history (e.g. the final minutes
+    # after the source stops at full time) while the replacement ffmpeg fills
+    # a new generation. Once the replacement has written a playlist it is
+    # promoted (``serve_dir = directory``) and the frozen files are removed.
+    serve_dir: Path | None = None
+    generation: int = 1
 
 
 class LivePreviewManager:
@@ -142,8 +151,25 @@ class LivePreviewManager:
             )
             self._reaper.start()
 
-    def media_dir(self, match_id: str) -> Path:
+    def match_root(self, match_id: str) -> Path:
+        """Per-match directory holding one ``gN`` sub-directory per ffmpeg run."""
         return self.root / match_id
+
+    def media_dir(self, match_id: str) -> Path:
+        """Directory whose playlist/segments are served for this match.
+
+        Normally the running ffmpeg's generation directory. After a crash it
+        stays on the dead run's frozen files until the replacement has
+        produced a playlist, so history survives the relaunch.
+        """
+        with self.lock:
+            entry = self.entries.get(match_id)
+            if entry is not None and entry.serve_dir is not None:
+                return entry.serve_dir
+        return self.match_root(match_id) / "g1"
+
+    def _generation_dir(self, match_id: str, generation: int) -> Path:
+        return self.match_root(match_id) / f"g{generation}"
 
     def playlist_url(self, match_id: str) -> str:
         return f"preview/{urllib.parse.quote(match_id)}/index.m3u8"
@@ -214,8 +240,10 @@ class LivePreviewManager:
                 self._stop_entry_locked(match_id, release_sibling=False)
             else:
                 self._stop_entry_locked(match_id, release_sibling=False)
-            directory = self.media_dir(match_id)
-            shutil.rmtree(directory, ignore_errors=True)
+            # An operator-driven (re)start is a clean slate: wipe every
+            # generation of this match and begin at g1.
+            shutil.rmtree(self.match_root(match_id), ignore_errors=True)
+            directory = self._generation_dir(match_id, 1)
             directory.mkdir(parents=True, exist_ok=True)
             log_path = directory / "ffmpeg.log"
             command = self._build_command(resource, directory)
@@ -237,6 +265,8 @@ class LivePreviewManager:
                 log_path=log_path,
                 started_at=now,
                 last_access=now,
+                serve_dir=directory,
+                generation=1,
             )
             return self._status_locked(match_id)
 
@@ -258,9 +288,13 @@ class LivePreviewManager:
         entry = self.entries.get(match_id)
         if entry is None:
             return {"running": False, "resource": None, "playlist_ready": False}
+        self._promote_locked(match_id, entry)
         return_code = entry.process.poll()
         running = return_code is None
-        playlist_ready = (entry.directory / "index.m3u8").is_file()
+        history_frozen = entry.serve_dir != entry.directory
+        playlist_ready = (
+            not history_frozen and (entry.directory / "index.m3u8").is_file()
+        )
         error = None
         if not running:
             error = self._read_log_tail(entry.log_path)
@@ -268,6 +302,10 @@ class LivePreviewManager:
             "running": running,
             "resource": entry.resource,
             "playlist_ready": playlist_ready,
+            # True while a relaunched ffmpeg has not yet produced a playlist:
+            # the browser is still being served the previous run's frozen
+            # history (scrubbable and clippable, but no new frames arrive).
+            "history_frozen": history_frozen,
             "started_at_unix": entry.started_at,
             "return_code": return_code,
             "error": error,
@@ -311,8 +349,8 @@ class LivePreviewManager:
     def _record_exit_locked(self, match_id: str, entry: _PreviewEntry, return_code: int | None, now: float) -> bytes:
         """Capture why the current process died; return its raw stderr.
 
-        The caller wipes the media directory before relaunching, so the raw log
-        is handed back to be re-written as ``ffmpeg.prev.log`` afterwards.
+        The raw log is handed back so the caller can re-write it as
+        ``ffmpeg.prev.log`` inside the replacement's generation directory.
         """
         log_tail = self._read_log_tail(entry.log_path)
         reason = self._summarize_exit_reason(log_tail)
@@ -355,7 +393,30 @@ class LivePreviewManager:
                     process.wait(timeout=3)
                 except subprocess.TimeoutExpired:
                     pass
-        shutil.rmtree(entry.directory, ignore_errors=True)
+        # Every generation (frozen history included) goes with the entry.
+        shutil.rmtree(self.match_root(match_id), ignore_errors=True)
+
+    def _promote_locked(self, match_id: str, entry: _PreviewEntry) -> None:
+        """Switch serving to the relaunched ffmpeg once it has a playlist.
+
+        Until then the previous run's frozen directory keeps being served so a
+        crash (or the source ending at full time) never erases the history the
+        operator may still want to scrub back into and clip.
+        """
+        if entry.serve_dir == entry.directory:
+            return
+        if not (entry.directory / "index.m3u8").is_file():
+            return
+        frozen = entry.serve_dir
+        entry.serve_dir = entry.directory
+        if frozen is not None:
+            shutil.rmtree(frozen, ignore_errors=True)
+        _log_event(
+            "preview_generation_promoted",
+            match_id=match_id,
+            generation=entry.generation,
+            dropped=str(frozen) if frozen is not None else None,
+        )
 
     def _reap_loop(self) -> None:
         while not self._stop.wait(5.0):
@@ -371,6 +432,7 @@ class LivePreviewManager:
                 if now - entry.last_access > self.idle_timeout_seconds:
                     self._stop_entry_locked(match_id)
                     continue
+                self._promote_locked(match_id, entry)
                 if not self.auto_restart:
                     continue
                 if return_code is None:
@@ -396,8 +458,13 @@ class LivePreviewManager:
             self.restart_max_delay,
         )
         prev_log = self._record_exit_locked(match_id, entry, entry.process.poll(), now)
-        directory = entry.directory
-        shutil.rmtree(directory, ignore_errors=True)
+        if entry.directory != entry.serve_dir:
+            # The previous relaunch never produced a playlist (its stderr was
+            # just captured above); drop that empty generation. The frozen
+            # history in ``serve_dir`` is deliberately left untouched.
+            shutil.rmtree(entry.directory, ignore_errors=True)
+        entry.generation += 1
+        directory = self._generation_dir(match_id, entry.generation)
         directory.mkdir(parents=True, exist_ok=True)
         if prev_log:
             try:
@@ -419,7 +486,8 @@ class LivePreviewManager:
                 )
                 entry.resource = replacement
         command = self._build_command(entry.resource, directory)
-        log_file = entry.log_path.open("wb")
+        log_path = directory / "ffmpeg.log"
+        log_file = log_path.open("wb")
         try:
             process = subprocess.Popen(
                 command,
@@ -430,6 +498,8 @@ class LivePreviewManager:
         finally:
             log_file.close()
         entry.process = process
+        entry.directory = directory
+        entry.log_path = log_path
         entry.started_at = now
         entry.restart_count += 1
         entry.restart_count_total += 1

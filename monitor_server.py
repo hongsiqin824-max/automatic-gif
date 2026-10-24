@@ -339,6 +339,71 @@ live_preview = LivePreviewManager(
 match_catalog = MatchCatalog()
 atexit.register(live_preview.shutdown)
 
+# How long a match that just left the ``Playing`` catalog stays known to the
+# monitor. The directory drops a match the moment the feed flips to Played -
+# exactly when an operator is scrubbing back for a stoppage-time goal and when
+# that goal's push tends to arrive late. Within this grace the match keeps its
+# tile (and so its preview and frozen history) and its alerts are accepted.
+FINISHED_GRACE_SECONDS = positive_env_float("GIF_MONITOR_FINISHED_GRACE_SECONDS", 600.0)
+
+
+class _FinishedMatchMemory:
+    """Remember matches that recently disappeared from the Playing catalog."""
+
+    def __init__(self, grace_seconds: float) -> None:
+        self.grace_seconds = float(grace_seconds)
+        self._lock = threading.Lock()
+        self._last_playing: dict[str, dict[str, Any]] | None = None
+        self._finished: dict[str, dict[str, Any]] = {}
+
+    def observe(self, playing: list[dict[str, Any]], now: float) -> None:
+        """Diff this catalog snapshot against the previous one."""
+        current = {
+            str(item.get("match_id") or ""): item
+            for item in playing
+            if isinstance(item, dict) and item.get("match_id")
+        }
+        with self._lock:
+            if self._last_playing is not None:
+                for match_id, item in self._last_playing.items():
+                    if match_id not in current and match_id not in self._finished:
+                        self._finished[match_id] = {"item": dict(item), "finished_at": now}
+            # Back in Playing (catalog glitch, or the feed flipped early): forget it.
+            for match_id in current:
+                self._finished.pop(match_id, None)
+            for match_id, record in list(self._finished.items()):
+                if now - record["finished_at"] > self.grace_seconds:
+                    del self._finished[match_id]
+            self._last_playing = current
+
+    def get(self, match_id: str, now: float) -> dict[str, Any] | None:
+        with self._lock:
+            record = self._finished.get(str(match_id))
+            if record is None or now - record["finished_at"] > self.grace_seconds:
+                return None
+            return {"item": dict(record["item"]), "finished_at": record["finished_at"]}
+
+    def rows(self, now: float) -> list[dict[str, Any]]:
+        with self._lock:
+            live = [
+                {"item": dict(record["item"]), "finished_at": record["finished_at"]}
+                for record in self._finished.values()
+                if now - record["finished_at"] <= self.grace_seconds
+            ]
+        live.sort(key=lambda record: (record["finished_at"], str(record["item"].get("match_id") or "")))
+        return live
+
+
+finished_matches = _FinishedMatchMemory(FINISHED_GRACE_SECONDS)
+
+
+def _catalog_playing() -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Current Playing rows from the catalog, feeding the finished-match memory."""
+    snapshot = match_catalog.snapshot()
+    playing = [item for item in snapshot.get("playing", []) if isinstance(item, dict)]
+    finished_matches.observe(playing, time.time())
+    return playing, snapshot
+
 
 class _AlertStore:
     """Thread-safe ring buffer of recent event alerts with monotonic cursors.
@@ -635,6 +700,18 @@ def _wait_playlist_ready(match_id: str, timeout: float = 9.0) -> bool:
             return True
         time.sleep(0.3)
     return playlist.is_file()
+
+
+def _preview_has_history(match_id: str) -> bool:
+    """True while this match's segments can be clipped.
+
+    A running ffmpeg obviously qualifies. So does a preview whose ffmpeg has
+    died (source dropped, match ended) but whose entry still exists: the
+    manager keeps that run's playlist frozen on disk, and the final minutes
+    are exactly what the operator wants to capture after a late goal.
+    """
+    status = live_preview.status(match_id)
+    return bool(status.get("running")) or status.get("resource") is not None
 
 
 def _parse_pdt(raw: str) -> float | None:
@@ -1222,32 +1299,47 @@ def health():
     return jsonify({"ok": True, "port": PORT, "service": "monitor", "time_unix": time.time()})
 
 
+def _match_row(item: dict[str, Any], status: str) -> dict[str, Any]:
+    return {
+        "match_id": str(item.get("match_id") or ""),
+        "team_A_name": item.get("team_A_name"),
+        "team_B_name": item.get("team_B_name"),
+        "team_A_logo": item.get("team_A_logo"),
+        "team_B_logo": item.get("team_B_logo"),
+        "fs_A": item.get("fs_A"),
+        "fs_B": item.get("fs_B"),
+        "minute": item.get("minute"),
+        "minute_period": item.get("minute_period"),
+        "competition_name": item.get("competition_name"),
+        "status": status,
+        "status_label": MATCH_STATUS_LABELS.get(status, status or "未知"),
+    }
+
+
 @app.get("/api/monitor/matches")
 def monitor_matches():
-    snapshot = match_catalog.snapshot()
+    catalog_playing, snapshot = _catalog_playing()
     playing = []
     match_ids: list[str] = []
-    for item in snapshot.get("playing", []):
-        if not isinstance(item, dict):
-            continue
-        status = str(item.get("status") or "")
-        playing.append(
-            {
-                "match_id": str(item.get("match_id") or ""),
-                "team_A_name": item.get("team_A_name"),
-                "team_B_name": item.get("team_B_name"),
-                "team_A_logo": item.get("team_A_logo"),
-                "team_B_logo": item.get("team_B_logo"),
-                "fs_A": item.get("fs_A"),
-                "fs_B": item.get("fs_B"),
-                "minute": item.get("minute"),
-                "minute_period": item.get("minute_period"),
-                "competition_name": item.get("competition_name"),
-                "status": status,
-                "status_label": MATCH_STATUS_LABELS.get(status, status or "未知"),
-            }
-        )
+    for item in catalog_playing:
+        playing.append(_match_row(item, str(item.get("status") or "")))
         match_ids.append(str(item.get("match_id") or ""))
+    # Matches that left the catalog within FINISHED_GRACE_SECONDS stay listed
+    # while someone still holds their preview: that preview's (frozen) buffer
+    # is where the final minutes live, so the tile must not be torn down the
+    # moment the feed says Played. Nobody watching -> nothing to offer -> hidden.
+    now = time.time()
+    for record in finished_matches.rows(now):
+        item = record["item"]
+        match_id = str(item.get("match_id") or "")
+        if match_id in match_ids or live_preview.status(match_id).get("resource") is None:
+            continue
+        row = _match_row(item, "Played")
+        row["finished"] = True
+        row["finished_at_unix"] = record["finished_at"]
+        row["finished_until_unix"] = record["finished_at"] + FINISHED_GRACE_SECONDS
+        playing.append(row)
+        match_ids.append(match_id)
     if os.environ.get("GIF_MONITOR_SOURCE_OVERRIDE", "").strip() and not playing:
         # Local-only: pair with the source override so the tile/stage path can
         # be exercised in a browser when the platform has no live fixture.
@@ -1288,6 +1380,29 @@ def monitor_matches():
     )
 
 
+def _frozen_preview_payload(match_id: str) -> dict[str, Any] | None:
+    """``preview/start`` answer when the source is gone but history remains.
+
+    After full time the source query fails, yet the manager may still hold the
+    run's frozen playlist. Hand the browser that playlist instead of a hard
+    ``no_source`` so a late-joining tab can still scrub and clip the finish.
+    """
+    status = live_preview.status(match_id)
+    if status.get("resource") is None:
+        return None
+    if not (live_preview.media_dir(match_id) / "index.m3u8").is_file():
+        return None
+    return {
+        "ok": True,
+        "match_id": match_id,
+        "playlist_url": live_preview.playlist_url(match_id),
+        **status,
+        "playlist_ready": True,
+        "history_only": True,
+        **_webrtc_fields(match_id, False),
+    }
+
+
 @app.post("/api/monitor/preview/start")
 def monitor_preview_start():
     body = request.get_json(silent=True) or {}
@@ -1298,10 +1413,19 @@ def monitor_preview_start():
     try:
         resource = _resolve_source(match_id)
     except LookupError as exc:
+        frozen = _frozen_preview_payload(match_id)
+        if frozen:
+            return jsonify(frozen)
         return jsonify({"error": str(exc), "code": "no_source"}), 409
     except Exception as exc:
+        frozen = _frozen_preview_payload(match_id)
+        if frozen:
+            return jsonify(frozen)
         return jsonify({"error": f"查询直播源失败：{exc}", "code": "source_error"}), 502
     if not resource:
+        frozen = _frozen_preview_payload(match_id)
+        if frozen:
+            return jsonify(frozen)
         return jsonify({"error": "该比赛暂未配置直播源", "code": "no_source"}), 409
     ffmpeg_source, webrtc = _preview_sources(match_id, resource)
     try:
@@ -1425,18 +1549,33 @@ def preview_media(match_id, filename):
     return response
 
 
+def _catalog_item_for(match_id: str) -> dict[str, Any] | None:
+    """The catalog row for a match: Playing now, or finished within grace."""
+    playing, _snapshot = _catalog_playing()
+    for item in playing:
+        if str(item.get("match_id") or "") == str(match_id):
+            return item
+    record = finished_matches.get(match_id, time.time())
+    return record["item"] if record else None
+
+
 def _match_detail_for(match_id: str) -> dict[str, Any]:
-    """Pull team names/ids for the title from the live catalog snapshot."""
-    for item in match_catalog.snapshot().get("playing", []):
-        if isinstance(item, dict) and str(item.get("match_id") or "") == str(match_id):
-            return {
-                "team_A_name": item.get("team_A_name"),
-                "team_B_name": item.get("team_B_name"),
-                "team_A_id": item.get("team_A_id"),
-                "team_B_id": item.get("team_B_id"),
-                "competition_name": item.get("competition_name"),
-            }
-    return {}
+    """Pull team names/ids for the title from the live catalog snapshot.
+
+    A match that finished within FINISHED_GRACE_SECONDS still resolves, so a
+    late goal push is not dropped as ``match_not_capturable`` and a clip of the
+    final minutes is still titled with the right teams.
+    """
+    item = _catalog_item_for(match_id)
+    if item is None:
+        return {}
+    return {
+        "team_A_name": item.get("team_A_name"),
+        "team_B_name": item.get("team_B_name"),
+        "team_A_id": item.get("team_A_id"),
+        "team_B_id": item.get("team_B_id"),
+        "competition_name": item.get("competition_name"),
+    }
 
 
 _ALERT_MINUTE_RE = re.compile(r"(\d{1,3})(?:\s*\+\s*(\d{1,2}))?\s*'?\s*$")
@@ -1456,14 +1595,14 @@ def _alert_minute_parts(value: Any) -> tuple[str, str]:
 
 def _catalog_clock_for(match_id: str) -> dict[str, Any]:
     """Current minute/score of a match from the catalog snapshot (fallback source)."""
-    for item in match_catalog.snapshot().get("playing", []):
-        if isinstance(item, dict) and str(item.get("match_id") or "") == str(match_id):
-            fs_a, fs_b = item.get("fs_A"), item.get("fs_B")
-            score = f"{fs_a}-{fs_b}" if fs_a not in (None, "") and fs_b not in (None, "") else ""
-            minute = str(item.get("minute") or "").strip()
-            extra = str(item.get("minute_extra") or "").strip()
-            return {"minute": minute if minute.isdigit() else "", "minute_extra": extra, "score": score}
-    return {}
+    item = _catalog_item_for(match_id)
+    if item is None:
+        return {}
+    fs_a, fs_b = item.get("fs_A"), item.get("fs_B")
+    score = f"{fs_a}-{fs_b}" if fs_a not in (None, "") and fs_b not in (None, "") else ""
+    minute = str(item.get("minute") or "").strip()
+    extra = str(item.get("minute_extra") or "").strip()
+    return {"minute": minute if minute.isdigit() else "", "minute_extra": extra, "score": score}
 
 
 def _match_clip_alert(match_id: str, anchor_epoch: float) -> dict[str, Any]:
@@ -1744,7 +1883,7 @@ def monitor_clip_pin():
         start_epoch = float(body["start_epoch_ms"]) / 1000.0
     except (KeyError, TypeError, ValueError):
         return jsonify({"error": "start_epoch_ms 必须是数字"}), 400
-    if not live_preview.status(match_id).get("running"):
+    if not _preview_has_history(match_id):
         return jsonify({"error": "请先开始预览该场，才能回捞画面", "code": "preview_not_running"}), 409
     segments = _read_playlist_segments(live_preview.media_dir(match_id))
     if not segments:
@@ -1839,7 +1978,7 @@ def monitor_clip():
                 400,
             )
         before_seconds = range_seconds
-    if not live_preview.status(match_id).get("running"):
+    if not _preview_has_history(match_id):
         return jsonify({"error": "请先开始预览该场，才能回捞画面", "code": "preview_not_running"}), 409
     segments = _read_playlist_segments(live_preview.media_dir(match_id))
     if pin is not None:

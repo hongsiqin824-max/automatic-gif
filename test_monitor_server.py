@@ -352,6 +352,34 @@ class ClipRangeEndpointTests(unittest.TestCase):
         self.assertEqual(response.status_code, 409)
         self.assertEqual(response.get_json()["code"], "anchor_out_of_buffer")
 
+    def test_dead_ffmpeg_with_frozen_history_still_clips(self):
+        # The source ended (full time) and ffmpeg exited, but the manager keeps
+        # the run's playlist on disk: pin + clip must keep working on it so a
+        # stoppage-time goal can still be captured.
+        frozen = {"running": False, "resource": "rtmp://host/s", "history_frozen": True}
+        with mock.patch.object(monitor_server.live_preview, "status", return_value=frozen):
+            pin_id = self._pin(4.0).get_json()["pin_id"]
+            response = self.client.post(
+                "/api/monitor/clip",
+                json={"match_id": "54622319", "pin_id": pin_id, "end_epoch_ms": round((self.base + 12.5) * 1000)},
+            )
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(len(self.encode_calls), 1)
+
+    def test_no_preview_entry_at_all_is_rejected(self):
+        gone = {"running": False, "resource": None, "playlist_ready": False}
+        with mock.patch.object(monitor_server.live_preview, "status", return_value=gone):
+            response = self._pin(4.0)
+            self.assertEqual(response.status_code, 409)
+            self.assertEqual(response.get_json()["code"], "preview_not_running")
+            response = self.client.post(
+                "/api/monitor/clip",
+                json={"match_id": "54622319", "anchor_epoch_ms": round((self.base + 12.5) * 1000)},
+            )
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.get_json()["code"], "preview_not_running")
+        self.assertEqual(self.encode_calls, [])
+
     def test_delete_pin_releases_it(self):
         pin_id = self._pin(2.0).get_json()["pin_id"]
         response = self.client.delete(f"/api/monitor/clip/pin/{pin_id}")
@@ -794,6 +822,7 @@ class EventAlertTests(unittest.TestCase):
         self.client = monitor_server.app.test_client()
         self._patches = [
             mock.patch.object(monitor_server, "alert_store", monitor_server._AlertStore(50)),
+            mock.patch.object(monitor_server, "finished_matches", monitor_server._FinishedMatchMemory(600.0)),
             mock.patch.object(monitor_server, "ALERT_ENABLED", True),
             mock.patch.object(
                 monitor_server, "ALERT_EVENT_TYPES", frozenset({"goal", "red_card"})
@@ -868,6 +897,25 @@ class EventAlertTests(unittest.TestCase):
         # Not even in the full Playing set: traceable as "not_in_catalog".
         self.assertEqual(data["detail_reason"], "not_in_catalog")
         self.feishu_mock.assert_not_called()
+
+    def test_late_goal_for_just_finished_match_is_accepted(self):
+        # The stoppage-time winner is pushed after the directory already flipped
+        # the match to Played. Within FINISHED_GRACE_SECONDS it must still be
+        # accepted and titled with the remembered team names.
+        self.client.get("/api/monitor/matches")  # catalog seen with the match Playing
+        self.catalog.stop()
+        self.catalog = mock.patch.object(
+            monitor_server.match_catalog, "snapshot", return_value={"playing": []}
+        )
+        self.catalog.start()
+        data = self._ingest(dedup_key="late").get_json()
+        self.assertTrue(data["accepted"], data)
+        self.assertIn("伊尔韦斯", self.feishu_mock.call_args[0][0])
+        # Past the grace it is gone for good.
+        with mock.patch.object(monitor_server.finished_matches, "grace_seconds", -1.0):
+            data = self._ingest(dedup_key="too-late").get_json()
+        self.assertFalse(data["accepted"])
+        self.assertEqual(data["reason"], "match_not_capturable")
 
     def test_drop_reason_beyond_catalog_limit(self):
         # A match present in the full set but absent from the shown playing list
@@ -1010,6 +1058,7 @@ class ClipAlertMatchTests(unittest.TestCase):
         self.store = monitor_server._AlertStore(50, None)
         self._patches = [
             mock.patch.object(monitor_server, "alert_store", self.store),
+            mock.patch.object(monitor_server, "finished_matches", monitor_server._FinishedMatchMemory(600.0)),
             mock.patch.object(monitor_server, "ALERT_MATCH_LOOKBACK_SECONDS", 600.0),
             mock.patch.object(monitor_server, "ALERT_MATCH_LOOKAHEAD_SECONDS", 180.0),
             mock.patch.object(monitor_server, "ALERT_MATCH_EXPECTED_OFFSET_SECONDS", 0.0),
@@ -1201,6 +1250,7 @@ class ClipEndpointAlertMatchTests(unittest.TestCase):
         self.queue.enqueue.return_value = {"status": "queued"}
         self._patches = [
             mock.patch.object(monitor_server, "alert_store", self.store),
+            mock.patch.object(monitor_server, "finished_matches", monitor_server._FinishedMatchMemory(600.0)),
             mock.patch.object(monitor_server, "manual_draft_queue", self.queue),
             mock.patch.object(monitor_server, "_clip_dir", return_value=self.dir / "clips"),
             mock.patch.object(monitor_server.live_preview, "status", return_value={"running": True}),
@@ -1797,6 +1847,131 @@ class PreviewStartWebRTCTests(unittest.TestCase):
             data = self.app.get("/api/monitor/preview/status?match_id=54477889").get_json()
         self.assertFalse(data["webrtc"])
         self.assertIsNone(data["whep_url"])
+
+
+class FinishedMatchGraceTests(unittest.TestCase):
+    """A match that just left the Playing catalog stays capturable for a while.
+
+    The directory flips to Played at the final whistle - exactly when the
+    operator is scrubbing back for a stoppage-time goal. The tile (and with it
+    the preview and its frozen history) must survive that flip.
+    """
+
+    PLAYING = {
+        "match_id": "54622319", "team_A_name": "伊尔韦斯", "team_B_name": "里耶卡",
+        "team_A_id": 1, "team_B_id": 2, "competition_name": "哥伦杯", "status": "Playing",
+        "fs_A": 2, "fs_B": 1, "minute": "90", "minute_period": "2H",
+    }
+
+    def setUp(self):
+        self.client = monitor_server.app.test_client()
+        self.memory = monitor_server._FinishedMatchMemory(600.0)
+        self._patches = [
+            mock.patch.object(monitor_server, "finished_matches", self.memory),
+            mock.patch.object(monitor_server, "_batch_query_sources", return_value={}),
+        ]
+        for patch in self._patches:
+            patch.start()
+
+    def tearDown(self):
+        for patch in self._patches:
+            patch.stop()
+
+    def test_memory_tracks_departure_expiry_and_return(self):
+        memory = monitor_server._FinishedMatchMemory(600.0)
+        a = {"match_id": "1", "team_A_name": "A"}
+        b = {"match_id": "2", "team_A_name": "B"}
+        memory.observe([a, b], 1000.0)
+        self.assertEqual(memory.rows(1000.0), [])
+        memory.observe([a], 1100.0)
+        self.assertEqual(memory.get("2", 1100.0), {"item": b, "finished_at": 1100.0})
+        self.assertIsNone(memory.get("1", 1100.0))
+        self.assertEqual([r["item"]["match_id"] for r in memory.rows(1699.0)], ["2"])
+        self.assertIsNone(memory.get("2", 1701.0))
+        self.assertEqual(memory.rows(1701.0), [])
+        # Back in Playing (catalog glitch): no longer remembered as finished.
+        memory.observe([a], 1200.0)
+        memory.observe([a, b], 1300.0)
+        self.assertIsNone(memory.get("2", 1300.0))
+        # The very first observation has nothing to diff against.
+        fresh = monitor_server._FinishedMatchMemory(600.0)
+        fresh.observe([], 1.0)
+        self.assertEqual(fresh.rows(1.0), [])
+
+    def _matches(self):
+        return self.client.get("/api/monitor/matches").get_json()["playing"]
+
+    def test_finished_match_stays_listed_only_while_previewed(self):
+        with mock.patch.object(monitor_server.match_catalog, "snapshot", return_value={"playing": [dict(self.PLAYING)]}):
+            rows = self._matches()
+        self.assertEqual([r["match_id"] for r in rows], ["54622319"])
+        self.assertNotIn("finished", rows[0])
+        # Final whistle: the catalog drops the match. Someone still has its
+        # preview open -> keep it listed, flagged, with the remembered teams.
+        with mock.patch.object(monitor_server.match_catalog, "snapshot", return_value={"playing": []}), \
+             mock.patch.object(monitor_server.live_preview, "status",
+                               return_value={"running": False, "resource": "rtmp://x", "history_frozen": True}):
+            rows = self._matches()
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["match_id"], "54622319")
+        self.assertTrue(row["finished"])
+        self.assertEqual(row["status"], "Played")
+        self.assertEqual(row["status_label"], "已结束")
+        self.assertEqual(row["team_A_name"], "伊尔韦斯")
+        self.assertAlmostEqual(row["finished_until_unix"] - row["finished_at_unix"], 600.0)
+        # Nobody holds a preview -> nothing to capture -> not listed.
+        with mock.patch.object(monitor_server.match_catalog, "snapshot", return_value={"playing": []}), \
+             mock.patch.object(monitor_server.live_preview, "status",
+                               return_value={"running": False, "resource": None, "playlist_ready": False}):
+            self.assertEqual(self._matches(), [])
+        # Grace over -> gone even with a preview.
+        with mock.patch.object(self.memory, "grace_seconds", -1.0), \
+             mock.patch.object(monitor_server.match_catalog, "snapshot", return_value={"playing": []}), \
+             mock.patch.object(monitor_server.live_preview, "status",
+                               return_value={"running": False, "resource": "rtmp://x"}):
+            self.assertEqual(self._matches(), [])
+
+    def test_detail_and_clock_resolve_for_finished_match(self):
+        with mock.patch.object(monitor_server.match_catalog, "snapshot", return_value={"playing": [dict(self.PLAYING)]}):
+            self._matches()
+        with mock.patch.object(monitor_server.match_catalog, "snapshot", return_value={"playing": []}):
+            detail = monitor_server._match_detail_for("54622319")
+            clock = monitor_server._catalog_clock_for("54622319")
+            self.assertEqual(monitor_server._match_detail_for("99999999"), {})
+        self.assertEqual(detail["team_A_name"], "伊尔韦斯")
+        self.assertEqual(detail["team_B_id"], 2)
+        self.assertEqual(clock["score"], "2-1")
+        self.assertEqual(clock["minute"], "90")
+
+    def test_preview_start_serves_frozen_history_when_source_is_gone(self):
+        # A tab (re)opening the workshop after full time: the source query
+        # fails, but the manager still holds the run's playlist -> hand it over
+        # instead of a hard no_source so the finish can still be scrubbed.
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            (directory / "index.m3u8").write_text("#EXTM3U", encoding="utf-8")
+            frozen = {"running": False, "resource": "rtmp://x", "playlist_ready": False, "history_frozen": True}
+            with mock.patch.object(monitor_server, "_resolve_source", side_effect=LookupError("该比赛暂无直播源")), \
+                 mock.patch.object(monitor_server.live_preview, "status", return_value=frozen), \
+                 mock.patch.object(monitor_server.live_preview, "media_dir", return_value=directory), \
+                 mock.patch.object(monitor_server.live_preview, "playlist_url", return_value="preview/54622319/index.m3u8"), \
+                 mock.patch.object(monitor_server.live_preview, "start") as start:
+                response = self.client.post("/api/monitor/preview/start", json={"match_id": "54622319"})
+            self.assertEqual(response.status_code, 200, response.get_json())
+            data = response.get_json()
+            self.assertTrue(data["history_only"])
+            self.assertTrue(data["playlist_ready"])
+            self.assertEqual(data["playlist_url"], "preview/54622319/index.m3u8")
+            self.assertFalse(data["webrtc"])
+            start.assert_not_called()
+        # No entry at all: the original no_source answer is unchanged.
+        gone = {"running": False, "resource": None, "playlist_ready": False}
+        with mock.patch.object(monitor_server, "_resolve_source", side_effect=LookupError("该比赛暂无直播源")), \
+             mock.patch.object(monitor_server.live_preview, "status", return_value=gone):
+            response = self.client.post("/api/monitor/preview/start", json={"match_id": "54622319"})
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.get_json()["code"], "no_source")
 
 
 class LatencyKillSwitchTests(unittest.TestCase):
