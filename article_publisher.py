@@ -130,6 +130,51 @@ def article_tabs_source() -> str:
     return value
 
 
+DEFAULT_BODY_FOOTERS = "英超=上咪咕独家看英超;西甲=上咪咕独家看西甲;中超=独家看中超就在咪咕"
+
+
+def article_body_footers() -> dict[str, str]:
+    """Per-competition text appended under the GIF, from ``ARTICLE_BODY_FOOTERS``.
+
+    Format ``赛事名=文字;赛事名=文字`` keyed by the catalog ``competition_name``.
+    Empty value = no footer for any competition.
+    """
+    raw = os.environ.get("ARTICLE_BODY_FOOTERS", DEFAULT_BODY_FOOTERS)
+    footers: dict[str, str] = {}
+    for part in raw.split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            raise RuntimeError("ARTICLE_BODY_FOOTERS 每项必须是 赛事名=文字，用 ; 分隔")
+        name, text = part.split("=", 1)
+        name, text = name.strip(), text.strip()
+        if not name or not text:
+            raise RuntimeError("ARTICLE_BODY_FOOTERS 的赛事名和文字都不能为空")
+        footers[name] = text
+    return footers
+
+
+def article_body_footer(match_detail: dict[str, Any] | None) -> str:
+    """Footer text for this match's competition; ``""`` when none configured."""
+    detail = match_detail if isinstance(match_detail, dict) else {}
+    competition = str(detail.get("competition_name") or "").strip()
+    if not competition:
+        return ""
+    try:
+        footers = article_body_footers()
+    except RuntimeError as exc:
+        print(
+            json.dumps(
+                {"event": "article_body_footer_config_invalid", "error": str(exc)},
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+        return ""
+    return footers.get(competition, "")
+
+
 def _positive_int(value: Any) -> int | None:
     if isinstance(value, bool):
         return None
@@ -1100,6 +1145,7 @@ class ArticlePublisher:
             "channelsnew": article_channelsnew() or None,
             "tabs": ",".join(article_tabs()) or None,
             "tabs_source": article_tabs_source(),
+            "body_footers": article_body_footers(),
             "channels_source": article_channels_source(),
             "type": "article",
             "style": "gif",
@@ -1651,6 +1697,7 @@ class ArticlePublisher:
                 publish_account=publish_account,
                 channels=self.team_channels.channels_for(match_detail),
                 tabs=self.team_channels.tabs_for(match_detail),
+                body_footer=article_body_footer(match_detail),
                 allow_relative_media=bool(
                     artifact_kind == "ocr_window"
                     and (
@@ -1827,6 +1874,7 @@ class ArticlePublisher:
                 publish_account=publish_account,
                 channels=self.team_channels.channels_for(match_detail),
                 tabs=self.team_channels.tabs_for(match_detail),
+                body_footer=article_body_footer(match_detail),
                 # A reused DB mapping predates the in-memory marker, so infer
                 # official mode from its persisted upload source marker.
                 allow_relative_media=bool(
@@ -2157,6 +2205,7 @@ def build_article_fields(
     litpic_url: str = "",
     channels: str = "",
     tabs: Sequence[str | int] = (),
+    body_footer: str = "",
 ) -> dict[str, Any]:
     if delivery_mode not in {"publish", "draft"}:
         raise ArticlePublishError(
@@ -2219,11 +2268,15 @@ def build_article_fields(
         normalized_archive_id = int(archive_id_text)
     code = str(event.get("code") or "").upper()
     is_draft = delivery_mode == "draft"
+    body = f'<p><img src="{html.escape(gif_url, quote=True)}" alt="比赛 GIF"></p>'
+    footer_text = str(body_footer or "").strip()
+    if footer_text:
+        # A separate paragraph so the CMS renders the text on its own line
+        # under the GIF.
+        body += f"<p>{html.escape(footer_text)}</p>"
     fields: dict[str, Any] = {
         "title": title,
-        "body": (
-            f'<p><img src="{html.escape(gif_url, quote=True)}" alt="比赛 GIF"></p>'
-        ),
+        "body": body,
         "archive_level": "B",
         "status": 0 if is_draft else 1,
         "type": "article",

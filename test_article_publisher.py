@@ -859,6 +859,67 @@ class ArticlePublisherTests(unittest.TestCase):
             fields = build_article_fields(**common, tabs=["57"])
         self.assertEqual(fields["tabs[]"], ["57"])
 
+    def test_body_footer_follows_competition_and_environment(self):
+        import os
+
+        import article_publisher
+
+        common = {
+            "match_id": "54478914",
+            "event": {"code": "G", "minute": "19", "score": "1-0"},
+            "gif_url": "https://matchgif.aisportsapp.com/publish-gifs/a.gif",
+            "cover_url": "https://matchgif.aisportsapp.com/publish-gif-covers/a.jpg",
+            "title": "t",
+        }
+        gif_p = '<p><img src="https://matchgif.aisportsapp.com/publish-gifs/a.gif" alt="比赛 GIF"></p>'
+        # Default mapping: the three 咪咕 competitions, exact name match.
+        self.assertEqual(
+            article_publisher.article_body_footer({"competition_name": "英超"}),
+            "上咪咕独家看英超",
+        )
+        self.assertEqual(
+            article_publisher.article_body_footer({"competition_name": "西甲"}),
+            "上咪咕独家看西甲",
+        )
+        self.assertEqual(
+            article_publisher.article_body_footer({"competition_name": "中超"}),
+            "独家看中超就在咪咕",
+        )
+        for detail in ({"competition_name": "中甲"}, {"competition_name": ""}, {}, None):
+            self.assertEqual(article_publisher.article_body_footer(detail), "")
+        # Footer lands as its own paragraph right after the GIF; none = GIF only.
+        fields = build_article_fields(**common, body_footer="上咪咕独家看英超")
+        self.assertEqual(fields["body"], gif_p + "<p>上咪咕独家看英超</p>")
+        fields = build_article_fields(**common)
+        self.assertEqual(fields["body"], gif_p)
+        fields = build_article_fields(**common, body_footer="  a<b  ")
+        self.assertEqual(fields["body"], gif_p + "<p>a&lt;b</p>")
+        # Environment overrides the mapping; empty disables all; bad = none.
+        with patch.dict(os.environ, {"ARTICLE_BODY_FOOTERS": " 中甲 = 看中甲 ; 英超=X "}):
+            self.assertEqual(
+                article_publisher.article_body_footers(), {"中甲": "看中甲", "英超": "X"}
+            )
+            self.assertEqual(
+                article_publisher.article_body_footer({"competition_name": "中甲"}), "看中甲"
+            )
+            self.assertEqual(
+                article_publisher.article_body_footer({"competition_name": "西甲"}), ""
+            )
+        with patch.dict(os.environ, {"ARTICLE_BODY_FOOTERS": ""}):
+            self.assertEqual(article_publisher.article_body_footers(), {})
+            self.assertEqual(
+                article_publisher.article_body_footer({"competition_name": "英超"}), ""
+            )
+        with patch.dict(os.environ, {"ARTICLE_BODY_FOOTERS": "英超"}):
+            with self.assertRaises(RuntimeError):
+                article_publisher.article_body_footers()
+            self.assertEqual(
+                article_publisher.article_body_footer({"competition_name": "英超"}), ""
+            )
+        with patch.dict(os.environ, {"ARTICLE_BODY_FOOTERS": "英超="}):
+            with self.assertRaises(RuntimeError):
+                article_publisher.article_body_footers()
+
     def test_channels_field_validated_and_omitted_when_empty(self):
         common = {
             "match_id": "54478914",
@@ -1166,6 +1227,20 @@ class ArticlePublisherTests(unittest.TestCase):
             self.assertEqual(platform.calls[0]["add_to_tab"], 0)
             self.assertEqual(platform.calls[0]["channelsnew"], "12039035")
             self.assertNotIn("archive_id", platform.calls[0])
+            # No competition in detail: GIF-only body.
+            self.assertTrue(platform.calls[0]["body"].endswith("></p>"))
+            self.assertNotIn("咪咕", platform.calls[0]["body"])
+
+            third = publisher.publish(
+                match_id="54478915",
+                event=event,
+                match_detail={**detail, "competition_name": "英超"},
+                source_path=source,
+            )
+            self.assertEqual(third["status"], "success")
+            self.assertTrue(
+                platform.calls[1]["body"].endswith("></p><p>上咪咕独家看英超</p>")
+            )
             self.assertEqual(
                 publisher.records_for_match("54478914")["goal-19"]["article_id"],
                 "3801234",
