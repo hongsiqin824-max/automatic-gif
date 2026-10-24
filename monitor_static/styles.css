@@ -80,6 +80,7 @@ body{
 .stage-inner{width:min(1500px,93vw);height:var(--stage-h);display:flex;flex-direction:column;background:#0d1723;border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow);overflow:hidden}
 .stage-head{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:12px 18px;border-bottom:1px solid var(--line);flex-shrink:0}
 .stage-head strong{font-size:18px}
+.stage-head-hint{flex:1 1 auto;min-width:0;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-align:center}
 .stage-actions{display:flex;gap:10px;align-items:center}
 .stage-actions .button{padding:10px 16px;font-size:14px}
 .stage-body{flex:1;min-height:0;display:flex}
@@ -201,6 +202,7 @@ body{
   .stage-clips{overflow:visible}
   .stage-video{width:100%;max-height:52vh}
   .stage-range-hint{display:none}
+  .stage-head-hint{display:none}
 }
 
 /* ---- Real-time goal/red-card alerts: collapsible launcher + panel + toasts ---- */
