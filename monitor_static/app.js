@@ -1703,6 +1703,10 @@ function renderFinishedSection(archived) {
   if (summary) summary.textContent = `已完赛待发布 (${archived.length})`;
   archived.forEach((data) => grid.appendChild(buildMatchCard(data)));
   section.classList.remove('hidden');
+  // A search that hits an archived match must not look like a miss: open the
+  // section so the result is visible. Without a search the operator's own
+  // open/closed choice is kept across refreshes.
+  if (String(state.listSearch || '').trim()) section.open = true;
 }
 
 function renderMatchGrid() {
@@ -1723,8 +1727,10 @@ function renderMatchGrid() {
   const empty = $('list-empty');
   if (!matches.length) {
     if (empty) {
+      // Only the live grid is empty; archived hits (if any) sit in the
+      // finished section below, so a search miss is phrased per grid.
       empty.textContent = needle && state.allMatches.length
-        ? `未找到匹配“${state.listSearch.trim()}”的比赛`
+        ? `未找到匹配“${state.listSearch.trim()}”的进行中比赛`
         : '当前没有进行中的比赛';
       empty.classList.remove('hidden');
     }
