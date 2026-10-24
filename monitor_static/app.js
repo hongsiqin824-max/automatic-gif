@@ -19,6 +19,10 @@ const state = {
   // Operator-chosen [start, end] range on the stage. ``pinId`` is the server
   // pin that hard-links the start so it survives the rolling buffer.
   range: {matchId: null, pinId: null, startMs: null, ttlTimer: null, busy: false},
+  // Operator crop box on the stage, as fractions of the video frame
+  // ({x, y, w, h} in 0..1) or null = full frame. Kept until the stage is
+  // closed or switched to another match; ``editing`` shows the handles.
+  crop: {box: null, editing: false, drag: null},
   // Date.now() of the operator's last manual scrub/pause on the stage. Stage
   // auto-seek stays off for stageUserGraceSeconds after it (see lagMonitor).
   stageUserActionAt: 0,
@@ -589,6 +593,7 @@ async function captureClip(matchId, button, range) {
       pin_id: range.pinId,
       end_epoch_ms: Math.round(range.endMs),
     };
+    if (state.crop.box) payload.crop = state.crop.box;
     const data = await requestJson('api/monitor/clip', {
       method: 'POST', body: JSON.stringify(payload),
     });
@@ -598,12 +603,13 @@ async function captureClip(matchId, button, range) {
     // list, checks the pre-filled CMS fields there, and clicks 「发布」.
     const publishNote = data.publish_enabled ? ' · 核对后在下方列表点「发布」' : ' · 仅本地保存';
     const alertNote = alertMatchNote(data.alert_match);
+    const cropNote = data.crop ? ` · 裁剪 ${cropPercentLabel(data.crop)}` : '';
     const prefix = warn ? '⚠ 未锚定，画面可能不准' : '已生成 GIF';
-    setTileStatus(matchId, `${prefix}（${sizeMb} MB）${publishNote}${alertNote}`, warn ? 'warn' : 'ok', true);
+    setTileStatus(matchId, `${prefix}（${sizeMb} MB）${cropNote}${publishNote}${alertNote}`, warn ? 'warn' : 'ok', true);
     if (state.stageMatchId === matchId) {
       const span = ((range.endMs - range.startMs) / 1000).toFixed(1);
       setRangeState(warn ? 'warn' : 'done',
-        `${warn ? '⚠ 已生成但未锚定' : '✓ 已生成 GIF'} ${span}s · ${sizeMb} MB${data.publish_enabled ? '，在右侧列表核对后发布' : ''}`);
+        `${warn ? '⚠ 已生成但未锚定' : '✓ 已生成 GIF'} ${span}s · ${sizeMb} MB${cropNote}${data.publish_enabled ? '，在右侧列表核对后发布' : ''}`);
     }
     // The push-match note is shown on the clip's own row (buildClipForm);
     // the stage notes under the video are kept for errors only.
@@ -1019,6 +1025,13 @@ function renderClipRow(item, publishEnabled) {
     label.title = '截取时没有时间戳，画面可能不准，发布前请打开核对';
   }
   head.appendChild(label);
+  if (item.crop && typeof item.crop.w === 'number') {
+    const badge = document.createElement('span');
+    badge.className = 'stage-clip-crop-badge';
+    badge.textContent = `裁剪 ${cropPercentLabel(item.crop)}`;
+    badge.title = '这条 GIF 只截取了画面的一部分';
+    head.appendChild(badge);
+  }
   head.appendChild(link);
   row.appendChild(head);
   if (!publishEnabled) {
@@ -1508,6 +1521,206 @@ function stageAutoSeekBlocker(video) {
   return null;
 }
 
+// ---- Stage crop box ----
+// The operator frames a region of the video; the GIF is cut to that region
+// (server side, in the ffmpeg filter). Everything here is in *frame fractions*
+// (0..1 of videoWidth/videoHeight) so it is independent of element size,
+// window resizes and the preview resolution. Pixels are only used while
+// dragging and are converted through the video's content rect, which
+// excludes any letterbox object-fit:contain adds.
+
+const CROP_MIN_FRACTION = 0.02; // keeps the box draggable, not a size policy
+
+function cropPercentLabel(box) {
+  return `${Math.round(box.w * 100)}%×${Math.round(box.h * 100)}%`;
+}
+
+// Where the frame actually sits inside the <video> element. Pure so it can be
+// unit-tested: inputs are the element's content size and the stream's size.
+function videoContentRect(elementWidth, elementHeight, videoWidth, videoHeight) {
+  if (!elementWidth || !elementHeight) return {left: 0, top: 0, width: 0, height: 0};
+  if (!videoWidth || !videoHeight) return {left: 0, top: 0, width: elementWidth, height: elementHeight};
+  const scale = Math.min(elementWidth / videoWidth, elementHeight / videoHeight);
+  const width = videoWidth * scale;
+  const height = videoHeight * scale;
+  return {left: (elementWidth - width) / 2, top: (elementHeight - height) / 2, width, height};
+}
+
+// Clamp a box into the frame and enforce the minimum size; returns a new box.
+function normalizeCropBox(box) {
+  let w = Math.min(1, Math.max(CROP_MIN_FRACTION, box.w));
+  let h = Math.min(1, Math.max(CROP_MIN_FRACTION, box.h));
+  let x = Math.min(1 - w, Math.max(0, box.x));
+  let y = Math.min(1 - h, Math.max(0, box.y));
+  const round = (v) => Math.round(v * 10000) / 10000;
+  x = round(x); y = round(y); w = round(w); h = round(h);
+  if (x <= 0 && y <= 0 && w >= 0.999 && h >= 0.999) return null; // full frame
+  return {x, y, w, h};
+}
+
+// Apply a drag of (dx, dy) frame-fractions to ``start`` for a handle
+// direction ('move', 'n', 'se', ...). Pure; clamping happens in normalize.
+function applyCropDrag(start, dir, dx, dy) {
+  let {x, y, w, h} = start;
+  if (dir === 'move') return {x: x + dx, y: y + dy, w, h};
+  if (dir.includes('e')) w = Math.max(CROP_MIN_FRACTION, Math.min(1 - x, w + dx));
+  if (dir.includes('s')) h = Math.max(CROP_MIN_FRACTION, Math.min(1 - y, h + dy));
+  if (dir.includes('w')) {
+    const nx = Math.max(0, Math.min(x + w - CROP_MIN_FRACTION, x + dx));
+    w = w + (x - nx); x = nx;
+  }
+  if (dir.includes('n')) {
+    const ny = Math.max(0, Math.min(y + h - CROP_MIN_FRACTION, y + dy));
+    h = h + (y - ny); y = ny;
+  }
+  return {x, y, w, h};
+}
+
+function stageCropRect() {
+  const video = state.stageVideoNode;
+  const host = $('stage-video-host');
+  if (!video || !host) return null;
+  const vr = video.getBoundingClientRect();
+  const hr = host.getBoundingClientRect();
+  const content = videoContentRect(vr.width, vr.height, video.videoWidth, video.videoHeight);
+  if (!content.width || !content.height) return null;
+  return {
+    left: vr.left - hr.left + content.left,
+    top: vr.top - hr.top + content.top,
+    width: content.width,
+    height: content.height,
+  };
+}
+
+function renderCrop() {
+  const overlay = $('stage-crop');
+  const btn = $('stage-crop-btn');
+  const reset = $('stage-crop-reset');
+  if (!overlay || !btn) return;
+  const c = state.crop;
+  const rect = state.stageMatchId ? stageCropRect() : null;
+  const box = c.box || {x: 0, y: 0, w: 1, h: 1};
+  const show = !!rect && (c.editing || !!c.box);
+  overlay.classList.toggle('hidden', !show);
+  overlay.classList.toggle('editing', c.editing);
+  if (rect) {
+    overlay.style.left = `${rect.left}px`;
+    overlay.style.top = `${rect.top}px`;
+    overlay.style.width = `${rect.width}px`;
+    overlay.style.height = `${rect.height}px`;
+    const px = {
+      left: box.x * rect.width, top: box.y * rect.height,
+      width: box.w * rect.width, height: box.h * rect.height,
+    };
+    const boxEl = $('stage-crop-box');
+    boxEl.style.left = `${px.left}px`; boxEl.style.top = `${px.top}px`;
+    boxEl.style.width = `${px.width}px`; boxEl.style.height = `${px.height}px`;
+    const shade = (cls, s) => {
+      const el = overlay.querySelector(`.stage-crop-shade-${cls}`);
+      Object.assign(el.style, s);
+    };
+    shade('top', {left: 0, top: 0, width: '100%', height: `${px.top}px`});
+    shade('bottom', {left: 0, top: `${px.top + px.height}px`, width: '100%', height: `${Math.max(0, rect.height - px.top - px.height)}px`});
+    shade('left', {left: 0, top: `${px.top}px`, width: `${px.left}px`, height: `${px.height}px`});
+    shade('right', {left: `${px.left + px.width}px`, top: `${px.top}px`, width: `${Math.max(0, rect.width - px.left - px.width)}px`, height: `${px.height}px`});
+    $('stage-crop-size').textContent = c.box ? cropPercentLabel(c.box) : '全画面';
+  }
+  btn.classList.toggle('active', !!c.box);
+  btn.classList.toggle('editing', c.editing);
+  btn.innerHTML = c.editing
+    ? '完成 <kbd>C</kbd>'
+    : (c.box ? `裁剪中 ◫ ${escapeHtml(cropPercentLabel(c.box))} <kbd>C</kbd>` : '裁剪 <kbd>C</kbd>');
+  if (reset) reset.classList.toggle('hidden', !c.box && !c.editing);
+}
+
+function setCropBox(box) {
+  state.crop.box = normalizeCropBox(box);
+  renderCrop();
+}
+
+function toggleCropEditing(force) {
+  const c = state.crop;
+  if (!state.stageMatchId) return;
+  const next = typeof force === 'boolean' ? force : !c.editing;
+  if (next && !stageCropRect()) { addStageNote('画面还没加载，稍后再框选', 'fail'); return; }
+  c.editing = next;
+  c.drag = null;
+  renderCrop();
+}
+
+function resetCrop() {
+  state.crop.box = null;
+  state.crop.editing = false;
+  state.crop.drag = null;
+  renderCrop();
+}
+
+function clearCrop() {
+  // Stage closed / switched: the box belongs to the previous match.
+  resetCrop();
+}
+
+// The frame size is only known after metadata, and the overlay must follow
+// the element whenever the stream's dimensions change. Bound once per node
+// (the tile <video> is reused across openStage calls).
+function watchStageVideoForCrop(video) {
+  if (video._cropWatched) return;
+  video._cropWatched = true;
+  video.addEventListener('loadedmetadata', () => { if (state.stageVideoNode === video) renderCrop(); });
+  video.addEventListener('resize', () => { if (state.stageVideoNode === video) renderCrop(); });
+}
+
+function bindCropOverlay() {
+  const overlay = $('stage-crop');
+  if (!overlay) return;
+  const onDown = (ev) => {
+    if (!state.crop.editing || ev.button !== 0) return;
+    const rect = stageCropRect();
+    if (!rect) return;
+    const handle = ev.target.closest('.stage-crop-handle');
+    const inBox = ev.target.closest('.stage-crop-box');
+    let dir;
+    let start = state.crop.box || {x: 0, y: 0, w: 1, h: 1};
+    if (handle) dir = handle.dataset.dir;
+    else if (inBox) dir = 'move';
+    else {
+      // Drag on the shade: start a fresh box from this point (like a
+      // screenshot tool), growing towards the south-east.
+      dir = 'se';
+      const ox = (ev.clientX - overlay.getBoundingClientRect().left) / rect.width;
+      const oy = (ev.clientY - overlay.getBoundingClientRect().top) / rect.height;
+      start = {x: Math.min(Math.max(0, ox), 1 - CROP_MIN_FRACTION), y: Math.min(Math.max(0, oy), 1 - CROP_MIN_FRACTION), w: CROP_MIN_FRACTION, h: CROP_MIN_FRACTION};
+    }
+    state.crop.drag = {dir, start, x0: ev.clientX, y0: ev.clientY, rect};
+    overlay.setPointerCapture?.(ev.pointerId);
+    ev.preventDefault();
+  };
+  const onMove = (ev) => {
+    const d = state.crop.drag;
+    if (!d) return;
+    const dx = (ev.clientX - d.x0) / d.rect.width;
+    const dy = (ev.clientY - d.y0) / d.rect.height;
+    const next = applyCropDrag(d.start, d.dir, dx, dy);
+    // While dragging keep the live box even if it momentarily equals the
+    // full frame; normalize at the end decides whether it is a crop.
+    state.crop.box = normalizeCropBox(next) || {x: 0, y: 0, w: 1, h: 1};
+    renderCrop();
+  };
+  const onUp = () => {
+    if (!state.crop.drag) return;
+    state.crop.drag = null;
+    setCropBox(state.crop.box || {x: 0, y: 0, w: 1, h: 1});
+  };
+  overlay.addEventListener('pointerdown', onDown);
+  overlay.addEventListener('pointermove', onMove);
+  overlay.addEventListener('pointerup', onUp);
+  overlay.addEventListener('pointercancel', onUp);
+  overlay.addEventListener('dblclick', (ev) => { ev.preventDefault(); toggleCropEditing(false); });
+  $('stage-crop-btn').addEventListener('click', () => toggleCropEditing());
+  $('stage-crop-reset').addEventListener('click', () => { resetCrop(); });
+  window.addEventListener('resize', () => { if (state.stageMatchId) renderCrop(); });
+}
+
 function openStage(matchId) {
   const tile = state.tiles.get(matchId);
   if (!tile || !tile.playlistUrl) { showNotice('该比赛直播还没准备好', 'warning'); return; }
@@ -1521,6 +1734,7 @@ function openStage(matchId) {
   state.stageOpenedAt = Date.now();
   state.stageUserActionAt = 0;
   stopDraftPoll();
+  clearCrop();
   const stage = $('stage');
   stage.classList.remove('hidden');
   $('stage-title').textContent = (tile.data.team_A_name || '主队') + ' vs ' + (tile.data.team_B_name || '客队');
@@ -1551,6 +1765,7 @@ function openStage(matchId) {
     state.stageOwnVideo = true;
     state.stageHls = attachHls(own, tile.playlistUrl, stageStatus);
     attachStageUserActionListeners(own);
+    watchStageVideoForCrop(own);
     renderLagBadge($('stage-lag'), null);
     return;
   }
@@ -1564,6 +1779,7 @@ function openStage(matchId) {
   video.setAttribute('controls', '');
   host.appendChild(video);
   attachStageUserActionListeners(video);
+  watchStageVideoForCrop(video);
   state.stageHls = video._hls || null;
   renderLagBadge($('stage-lag'), liveLagSeconds(video));
   const tileOverlay = wrap.querySelector('.tile-overlay');
@@ -1577,6 +1793,7 @@ function closeStage() {
   state.stageMatchId = null;
   stopDraftPoll();
   clearRange();
+  clearCrop();
   const video = state.stageVideoNode;
   if (video && state.stageOwnVideo) {
     detachPlayer(video);
@@ -1902,6 +2119,7 @@ $('back-to-list-btn').addEventListener('click', leaveWorkshop);
 $('stage-close').addEventListener('click', closeStage);
 $('stage-range-start').addEventListener('click', setRangeStart);
 $('stage-range-end').addEventListener('click', (ev) => setRangeEndAndCapture(ev.currentTarget));
+bindCropOverlay();
 $('stage-live').addEventListener('click', () => {
   if (!state.stageVideoNode) return;
   $('stage-status').textContent = '正在回到直播…';
@@ -1914,10 +2132,12 @@ $('stage-live').addEventListener('click', () => {
 document.addEventListener('keydown', (ev) => {
   if (ev.key === 'Escape') {
     if (state.alertPanelOpen) { closeAlertPanel(); return; }
+    // First Esc leaves crop editing (keeps the box); the next one closes.
+    if (state.crop.editing) { toggleCropEditing(false); return; }
     closeStage();
     return;
   }
-  // S / E drive the capture buttons while the stage is open and the operator
+  // S / E / C drive the capture buttons while the stage is open and the operator
   // is not typing in a form field (the title input handles Enter itself).
   if (!state.stageMatchId || ev.metaKey || ev.ctrlKey || ev.altKey || ev.isComposing) return;
   const tag = (ev.target && ev.target.tagName) || '';
@@ -1931,6 +2151,9 @@ document.addEventListener('keydown', (ev) => {
     ev.preventDefault();
     const btn = $('stage-range-end');
     if (btn && !btn.disabled) btn.click();
+  } else if (key === 'c') {
+    ev.preventDefault();
+    toggleCropEditing();
   }
 });
 window.addEventListener('beforeunload', () => {

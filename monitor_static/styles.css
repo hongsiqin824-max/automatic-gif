@@ -85,8 +85,35 @@ body{
 .stage-body{flex:1;min-height:0;display:flex}
 .stage-left{flex:1 1 60%;min-width:0;display:flex;flex-direction:column;padding:14px 18px;overflow:auto;border-right:1px solid var(--line)}
 .stage-right{flex:0 0 40%;max-width:560px;min-width:380px;display:flex;flex-direction:column;min-height:0;background:rgba(255,255,255,.02)}
-.stage-video-host{flex-shrink:0}
+.stage-video-host{flex-shrink:0;position:relative}
 .stage-video{display:block;width:min(100%,calc((var(--stage-h) - var(--stage-reserve)) * 16 / 9));margin:0 auto;aspect-ratio:16/9;object-fit:contain;background:#000;border-radius:8px}
+/* Crop overlay: positioned by JS to the video's content rect (letterbox excluded).
+   Editing = shades + handles catch the pointer; idle = a thin outline only, so
+   the native video controls stay usable underneath. */
+.stage-crop{position:absolute;z-index:5;pointer-events:none;user-select:none;touch-action:none}
+.stage-crop.editing{pointer-events:auto;cursor:crosshair}
+.stage-crop-shade{position:absolute;background:rgba(0,0,0,.55);display:none}
+.stage-crop.editing .stage-crop-shade{display:block}
+.stage-crop-box{position:absolute;box-sizing:border-box;border:2px solid var(--amber,#f5b942);box-shadow:0 0 0 1px rgba(0,0,0,.6)}
+.stage-crop.editing .stage-crop-box{cursor:move;pointer-events:auto}
+.stage-crop:not(.editing) .stage-crop-box{border-style:dashed;opacity:.85}
+.stage-crop-size{position:absolute;left:4px;top:4px;font:600 11px/1 ui-monospace,Menlo,monospace;color:#fff;background:rgba(0,0,0,.6);padding:3px 5px;border-radius:3px;pointer-events:none}
+.stage-crop-handle{position:absolute;width:14px;height:14px;background:var(--amber,#f5b942);border:1px solid rgba(0,0,0,.6);border-radius:2px;display:none;pointer-events:auto}
+.stage-crop.editing .stage-crop-handle{display:block}
+.stage-crop-handle.n{top:-8px;left:calc(50% - 7px);cursor:ns-resize}
+.stage-crop-handle.s{bottom:-8px;left:calc(50% - 7px);cursor:ns-resize}
+.stage-crop-handle.w{left:-8px;top:calc(50% - 7px);cursor:ew-resize}
+.stage-crop-handle.e{right:-8px;top:calc(50% - 7px);cursor:ew-resize}
+.stage-crop-handle.nw{top:-8px;left:-8px;cursor:nwse-resize}
+.stage-crop-handle.se{bottom:-8px;right:-8px;cursor:nwse-resize}
+.stage-crop-handle.ne{top:-8px;right:-8px;cursor:nesw-resize}
+.stage-crop-handle.sw{bottom:-8px;left:-8px;cursor:nesw-resize}
+.stage-crop-ctl{display:inline-flex;align-items:center;gap:6px}
+.stage-crop-ctl .button.ghost{padding:10px 14px;font-size:14px;min-height:40px}
+#stage-crop-btn.active{border-color:var(--amber,#f5b942);color:var(--amber,#f5b942)}
+#stage-crop-btn.editing{background:rgba(245,185,66,.18)}
+.stage-crop-reset{font-size:13px}
+.stage-clip-crop-badge{display:inline-block;margin-left:6px;font-size:11px;padding:1px 6px;border-radius:3px;border:1px solid var(--amber,#f5b942);color:var(--amber,#f5b942);vertical-align:middle}
 .stage-range{display:flex;align-items:center;gap:12px;margin:14px 0 10px;flex-wrap:wrap}
 .stage-range .button{padding:12px 22px;font-size:16px;min-height:44px;display:inline-flex;align-items:center;gap:8px}
 .stage-range kbd{font:600 11px/1 ui-monospace,Menlo,monospace;padding:3px 6px;border-radius:4px;border:1px solid rgba(255,255,255,.3);background:rgba(0,0,0,.25);color:inherit;opacity:.85}

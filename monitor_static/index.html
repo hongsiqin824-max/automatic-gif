@@ -84,12 +84,30 @@
       </div>
       <div class="stage-body">
         <div class="stage-left">
-          <div id="stage-video-host" class="stage-video-host"></div>
+          <div id="stage-video-host" class="stage-video-host">
+            <div id="stage-crop" class="stage-crop hidden" aria-label="裁剪框">
+              <div class="stage-crop-shade stage-crop-shade-top"></div>
+              <div class="stage-crop-shade stage-crop-shade-bottom"></div>
+              <div class="stage-crop-shade stage-crop-shade-left"></div>
+              <div class="stage-crop-shade stage-crop-shade-right"></div>
+              <div id="stage-crop-box" class="stage-crop-box">
+                <span class="stage-crop-size" id="stage-crop-size"></span>
+                <i class="stage-crop-handle n" data-dir="n"></i><i class="stage-crop-handle s" data-dir="s"></i>
+                <i class="stage-crop-handle w" data-dir="w"></i><i class="stage-crop-handle e" data-dir="e"></i>
+                <i class="stage-crop-handle nw" data-dir="nw"></i><i class="stage-crop-handle ne" data-dir="ne"></i>
+                <i class="stage-crop-handle sw" data-dir="sw"></i><i class="stage-crop-handle se" data-dir="se"></i>
+              </div>
+            </div>
+          </div>
           <div class="stage-range">
             <button id="stage-range-start" class="button secondary" type="button" title="把当前画面设为 GIF 起点（快捷键 S）">开始 <kbd>S</kbd></button>
             <button id="stage-range-end" class="button primary" type="button" disabled title="把当前画面设为终点并生成 GIF（快捷键 E；不发布，发布在右侧面板）">结束 <kbd>E</kbd></button>
+            <span class="stage-crop-ctl">
+              <button id="stage-crop-btn" class="button ghost" type="button" title="在画面上框选要截取的区域（快捷键 C；默认整个画面）">裁剪 <kbd>C</kbd></button>
+              <button id="stage-crop-reset" class="button ghost stage-crop-reset hidden" type="button" title="恢复整个画面">全画面</button>
+            </span>
             <span id="stage-range-state" class="stage-range-state hidden"></span>
-            <span class="stage-range-hint muted">快捷键：S 起点 · E 终点并截取 · Enter 发布 · Esc 关闭</span>
+            <span class="stage-range-hint muted">快捷键：S 起点 · E 终点并截取 · C 裁剪 · Enter 发布 · Esc 关闭</span>
           </div>
           <div id="stage-status" class="stage-status muted"></div>
           <div id="stage-notes" class="stage-notes"></div>

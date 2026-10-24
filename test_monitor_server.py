@@ -35,6 +35,12 @@ from monitor_server import (
 )
 
 
+def _gif_size(path: Path) -> tuple[int, int]:
+    """Logical screen size from the GIF header (bytes 6-9, little-endian)."""
+    header = path.read_bytes()[:10]
+    return int.from_bytes(header[6:8], "little"), int.from_bytes(header[8:10], "little")
+
+
 class PlaylistParsingTests(unittest.TestCase):
     def test_reads_segments_and_durations_in_order(self):
         with TemporaryDirectory() as tmp:
@@ -291,8 +297,10 @@ class ClipRangeEndpointTests(unittest.TestCase):
         self.store.shutdown()
         self.tmp.cleanup()
 
-    def _fake_encode(self, segments, before_seconds, output_path, anchor_epoch=None, start_epoch=None):
+    def _fake_encode(self, segments, before_seconds, output_path, anchor_epoch=None, start_epoch=None, crop=None):
         self.encode_calls.append((before_seconds, anchor_epoch, start_epoch))
+        self.encode_crops = getattr(self, "encode_crops", [])
+        self.encode_crops.append(crop)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_bytes(b"GIF")
 
@@ -395,6 +403,51 @@ class ClipRangeEndpointTests(unittest.TestCase):
         before, anchor, start = self.encode_calls[-1]
         self.assertEqual(before, 5.0)
         self.assertIsNone(start)
+
+    def test_crop_is_validated_normalised_and_persisted(self):
+        pin_id = self._pin(4.0).get_json()["pin_id"]
+        body = {"match_id": "54622319", "pin_id": pin_id, "end_epoch_ms": round((self.base + 12.5) * 1000)}
+        # Operator box: fractions of the frame.
+        response = self.client.post(
+            "/api/monitor/clip", json={**body, "crop": {"x": 0.1, "y": 0.2, "w": 0.5, "h": 0.6}}
+        )
+        self.assertEqual(response.status_code, 200, response.get_json())
+        crop = {"x": 0.1, "y": 0.2, "w": 0.5, "h": 0.6}
+        self.assertEqual(self.encode_crops[-1], crop)
+        self.assertEqual(response.get_json()["crop"], crop)
+        meta = monitor_server._read_clip_meta(self.dir / "clips" / response.get_json()["name"])
+        self.assertEqual(meta["crop"], crop)
+        listed = {row["name"]: row for row in monitor_server._list_clips("54622319")}
+        self.assertEqual(listed[response.get_json()["name"]]["crop"], crop)
+
+        # Full frame (or absent) = no crop, exactly the historical path.
+        pin_id = self._pin(4.0).get_json()["pin_id"]
+        body["pin_id"] = pin_id
+        response = self.client.post(
+            "/api/monitor/clip", json={**body, "crop": {"x": 0, "y": 0, "w": 1, "h": 1}}
+        )
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertIsNone(self.encode_crops[-1])
+        self.assertIsNone(response.get_json()["crop"])
+        self.assertIsNone(monitor_server._read_clip_meta(self.dir / "clips" / response.get_json()["name"])["crop"])
+
+    def test_bad_crop_is_rejected_before_encoding(self):
+        pin_id = self._pin(4.0).get_json()["pin_id"]
+        body = {"match_id": "54622319", "pin_id": pin_id, "end_epoch_ms": round((self.base + 12.5) * 1000)}
+        for bad in (
+            "box",
+            {"x": 0.5, "y": 0, "w": 0.6, "h": 1},   # runs off the right edge
+            {"x": 0, "y": 0, "w": 0, "h": 1},        # zero width
+            {"x": -0.1, "y": 0, "w": 0.5, "h": 0.5},
+            {"x": "a", "y": 0, "w": 0.5, "h": 0.5},
+            {"x": 0, "y": 0, "w": 0.5},              # missing h
+        ):
+            response = self.client.post("/api/monitor/clip", json={**body, "crop": bad})
+            self.assertEqual(response.status_code, 400, bad)
+            self.assertEqual(response.get_json()["code"], "crop_invalid")
+        self.assertEqual(self.encode_calls, [])
+        # Pin stays alive so the operator can fix the box and retry.
+        self.assertIsNotNone(self.store.get(pin_id, "54622319"))
 
     def _run_through_real_encoder(self, body: dict):
         """POST /api/monitor/clip with the *real* ``_encode_clip_gif``.
@@ -698,6 +751,74 @@ class ClipDiscardTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
 
 
+class StageCropMathTests(unittest.TestCase):
+    """Run the pure crop helpers from monitor_static/app.js under node.
+
+    They are extracted by name so the browser code stays a plain script; the
+    rest of app.js (DOM, hls.js) is never loaded.
+    """
+
+    NAMES = ("videoContentRect", "normalizeCropBox", "applyCropDrag")
+
+    @classmethod
+    def setUpClass(cls):
+        cls.node = shutil.which("node")
+        if not cls.node:
+            raise unittest.SkipTest("node 不可用")
+        source = (Path(monitor_server.__file__).parent / "monitor_static" / "app.js").read_text(encoding="utf-8")
+        import re
+        const = re.search(r"^const CROP_MIN_FRACTION = [^;]+;", source, re.M)
+        if const is None:
+            raise AssertionError("CROP_MIN_FRACTION missing from app.js")
+        parts = [const.group(0)]
+        for name in cls.NAMES:
+            match = re.search(rf"^function {name}\([^)]*\) \{{.*?^\}}", source, re.M | re.S)
+            if match is None:
+                raise AssertionError(f"{name} missing from app.js")
+            parts.append(match.group(0))
+        cls.prelude = "\n".join(parts)
+
+    def run_js(self, expr: str):
+        script = f"{self.prelude}\nprocess.stdout.write(JSON.stringify({expr}));"
+        result = subprocess.run([self.node, "-e", script], capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_video_content_rect_excludes_letterbox(self):
+        # 16:9 element showing a 4:3 stream: pillarboxed, centred.
+        rect = self.run_js("videoContentRect(800, 450, 640, 480)")
+        self.assertEqual(rect, {"left": 100, "top": 0, "width": 600, "height": 450})
+        # Same aspect: fills the element.
+        self.assertEqual(self.run_js("videoContentRect(854, 480, 854, 480)"), {"left": 0, "top": 0, "width": 854, "height": 480})
+        # Unknown stream size (metadata not loaded yet): assume it fills.
+        self.assertEqual(self.run_js("videoContentRect(800, 450, 0, 0)")["width"], 800)
+        self.assertEqual(self.run_js("videoContentRect(0, 0, 854, 480)")["width"], 0)
+
+    def test_normalize_clamps_and_treats_full_frame_as_null(self):
+        self.assertIsNone(self.run_js("normalizeCropBox({x:0,y:0,w:1,h:1})"))
+        self.assertIsNone(self.run_js("normalizeCropBox({x:-0.2,y:-0.1,w:1.5,h:1.2})"))
+        self.assertEqual(
+            self.run_js("normalizeCropBox({x:0.7,y:0.6,w:0.5,h:0.5})"),
+            {"x": 0.5, "y": 0.5, "w": 0.5, "h": 0.5},
+        )
+        self.assertEqual(self.run_js("normalizeCropBox({x:0.1,y:0.1,w:0.001,h:0.001}).w"), 0.02)
+
+    def assertBox(self, box, x, y, w, h):
+        for key, want in zip("xywh", (x, y, w, h)):
+            self.assertAlmostEqual(box[key], want, places=6, msg=key)
+
+    def test_apply_drag_moves_and_resizes_from_each_edge(self):
+        start = "{x:0.2,y:0.2,w:0.4,h:0.4}"
+        self.assertBox(self.run_js(f"applyCropDrag({start}, 'move', 0.1, -0.05)"), 0.3, 0.15, 0.4, 0.4)
+        self.assertBox(self.run_js(f"applyCropDrag({start}, 'se', 0.1, 0.1)"), 0.2, 0.2, 0.5, 0.5)
+        # North-west handle: moves the origin and shrinks the box by the same amount.
+        self.assertBox(self.run_js(f"applyCropDrag({start}, 'nw', 0.1, 0.1)"), 0.3, 0.3, 0.3, 0.3)
+        # Resizing never crosses the opposite edge or the frame.
+        self.assertAlmostEqual(self.run_js(f"applyCropDrag({start}, 'e', 5, 0)")["w"], 0.8)
+        self.assertAlmostEqual(self.run_js(f"applyCropDrag({start}, 'w', 5, 0)")["w"], 0.02)
+        self.assertAlmostEqual(self.run_js(f"applyCropDrag({start}, 'n', -5, -5)")["y"], 0.0)
+
+
 class ClipEncodingTests(unittest.TestCase):
     def _make_segments(self, directory: Path, count: int) -> list:
         """Produce real 2-second MPEG-TS segments with ffmpeg for a true clip."""
@@ -728,6 +849,57 @@ class ClipEncodingTests(unittest.TestCase):
             # Neither the concat list nor the hard-link staging dir may linger.
             self.assertEqual(list(directory.glob(".concat_*.txt")), [])
             self.assertEqual(list(directory.glob(".src_*")), [])
+
+    def test_clip_video_filter_full_frame_is_unchanged_and_crop_never_upscales(self):
+        with mock.patch.object(monitor_server, "CLIP_GIF_WIDTH", 440), \
+                mock.patch.object(monitor_server, "CLIP_GIF_FPS", 50 / 3):
+            self.assertEqual(
+                monitor_server._clip_video_filter(None),
+                "fps=16.6667,scale=440:-2:flags=lanczos",
+            )
+            cropped = monitor_server._clip_video_filter({"x": 0.1, "y": 0.2, "w": 0.5, "h": 0.6})
+        self.assertEqual(
+            cropped,
+            "fps=16.6667,"
+            "crop=floor(iw*0.5000/2)*2:floor(ih*0.6000/2)*2:floor(iw*0.1000):floor(ih*0.2000),"
+            "scale=w='min(440\\,iw)':h=-2:flags=lanczos",
+        )
+
+    def test_parse_clip_crop_normalises_full_frame_and_clamps_edges(self):
+        parse = monitor_server._parse_clip_crop
+        self.assertIsNone(parse(None))
+        self.assertIsNone(parse({"x": 0, "y": 0, "w": 1, "h": 1}))
+        self.assertIsNone(parse({"x": "0", "y": "0", "w": "0.9995", "h": "1"}))
+        # Float noise past the edge is clamped, not rejected.
+        self.assertEqual(
+            parse({"x": 0.5, "y": 0.5, "w": 0.50005, "h": 0.5}),
+            {"x": 0.5, "y": 0.5, "w": 0.5, "h": 0.5},
+        )
+        self.assertEqual(
+            parse({"x": 0.123456, "y": 0, "w": 0.5, "h": 0.5}),
+            {"x": 0.1235, "y": 0.0, "w": 0.5, "h": 0.5},
+        )
+        for bad in ([], 1, {"x": 0, "y": 0, "w": 1.2, "h": 1}, {"x": 0, "y": 0, "w": 0.5, "h": -0.1},
+                    {"x": float("nan"), "y": 0, "w": 0.5, "h": 0.5}):
+            with self.assertRaises(ValueError, msg=bad):
+                parse(bad)
+
+    def test_encode_clip_gif_with_crop_outputs_cropped_size(self):
+        """Real ffmpeg: a 50%x50% box of a 320x180 source gives a 160x90 GIF
+        (no upscale to 440), while the full frame is scaled to CLIP_GIF_WIDTH."""
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            segments = self._make_segments(directory, 3)
+            cropped = directory / "crop.gif"
+            with mock.patch.object(monitor_server, "CLIP_GIF_WIDTH", 440):
+                _encode_clip_gif(
+                    segments, before_seconds=2.0, output_path=cropped,
+                    crop={"x": 0.25, "y": 0.25, "w": 0.5, "h": 0.5},
+                )
+                full = directory / "full.gif"
+                _encode_clip_gif(segments, before_seconds=2.0, output_path=full)
+            self.assertEqual(_gif_size(cropped), (160, 90))
+            self.assertEqual(_gif_size(full)[0], 440)
 
     def test_encode_clip_gif_with_explicit_range(self):
         """Real ffmpeg run through the 5-argument (anchor + start) signature.
@@ -1271,7 +1443,7 @@ class ClipEndpointAlertMatchTests(unittest.TestCase):
             patch.stop()
         self.tmp.cleanup()
 
-    def _fake_encode(self, segments, before_seconds, output_path, anchor_epoch=None, start_epoch=None):
+    def _fake_encode(self, segments, before_seconds, output_path, anchor_epoch=None, start_epoch=None, crop=None):
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_bytes(b"GIF")
 

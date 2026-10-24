@@ -889,12 +889,62 @@ def _select_clip_window(
     return kept, start_offset, window
 
 
+def _parse_clip_crop(raw: Any) -> dict[str, float] | None:
+    """Validate an operator crop box; ``None`` = full frame.
+
+    The browser sends fractions of the *video frame* (not the element), so
+    the server never needs the stream resolution. A box that covers the whole
+    frame is normalised to ``None`` so the GIF is encoded exactly as before.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("crop 必须是对象 {x, y, w, h}")
+    values: dict[str, float] = {}
+    for key in ("x", "y", "w", "h"):
+        try:
+            value = float(raw.get(key))
+        except (TypeError, ValueError):
+            raise ValueError(f"crop.{key} 必须是 0~1 的数字")
+        if value != value or value < 0 or value > 1:  # NaN or out of range
+            raise ValueError(f"crop.{key} 必须是 0~1 的数字")
+        values[key] = value
+    if values["w"] <= 0 or values["h"] <= 0:
+        raise ValueError("crop 的宽高必须大于 0")
+    if values["x"] + values["w"] > 1.0001 or values["y"] + values["h"] > 1.0001:
+        raise ValueError("crop 超出画面范围")
+    values["w"] = min(values["w"], 1.0 - values["x"])
+    values["h"] = min(values["h"], 1.0 - values["y"])
+    if values["x"] <= 0 and values["y"] <= 0 and values["w"] >= 0.999 and values["h"] >= 0.999:
+        return None
+    return {key: round(value, 4) for key, value in values.items()}
+
+
+def _clip_video_filter(crop: dict[str, float] | None) -> str:
+    """fps + (crop) + scale part of the GIF filter graph.
+
+    Full frame keeps the historical ``scale=440:-2``. A crop is expressed with
+    ``iw``/``ih`` so it works for any preview resolution, snapped to even
+    pixels, and then scaled *down* only: ``min(440, iw)`` never upsamples a
+    small region of the 480p preview into a blurry 440-wide GIF.
+    """
+    fps = f"fps={CLIP_GIF_FPS:g}"
+    if crop is None:
+        return f"{fps},scale={CLIP_GIF_WIDTH}:-2:flags=lanczos"
+    crop_expr = (
+        f"crop=floor(iw*{crop['w']:.4f}/2)*2:floor(ih*{crop['h']:.4f}/2)*2"
+        f":floor(iw*{crop['x']:.4f}):floor(ih*{crop['y']:.4f})"
+    )
+    return f"{fps},{crop_expr},scale=w='min({CLIP_GIF_WIDTH}\\,iw)':h=-2:flags=lanczos"
+
+
 def _encode_clip_gif(
     segments: list[tuple[Path, float, float | None]],
     before_seconds: float,
     output_path: Path,
     anchor_epoch: float | None = None,
     start_epoch: float | None = None,
+    crop: dict[str, float] | None = None,
 ) -> None:
     """Concatenate recent segments and encode the target window to a GIF."""
     kept, start_offset, window = _select_clip_window(segments, before_seconds, anchor_epoch, start_epoch)
@@ -926,7 +976,7 @@ def _encode_clip_gif(
         )
         palette_filter = (
             # ``:g`` keeps a fractional rate short (16.6667, not 16.666666666666668).
-            f"fps={CLIP_GIF_FPS:g},scale={CLIP_GIF_WIDTH}:-2:flags=lanczos,"
+            f"{_clip_video_filter(crop)},"
             "split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse"
         )
         command = [
@@ -1201,6 +1251,7 @@ def _list_clips(match_id: str) -> list[dict[str, Any]]:
             "title": str(form.get("title") or ""),
             "form": form,
             "anchored": meta.get("anchored"),
+            "crop": meta.get("crop") if isinstance(meta.get("crop"), dict) else None,
             "discarded": bool(meta.get("discarded")),
             "alert_match": meta.get("alert_match_public"),
             "event_key": record.get("event_key") if record else None,
@@ -2068,6 +2119,10 @@ def monitor_clip():
             anchor_epoch = float(body["anchor_epoch_ms"]) / 1000.0
         except (TypeError, ValueError):
             return jsonify({"error": "anchor_epoch_ms 必须是数字"}), 400
+    try:
+        crop = _parse_clip_crop(body.get("crop"))
+    except ValueError as exc:
+        return jsonify({"error": str(exc), "code": "crop_invalid"}), 400
     # Range mode: a pinned start plus the end frame the operator is looking at.
     pin: dict[str, Any] | None = None
     start_epoch: float | None = None
@@ -2130,7 +2185,7 @@ def monitor_clip():
     output_path = _clip_dir(match_id) / f"clip_{timestamp}_{uuid.uuid4().hex[:6]}.gif"
     anchored = anchor_epoch is not None and all(seg[2] is not None for seg in segments)
     try:
-        _encode_clip_gif(segments, before_seconds, output_path, anchor_epoch, start_epoch)
+        _encode_clip_gif(segments, before_seconds, output_path, anchor_epoch, start_epoch, crop=crop)
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
     if pin is not None:
@@ -2150,6 +2205,7 @@ def monitor_clip():
                 "anchor_epoch_ms": None if anchor_epoch is None else round(anchor_epoch * 1000),
                 "start_epoch_ms": None if start_epoch is None else round(start_epoch * 1000),
                 "pin_id": pin_id or None,
+                "crop": crop,
                 "segments": len(segments),
                 "with_pdt": sum(1 for seg in segments if seg[2] is not None),
                 "clip": output_path.name,
@@ -2184,6 +2240,7 @@ def monitor_clip():
             "anchor_epoch_ms": None if anchor_epoch is None else round(anchor_epoch * 1000),
             "start_epoch_ms": None if start_epoch is None else round(start_epoch * 1000),
             "before_seconds": before_seconds,
+            "crop": crop,
             "form": form,
             "alert_match": alert_match,
             "alert_match_public": _alert_match_public(alert_match),
@@ -2197,6 +2254,7 @@ def monitor_clip():
             "name": output_path.name,
             "before_seconds": before_seconds,
             "anchored": anchored,
+            "crop": crop,
             "clip_url": f"clips/{match_id}/{output_path.name}",
             "bytes": output_path.stat().st_size,
             "publish_enabled": manual_draft_queue is not None,
