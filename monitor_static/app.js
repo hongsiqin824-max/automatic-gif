@@ -588,6 +588,11 @@ async function captureClip(matchId, button, range) {
     const alertNote = alertMatchNote(data.alert_match);
     const prefix = warn ? '⚠ 未锚定，画面可能不准' : '已生成 GIF';
     setTileStatus(matchId, `${prefix}（${sizeMb} MB）${publishNote}${alertNote}`, warn ? 'warn' : 'ok', true);
+    if (state.stageMatchId === matchId) {
+      const span = ((range.endMs - range.startMs) / 1000).toFixed(1);
+      setRangeState(warn ? 'warn' : 'done',
+        `${warn ? '⚠ 已生成但未锚定' : '✓ 已生成 GIF'} ${span}s · ${sizeMb} MB${data.publish_enabled ? '，在右侧列表核对后发布' : ''}`);
+    }
     // The push-match note is shown on the clip's own row (buildClipForm);
     // the stage notes under the video are kept for errors only.
     const tile = state.tiles.get(matchId);
@@ -598,7 +603,10 @@ async function captureClip(matchId, button, range) {
     return true;
   } catch (error) {
     setTileStatus(matchId, error.message, 'warn');
-    if (state.stageMatchId === matchId) addStageNote('截取失败：' + error.message, 'fail');
+    if (state.stageMatchId === matchId) {
+      addStageNote('截取失败：' + error.message, 'fail');
+      setRangeState('fail', '✕ 截取失败：' + error.message + '（起点还在，可换个终点重试）');
+    }
     return false;
   } finally {
     if (button) { button.disabled = false; button.innerHTML = prevLabel; }
@@ -1197,6 +1205,57 @@ function renderRange() {
   startBtn.firstChild.textContent = hasStart ? '重新开始 ' : '开始 ';
   startBtn.disabled = r.busy;
   endBtn.disabled = !hasStart || r.busy;
+  if (r.busy) setRangeState('busy', '正在截取…');
+  else if (hasStart) renderRangeRecording();
+  else if (rangeStateIsTransient()) setRangeState(null);
+}
+
+// Inline status to the right of 「结束」: the only place the operator looks
+// while working the stage, and otherwise empty. ``recording`` ticks every
+// second (see startLagMonitoring); ``done`` fades after RANGE_DONE_NOTE_MS
+// so a stale result is not sitting there during the next take; ``fail``
+// stays until the next 「开始」.
+const RANGE_DONE_NOTE_MS = 6000;
+const RANGE_FAIL_HOLD_MS = 6000;
+const RANGE_NEAR_LIMIT_SECONDS = 5;
+
+function rangeStateIsTransient() {
+  const el = $('stage-range-state');
+  return !!el && (el.classList.contains('recording') || el.classList.contains('busy'));
+}
+
+function setRangeState(kind, text) {
+  const el = $('stage-range-state');
+  if (!el) return;
+  if (el._doneTimer) { clearTimeout(el._doneTimer); el._doneTimer = null; }
+  el._holdUntil = 0;
+  if (!kind) { el.className = 'stage-range-state hidden'; el.textContent = ''; return; }
+  el.className = `stage-range-state ${kind}`;
+  el.textContent = text;
+  if (kind === 'done' || kind === 'warn') {
+    el._doneTimer = setTimeout(() => { if (el.classList.contains(kind)) setRangeState(null); }, RANGE_DONE_NOTE_MS);
+  } else if (kind === 'fail') {
+    // A failed capture keeps the pin alive for a retry; let the error sit
+    // for a moment before the recording counter takes the slot back.
+    el._holdUntil = Date.now() + RANGE_FAIL_HOLD_MS;
+  }
+}
+
+function renderRangeRecording() {
+  const r = state.range;
+  const video = state.stageVideoNode;
+  const el = $('stage-range-state');
+  if (!el || r.pinId == null || r.startMs == null || !video) return;
+  if (el._holdUntil && Date.now() < el._holdUntil) return;
+  const nowMs = frameAnchorMs(video);
+  const seconds = nowMs == null ? 0 : Math.max(0, (nowMs - r.startMs) / 1000);
+  const max = state.clipRangeMaxSeconds;
+  const startClock = new Date(r.startMs).toLocaleTimeString('zh-CN', {hour12: false});
+  let text = `录制中 ${seconds.toFixed(1)}s · 起点 ${startClock}`;
+  if (seconds > max) text = `已超过 ${max}s 上限（${seconds.toFixed(1)}s），请拖回再点「结束」`;
+  else if (seconds >= max - RANGE_NEAR_LIMIT_SECONDS) text += ` · 还剩 ${(max - seconds).toFixed(1)}s`;
+  setRangeState('recording', text);
+  el.classList.toggle('near-limit', seconds >= max - RANGE_NEAR_LIMIT_SECONDS);
 }
 
 function clearRange(options = {}) {
@@ -1217,6 +1276,7 @@ async function setRangeStart() {
   if (startMs == null) { addStageNote('当前画面没有时间戳，无法设起点', 'fail'); return; }
   const btn = $('stage-range-start');
   btn.disabled = true;
+  setRangeState(null);
   try {
     clearRange();
     const data = await requestJson('api/monitor/clip/pin', {
@@ -1237,10 +1297,12 @@ async function setRangeStart() {
       ttlTimer: setTimeout(() => {
         addStageNote('起点已失效（超时未截取），请重新点「开始」', 'fail');
         clearRange({keepServerPin: true});
+        setRangeState('fail', '起点已失效（超时未截取），请重新点「开始」');
       }, Math.max(1000, (data.ttl_seconds || 180) * 1000)),
     };
   } catch (error) {
     addStageNote('设起点失败：' + error.message, 'fail');
+    setRangeState('fail', '设起点失败：' + error.message);
   } finally {
     btn.disabled = false;
     renderRange();
@@ -1370,6 +1432,7 @@ function openStage(matchId) {
   $('stage-clips-count').textContent = '';
   loadStageClips(matchId);
   clearRange();
+  setRangeState(null);
   const stageStatus = (text, cls) => {
     $('stage-status').textContent = text;
     $('stage-status').className = `stage-status ${cls || ''}`;
@@ -2289,7 +2352,11 @@ function startLagMonitoring() {
         );
       }
       const lag = liveLagSeconds(video);
-      if (state.stageMatchId === matchId) renderLagBadge($('stage-lag'), lag);
+      if (state.stageMatchId === matchId) {
+        renderLagBadge($('stage-lag'), lag);
+        // Tick the 「录制中 N.Ns」 counter next to 「结束」 while a start is set.
+        if (state.range.pinId != null && !state.range.busy) renderRangeRecording();
+      }
       if (!video || !video._hls) continue;
       const hls = video._hls;
       const onStage = isStageVideo(video);
