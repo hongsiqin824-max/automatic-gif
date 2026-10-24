@@ -192,6 +192,10 @@ body{
 
 /* ---- Match card grid (two-column) ---- */
 .match-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px}
+.list-search{margin-bottom:12px}
+.list-search-input{width:100%;max-width:420px;background:#0d1723;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:9px 12px;font:inherit;outline:none}
+.list-search-input:focus{border-color:var(--cyan)}
+.list-search-input::placeholder{color:#6e859a}
 .match-card{display:flex;align-items:center;gap:10px;padding:12px 14px;border:1px solid var(--line);border-radius:8px;background:rgba(17,27,40,.55);cursor:pointer;transition:background .12s;font-size:13px}
 .match-card:hover{background:rgba(93,225,208,.06)}
 .match-card.no-source{opacity:.55}

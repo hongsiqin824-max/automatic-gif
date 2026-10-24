@@ -33,6 +33,7 @@ const state = {
   // ---- Two-view workflow ----
   view: 'list',                     // 'list' | 'workshop'
   allMatches: [],                   // full playing list + optional source_state
+  listSearch: '',                   // list-view search box text (filters the grid only)
   selectedMatchIds: new Set(),      // checked match_id set
   sourceCache: {},                  // match_id → source_state (survives refreshes)
   workshopIdleTimer: null,          // setTimeout id for 90s idle cleanup
@@ -1474,11 +1475,22 @@ function sourceLabel(stateVal) {
   return '未知';
 }
 
+// List-view search: case-insensitive substring over teams / competition /
+// match id. Selection (checkboxes) is untouched by filtering, so a match
+// ticked before narrowing the list still enters the workshop.
+function matchMatchesSearch(data, needle) {
+  if (!needle) return true;
+  const hay = [data.team_A_name, data.team_B_name, data.competition_name, data.match_id]
+    .map((v) => String(v == null ? '' : v).toLowerCase()).join(' ');
+  return hay.includes(needle);
+}
+
 function renderMatchGrid() {
   const grid = $('match-grid');
   if (!grid) return;
   grid.innerHTML = '';
-  const matches = state.allMatches;
+  const needle = String(state.listSearch || '').trim().toLowerCase();
+  const matches = state.allMatches.filter((m) => matchMatchesSearch(m, needle));
   // 有源比赛在前，无源在后
   matches.sort((a, b) => {
     const aOk = (a.source_state || state.sourceCache[a.match_id] || 'unknown') === 'available';
@@ -1487,7 +1499,12 @@ function renderMatchGrid() {
   });
   const empty = $('list-empty');
   if (!matches.length) {
-    if (empty) empty.classList.remove('hidden');
+    if (empty) {
+      empty.textContent = needle && state.allMatches.length
+        ? `未找到匹配“${state.listSearch.trim()}”的比赛`
+        : '当前没有进行中的比赛';
+      empty.classList.remove('hidden');
+    }
     return;
   }
   if (empty) empty.classList.add('hidden');
@@ -1535,6 +1552,15 @@ function updateSelectionUI() {
   const n = state.selectedMatchIds.size;
   btn.textContent = n ? `进入工作台 (${n})` : '进入工作台';
   btn.disabled = n === 0;
+}
+
+function updateListSummary() {
+  const summary = $('list-summary');
+  if (!summary || state.view !== 'list') return;
+  const total = state.allMatches.length;
+  const needle = String(state.listSearch || '').trim().toLowerCase();
+  const shown = needle ? state.allMatches.filter((m) => matchMatchesSearch(m, needle)).length : total;
+  summary.textContent = needle ? `进行中 ${shown} / ${total} 场` : `进行中 ${total} 场`;
 }
 
 function enterWorkshop() {
@@ -1645,7 +1671,7 @@ async function refreshMatches() {
         return m;
       });
       renderMatchGrid();
-      if (listSummary) listSummary.textContent = `进行中 ${playing.length} 场`;
+      updateListSummary();
     } else {
       // Workshop: only keep tiles for the selected matches.
       const selected = playing.filter((m) => state.selectedMatchIds.has(m.match_id));
@@ -1667,6 +1693,11 @@ async function refreshMatches() {
 // ---- event bindings ----
 
 $('enter-workshop-btn').addEventListener('click', enterWorkshop);
+$('list-search-input').addEventListener('input', (ev) => {
+  state.listSearch = ev.target.value || '';
+  renderMatchGrid();
+  updateListSummary();
+});
 $('refresh-btn-2').addEventListener('click', refreshMatches);
 $('back-to-list-btn').addEventListener('click', leaveWorkshop);
 $('stage-close').addEventListener('click', closeStage);
