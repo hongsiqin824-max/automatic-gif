@@ -1823,8 +1823,49 @@ async function restartTilePreview(matchId) {
 
 // ---- init ----
 
+// Top-right user area: who is logged in, an admin-only link to the approval
+// page (with the pending count) and a logout button. Hidden entirely when
+// Feishu auth is off (local dev). Polled every 30s so a new request shows
+// up in the badge without reloading the page. Guests get no logout button:
+// their cookie survives logout by design, so the button would be a no-op.
+const AUTH_ME_URL = 'api/auth/me';
+const AUTH_BAR_REFRESH_MS = 30000;
+
+async function refreshAuthBar() {
+  let data;
+  try {
+    const res = await fetch(AUTH_ME_URL, {headers: {Accept: 'application/json'}, credentials: 'same-origin'});
+    data = await res.json();
+  } catch (e) {
+    return;
+  }
+  const bar = $('topbar-actions');
+  if (!data || !data.enabled || !data.user) { bar.classList.add('hidden'); return; }
+  bar.classList.remove('hidden');
+  const user = data.user;
+  const role = user.env_admin ? '超级管理员' : user.is_admin ? '管理员' : user.kind === 'guest' ? '访客' : '';
+  $('auth-user').textContent = role ? `${user.name || user.open_id} · ${role}` : (user.name || user.open_id);
+  const link = $('auth-admin-link');
+  link.classList.toggle('hidden', !user.is_admin);
+  const badge = $('auth-pending-badge');
+  const pending = Number(data.pending_count || 0);
+  badge.textContent = pending > 99 ? '99+' : String(pending);
+  badge.classList.toggle('hidden', !(user.is_admin && pending > 0));
+  link.title = pending > 0 ? `${pending} 条申请待审批` : '管理访问申请、访客链接和管理员';
+  $('auth-logout-btn').classList.toggle('hidden', user.kind === 'guest');
+}
+
+$('auth-logout-btn').addEventListener('click', async () => {
+  try {
+    await fetch('api/auth/logout', {method: 'POST', credentials: 'same-origin'});
+  } catch (e) {}
+  location.reload();
+});
+
+refreshAuthBar();
 refreshMatches();
 setInterval(refreshMatches, REFRESH_MS);
+setInterval(refreshAuthBar, AUTH_BAR_REFRESH_MS);
 setInterval(keepAlivePreviews, 8000);
 
 // ---- Real-time goal/red-card alerts (unchanged) ----

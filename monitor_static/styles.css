@@ -12,6 +12,8 @@ body{
 .shell{max-width:1600px;margin:0 auto;padding:28px 28px 40px}
 .topbar{display:flex;justify-content:space-between;gap:24px;align-items:flex-start;margin-bottom:18px}
 .topbar-actions{display:flex;align-items:center;gap:14px;flex-shrink:0}
+.topbar-actions .button{text-decoration:none;display:inline-flex;align-items:center;gap:6px}
+.pending-badge{display:inline-flex;align-items:center;justify-content:center;min-width:18px;height:18px;padding:0 5px;border-radius:999px;background:var(--amber);color:#08221f;font-size:11px;font-weight:700}
 .eyebrow{margin:0 0 8px;color:var(--cyan);font-size:11px;font-weight:700;letter-spacing:1.8px}
 .topbar h1{margin:0;font-size:30px;line-height:1.1}
 #enter-workshop-btn{margin-top:14px}
