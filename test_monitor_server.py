@@ -510,6 +510,81 @@ class ClipListTests(unittest.TestCase):
             body = self.client.get("/api/monitor/clips?match_id=54622319").get_json()
         self.assertFalse(body["clips"][0]["discarded"])
 
+    def test_exposes_retry_progress_so_a_backing_off_row_is_not_a_mystery(self):
+        self._gif("clip_a.gif", 1_000.0)
+        queue = mock.Mock()
+        queue.records_by_source_name.return_value = {
+            "clip_a.gif": {
+                "event_key": "manual_42", "status": "retry_wait", "stage": "official_image_upload",
+                "draft_url": None, "error": "上传超时", "retriable": True,
+                "attempt_count": 2, "next_attempt_at_unix": 1_700_000_030.0,
+            },
+        }
+        with mock.patch.object(monitor_server, "manual_draft_queue", queue):
+            body = self.client.get("/api/monitor/clips?match_id=54622319").get_json()
+        clip = body["clips"][0]
+        self.assertEqual(clip["draft_status"], "retry_wait")
+        self.assertEqual(clip["draft_stage"], "official_image_upload")
+        self.assertTrue(clip["draft_retriable"])
+        self.assertEqual(clip["draft_attempt"], 2)
+        self.assertEqual(clip["draft_next_attempt_unix"], 1_700_000_030.0)
+
+    def test_retry_fields_default_when_no_record(self):
+        self._gif("clip_a.gif", 1_000.0)
+        with mock.patch.object(monitor_server, "manual_draft_queue", None):
+            body = self.client.get("/api/monitor/clips?match_id=54622319").get_json()
+        clip = body["clips"][0]
+        self.assertIsNone(clip["draft_stage"])
+        self.assertEqual(clip["draft_attempt"], 0)
+        self.assertIsNone(clip["draft_next_attempt_unix"])
+
+
+class ClipRetryTests(unittest.TestCase):
+    """``POST /api/monitor/clip/retry``: re-queue a failed / backing-off publish now."""
+
+    def setUp(self):
+        self.client = monitor_server.app.test_client()
+
+    def _post(self, **body):
+        return self.client.post("/api/monitor/clip/retry", json={"match_id": "54622319", **body})
+
+    def test_requeues_through_the_manual_queue(self):
+        queue = mock.Mock()
+        queue.retry.return_value = {"status": "queued"}
+        with mock.patch.object(monitor_server, "manual_draft_queue", queue):
+            response = self._post(event_key="manual_42")
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(response.get_json()["status"], "queued")
+        queue.retry.assert_called_once_with(
+            match_id="54622319", event_key="manual_42",
+            artifact_kind=monitor_server.MANUAL_ARTIFACT_KIND,
+        )
+
+    def test_unknown_task_is_404(self):
+        queue = mock.Mock()
+        queue.retry.return_value = None
+        with mock.patch.object(monitor_server, "manual_draft_queue", queue):
+            response = self._post(event_key="manual_nope")
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.get_json()["code"], "task_missing")
+
+    def test_requires_event_key(self):
+        with mock.patch.object(monitor_server, "manual_draft_queue", mock.Mock()):
+            response = self._post()
+        self.assertEqual(response.status_code, 400)
+
+    def test_publish_disabled_is_409(self):
+        with mock.patch.object(monitor_server, "manual_draft_queue", None):
+            response = self._post(event_key="manual_42")
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.get_json()["code"], "publish_disabled")
+
+    def test_manual_backoff_is_short_because_someone_is_watching(self):
+        # The 8899 default (30/120/300/600s) would leave an operator staring at a
+        # stalled row for minutes after one transient upload error.
+        self.assertEqual(monitor_server.MANUAL_DRAFT_RETRY_DELAYS_SECONDS, (10.0, 30.0, 60.0))
+        self.assertLessEqual(max(monitor_server.MANUAL_DRAFT_RETRY_DELAYS_SECONDS), 60.0)
+
 
 class ClipDiscardTests(unittest.TestCase):
     """``POST /api/monitor/clip/discard``: flag a bad clip (reversible), never delete it."""

@@ -122,8 +122,12 @@ body{
 .stage-clip-open:hover{border-color:var(--cyan)}
 .stage-clip-draft{font-size:13px;color:var(--cyan);flex:1;min-width:0;overflow-wrap:anywhere}
 .stage-clip-draft.fail{color:var(--red,#ff6b6b)}
-.stage-clip-draft.warn{color:var(--muted)}
+.stage-clip-draft.warn{color:var(--amber)}
 .stage-clip-draft a{color:var(--cyan);text-decoration:none;font-weight:600}
+/* 立即重试: inline next to a failed / backing-off publish message. */
+.stage-clip-retry{font-size:12px;color:var(--cyan);border:1px solid rgba(93,225,208,.5);border-radius:6px;padding:2px 8px;margin-left:6px;white-space:nowrap;background:transparent;cursor:pointer;vertical-align:middle}
+.stage-clip-retry:hover{background:rgba(93,225,208,.1)}
+.stage-clip-retry:disabled{opacity:.5;cursor:default}
 .stage-clip-summary{font-size:13px;color:var(--muted);flex:1 1 100%;min-width:0;overflow-wrap:anywhere}
 .stage-clip-form{display:flex;flex-direction:column;gap:10px;border-top:1px dashed var(--line);padding-top:10px}
 /* Per-clip note about the auto push match (was a stage-wide line under the

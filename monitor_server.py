@@ -102,6 +102,11 @@ CLIP_GIF_FPS = positive_env_float("GIF_MONITOR_CLIP_FPS", 50 / 3)
 # history — enough to cover that lag plus the capture window — or the requested
 # frames are already gone.
 PREVIEW_LIST_SIZE = positive_env_int("GIF_MONITOR_PREVIEW_SEGMENTS", 180)
+# Retry backoff for operator-published clips. The queue default (30/120/300/
+# 600s) suits the unattended 8899 worker; here someone is watching the row, so
+# a transient upload/CMS error should come back within seconds, not minutes.
+# Also caps the auth_required wait (the queue uses the last entry for it).
+MANUAL_DRAFT_RETRY_DELAYS_SECONDS = (10.0, 30.0, 60.0)
 
 
 def env_flag(name: str, default: bool) -> bool:
@@ -540,6 +545,7 @@ def _build_manual_draft_queue() -> "ArticleDraftQueue | None":
             poll_seconds=positive_env_float("GIF_MONITOR_DRAFT_POLL_SECONDS", 2.0),
             lease_seconds=positive_env_float("GIF_MONITOR_DRAFT_LEASE_SECONDS", 180.0),
             person_wait_seconds=positive_env_float("GIF_MONITOR_PERSON_WAIT_SECONDS", 5.0),
+            retry_delays_seconds=MANUAL_DRAFT_RETRY_DELAYS_SECONDS,
             claim_artifact_kinds=(MANUAL_ARTIFACT_KIND,),
             manual_delivery_mode=_manual_delivery_mode(),
             start_worker=True,
@@ -1048,9 +1054,12 @@ def _list_clips(match_id: str) -> list[dict[str, Any]]:
             "alert_match": meta.get("alert_match_public"),
             "event_key": record.get("event_key") if record else None,
             "draft_status": record.get("status") if record else None,
+            "draft_stage": record.get("stage") if record else None,
             "draft_url": record.get("draft_url") if record else None,
             "draft_error": record.get("error") if record else None,
             "draft_retriable": bool(record.get("retriable")) if record else False,
+            "draft_attempt": int(record.get("attempt_count") or 0) if record else 0,
+            "draft_next_attempt_unix": record.get("next_attempt_at_unix") if record else None,
         }
         if record is None and manual_draft_queue is not None:
             # Unpublished rows get the radio options; computed once per listing.
@@ -2104,6 +2113,43 @@ def monitor_clip_discard():
         meta["discarded"] = True
     _write_clip_meta(gif_path, meta)
     return jsonify({"ok": True, "match_id": match_id, "name": name, "discarded": not restore})
+
+
+@app.post("/api/monitor/clip/retry")
+def monitor_clip_retry():
+    """Re-queue a failed or backing-off clip publish right now.
+
+    Only ``failed`` / ``retry_wait`` rows move; anything else (queued,
+    publishing, published) is returned unchanged so a double click is harmless.
+    """
+    body = request.get_json(silent=True) or {}
+    try:
+        match_id = validate_match_id(str(body.get("match_id") or ""))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    event_key = str(body.get("event_key") or "").strip()
+    if not event_key:
+        return jsonify({"error": "缺少 event_key"}), 400
+    if manual_draft_queue is None:
+        return jsonify({"error": "发文未启用（GIF 仅本地保存）", "code": "publish_disabled"}), 409
+    record = manual_draft_queue.retry(
+        match_id=match_id, event_key=event_key, artifact_kind=MANUAL_ARTIFACT_KIND
+    )
+    if record is None:
+        return jsonify({"error": "没有找到对应的发布任务", "code": "task_missing"}), 404
+    print(
+        json.dumps(
+            {
+                "event": "manual_draft_retry",
+                "match_id": match_id,
+                "event_key": event_key,
+                "status": record.get("status"),
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
+    return jsonify({"ok": True, "match_id": match_id, "event_key": event_key, "status": record.get("status")})
 
 
 @app.get("/api/monitor/publish/status")

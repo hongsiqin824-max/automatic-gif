@@ -915,6 +915,25 @@ class ArticlePublisher:
                 raise OpenPlatformError("当前开放平台客户端不支持标签搜索")
         self.team_channels = TeamChannelResolver(search)
 
+    def _verify_public_media(self, gif: dict[str, Any]) -> None:
+        """HEAD-probe the GIF/cover URLs when they are ours to serve.
+
+        The probe exists for the self-hosted uploader (our own nginx must be
+        reachable before the CMS fetches the file). A GIF that went through
+        the official image API already lives on the platform's FastDFS: it
+        was confirmed by the upload response, and probing its CDN URL right
+        after upload only adds 8s+8s of latency and a spurious retriable
+        failure while the edge warms up.
+        """
+        if not self.verify_public_url:
+            return
+        if gif.get("official_upload") or gif.get("upload_source") == "official":
+            return
+        if _is_absolute_http_url(gif.get("url")):
+            self.public_url_checker(str(gif["url"]))
+        if _is_absolute_http_url(gif.get("cover_url")):
+            self.public_cover_url_checker(str(gif["cover_url"]))
+
     def status(self) -> dict[str, Any]:
         try:
             account_pool_status = (
@@ -1519,11 +1538,7 @@ class ArticlePublisher:
                 publish_account=publish_account,
             )
             try:
-                if self.verify_public_url:
-                    if _is_absolute_http_url(gif.get("url")):
-                        self.public_url_checker(str(gif["url"]))
-                    if _is_absolute_http_url(gif.get("cover_url")):
-                        self.public_cover_url_checker(str(gif["cover_url"]))
+                self._verify_public_media(gif)
                 self._save_record(
                     stable_id=stable_id,
                     match_id=match_id,
@@ -1686,13 +1701,7 @@ class ArticlePublisher:
                 ),
             )
             try:
-                if self.verify_public_url:
-                    # FastDFS `url` values from the official image API are
-                    # relative paths and cannot be probed with HTTP HEAD.
-                    if _is_absolute_http_url(gif.get("url")):
-                        self.public_url_checker(str(gif["url"]))
-                    if _is_absolute_http_url(gif.get("cover_url")):
-                        self.public_cover_url_checker(str(gif["cover_url"]))
+                self._verify_public_media(gif)
                 result = self.platform_client.create_article(fields)
             except ArticlePublishError as exc:
                 base_diagnostics = _draft_diagnostics(

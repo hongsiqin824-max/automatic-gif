@@ -118,6 +118,68 @@ class FailingOfficialImageClient(FakeOfficialImageClient):
 
 
 class ArticlePublisherTests(unittest.TestCase):
+    def test_official_upload_skips_public_head_probe_but_self_hosted_still_probes(self):
+        # The HEAD probe guards our own nginx. A GIF already on the platform's
+        # FastDFS was confirmed by the upload response; probing its CDN URL
+        # right after upload only adds latency and spurious retriable failures.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "ocr.gif"
+            source.write_bytes(animated_gif_bytes())
+            checked_urls = []
+            official = FakeOfficialImageClient()
+            publisher = ArticlePublisher(
+                platform_client=FakePlatformClient(),
+                gif_store=PublishedGifStore(
+                    root / "published", "https://matchgif.aisportsapp.com"
+                ),
+                database_path=root / "publish.sqlite3",
+                verify_public_url=True,
+                public_url_checker=checked_urls.append,
+                ocr_image_upload_client=official,
+            )
+            event = {"event_key": "goal-19", "code": "G", "minute": "19"}
+
+            publisher.create_or_update_article(
+                match_id="54478914",
+                event=event,
+                match_detail={},
+                source_path=source,
+                delivery_mode="publish",
+            )
+            # Second call reuses the persisted mapping (upload_source=official).
+            publisher.create_or_update_article(
+                match_id="54478914",
+                event=event,
+                match_detail={},
+                source_path=source,
+                delivery_mode="publish",
+            )
+
+            self.assertEqual(len(official.calls), 1)
+            self.assertEqual(checked_urls, [])
+
+            # Without the official client the self-hosted URL is still probed.
+            local_publisher = ArticlePublisher(
+                platform_client=FakePlatformClient(),
+                gif_store=PublishedGifStore(
+                    root / "published2", "https://matchgif.aisportsapp.com"
+                ),
+                database_path=root / "publish2.sqlite3",
+                verify_public_url=True,
+                public_url_checker=checked_urls.append,
+            )
+            local_publisher.create_or_update_article(
+                match_id="54478914",
+                event=event,
+                match_detail={},
+                source_path=source,
+                delivery_mode="publish",
+            )
+            # GIF and its JPEG cover, both served from our own origin.
+            self.assertEqual(len(checked_urls), 2)
+            self.assertTrue(all(url.startswith("https://matchgif.aisportsapp.com/") for url in checked_urls))
+
     def test_ocr_uses_official_image_urls_and_reuses_upload_for_archive_update(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

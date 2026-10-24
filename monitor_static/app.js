@@ -661,7 +661,38 @@ function fmtClipTime(unix) {
   return new Date(unix * 1000).toLocaleTimeString('zh-CN', {hour12: false});
 }
 
-function applyDraftState(draftEl, status, draftUrl, error, retriable) {
+// Human label for the publish worker's stage; unknown stages fall back to
+// the raw value so a new backend stage is still visible.
+const DRAFT_STAGE_LABELS = {
+  gif_validation: '校验 GIF',
+  gif_cover: '生成封面',
+  official_image_upload: '上传到懂球帝',
+  remote_gif_upload: '上传 GIF',
+  public_url_check: '公网校验',
+  cover_public_url_check: '公网校验',
+  platform_publish: '创建文章',
+  authorization: '授权',
+  creating: '准备中',
+  creating_draft: '创建草稿',
+  publishing: '发布中',
+  manual_retry: '重新排队',
+};
+
+function draftStageLabel(stage) {
+  return DRAFT_STAGE_LABELS[stage] || stage || '';
+}
+
+// Renders one row's publish state from a delivery record. Returns true while
+// the row still needs polling. ``rec`` carries the queue's public task fields
+// (status / stage / error / retriable / attempt_count / next_attempt_at_unix);
+// the clip list passes the same values under ``draft_*`` names.
+function applyDraftState(draftEl, rec, matchId, eventKey) {
+  const status = rec.status;
+  const draftUrl = rec.draft_url;
+  const error = rec.error;
+  const retriable = rec.retriable;
+  const stage = rec.stage;
+  const attempt = Number(rec.attempt_count || 0);
   if ((status === 'published' || status === 'drafted') && draftUrl) {
     const label = status === 'published' ? '打开文章 ↗' : '打开草稿 ↗';
     draftEl.innerHTML = `<a href="${escapeHtml(draftUrl)}" target="_blank" rel="noreferrer">${label}</a>`;
@@ -681,6 +712,42 @@ function applyDraftState(draftEl, status, draftUrl, error, retriable) {
   draftEl.textContent = '草稿生成中…';
   draftEl.className = 'stage-clip-draft';
   return true;
+}
+
+function appendRetryButton(draftEl, matchId, eventKey) {
+  if (!matchId || !eventKey) return;
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'stage-clip-retry';
+  button.textContent = '立即重试';
+  button.addEventListener('click', async () => {
+    button.disabled = true;
+    try {
+      await requestJson('api/monitor/clip/retry', {
+        method: 'POST',
+        body: JSON.stringify({match_id: matchId, event_key: eventKey}),
+      });
+      addStageNote('已重新排队', 'ok');
+      if (state.stageMatchId === matchId) loadStageClips(matchId);
+    } catch (error) {
+      button.disabled = false;
+      addStageNote('重试失败：' + error.message, 'fail');
+    }
+  });
+  draftEl.appendChild(document.createTextNode(' '));
+  draftEl.appendChild(button);
+}
+
+function clipDraftRecord(item) {
+  return {
+    status: item.draft_status,
+    stage: item.draft_stage,
+    draft_url: item.draft_url,
+    error: item.draft_error,
+    retriable: item.draft_retriable,
+    attempt_count: item.draft_attempt,
+    next_attempt_at_unix: item.draft_next_attempt_unix,
+  };
 }
 
 // ---- publish form (mirrors the CMS gif-article fields) ----
@@ -934,7 +1001,7 @@ function renderClipRow(item, publishEnabled) {
     head.appendChild(buildPublishedSummary(item));
     const draftEl = document.createElement('span');
     draftEl.className = 'stage-clip-draft';
-    applyDraftState(draftEl, item.draft_status, item.draft_url, item.draft_error, item.draft_retriable);
+    applyDraftState(draftEl, clipDraftRecord(item), state.stageMatchId, item.event_key);
     head.appendChild(draftEl);
     return row;
   }
@@ -1180,7 +1247,7 @@ function refreshDraftLinks(matchId) {
         const rec = data.records[row.dataset.eventKey];
         const draftEl = row.querySelector('.stage-clip-draft');
         if (!rec || !draftEl) { pending += 1; return; }
-        if (applyDraftState(draftEl, rec.status, rec.draft_url, rec.error, rec.retriable)) pending += 1;
+        if (applyDraftState(draftEl, rec, matchId, row.dataset.eventKey)) pending += 1;
       });
       if (pending === 0) stopDraftPoll();
     })
