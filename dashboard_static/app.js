@@ -11,6 +11,7 @@ const state = {
   sessionMatchId: '',
   sessionLocked: false,
   discoveryCollapsed: false,
+  discoverySearch: '',
   viewSequence: 0,
   refreshRequestSerial: 0,
   lastRenderedRefreshSerial: 0,
@@ -484,10 +485,26 @@ function healthPresentation(health, hasData) {
   if (value === 'error' || value === 'failed' || value === 'unhealthy') return {label:friendlyText(health.label, '接口暂时异常'), cls:'error'};
   return {label:friendlyText(health.label, value === 'healthy' ? '接口正常' : hasData ? '接口正常' : '已连接'), cls:'healthy'};
 }
+function matchMatchesSearch(match, needle) {
+  if (!needle) return true;
+  const haystack = [
+    match.team_A_name, match.team_B_name,
+    match.competition_name, match.round_name,
+    match.match_id,
+  ].map(value => String(value == null ? '' : value).toLowerCase()).join(' ');
+  return haystack.includes(needle);
+}
+function filterDiscoveryMatches(list, needle) {
+  if (!needle) return list;
+  return list.filter(match => matchMatchesSearch(match || {}, needle));
+}
 function renderMatches(data) {
   const payload = data && typeof data === 'object' ? data : {};
   const playing = Array.isArray(payload.playing) ? payload.playing : [];
   const upcoming = Array.isArray(payload.upcoming) ? payload.upcoming : [];
+  const searchNeedle = String(state.discoverySearch || '').trim().toLowerCase();
+  const visiblePlaying = filterDiscoveryMatches(playing, searchNeedle);
+  const visibleUpcoming = filterDiscoveryMatches(upcoming, searchNeedle);
   const health = payload.health && typeof payload.health === 'object' ? payload.health : {};
   state.matches = payload;
   state.activeMatches = normalizeActiveMatches(payload);
@@ -498,12 +515,20 @@ function renderMatches(data) {
   const healthEl = $('discovery-health');
   healthEl.className = `discovery-health ${presentation.cls}`;
   healthEl.innerHTML = `<i></i>${escapeHtml(presentation.label)}`;
-  $('playing-count').textContent = `${playing.length} 场`;
-  $('upcoming-count').textContent = `${upcoming.length} 场`;
-  $('playing-matches').innerHTML = playing.length ? playing.map(match => discoveryMatch(match || {}, 'playing')).join('') : '<div class="discovery-empty">暂无进行中的比赛</div>';
-  $('upcoming-matches').innerHTML = upcoming.length ? upcoming.map(match => discoveryMatch(match || {}, 'upcoming')).join('') : '<div class="discovery-empty">未来 15 分钟暂无比赛</div>';
+  const searching = Boolean(searchNeedle);
+  $('playing-count').textContent = searching ? `${visiblePlaying.length} / ${playing.length} 场` : `${playing.length} 场`;
+  $('upcoming-count').textContent = searching ? `${visibleUpcoming.length} / ${upcoming.length} 场` : `${upcoming.length} 场`;
+  const noMatchHtml = `<div class="discovery-empty">未找到匹配“${escapeHtml(String(state.discoverySearch || '').trim())}”的比赛</div>`;
+  $('playing-matches').innerHTML = visiblePlaying.length
+    ? visiblePlaying.map(match => discoveryMatch(match || {}, 'playing')).join('')
+    : (searching && playing.length ? noMatchHtml : '<div class="discovery-empty">暂无进行中的比赛</div>');
+  $('upcoming-matches').innerHTML = visibleUpcoming.length
+    ? visibleUpcoming.map(match => discoveryMatch(match || {}, 'upcoming')).join('')
+    : (searching && upcoming.length ? noMatchHtml : '<div class="discovery-empty">未来 15 分钟暂无比赛</div>');
   const total = finiteNumber(health.source_count) ?? finiteNumber(health.total_count) ?? playing.length + upcoming.length;
-  $('discovery-summary').textContent = `进行中 ${playing.length} · 即将开赛 ${upcoming.length}`;
+  $('discovery-summary').textContent = searching
+    ? `筛选中 · 进行中 ${visiblePlaying.length}/${playing.length} · 即将开赛 ${visibleUpcoming.length}/${upcoming.length}`
+    : `进行中 ${playing.length} · 即将开赛 ${upcoming.length}`;
   const details = [];
   if (health.last_success_at_unix) details.push(`最近成功 ${fmtTime(health.last_success_at_unix)}`);
   if (finiteNumber(health.latency_ms) != null) details.push(`${Math.round(Number(health.latency_ms))}ms`);
@@ -1408,6 +1433,7 @@ for (const id of ['playing-matches', 'upcoming-matches']) {
   });
 }
 $('match-id').addEventListener('input', () => { if (state.matches) renderMatches(state.matches); else { applyControlAvailability(); renderSelectionHint(); } });
+$('discovery-search-input').addEventListener('input', event => { state.discoverySearch = event.target.value || ''; if (state.matches) renderMatches(state.matches); });
 $('load-btn').addEventListener('click', () => { const id = matchId(); if (!id) return; selectViewedMatch(id); refresh(id); });
 $('demo-btn').addEventListener('click', () => {
   $('match-id').value = `demo-proof-${Date.now()}`;
