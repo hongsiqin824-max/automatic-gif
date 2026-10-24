@@ -23,6 +23,7 @@ PLATFORM_ORIGIN = "https://platform.dongqiudi.com"
 DEFAULT_API_NAME = "admin-archive-createarticle"
 IMAGE_UPLOAD_API_NAME = "image-uploadimage-ai"
 CHANNEL_SEARCH_API_NAME = "admin-archive-channelsearch"
+PLAYER_TEAM_API_NAME = "admin-archive-playerteam"
 # Tag lookup is best-effort and runs inside the publisher lock right before
 # create_article, so it must give up quickly instead of holding publishing.
 CHANNEL_SEARCH_TIMEOUT_SECONDS = 5.0
@@ -488,6 +489,49 @@ class OpenPlatformClient:
         if not isinstance(rows, list):
             return []
         return [row for row in rows if isinstance(row, dict)]
+
+    def player_team(self, channel_id: int | str) -> dict[str, Any]:
+        """Look up a player/team tag's club and columns (``admin-archive-playerteam``).
+
+        Same gateway shape as ``search_channels``: no login, ``channel_id`` is
+        part of the signed query. The platform returns a dict for a known
+        player/team tag and ``[]`` for anything else; both normalise to a dict
+        (empty when nothing matched) so callers only check for keys.
+        """
+        self._require_configuration()
+        normalized = str(channel_id or "").strip()
+        if not re.fullmatch(r"[1-9]\d{0,19}", normalized):
+            raise OpenPlatformError("标签 channel_id 必须是正整数", status_code=400)
+        query = {
+            "api_name": PLAYER_TEAM_API_NAME,
+            "appid": self.config.appid,
+            "nonce": secrets.token_hex(16),
+            "timestamp": int(time.time()),
+            "channel_id": normalized,
+        }
+        query["sign"] = sign_query(query, self.config.app_secret)
+        url = f"{PLATFORM_ORIGIN}/open/v1/do?{urllib.parse.urlencode(query)}"
+        payload = self._request_json(
+            "GET",
+            url,
+            body=b"",
+            content_type="application/x-www-form-urlencoded",
+            timeout_seconds=CHANNEL_SEARCH_TIMEOUT_SECONDS,
+        )
+        result = _business_result(payload)
+        if not result:
+            raise OpenPlatformError("开放平台返回了无法解析的球队栏目结果")
+        code = result.get("code")
+        if code != 0:
+            raise OpenPlatformError(
+                str(result.get("message") or payload.get("message") or "球队栏目查询失败"),
+                code=code,
+                status_code=502,
+                retriable=code in (5,),
+                http_status=payload.get("__http_status"),
+            )
+        data = result.get("data")
+        return data if isinstance(data, dict) else {}
 
     def upload_images(
         self,

@@ -339,6 +339,61 @@ class OpenPlatformChannelSearchTests(unittest.TestCase):
             ):
                 self.assertEqual(client.search_channels("皇马"), [])
 
+    def test_player_team_signs_channel_id_and_normalises_payload(self):
+        payload = {
+            "value": 11695165,
+            "name": "迈阿密国际",
+            "type": "球队",
+            "table_id": 57,
+            "table_name": "五洲",
+            "channel_id": "14572",
+            "new_table_id": [57, 253],
+        }
+        request_json = Mock(
+            return_value={"code": 0, "data": {"code": 0, "message": "ok", "data": payload}}
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            client = self.make_client(Path(directory))
+            with patch.object(client, "_request_json", request_json):
+                result = client.player_team(14572)
+
+        self.assertEqual(result, payload)
+        args = request_json.call_args
+        self.assertEqual(args.args[0], "GET")
+        parsed = urllib.parse.urlsplit(args.args[1])
+        query = urllib.parse.parse_qs(parsed.query)
+        self.assertEqual(query["api_name"], ["admin-archive-playerteam"])
+        self.assertEqual(query["channel_id"], ["14572"])
+        self.assertIsNone(args.kwargs.get("authorization"))
+        self.assertEqual(args.kwargs["timeout_seconds"], 5.0)
+        unsigned = {key: values[0] for key, values in query.items() if key != "sign"}
+        self.assertEqual(query["sign"], [sign_query(unsigned, "secret-1")])
+
+    def test_player_team_rejects_bad_id_and_tolerates_empty_or_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client = self.make_client(Path(directory))
+            with patch.object(client, "_request_json") as request_json:
+                for bad in ("", "0", "abc", None):
+                    with self.assertRaises(OpenPlatformError):
+                        client.player_team(bad)
+            request_json.assert_not_called()
+            # "no match" is data: [] on the platform; callers get {}.
+            with patch.object(
+                client,
+                "_request_json",
+                return_value={"code": 0, "data": {"code": 0, "message": "ok", "data": []}},
+            ):
+                self.assertEqual(client.player_team("14572"), {})
+            with patch.object(
+                client,
+                "_request_json",
+                return_value={"code": 0, "data": {"code": 5, "message": "服务异常"}},
+            ):
+                with self.assertRaises(OpenPlatformError) as context:
+                    client.player_team(14572)
+            self.assertEqual(context.exception.code, 5)
+            self.assertTrue(context.exception.retriable)
+
 
 if __name__ == "__main__":
     unittest.main()

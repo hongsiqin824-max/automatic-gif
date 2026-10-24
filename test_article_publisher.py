@@ -20,6 +20,7 @@ from article_publisher import (
     build_article_title,
     inspect_animated_gif,
     pick_team_channel,
+    pick_team_tabs,
     team_tag_row_id,
 )
 from open_platform_client import ImageUploadResults, OpenPlatformError
@@ -850,6 +851,13 @@ class ArticlePublisherTests(unittest.TestCase):
         with patch.dict(os.environ, {"ARTICLE_TABS": "1,x"}):
             with self.assertRaises(RuntimeError):
                 article_publisher.article_tabs()
+        # Per-team columns from playerteam follow the fixed ones, de-duplicated.
+        with patch.dict(os.environ, {"ARTICLE_TABS": "1,284"}):
+            fields = build_article_fields(**common, tabs=["57", 284, "253", "57"])
+        self.assertEqual(fields["tabs[]"], ["1", "284", "57", "253"])
+        with patch.dict(os.environ, {"ARTICLE_TABS": ""}):
+            fields = build_article_fields(**common, tabs=["57"])
+        self.assertEqual(fields["tabs[]"], ["57"])
 
     def test_channels_field_validated_and_omitted_when_empty(self):
         common = {
@@ -1550,6 +1558,90 @@ class TeamChannelResolverTests(unittest.TestCase):
             bare.channels_for({"team_A_name": "胡志明市女足", "team_B_name": "丰富府里女足"}),
             "",
         )
+
+    def test_pick_team_tabs_prefers_new_table_id_then_table_id(self):
+        self.assertEqual(
+            pick_team_tabs({"table_id": 57, "new_table_id": [57, 253, "253", 0, "x"]}),
+            [57, 253],
+        )
+        self.assertEqual(pick_team_tabs({"table_id": "57", "new_table_id": []}), [57])
+        self.assertEqual(pick_team_tabs({"table_id": None}), [])
+        self.assertEqual(pick_team_tabs({}), [])
+        self.assertEqual(pick_team_tabs([]), [])
+        self.assertEqual(pick_team_tabs(None), [])
+
+    def test_tabs_for_resolves_each_team_once_and_merges_columns(self):
+        rows_by_keyword = {
+            "根特": self.ROWS,
+            "丰富府里女足": [
+                {"id": 14474, "value": 10728023, "name": "丰富府里女足", "type": "球队"},
+            ],
+        }
+        tabs_by_channel = {
+            1652: {"table_id": 57, "table_name": "五洲", "new_table_id": [57, 253]},
+            10728023: {"table_id": 60, "new_table_id": [60, 253]},
+        }
+        search = Mock(side_effect=lambda keyword: rows_by_keyword[keyword])
+        player_team = Mock(side_effect=lambda value: tabs_by_channel[value])
+        resolver = TeamChannelResolver(search, player_team)
+        detail = {
+            "team_A_id": "50000138",
+            "team_A_name": "根特",
+            "team_B_id": "50014474",
+            "team_B_name": "丰富府里女足",
+        }
+        self.assertEqual(resolver.channels_for(detail), "1652,10728023")
+        self.assertEqual(resolver.tabs_for(detail), ["57", "253", "60"])
+        # channelsearch is shared with channels_for via the cache; playerteam
+        # once per team, then cached for the next article.
+        self.assertEqual(search.call_count, 2)
+        self.assertEqual(player_team.call_count, 2)
+        self.assertEqual(resolver.tabs_for(detail), ["57", "253", "60"])
+        self.assertEqual(search.call_count, 2)
+        self.assertEqual(player_team.call_count, 2)
+        # Unresolved team contributes nothing; no playerteam call for it.
+        self.assertEqual(
+            resolver.tabs_for({"team_A_id": "50000138", "team_A_name": "根特", "team_B_name": "波鸿"}),
+            ["57", "253"],
+        )
+        self.assertEqual(player_team.call_count, 2)
+        with patch.dict(os.environ, {"ARTICLE_TABS_SOURCE": "off"}):
+            self.assertEqual(resolver.tabs_for(detail), [])
+        with patch.dict(os.environ, {"ARTICLE_TABS_SOURCE": "bogus"}):
+            self.assertEqual(resolver.tabs_for(detail), [])
+        # tabs source stays independent of the channels switch.
+        with patch.dict(os.environ, {"ARTICLE_CHANNELS_SOURCE": "off"}):
+            self.assertEqual(resolver.tabs_for(detail), ["57", "253", "60"])
+
+    def test_tabs_for_swallows_lookup_errors_and_negative_caches(self):
+        clock = {"now": 100.0}
+        calls = {"n": 0}
+
+        def failing(_value):
+            calls["n"] += 1
+            raise OpenPlatformError("服务异常", code=5, retriable=True)
+
+        resolver = TeamChannelResolver(
+            Mock(return_value=self.ROWS),
+            failing,
+            negative_ttl_seconds=120,
+            clock=lambda: clock["now"],
+        )
+        detail = {"team_A_id": "50000138", "team_A_name": "根特"}
+        self.assertEqual(resolver.tabs_for(detail), [])
+        self.assertEqual(resolver.tabs_for(detail), [])
+        self.assertEqual(calls["n"], 1)
+        clock["now"] = 221.0
+        self.assertEqual(resolver.tabs_for(detail), [])
+        self.assertEqual(calls["n"], 2)
+        # No playerteam callable (older client): silently no columns.
+        plain = TeamChannelResolver(Mock(return_value=self.ROWS))
+        self.assertEqual(plain.tabs_for(detail), [])
+        # Platform "no match" ([] -> {}) and non-dict payloads: no columns.
+        empty = TeamChannelResolver(Mock(return_value=self.ROWS), Mock(return_value={}))
+        self.assertEqual(empty.tabs_for(detail), [])
+        weird = TeamChannelResolver(Mock(return_value=self.ROWS), Mock(return_value=Mock()))
+        self.assertEqual(weird.tabs_for(detail), [])
 
     def test_monitor_catalog_snapshot_keeps_team_ids_for_channel_lookup(self):
         """8901 builds match_detail from match_catalog; without the ids in the

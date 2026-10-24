@@ -17,7 +17,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 from open_platform_client import OpenPlatformClient, OpenPlatformError
 from publish_account_pool import (
@@ -89,6 +89,7 @@ def article_litpic_source() -> str:
 
 
 CHANNELS_SOURCES = frozenset({"teams", "off"})
+TABS_SOURCES = frozenset({"teams", "off"})
 TEAM_CHANNEL_CACHE_TTL_SECONDS = 6 * 60 * 60
 # Misses (platform error or no usable tag) are remembered briefly so an outage
 # costs one search per team per window instead of two timeouts per article.
@@ -112,6 +113,20 @@ def article_channels_source() -> str:
     value = os.environ.get("ARTICLE_CHANNELS_SOURCE", "teams").strip().lower()
     if value not in CHANNELS_SOURCES:
         raise RuntimeError("ARTICLE_CHANNELS_SOURCE 必须是 teams 或 off")
+    return value
+
+
+def article_tabs_source() -> str:
+    """Where per-match columns (``tabs[]``) come from, on top of ``ARTICLE_TABS``.
+
+    ``teams`` (default) asks ``admin-archive-playerteam`` for each resolved
+    team tag and appends its ``new_table_id`` list, mirroring the CMS editor
+    that ticks the competition/sport columns when a team tag is added.
+    ``off`` sends only the fixed ``ARTICLE_TABS``.
+    """
+    value = os.environ.get("ARTICLE_TABS_SOURCE", "teams").strip().lower()
+    if value not in TABS_SOURCES:
+        raise RuntimeError("ARTICLE_TABS_SOURCE 必须是 teams 或 off")
     return value
 
 
@@ -172,6 +187,26 @@ def pick_team_channel(
     return _positive_int(by_name[0].get("value")), "name"
 
 
+def pick_team_tabs(payload: Any) -> list[int]:
+    """Column ids from an ``admin-archive-playerteam`` payload, in order.
+
+    ``new_table_id`` is the platform's recommended list (it already includes
+    ``table_id`` plus related columns); ``table_id`` alone is the fallback for
+    older rows. Anything that is not a positive int is dropped.
+    """
+    data = payload if isinstance(payload, dict) else {}
+    raw = data.get("new_table_id")
+    candidates = list(raw) if isinstance(raw, (list, tuple)) else []
+    if not candidates:
+        candidates = [data.get("table_id")]
+    tabs: list[int] = []
+    for item in candidates:
+        numeric = _positive_int(item)
+        if numeric is not None and numeric not in tabs:
+            tabs.append(numeric)
+    return tabs
+
+
 class TeamChannelResolver:
     """Resolve teams to CMS tag ids with an in-process TTL cache.
 
@@ -186,12 +221,14 @@ class TeamChannelResolver:
     def __init__(
         self,
         search: Callable[[str], list[dict[str, Any]]],
+        player_team: Callable[[int], dict[str, Any]] | None = None,
         *,
         ttl_seconds: float = TEAM_CHANNEL_CACHE_TTL_SECONDS,
         negative_ttl_seconds: float = TEAM_CHANNEL_NEGATIVE_TTL_SECONDS,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._search = search
+        self._player_team = player_team
         self._ttl = float(ttl_seconds)
         self._negative_ttl = float(negative_ttl_seconds)
         self._clock = clock
@@ -200,6 +237,8 @@ class TeamChannelResolver:
         # on the shorter negative TTL so a platform outage or a late-added tag
         # is retried without pinning every article behind two timeouts.
         self._cache: dict[str, tuple[int | None, float, str]] = {}
+        # Columns per resolved team tag id; None = cached miss, same TTLs.
+        self._tabs_cache: dict[int, tuple[list[int] | None, float]] = {}
 
     def _remember(self, cache_key: str, value: int | None, now: float, reason: str) -> None:
         ttl = self._ttl if value is not None else self._negative_ttl
@@ -321,6 +360,84 @@ class TeamChannelResolver:
             if value is not None and value not in ids:
                 ids.append(value)
         return ",".join(str(item) for item in ids)
+
+    def tabs_for_channel(self, channel_value: int) -> list[int]:
+        """Columns for one team tag id via playerteam; ``[]`` on miss/error."""
+        if self._player_team is None:
+            return []
+        now = self._clock()
+        with self._lock:
+            cached = self._tabs_cache.get(channel_value)
+        if cached and cached[1] > now:
+            return list(cached[0] or [])
+        try:
+            payload = self._player_team(channel_value)
+        except Exception as exc:  # noqa: BLE001 - lookup must not block publishing
+            print(
+                json.dumps(
+                    {
+                        "event": "team_tabs_lookup_failed",
+                        "channel_id": channel_value,
+                        "error": str(exc),
+                        "platform_code": getattr(exc, "code", None),
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+            with self._lock:
+                self._tabs_cache[channel_value] = (None, now + self._negative_ttl)
+            return []
+        tabs = pick_team_tabs(payload)
+        print(
+            json.dumps(
+                {
+                    "event": "team_tabs_resolved" if tabs else "team_tabs_not_found",
+                    "channel_id": channel_value,
+                    "tabs": tabs,
+                    "table_name": (
+                        payload.get("table_name") if isinstance(payload, dict) else None
+                    ),
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+        ttl = self._ttl if tabs else self._negative_ttl
+        with self._lock:
+            self._tabs_cache[channel_value] = (tabs or None, now + ttl)
+        return list(tabs)
+
+    def tabs_for(self, match_detail: dict[str, Any]) -> list[str]:
+        """Column ids for both teams (home first), de-duplicated; ``[]`` when off."""
+        try:
+            source = article_tabs_source()
+        except RuntimeError as exc:
+            print(
+                json.dumps(
+                    {"event": "team_tabs_config_invalid", "error": str(exc)},
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+            return []
+        if source == "off":
+            return []
+        detail = match_detail if isinstance(match_detail, dict) else {}
+        tabs: list[int] = []
+        for side in ("A", "B"):
+            # resolve() is cached, so this shares the channelsearch call with
+            # channels_for() for the same article.
+            value = self.resolve(
+                str(detail.get(f"team_{side}_name") or ""),
+                detail.get(f"team_{side}_id"),
+            )
+            if value is None:
+                continue
+            for tab in self.tabs_for_channel(value):
+                if tab not in tabs:
+                    tabs.append(tab)
+        return [str(item) for item in tabs]
 
 
 RELIABLE_PERSON_PLACEHOLDERS = frozenset(
@@ -923,7 +1040,10 @@ class ArticlePublisher:
         if not callable(search):
             def search(keyword: str) -> list[dict[str, Any]]:
                 raise OpenPlatformError("当前开放平台客户端不支持标签搜索")
-        self.team_channels = TeamChannelResolver(search)
+        player_team = getattr(platform_client, "player_team", None)
+        self.team_channels = TeamChannelResolver(
+            search, player_team if callable(player_team) else None
+        )
 
     def _verify_public_media(self, gif: dict[str, Any]) -> None:
         """HEAD-probe the GIF/cover URLs when they are ours to serve.
@@ -979,6 +1099,7 @@ class ArticlePublisher:
             "add_to_tab": article_add_to_tab(),
             "channelsnew": article_channelsnew() or None,
             "tabs": ",".join(article_tabs()) or None,
+            "tabs_source": article_tabs_source(),
             "channels_source": article_channels_source(),
             "type": "article",
             "style": "gif",
@@ -1529,6 +1650,7 @@ class ArticlePublisher:
                 title=title,
                 publish_account=publish_account,
                 channels=self.team_channels.channels_for(match_detail),
+                tabs=self.team_channels.tabs_for(match_detail),
                 allow_relative_media=bool(
                     artifact_kind == "ocr_window"
                     and (
@@ -1704,6 +1826,7 @@ class ArticlePublisher:
                 archive_id=archive_id,
                 publish_account=publish_account,
                 channels=self.team_channels.channels_for(match_detail),
+                tabs=self.team_channels.tabs_for(match_detail),
                 # A reused DB mapping predates the in-memory marker, so infer
                 # official mode from its persisted upload source marker.
                 allow_relative_media=bool(
@@ -2033,6 +2156,7 @@ def build_article_fields(
     allow_relative_media: bool = False,
     litpic_url: str = "",
     channels: str = "",
+    tabs: Sequence[str | int] = (),
 ) -> dict[str, Any]:
     if delivery_mode not in {"publish", "draft"}:
         raise ArticlePublishError(
@@ -2111,11 +2235,16 @@ def build_article_fields(
     channelsnew = article_channelsnew()
     if channelsnew:
         fields["channelsnew"] = channelsnew
-    tabs = article_tabs()
-    if tabs:
+    tabs_out: list[str] = []
+    for item in [*article_tabs(), *(tabs or ())]:
+        text = str(item).strip()
+        if text and text not in tabs_out:
+            tabs_out.append(text)
+    if tabs_out:
         # Platform expects PHP-style array params; urlencode(doseq=True) emits
-        # one ``tabs[]=id`` pair per element.
-        fields["tabs[]"] = tabs
+        # one ``tabs[]=id`` pair per element. Fixed ARTICLE_TABS come first,
+        # then the per-team columns from playerteam.
+        fields["tabs[]"] = tabs_out
     normalized_channels = str(channels or "").strip()
     if normalized_channels:
         if not re.fullmatch(r"\d{1,20}(,\d{1,20})*", normalized_channels):
