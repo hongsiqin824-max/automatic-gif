@@ -331,6 +331,21 @@ function currentLevelDetails(hls) {
   return level && level.details ? level.details : null;
 }
 
+// Seconds of history still playable *behind* the playhead: distance to the
+// first fragment of the last playlist hls.js fetched, minus that playlist's
+// age (the server window keeps sliding while a stale playlist sits in
+// memory). ffmpeg deletes a segment right after it leaves the playlist, so
+// this is how close a scrubbed-back playhead is to being cut off. null when
+// no playlist has been parsed yet (or on WebRTC).
+function bufferEdgeDistanceSeconds(video) {
+  const details = currentLevelDetails(video && video._hls);
+  if (!details || !Array.isArray(details.fragments) || !details.fragments.length) return null;
+  const first = details.fragments[0].start;
+  if (typeof first !== 'number' || !isFinite(first) || !isFinite(video.currentTime)) return null;
+  const age = typeof details.age === 'number' && details.age > 0 ? details.age : 0;
+  return video.currentTime - first - age;
+}
+
 function jumpToLiveSync(video) {
   const hls = video._hls;
   // Stamp so the stage's user-action listener can tell this seek apart from
@@ -1255,13 +1270,17 @@ async function setRangeEndAndCapture(button) {
 }
 
 // ---- Stage user-action tracking (for GIF_MONITOR_STAGE_AUTO_SEEK_LAG) ----
-// A manual scrub-back or pause on the stage's native controls means the
-// operator is working there; auto-seek must leave the stage alone for the
-// grace period. Not counted: our own jumpToLiveSync (stamped), hls.js stall
-// nudges (+0.1s) and live re-syncs (forward) - only a seek that moves the
-// playhead backwards by at least MANUAL_SEEK_BACK_MIN_SECONDS qualifies.
+// A manual scrub or pause on the stage's native controls means the operator
+// is working there; auto-seek must leave the stage alone for the grace
+// period. Not counted: our own jumpToLiveSync (stamped), hls.js stall nudges
+// (+0.1s) and live re-syncs (a few seconds forward) - only a seek that moves
+// the playhead by at least MANUAL_SEEK_MIN_SECONDS in either direction
+// qualifies, so a forward nudge after a scrub-back renews the grace too.
 const PROGRAMMATIC_SEEK_WINDOW_MS = 1500;
-const MANUAL_SEEK_BACK_MIN_SECONDS = 1;
+const MANUAL_SEEK_MIN_SECONDS = 1;
+// hls.js re-syncs to live by jumping forward at most this much; anything
+// bigger is the operator dragging the bar.
+const HLS_RESYNC_MAX_FORWARD_SECONDS = 5;
 
 function noteStageUserAction(video, kind) {
   // Only the open stage counts: a tile has no controls, and the DOM moves in
@@ -1271,9 +1290,43 @@ function noteStageUserAction(video, kind) {
   if (kind === 'seeking') {
     if (video._programmaticSeekAt && Date.now() - video._programmaticSeekAt < PROGRAMMATIC_SEEK_WINDOW_MS) return;
     const from = video._lastPlayheadTime;
-    if (typeof from !== 'number' || video.currentTime > from - MANUAL_SEEK_BACK_MIN_SECONDS) return;
+    if (typeof from !== 'number') return;
+    const delta = video.currentTime - from;
+    if (delta > -MANUAL_SEEK_MIN_SECONDS && delta < HLS_RESYNC_MAX_FORWARD_SECONDS) return;
+    noteStageScrub(video);
   }
   state.stageUserActionAt = Date.now();
+}
+
+// Tell the operator what a manual scrub means: how much history is behind
+// the playhead and that auto-seek is off while they work. Throttled per
+// scrub gesture (dragging fires `seeking` many times).
+const SCRUB_NOTE_THROTTLE_MS = 800;
+
+function noteStageScrub(video) {
+  const now = Date.now();
+  if (now - (video._scrubNotedAt || 0) < SCRUB_NOTE_THROTTLE_MS) return;
+  video._scrubNotedAt = now;
+  const lag = liveLagSeconds(video);
+  const behind = bufferEdgeDistanceSeconds(video);
+  const parts = [];
+  if (lag != null) parts.push(`已拖到落后 ${Math.round(lag)}s`);
+  if (behind != null) parts.push(`回看余量还剩 ${Math.max(0, Math.round(behind))}s`);
+  const grace = LATENCY.stageUserGraceSeconds;
+  if (LATENCY.stageAutoSeekLag <= 0) {
+    parts.push('大窗不会自动跳回直播（只在快到回看尽头时跳）');
+  } else {
+    parts.push(grace > 0 ? `${grace}s 内不会自动跳回直播` : '暂停或设区间起点可避免自动跳回');
+  }
+  const cls = behind != null && behind <= STAGE_EDGE_WARN_SECONDS ? 'fail' : 'warn';
+  addStageNote(parts.join('，'), cls, 'scrub');
+  const status = $('stage-status');
+  if (status) {
+    status.textContent = behind != null && behind <= STAGE_EDGE_WARN_SECONDS
+      ? `快到回看尽头了（剩 ${Math.max(0, Math.round(behind))}s），再往左会被自动跳回`
+      : '已手动拖动，自动回跳已暂停';
+    status.className = `stage-status ${cls}`;
+  }
 }
 
 function attachStageUserActionListeners(video) {
@@ -2003,10 +2056,17 @@ function renderLagBadge(node, lag) {
 //   stageAutoSeekBlocker). Rules 1/4 below still apply to the stage.
 // * Rule 1: when the tab returns to the foreground, seek tiles to live
 //   (Chrome throttles hidden tabs so they fall minutes behind). The stage only
-//   seeks when it is clearly adrift (> STAGE_FOREGROUND_SEEK_LAG) so a
-//   deliberate scrub survives a quick glance at another window.
-// * Rule 4: at HARD_SEEK_LAG, seek unconditionally - 30 s later the server has
-//   deleted that part of the 180 s ring and hls.js would hard-jump on its own.
+//   seeks when it is clearly adrift (> STAGE_FOREGROUND_SEEK_LAG) and nobody
+//   is working there, so a deliberate scrub survives a quick glance at
+//   another window.
+// * Rule 4: at HARD_SEEK_LAG, tiles seek unconditionally. The stage treats it
+//   like the stage jump above (blockers apply): lag alone is not dangerous,
+//   because a playing stage keeps a constant distance from the delete edge.
+// * Stage edge guard: what actually matters on the stage is the distance to
+//   the oldest segment still in the playlist (bufferEdgeDistanceSeconds).
+//   Below STAGE_EDGE_WARN_SECONDS the operator is warned; at
+//   STAGE_EDGE_SEEK_SECONDS the stage jumps regardless of blockers, since the
+//   server is about to delete that segment anyway.
 //
 // All thresholds (and hls.js liveSyncDurationCount) are tunable from the
 // server .env; the LATENCY object (declared near the top of this file) only
@@ -2034,19 +2094,31 @@ function applyLatencyConfig(cfg) {
       `倍速 ${LATENCY.catchupRateEnabled ? `${LATENCY.catchupRate}x@≥${LATENCY.catchupMinLag}s` : '关'} | ` +
       `小窗跳回 ${LATENCY.tileSeekLag > 0 ? `≥${LATENCY.tileSeekLag}s` : '关'} | ` +
       `大窗跳回 ${LATENCY.stageAutoSeekLag > 0 ? `≥${LATENCY.stageAutoSeekLag}s（操作后豁免 ${LATENCY.stageUserGraceSeconds}s）` : '关'} | ` +
-      `大窗前台≥${LATENCY.stageSeekLag}s 硬跳≥${LATENCY.hardSeekLag}s` +
+      `大窗前台≥${LATENCY.stageSeekLag}s 硬跳≥${LATENCY.hardSeekLag}s（大窗有人操作时不硬跳）| ` +
+      `大窗缓冲尽头 警告≤${STAGE_EDGE_WARN_SECONDS}s 强制跳回≤${STAGE_EDGE_SEEK_SECONDS}s` +
       (Array.isArray(cfg.adjusted) && cfg.adjusted.length ? ` | 已被服务器修正: ${cfg.adjusted.join(', ')}` : '')
     );
   }
 }
 const AUTO_SEEK_NOTE_MS = 3000;
 
+// Stage ring-buffer edge guard. The server keeps history_seconds of segments
+// and deletes the oldest as it goes, so a scrubbed-back playhead is a fixed
+// distance from the delete edge while it plays, and drifts towards it only
+// while paused or stalled. Below STAGE_EDGE_WARN_SECONDS the operator gets a
+// warning; at STAGE_EDGE_SEEK_SECONDS the stage jumps to live no matter what,
+// because hls.js would otherwise hard-jump on a 404 a moment later anyway.
+const STAGE_EDGE_WARN_SECONDS = 30;
+const STAGE_EDGE_SEEK_SECONDS = 10;
+
 function isStageVideo(video) {
   return !!video && state.stageVideoNode === video;
 }
 
 function noteAutoSeek(matchId, reason, lag) {
-  const text = `落后 ${Math.round(lag)}s，已自动回到直播`;
+  const text = reason === 'buffer-edge'
+    ? `回看已到尽头（落后 ${Math.round(lag)}s），已自动回到直播`
+    : `落后 ${Math.round(lag)}s，已自动回到直播`;
   console.log(`[AUTO-SEEK] ${matchId} | ${reason} | 落后 ${lag.toFixed(1)}s`);
   setTileStatus(matchId, text, 'warn', true);
   if (state.stageMatchId === matchId) {
@@ -2101,7 +2173,19 @@ function onVisibilityRestored() {
     const video = videoForMatch(matchId);
     if (!video || !video._hls) continue;
     const lag = liveLagSeconds(video);
-    if (isStageVideo(video) && !(lag != null && lag > LATENCY.stageSeekLag)) continue;
+    if (isStageVideo(video)) {
+      // Stage auto-seek off (STAGE_AUTO_SEEK_LAG=0): the stage is the
+      // operator's surface, leave it where it is; the edge guard still applies.
+      if (LATENCY.stageAutoSeekLag <= 0) continue;
+      if (!(lag != null && lag > LATENCY.stageSeekLag)) continue;
+      // A deliberate scrub/pause survives a glance at another window; the
+      // ring-buffer guard in the lag monitor still catches a real cut-off.
+      const blocker = stageAutoSeekBlocker(video);
+      if (blocker) {
+        console.log(`[AUTO-SEEK] ${matchId} | foreground stage-hold (${blocker}) | 落后 ${lag.toFixed(1)}s，大窗有人在用，不跳`);
+        continue;
+      }
+    }
     autoSeekToLive(matchId, video, 'foreground', lag == null ? 0 : lag);
   }
 }
@@ -2136,28 +2220,62 @@ function startLagMonitoring() {
       if (state.stageMatchId === matchId) renderLagBadge($('stage-lag'), lag);
       if (!video || !video._hls) continue;
       const hls = video._hls;
+      const onStage = isStageVideo(video);
+      const edge = onStage ? bufferEdgeDistanceSeconds(video) : null;
 
-      if (lag != null && lag >= LATENCY.hardSeekLag) {
+      if (onStage && edge != null && edge <= STAGE_EDGE_SEEK_SECONDS) {
+        // About to fall off the ring buffer: nothing can save this position,
+        // so jump even if the operator is paused or inside the grace window.
+        video._stageEdgeWarned = false;
+        autoSeekToLive(matchId, video, 'buffer-edge', lag == null ? 0 : lag);
+      } else if (lag != null && lag >= LATENCY.hardSeekLag && !onStage) {
         autoSeekToLive(matchId, video, 'hard-limit', lag);
-      } else if (lag != null && LATENCY.tileSeekLag > 0 && lag >= LATENCY.tileSeekLag && !isStageVideo(video)) {
+      } else if (lag != null && LATENCY.tileSeekLag > 0 && lag >= LATENCY.tileSeekLag && !onStage) {
         // Tile-only instant jump (GIF_MONITOR_TILE_SEEK_LAG).
         autoSeekToLive(matchId, video, 'tile-limit', lag);
-      } else if (lag != null && LATENCY.stageAutoSeekLag > 0 && lag >= LATENCY.stageAutoSeekLag && isStageVideo(video)) {
-        // Stage jump (GIF_MONITOR_STAGE_AUTO_SEEK_LAG), unless the operator is
-        // working there: range pin set, paused, or a manual action within grace.
+      } else if (onStage && lag != null && LATENCY.stageAutoSeekLag > 0
+                 && (lag >= LATENCY.hardSeekLag || lag >= LATENCY.stageAutoSeekLag)) {
+        // Stage jump (GIF_MONITOR_STAGE_AUTO_SEEK_LAG / HARD_SEEK_LAG), unless
+        // the operator is working there: range pin set, paused, or a manual
+        // action within grace. The hard limit used to bypass this, which is
+        // what yanked a deliberately scrubbed-back stage straight to live.
+        // With STAGE_AUTO_SEEK_LAG off the stage never auto-seeks on lag at
+        // all; only the ring-buffer edge guard above remains.
+        const reason = lag >= LATENCY.hardSeekLag ? 'hard-limit' : 'stage-limit';
         const blocker = stageAutoSeekBlocker(video);
         if (blocker) {
           if (!video._stageHoldLogged) {
             video._stageHoldLogged = true;
-            console.log(`[AUTO-SEEK] ${matchId} | stage-hold (${blocker}) | 落后 ${lag.toFixed(1)}s，大窗有人在用，不跳`);
+            console.log(`[AUTO-SEEK] ${matchId} | stage-hold (${blocker}, ${reason}) | 落后 ${lag.toFixed(1)}s，大窗有人在用，不跳`);
           }
         } else {
           video._stageHoldLogged = false;
-          autoSeekToLive(matchId, video, 'stage-limit', lag);
+          autoSeekToLive(matchId, video, reason, lag);
         }
       } else {
         if (video._stageHoldLogged) video._stageHoldLogged = false;
         applyTileCatchupRate(video, lag);
+      }
+
+      if (onStage && edge != null) {
+        if (edge <= STAGE_EDGE_WARN_SECONDS && edge > STAGE_EDGE_SEEK_SECONDS) {
+          const text = `回看余量只剩 ${Math.round(edge)}s，低于 ${STAGE_EDGE_SEEK_SECONDS}s 会自动跳回直播`;
+          if (!video._stageEdgeWarned) {
+            video._stageEdgeWarned = true;
+            addStageNote(text, 'fail', 'edge');
+            console.log(`[AUTO-SEEK] ${matchId} | edge-warn | 距缓冲尽头 ${edge.toFixed(1)}s`);
+          }
+          // The status line counts down every tick; the note above stays put.
+          const status = $('stage-status');
+          if (status) { status.textContent = text; status.className = 'stage-status fail'; }
+        } else if (edge > STAGE_EDGE_WARN_SECONDS && video._stageEdgeWarned) {
+          video._stageEdgeWarned = false;
+          const status = $('stage-status');
+          if (status && status.textContent.startsWith('回看余量只剩')) {
+            status.textContent = '直播播放中';
+            status.className = 'stage-status ok';
+          }
+        }
       }
 
       const latency = lag != null ? `${lag.toFixed(1)}s` : 'N/A';
