@@ -1044,6 +1044,7 @@ def _list_clips(match_id: str) -> list[dict[str, Any]]:
             "title": str(form.get("title") or ""),
             "form": form,
             "anchored": meta.get("anchored"),
+            "discarded": bool(meta.get("discarded")),
             "alert_match": meta.get("alert_match_public"),
             "event_key": record.get("event_key") if record else None,
             "draft_status": record.get("status") if record else None,
@@ -1956,6 +1957,10 @@ def monitor_clip_publish():
     if manual_draft_queue is None:
         return jsonify({"error": "发文未启用（GIF 仅本地保存）", "code": "publish_disabled"}), 409
     meta = _read_clip_meta(gif_path)
+    if meta.get("discarded"):
+        # Abandoned in another tab/window while this page still showed the form:
+        # 放弃 means "do not publish", so refuse until the operator 恢复s it.
+        return jsonify({"error": "该 GIF 已放弃，请先恢复再发布", "code": "clip_discarded"}), 409
     alert_match = meta.get("alert_match")
     if not isinstance(alert_match, dict):
         # Pre-sidecar clip: best effort from the file's own timestamp.
@@ -2061,6 +2066,44 @@ def monitor_clip_publish():
             "delivery_mode": _manual_delivery_mode(),
         }
     )
+
+
+@app.post("/api/monitor/clip/discard")
+def monitor_clip_discard():
+    """Mark a captured GIF as abandoned, or restore it.
+
+    The file stays on disk either way: this only flips a ``discarded`` flag in the
+    sidecar so the page can keep the row (greyed out, read-only, with a 恢复
+    button) instead of leaving a bad clip stuck in the "待发布" list forever.
+    Reversible, and it never touches the CMS.
+    """
+    body = request.get_json(silent=True) or {}
+    try:
+        match_id = validate_match_id(str(body.get("match_id") or ""))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    name = str(body.get("name") or "").strip()
+    if not _CLIP_NAME_RE.fullmatch(name):
+        return jsonify({"error": "无效的 GIF 文件名"}), 400
+    gif_path = _clip_dir(match_id) / name
+    if not gif_path.is_file():
+        return jsonify({"error": "GIF 不存在或已被清理", "code": "clip_missing"}), 404
+    restore = bool(body.get("restore"))
+    # A clip already sent to the CMS has a draft record; abandoning it would only
+    # hide a row that is already published, so refuse. 恢复 is always allowed.
+    if not restore and manual_draft_queue is not None:
+        record = manual_draft_queue.records_by_source_name(
+            match_id, artifact_kind=MANUAL_ARTIFACT_KIND
+        ).get(name)
+        if record is not None:
+            return jsonify({"error": "该 GIF 已提交发布，不能放弃", "code": "already_published"}), 409
+    meta = _read_clip_meta(gif_path)
+    if restore:
+        meta.pop("discarded", None)
+    else:
+        meta["discarded"] = True
+    _write_clip_meta(gif_path, meta)
+    return jsonify({"ok": True, "match_id": match_id, "name": name, "discarded": not restore})
 
 
 @app.get("/api/monitor/publish/status")

@@ -684,6 +684,14 @@ function candidateLabel(c) {
 function buildClipForm(item, row) {
   const form = document.createElement('div');
   form.className = 'stage-clip-form';
+  // Inline auto-playing preview so the operator can judge the clip here, on the
+  // row being reviewed, instead of opening the GIF in a new tab first.
+  const preview = document.createElement('img');
+  preview.className = 'stage-clip-preview';
+  preview.loading = 'lazy';
+  preview.alt = '本段 GIF 预览';
+  preview.src = item.clip_url;
+  form.appendChild(preview);
   const initial = item.form || {};
   const am = item.alert_match || {};
   const candidates = Array.isArray(item.candidates) ? item.candidates : [];
@@ -779,8 +787,20 @@ function buildClipForm(item, row) {
     ev.preventDefault();
     if (!publish.disabled) publish.click();
   });
-  titleRow.appendChild(publish);
   form.appendChild(titleRow);
+  // 发布 + 放弃 on one row. 放弃 only flags the clip locally (reversible, never
+  // touches the CMS) so a bad capture can leave the 待发布 list.
+  const actions = document.createElement('div');
+  actions.className = 'stage-clip-actions';
+  const discard = document.createElement('button');
+  discard.className = 'button ghost stage-clip-discard';
+  discard.type = 'button';
+  discard.textContent = '放弃';
+  discard.title = '标记为放弃（不发布，GIF 仍保留，可恢复）';
+  discard.addEventListener('click', () => discardClip(item.name, discard, row));
+  actions.appendChild(publish);
+  actions.appendChild(discard);
+  form.appendChild(actions);
 
   function applySource(radio) {
     // The pick itself counts as an edit (so a list rebuild keeps it); re-fill
@@ -894,6 +914,22 @@ function renderClipRow(item, publishEnabled) {
     head.appendChild(draftEl);
     return row;
   }
+  if (item.discarded) {
+    // Abandoned: kept in place, greyed and read-only, with a one-click 恢复.
+    row.classList.add('discarded');
+    const tag = document.createElement('span');
+    tag.className = 'stage-clip-tag';
+    tag.textContent = '已放弃';
+    head.appendChild(tag);
+    const restore = document.createElement('button');
+    restore.className = 'stage-clip-restore';
+    restore.type = 'button';
+    restore.textContent = '恢复';
+    restore.title = '撤销放弃，重新进入待发布';
+    restore.addEventListener('click', () => restoreClip(item.name, restore, row));
+    head.appendChild(restore);
+    return row;
+  }
   row.classList.add('editing');
   row.appendChild(buildClipForm(item, row));
   return row;
@@ -939,6 +975,44 @@ async function publishClip(name, formValues, button, row, force) {
   }
 }
 
+async function discardClip(name, button, row) {
+  const matchId = state.stageMatchId;
+  if (!matchId) return;
+  button.disabled = true;
+  button.textContent = '放弃中…';
+  try {
+    await requestJson('api/monitor/clip/discard', {
+      method: 'POST',
+      body: JSON.stringify({match_id: matchId, name}),
+    });
+    addStageNote('已放弃（GIF 仍保留，可恢复）', 'ok');
+    if (state.stageMatchId === matchId) loadStageClips(matchId);
+  } catch (error) {
+    addStageNote('放弃失败：' + error.message, 'fail');
+    button.disabled = false;
+    button.textContent = '放弃';
+  }
+}
+
+async function restoreClip(name, button, row) {
+  const matchId = state.stageMatchId;
+  if (!matchId) return;
+  button.disabled = true;
+  button.textContent = '恢复中…';
+  try {
+    await requestJson('api/monitor/clip/discard', {
+      method: 'POST',
+      body: JSON.stringify({match_id: matchId, name, restore: true}),
+    });
+    addStageNote('已恢复到待发布', 'ok');
+    if (state.stageMatchId === matchId) loadStageClips(matchId);
+  } catch (error) {
+    addStageNote('恢复失败：' + error.message, 'fail');
+    button.disabled = false;
+    button.textContent = '恢复';
+  }
+}
+
 async function loadStageClips(matchId, options = {}) {
   const list = $('stage-clips');
   if (!list) return;
@@ -980,7 +1054,10 @@ async function loadStageClips(matchId, options = {}) {
   }
   const countEl = $('stage-clips-count');
   if (countEl) {
-    const unpublished = data.publish_enabled ? clips.filter((c) => !c.event_key).length : 0;
+    // Abandoned clips stay in the list but are not waiting to be published.
+    const unpublished = data.publish_enabled
+      ? clips.filter((c) => !c.event_key && !c.discarded).length
+      : 0;
     countEl.textContent = clips.length
       ? (unpublished ? `${unpublished} 条待发布 / 共 ${clips.length} 条` : `共 ${clips.length} 条`)
       : '';

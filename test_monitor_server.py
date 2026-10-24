@@ -497,6 +497,103 @@ class ClipListTests(unittest.TestCase):
         response = self.client.get("/api/monitor/clips?match_id=../etc")
         self.assertEqual(response.status_code, 400)
 
+    def test_discarded_flag_is_reported(self):
+        gif = self._gif("clip_a.gif", 1_000.0)
+        monitor_server._write_clip_meta(gif, {"discarded": True})
+        with mock.patch.object(monitor_server, "manual_draft_queue", None):
+            body = self.client.get("/api/monitor/clips?match_id=54622319").get_json()
+        self.assertTrue(body["clips"][0]["discarded"])
+
+    def test_clip_without_meta_is_not_discarded(self):
+        self._gif("clip_a.gif", 1_000.0)
+        with mock.patch.object(monitor_server, "manual_draft_queue", None):
+            body = self.client.get("/api/monitor/clips?match_id=54622319").get_json()
+        self.assertFalse(body["clips"][0]["discarded"])
+
+
+class ClipDiscardTests(unittest.TestCase):
+    """``POST /api/monitor/clip/discard``: flag a bad clip (reversible), never delete it."""
+
+    _NAME = "clip_20260101-120000_abcdef.gif"
+
+    def setUp(self):
+        self.client = monitor_server.app.test_client()
+        self.tmp = TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self._patches = [mock.patch.object(monitor_server, "_clip_dir", return_value=self.dir)]
+        for patch in self._patches:
+            patch.start()
+        self.gif = self.dir / self._NAME
+        self.gif.write_bytes(b"GIF")
+
+    def tearDown(self):
+        for patch in self._patches:
+            patch.stop()
+        self.tmp.cleanup()
+
+    def _post(self, **body):
+        return self.client.post("/api/monitor/clip/discard", json={"match_id": "54622319", **body})
+
+    def test_discard_flags_meta_and_keeps_file(self):
+        with mock.patch.object(monitor_server, "manual_draft_queue", None):
+            response = self._post(name=self._NAME)
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertTrue(response.get_json()["discarded"])
+        self.assertTrue(self.gif.is_file())  # the GIF is kept, only flagged
+        self.assertTrue(monitor_server._read_clip_meta(self.gif)["discarded"])
+
+    def test_discard_preserves_existing_meta(self):
+        monitor_server._write_clip_meta(self.gif, {"form": {"title": "保留我"}, "anchored": True})
+        with mock.patch.object(monitor_server, "manual_draft_queue", None):
+            self._post(name=self._NAME)
+        meta = monitor_server._read_clip_meta(self.gif)
+        self.assertTrue(meta["discarded"])
+        self.assertEqual(meta["form"]["title"], "保留我")
+        self.assertTrue(meta["anchored"])
+
+    def test_restore_clears_flag(self):
+        monitor_server._write_clip_meta(self.gif, {"discarded": True, "anchored": True})
+        with mock.patch.object(monitor_server, "manual_draft_queue", None):
+            response = self._post(name=self._NAME, restore=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.get_json()["discarded"])
+        meta = monitor_server._read_clip_meta(self.gif)
+        self.assertNotIn("discarded", meta)
+        self.assertTrue(meta["anchored"])  # unrelated fields untouched
+
+    def test_cannot_discard_already_published_clip(self):
+        queue = mock.Mock()
+        queue.records_by_source_name.return_value = {self._NAME: {"event_key": "manual_1"}}
+        with mock.patch.object(monitor_server, "manual_draft_queue", queue):
+            response = self._post(name=self._NAME)
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.get_json()["code"], "already_published")
+        self.assertFalse(monitor_server._read_clip_meta(self.gif).get("discarded"))
+
+    def test_restore_allowed_even_with_draft_record(self):
+        queue = mock.Mock()
+        queue.records_by_source_name.return_value = {self._NAME: {"event_key": "manual_1"}}
+        monitor_server._write_clip_meta(self.gif, {"discarded": True})
+        with mock.patch.object(monitor_server, "manual_draft_queue", queue):
+            response = self._post(name=self._NAME, restore=True)
+        self.assertEqual(response.status_code, 200)
+        queue.records_by_source_name.assert_not_called()  # the guard is skipped for 恢复
+
+    def test_missing_clip_is_404(self):
+        with mock.patch.object(monitor_server, "manual_draft_queue", None):
+            response = self._post(name="clip_20260101-120000_ffffff.gif")
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.get_json()["code"], "clip_missing")
+
+    def test_malformed_name_rejected(self):
+        with mock.patch.object(monitor_server, "manual_draft_queue", None):
+            response = self._post(name="../etc/passwd")
+        self.assertEqual(response.status_code, 400)
+
+    def test_invalid_match_id_rejected(self):
+        response = self.client.post("/api/monitor/clip/discard", json={"match_id": "../x", "name": self._NAME})
+        self.assertEqual(response.status_code, 400)
+
 
 class ClipEncodingTests(unittest.TestCase):
     def _make_segments(self, directory: Path, count: int) -> list:
@@ -1413,6 +1510,28 @@ class ClipPublishEndpointTests(ClipEndpointAlertMatchTests):
             )
         self.assertEqual(response.status_code, 409)
         self.assertEqual(response.get_json()["code"], "publish_disabled")
+
+    def test_publish_rejects_discarded_clip_until_restored(self):
+        """放弃 in another tab must stop a stale form from publishing; 恢复 re-opens it."""
+        name = self._clip(10.0).get_json()["name"]
+        self.queue.records_by_source_name.return_value = {}  # nothing published yet
+        discarded = self.client.post("/api/monitor/clip/discard", json={"match_id": "54622319", "name": name})
+        self.assertEqual(discarded.status_code, 200, discarded.get_json())
+        response = self.client.post(
+            "/api/monitor/clip/publish", json={"match_id": "54622319", "name": name, "title": "t"}
+        )
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.get_json()["code"], "clip_discarded")
+        self.queue.enqueue.assert_not_called()
+        restored = self.client.post(
+            "/api/monitor/clip/discard", json={"match_id": "54622319", "name": name, "restore": True}
+        )
+        self.assertEqual(restored.status_code, 200)
+        response = self.client.post(
+            "/api/monitor/clip/publish", json={"match_id": "54622319", "name": name, "title": "t"}
+        )
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.queue.enqueue.assert_called_once()
 
     def test_publish_surfaces_queue_error(self):
         name = self._clip(10.0).get_json()["name"]
