@@ -210,6 +210,9 @@ body{
 
 /* ---- Match card grid (two-column) ---- */
 .match-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px}
+.finished-section{margin-top:18px;border-top:1px solid var(--line);padding-top:10px}
+.finished-section>summary{cursor:pointer;color:var(--muted);font-size:13px;padding:6px 0 10px;user-select:none}
+.finished-section>summary:hover{color:var(--text)}
 .list-search{margin-bottom:12px}
 .list-search-input{width:100%;max-width:420px;background:#0d1723;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:9px 12px;font:inherit;outline:none}
 .list-search-input:focus{border-color:var(--cyan)}

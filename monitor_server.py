@@ -1425,7 +1425,11 @@ def monitor_matches():
         row = _match_row(item, "Played")
         row["finished"] = True
         row["finished_at_unix"] = record["finished_at"]
-        row["finished_until_unix"] = record["finished_at"] + FINISHED_GRACE_SECONDS
+        row["finished_until_unix"] = record["finished_at"] + finished_matches.grace_seconds
+        # Past the grace the row only exists for its unpublished GIFs; the
+        # list page files those under a collapsed section instead of mixing
+        # them with live matches. Decided here so the browser clock is moot.
+        row["grace_active"] = now <= row["finished_until_unix"]
         row["pending_clips"] = pending
         playing.append(row)
         match_ids.append(match_id)

@@ -1930,6 +1930,7 @@ class FinishedMatchGraceTests(unittest.TestCase):
         self.assertEqual(row["status_label"], "已结束")
         self.assertEqual(row["team_A_name"], "伊尔韦斯")
         self.assertAlmostEqual(row["finished_until_unix"] - row["finished_at_unix"], 600.0)
+        self.assertTrue(row["grace_active"])
         # Nobody holds a preview -> nothing to capture -> not listed.
         with mock.patch.object(monitor_server.match_catalog, "snapshot", return_value={"playing": []}), \
              mock.patch.object(monitor_server.live_preview, "status",
@@ -1976,11 +1977,14 @@ class FinishedMatchGraceTests(unittest.TestCase):
                     self.assertTrue(rows[0]["finished"])
                     self.assertEqual(rows[0]["pending_clips"], 1)
                     self.assertEqual(rows[0]["team_A_name"], "伊尔韦斯")
+                    self.assertTrue(rows[0]["grace_active"])
                     # Grace long over: still there, and the detail lookup used by
-                    # publish still resolves the teams.
+                    # publish still resolves the teams. The list page files it
+                    # under the collapsed finished section (grace_active=False).
                     with mock.patch.object(self.memory, "grace_seconds", -1.0):
                         rows = self._matches()
                         self.assertEqual([r["match_id"] for r in rows], ["54622319"])
+                        self.assertFalse(rows[0]["grace_active"])
                         self.assertEqual(monitor_server._match_detail_for("54622319")["team_B_name"], "里耶卡")
                         # 放弃 the only GIF -> nothing pending -> row and memory go.
                         self._write_clip(clips, "clip_20261024-220000_aaaaaa.gif", {"event_key": "manual_1", "discarded": True})

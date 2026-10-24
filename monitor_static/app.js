@@ -1646,18 +1646,80 @@ function matchMatchesSearch(data, needle) {
   return hay.includes(needle);
 }
 
+// A finished row past its grace exists only for its unpublished GIFs; it is
+// filed under the collapsed "已完赛待发布" section so the live list stays
+// clean. Within the grace it stays in the main grid (the operator may still be
+// scrubbing back for a late goal).
+function isArchivedFinished(data) {
+  return !!data.finished && data.grace_active === false;
+}
+
+function buildMatchCard(data) {
+  const mid = data.match_id;
+  const checked = state.selectedMatchIds.has(mid) ? 'checked' : '';
+  const srcState = data.source_state || state.sourceCache[mid] || 'unknown';
+  const noSource = srcState !== 'available';
+  const card = document.createElement('div');
+  card.className = 'match-card' + (noSource ? ' no-source' : '') + (data.finished ? ' finished' : '');
+  card.dataset.matchId = mid;
+  card.innerHTML =
+    `<div class="match-card-check"><input type="checkbox" class="match-checkbox" data-match-id="${escapeHtml(mid)}" ${checked}></div>` +
+    `<div class="match-card-teams">${teamsText(data)}</div>` +
+    `<div class="match-card-meta">${metaText(data)}</div>` +
+    `<div class="match-card-source">${sourceDot(srcState)} <span class="source-label">${escapeHtml(sourceLabel(srcState))}</span></div>`;
+  card.querySelector('.match-checkbox').addEventListener('change', (ev) => {
+    ev.stopPropagation();
+    if (ev.target.checked) {
+      state.selectedMatchIds.add(mid);
+    } else {
+      state.selectedMatchIds.delete(mid);
+    }
+    updateSelectionUI();
+  });
+  card.addEventListener('click', (ev) => {
+    if (ev.target.tagName === 'INPUT') return; // 让 checkbox 自己的 change 事件处理
+    const cb = card.querySelector('.match-checkbox');
+    cb.checked = !cb.checked;
+    if (cb.checked) {
+      state.selectedMatchIds.add(mid);
+    } else {
+      state.selectedMatchIds.delete(mid);
+    }
+    updateSelectionUI();
+  });
+  return card;
+}
+
+function renderFinishedSection(archived) {
+  const section = $('finished-section');
+  const grid = $('finished-grid');
+  if (!section || !grid) return;
+  grid.innerHTML = '';
+  if (!archived.length) {
+    section.classList.add('hidden');
+    return;
+  }
+  const summary = $('finished-summary');
+  if (summary) summary.textContent = `已完赛待发布 (${archived.length})`;
+  archived.forEach((data) => grid.appendChild(buildMatchCard(data)));
+  section.classList.remove('hidden');
+}
+
 function renderMatchGrid() {
   const grid = $('match-grid');
   if (!grid) return;
   grid.innerHTML = '';
   const needle = String(state.listSearch || '').trim().toLowerCase();
-  const matches = state.allMatches.filter((m) => matchMatchesSearch(m, needle));
+  const visible = state.allMatches.filter((m) => matchMatchesSearch(m, needle));
+  const archived = visible.filter(isArchivedFinished);
+  const matches = visible.filter((m) => !isArchivedFinished(m));
   // 有源比赛在前，无源在后
   matches.sort((a, b) => {
     const aOk = (a.source_state || state.sourceCache[a.match_id] || 'unknown') === 'available';
     const bOk = (b.source_state || state.sourceCache[b.match_id] || 'unknown') === 'available';
     return aOk === bOk ? 0 : aOk ? -1 : 1;
   });
+  renderFinishedSection(archived);
   const empty = $('list-empty');
   if (!matches.length) {
     if (empty) {
@@ -1666,44 +1728,11 @@ function renderMatchGrid() {
         : '当前没有进行中的比赛';
       empty.classList.remove('hidden');
     }
+    updateSelectionUI();
     return;
   }
   if (empty) empty.classList.add('hidden');
-  matches.forEach((data) => {
-    const mid = data.match_id;
-    const checked = state.selectedMatchIds.has(mid) ? 'checked' : '';
-    const srcState = data.source_state || state.sourceCache[mid] || 'unknown';
-    const noSource = srcState !== 'available';
-    const card = document.createElement('div');
-    card.className = 'match-card' + (noSource ? ' no-source' : '') + (data.finished ? ' finished' : '');
-    card.dataset.matchId = mid;
-    card.innerHTML =
-      `<div class="match-card-check"><input type="checkbox" class="match-checkbox" data-match-id="${escapeHtml(mid)}" ${checked}></div>` +
-      `<div class="match-card-teams">${teamsText(data)}</div>` +
-      `<div class="match-card-meta">${metaText(data)}</div>` +
-      `<div class="match-card-source">${sourceDot(srcState)} <span class="source-label">${escapeHtml(sourceLabel(srcState))}</span></div>`;
-    card.querySelector('.match-checkbox').addEventListener('change', (ev) => {
-      ev.stopPropagation();
-      if (ev.target.checked) {
-        state.selectedMatchIds.add(mid);
-      } else {
-        state.selectedMatchIds.delete(mid);
-      }
-      updateSelectionUI();
-    });
-    card.addEventListener('click', (ev) => {
-      if (ev.target.tagName === 'INPUT') return; // 让 checkbox 自己的 change 事件处理
-      const cb = card.querySelector('.match-checkbox');
-      cb.checked = !cb.checked;
-      if (cb.checked) {
-        state.selectedMatchIds.add(mid);
-      } else {
-        state.selectedMatchIds.delete(mid);
-      }
-      updateSelectionUI();
-    });
-    grid.appendChild(card);
-  });
+  matches.forEach((data) => grid.appendChild(buildMatchCard(data)));
   updateSelectionUI();
 }
 
@@ -1718,9 +1747,11 @@ function updateSelectionUI() {
 function updateListSummary() {
   const summary = $('list-summary');
   if (!summary || state.view !== 'list') return;
-  const total = state.allMatches.length;
+  // Archived finished rows live in their own section and are not "进行中".
+  const live = state.allMatches.filter((m) => !isArchivedFinished(m));
+  const total = live.length;
   const needle = String(state.listSearch || '').trim().toLowerCase();
-  const shown = needle ? state.allMatches.filter((m) => matchMatchesSearch(m, needle)).length : total;
+  const shown = needle ? live.filter((m) => matchMatchesSearch(m, needle)).length : total;
   summary.textContent = needle ? `进行中 ${shown} / ${total} 场` : `进行中 ${total} 场`;
 }
 
