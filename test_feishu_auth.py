@@ -190,7 +190,9 @@ class LoginWallTests(unittest.TestCase):
         self.assertEqual(matches.status_code, 200)
         me = self.client.get("/api/auth/me").get_json()
         self.assertEqual(
-            me["user"], {"open_id": "ou_1", "name": "运营甲", "is_admin": False, "kind": "feishu"}
+            me["user"],
+            {"open_id": "ou_1", "name": "运营甲", "is_admin": False, "env_admin": False,
+             "kind": "feishu"},
         )
 
     def test_callback_rejects_bad_state(self):
@@ -649,6 +651,117 @@ class ApprovalModeTests(unittest.TestCase):
                                json={"open_id": "ou_new", "action": "approve"})
         self.assertEqual(response.status_code, 403)
 
+    # -- promoted (page) admins --
+
+    def approve(self, admin, open_id: str):
+        return admin.post(feishu_auth.ADMIN_API_PATH + "/decide",
+                          json={"open_id": open_id, "action": "approve"})
+
+    def decide_as(self, admin, open_id: str, action: str):
+        return admin.post(feishu_auth.ADMIN_API_PATH + "/decide",
+                          json={"open_id": open_id, "action": action})
+
+    def test_promote_gives_admin_rights_immediately_and_demote_removes_them(self):
+        stranger = self.app.test_client()
+        self.login_and_apply(stranger, self.STRANGER)
+        admin = self.app.test_client()
+        self.login(admin, self.ADMIN)
+        self.approve(admin, "ou_new")
+        stranger.get(feishu_auth.PENDING_API_PATH)
+        self.assertEqual(stranger.get(feishu_auth.ADMIN_API_PATH).status_code, 403)
+        me = stranger.get("/api/auth/me").get_json()["user"]
+        self.assertFalse(me["is_admin"])
+
+        decision = self.decide_as(admin, "ou_new", "promote").get_json()
+        self.assertTrue(decision["ok"])
+        self.assertEqual(decision["request"]["role"], "admin")
+        self.assertEqual(decision["request"]["status"], "approved")
+        # Same cookie, next request: admin pages/APIs open, flagged as page admin.
+        self.assertEqual(stranger.get(feishu_auth.ADMIN_PAGE_PATH).status_code, 200)
+        listing = stranger.get(feishu_auth.ADMIN_API_PATH).get_json()
+        self.assertEqual(listing["admin"], {"open_id": "ou_new", "name": "新人", "env_admin": False})
+        self.assertEqual(listing["requests"][0]["role"], "admin")
+        me = stranger.get("/api/auth/me").get_json()
+        self.assertTrue(me["user"]["is_admin"])
+        self.assertFalse(me["user"]["env_admin"])
+        self.assertIn("pending_count", me)
+        env_me = admin.get("/api/auth/me").get_json()["user"]
+        self.assertTrue(env_me["is_admin"])
+        self.assertTrue(env_me["env_admin"])
+
+        self.assertEqual(self.decide_as(admin, "ou_new", "demote").get_json()["request"]["role"], "user")
+        self.assertEqual(stranger.get(feishu_auth.ADMIN_API_PATH).status_code, 403)
+        self.assertFalse(stranger.get("/api/auth/me").get_json()["user"]["is_admin"])
+        # Still an approved user though.
+        self.assertEqual(stranger.get("/api/monitor/matches").status_code, 200)
+
+    def test_promoted_admin_survives_relogin_but_only_as_store_backed_session(self):
+        stranger = self.app.test_client()
+        self.login_and_apply(stranger, self.STRANGER)
+        admin = self.app.test_client()
+        self.login(admin, self.ADMIN)
+        self.approve(admin, "ou_new")
+        self.decide_as(admin, "ou_new", "promote")
+        fresh = self.app.test_client()
+        response = self.login(fresh, self.STRANGER, "/deep")
+        self.assertEqual(response.headers["Location"], "/deep")
+        self.assertTrue(fresh.get("/api/auth/me").get_json()["user"]["is_admin"])
+        with fresh.session_transaction() as flask_session:
+            self.assertEqual(flask_session[SESSION_KEY]["via"], "approved")
+        # Revoke → kicked out at once, and the admin role is gone for good.
+        self.decide_as(admin, "ou_new", "reject")
+        self.assertEqual(fresh.get("/api/monitor/matches").status_code, 401)
+        self.assertEqual(fresh.get(feishu_auth.ADMIN_API_PATH).status_code, 401)
+        self.approve(admin, "ou_new")
+        self.login(fresh, self.STRANGER)
+        self.assertFalse(fresh.get("/api/auth/me").get_json()["user"]["is_admin"])
+        record = admin.get(feishu_auth.ADMIN_API_PATH).get_json()["requests"][0]
+        self.assertEqual((record["status"], record["role"]), ("approved", "user"))
+
+    def test_page_admin_can_manage_others_but_not_env_admins(self):
+        # ou_new becomes a page admin; ou_other is a second applicant.
+        stranger = self.app.test_client()
+        self.login_and_apply(stranger, self.STRANGER)
+        other = self.app.test_client()
+        self.login_and_apply(other, {"open_id": "ou_other", "name": "路人"})
+        admin = self.app.test_client()
+        self.login(admin, self.ADMIN)
+        self.approve(admin, "ou_new")
+        self.decide_as(admin, "ou_new", "promote")
+        stranger.get(feishu_auth.PENDING_API_PATH)
+        # Page admin approves, promotes, demotes and revokes another user.
+        self.assertTrue(self.decide_as(stranger, "ou_other", "approve").get_json()["ok"])
+        self.assertEqual(self.decide_as(stranger, "ou_other", "promote").get_json()["request"]["role"], "admin")
+        self.assertEqual(self.decide_as(stranger, "ou_other", "demote").get_json()["request"]["role"], "user")
+        self.assertTrue(self.decide_as(stranger, "ou_other", "reject").get_json()["ok"])
+        self.assertTrue(stranger.post(feishu_auth.ADMIN_API_PATH + "/guest-link/reset").get_json()["ok"])
+        # A .env admin who also has a row cannot be rejected or demoted from the page.
+        env_client = self.app.test_client()
+        self.login(env_client, self.ADMIN)
+        store = self.app.extensions["feishu_auth_store"]
+        store.request("ou_admin", "管理员")
+        store.decide("ou_admin", "approved", "ou_admin")
+        for action in ("reject", "demote"):
+            response = self.decide_as(stranger, "ou_admin", action)
+            self.assertEqual(response.status_code, 403, action)
+            self.assertIn(".env", response.get_json()["error"])
+        self.assertEqual(env_client.get(feishu_auth.ADMIN_API_PATH).status_code, 200)
+        # Promote/approve on an env admin's row is harmless and allowed.
+        self.assertEqual(self.decide_as(stranger, "ou_admin", "promote").status_code, 200)
+
+    def test_promote_requires_approved_record_and_validates_action(self):
+        stranger = self.app.test_client()
+        self.login_and_apply(stranger, self.STRANGER)
+        admin = self.app.test_client()
+        self.login(admin, self.ADMIN)
+        # Pending row cannot be promoted.
+        response = self.decide_as(admin, "ou_new", "promote")
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(admin.get(feishu_auth.ADMIN_API_PATH).get_json()["requests"][0]["role"], "user")
+        # Unknown id / unknown action.
+        self.assertEqual(self.decide_as(admin, "ou_nobody", "promote").status_code, 404)
+        self.assertEqual(self.decide_as(admin, "ou_new", "crown").status_code, 400)
+
     def test_anonymous_admin_routes_require_login(self):
         client = self.app.test_client()
         self.assertEqual(client.get(feishu_auth.ADMIN_API_PATH).status_code, 401)
@@ -889,7 +1002,9 @@ class GuestLinkTests(unittest.TestCase):
         self.assertEqual(guest.get("/api/auth/check").status_code, 401)
         self.assertEqual(guest.get("/", headers={"Accept": "text/html"}).status_code, 302)
 
-    def test_logout_clears_guest_cookie(self):
+    def test_logout_keeps_guest_cookie_so_approved_guest_reenters(self):
+        """Logging out ends the session only; the guest's identity cookie stays
+        so they get back in until an admin revokes them."""
         key = self.key_of(self.reset_link())
         guest = self.app.test_client()
         guest_id = self.apply(guest, key).get_json()["open_id"]
@@ -897,8 +1012,74 @@ class GuestLinkTests(unittest.TestCase):
         guest.get(feishu_auth.PENDING_API_PATH)
         self.assertEqual(guest.get("/api/monitor/matches").status_code, 200)
         response = guest.post("/api/auth/logout")
-        self.assertIn(feishu_auth.GUEST_COOKIE_NAME + "=;", response.headers.get("Set-Cookie", ""))
+        self.assertNotIn(feishu_auth.GUEST_COOKIE_NAME + "=;", response.headers.get("Set-Cookie", ""))
+        # Next visit resumes silently from the cookie - no form, no re-approval.
+        page = guest.get("/", headers={"Accept": "text/html"})
+        self.assertNotEqual(page.status_code, 302)
+        self.assertEqual(guest.get("/api/monitor/matches").status_code, 200)
+        self.assertEqual(self.notify_mock.call_count, 1)
+        # Revoke still wins over the kept cookie.
+        self.decide(guest_id, "reject")
+        guest.post("/api/auth/logout")
         self.assertEqual(guest.get("/api/monitor/matches").status_code, 401)
+
+    def test_recover_link_reattaches_cookie_on_new_browser(self):
+        key = self.key_of(self.reset_link())
+        guest = self.app.test_client()
+        guest_id = self.apply(guest, key).get_json()["open_id"]
+        # Only approved guests get a recovery link.
+        self.assertEqual(self.admin.post(feishu_auth.ADMIN_API_PATH + "/guest-link/recover",
+                                         json={"open_id": guest_id}).status_code, 409)
+        self.decide(guest_id, "approve")
+        data = self.admin.post(feishu_auth.ADMIN_API_PATH + "/guest-link/recover",
+                               json={"open_id": guest_id}).get_json()
+        link = data["recover_link"]
+        self.assertTrue(link.startswith("https://monitor.example.com/guest?r="))
+        self.assertEqual(data["expires_in_seconds"], feishu_auth.GUEST_RECOVER_TTL_SECONDS)
+        token = urllib.parse.parse_qs(urllib.parse.urlparse(link).query)["r"][0]
+        # New browser: no cookie, no session. The link logs in and sets the cookie.
+        fresh = self.app.test_client()
+        response = fresh.get(feishu_auth.GUEST_PAGE_PATH + "?r=" + urllib.parse.quote(token, safe=""))
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.headers["Location"], "/")
+        self.assertIn(feishu_auth.GUEST_COOKIE_NAME + "=" + guest_id + ".",
+                      response.headers.get("Set-Cookie", ""))
+        self.assertEqual(fresh.get("/api/monitor/matches").status_code, 200)
+        self.assertEqual(fresh.get("/api/auth/me").get_json()["user"]["open_id"], guest_id)
+        # Survives session expiry via the re-attached cookie.
+        with fresh.session_transaction() as flask_session:
+            flask_session.clear()
+        self.assertEqual(fresh.get("/api/monitor/matches").status_code, 200)
+        self.assertEqual(self.notify_mock.call_count, 1)
+
+    def test_recover_link_rejects_forged_expired_and_revoked(self):
+        key = self.key_of(self.reset_link())
+        guest = self.app.test_client()
+        guest_id = self.apply(guest, key).get_json()["open_id"]
+        self.decide(guest_id, "approve")
+        link = self.admin.post(feishu_auth.ADMIN_API_PATH + "/guest-link/recover",
+                               json={"open_id": guest_id}).get_json()["recover_link"]
+        token = urllib.parse.parse_qs(urllib.parse.urlparse(link).query)["r"][0]
+        gid, exp, sig = token.split(".")
+        # Tampered signature / id / expiry → plain 403, no session.
+        for bad in (f"{gid}.{exp}.deadbeef", f"guest_other.{exp}.{sig}", f"{gid}.{int(exp) + 1}.{sig}", "junk"):
+            fresh = self.app.test_client()
+            self.assertEqual(fresh.get(feishu_auth.GUEST_PAGE_PATH + "?r=" + bad).status_code, 403, bad)
+            self.assertEqual(fresh.get("/api/monitor/matches").status_code, 401, bad)
+        # Expired token.
+        with mock.patch("feishu_auth.time.time", return_value=int(exp) + 1):
+            fresh = self.app.test_client()
+            self.assertEqual(fresh.get(feishu_auth.GUEST_PAGE_PATH + "?r=" + token).status_code, 403)
+        # Revoked guest: valid token no longer helps.
+        self.decide(guest_id, "reject")
+        fresh = self.app.test_client()
+        self.assertEqual(fresh.get(feishu_auth.GUEST_PAGE_PATH + "?r=" + token).status_code, 403)
+        self.assertEqual(fresh.get("/api/monitor/matches").status_code, 401)
+        # Non-admins cannot mint one; unknown / feishu ids are 404.
+        self.assertEqual(guest.post(feishu_auth.ADMIN_API_PATH + "/guest-link/recover",
+                                    json={"open_id": guest_id}).status_code, 401)
+        self.assertEqual(self.admin.post(feishu_auth.ADMIN_API_PATH + "/guest-link/recover",
+                                         json={"open_id": "nope"}).status_code, 404)
 
     def test_rotated_link_keeps_approved_guest_but_blocks_new_applicants(self):
         old_key = self.key_of(self.reset_link())
@@ -979,7 +1160,20 @@ class GuestLinkTests(unittest.TestCase):
             record = store.get("ou_old")
             self.assertEqual(record["kind"], "feishu")
             self.assertEqual(record["note"], "")
+            self.assertEqual(record["role"], "user")
             self.assertTrue(store.is_approved("ou_old"))
+            self.assertFalse(store.is_admin("ou_old"))
+            self.assertEqual(store.set_role("ou_old", "admin", "ou_admin")["role"], "admin")
+            self.assertTrue(feishu_auth.AccessStore(path).is_admin("ou_old"))
+            # Revoke strips the role; a later re-approve is a plain user.
+            store.decide("ou_old", "rejected", "ou_admin")
+            self.assertFalse(store.is_admin("ou_old"))
+            self.assertEqual(store.decide("ou_old", "approved", "ou_admin")["role"], "user")
+            # set_role on a non-approved row is a no-op.
+            store.decide("ou_old", "rejected", "ou_admin")
+            self.assertIsNone(store.set_role("ou_old", "admin", "ou_admin"))
+            with self.assertRaises(ValueError):
+                store.set_role("ou_old", "king", "ou_admin")
             self.assertEqual(store.guest_key(), "")
             key = store.reset_guest_key()
             self.assertEqual(feishu_auth.AccessStore(path).guest_key(), key)

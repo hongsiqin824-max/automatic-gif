@@ -37,8 +37,14 @@ Access control has two modes, chosen by ``GIF_MONITOR_FEISHU_ADMIN_USERS``:
   ``/guest?k=…`` link. Anyone opening it fills in a name and a note, which
   files a request in the same queue (``kind=guest``). A signed year-long
   cookie remembers the guest so an approved visitor re-enters after session
-  expiry without re-applying; rotating the link never affects approved
-  guests, revoking a guest locks them out on the next request.
+  expiry or logout without re-applying; rotating the link never affects
+  approved guests, revoking a guest locks them out on the next request. A
+  guest who lost the cookie gets a 7-day personal ``/guest?r=…`` recovery
+  link from the admin page instead of a second approval.
+* **Promoted admins**: an approved record can be given ``role=admin`` from
+  ``/admin/access``. They get the same admin pages/APIs (approve, revoke,
+  promote, demote, guest links) and can be demoted or revoked there; the
+  ``.env`` admins are the only ones the page cannot touch.
 """
 
 from __future__ import annotations
@@ -102,6 +108,15 @@ KIND_FEISHU = "feishu"
 KIND_GUEST = "guest"
 GUEST_NAME_MAX = 40
 GUEST_NOTE_MAX = 200
+
+# Per-record role. ``admin`` rows get the admin pages/APIs exactly like the
+# .env admins, but can be demoted or revoked from the admin page; .env
+# admins cannot be touched from there.
+ROLE_USER = "user"
+ROLE_ADMIN = "admin"
+# A guest "recovery" link (admin page → 找回链接) is valid this long; it
+# re-issues the guest cookie on a new browser without a second approval.
+GUEST_RECOVER_TTL_SECONDS = 7 * 24 * 3600
 
 # Reachable without a login session. Prefixes end with "/" on purpose so
 # "/static/x" matches but a hypothetical "/staticfoo" does not.
@@ -281,11 +296,12 @@ class AccessStore:
                     decided_by TEXT NOT NULL DEFAULT '',
                     last_login_at REAL,
                     kind TEXT NOT NULL DEFAULT 'feishu',
-                    note TEXT NOT NULL DEFAULT ''
+                    note TEXT NOT NULL DEFAULT '',
+                    role TEXT NOT NULL DEFAULT 'user'
                 )
                 """
             )
-            # Tables created by the first release lack kind/note; add them in place.
+            # Tables created by earlier releases lack kind/note/role; add them in place.
             existing = {
                 row["name"] for row in self._conn.execute("PRAGMA table_info(access_requests)")
             }
@@ -296,6 +312,10 @@ class AccessStore:
             if "note" not in existing:
                 self._conn.execute(
                     "ALTER TABLE access_requests ADD COLUMN note TEXT NOT NULL DEFAULT ''"
+                )
+            if "role" not in existing:
+                self._conn.execute(
+                    "ALTER TABLE access_requests ADD COLUMN role TEXT NOT NULL DEFAULT 'user'"
                 )
             self._conn.execute(
                 "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
@@ -312,6 +332,7 @@ class AccessStore:
             "kind": row["kind"],
             "note": row["note"],
             "status": row["status"],
+            "role": row["role"],
             "requested_at": row["requested_at"],
             "updated_at": row["updated_at"],
             "decided_by": row["decided_by"],
@@ -364,10 +385,38 @@ class AccessStore:
         if status not in {STATUS_APPROVED, STATUS_REJECTED}:
             raise ValueError(f"invalid status: {status}")
         with self._lock:
+            if status == STATUS_REJECTED:
+                # Revoking access also strips the admin role, so a later
+                # re-approve does not silently hand admin rights back.
+                cursor = self._conn.execute(
+                    "UPDATE access_requests SET status = ?, role = ?, updated_at = ?,"
+                    " decided_by = ? WHERE open_id = ?",
+                    (status, ROLE_USER, time.time(), decided_by, open_id),
+                )
+            else:
+                cursor = self._conn.execute(
+                    "UPDATE access_requests SET status = ?, updated_at = ?, decided_by = ?"
+                    " WHERE open_id = ?",
+                    (status, time.time(), decided_by, open_id),
+                )
+            self._conn.commit()
+            if cursor.rowcount == 0:
+                return None
+            row = self._conn.execute(
+                "SELECT * FROM access_requests WHERE open_id = ?", (open_id,)
+            ).fetchone()
+        return self._row_to_dict(row)
+
+    def set_role(self, open_id: str, role: str, decided_by: str) -> dict[str, Any] | None:
+        """Promote/demote an *approved* record. Returns None when no such row
+        is approved (pending/rejected rows cannot hold the admin role)."""
+        if role not in {ROLE_USER, ROLE_ADMIN}:
+            raise ValueError(f"invalid role: {role}")
+        with self._lock:
             cursor = self._conn.execute(
-                "UPDATE access_requests SET status = ?, updated_at = ?, decided_by = ?"
-                " WHERE open_id = ?",
-                (status, time.time(), decided_by, open_id),
+                "UPDATE access_requests SET role = ?, updated_at = ?, decided_by = ?"
+                " WHERE open_id = ? AND status = ?",
+                (role, time.time(), decided_by, open_id, STATUS_APPROVED),
             )
             self._conn.commit()
             if cursor.rowcount == 0:
@@ -383,6 +432,14 @@ class AccessStore:
                 "SELECT status FROM access_requests WHERE open_id = ?", (open_id,)
             ).fetchone()
         return bool(row) and row["status"] == STATUS_APPROVED
+
+    def is_admin(self, open_id: str) -> bool:
+        """Approved *and* role=admin; a revoked admin loses both at once."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT status, role FROM access_requests WHERE open_id = ?", (open_id,)
+            ).fetchone()
+        return bool(row) and row["status"] == STATUS_APPROVED and row["role"] == ROLE_ADMIN
 
     def touch_login(self, open_id: str) -> None:
         with self._lock:
@@ -704,6 +761,7 @@ _ADMIN_PAGE_HTML = """<!doctype html>
   .box code { word-break: break-all; }
   .kind { font-size: 11px; padding: 1px 6px; border-radius: 4px; background: #eef2ff; color: #3730a3; }
   .kind.guest { background: #fdf2f8; color: #9d174d; }
+  .role { font-size: 11px; padding: 1px 6px; border-radius: 4px; background: #fef3c7; color: #92400e; margin-left: 4px; }
   .note { color: #4b5563; font-size: 13px; }
 </style></head>
 <body><div class="wrap"><div class="card">
@@ -717,6 +775,7 @@ _ADMIN_PAGE_HTML = """<!doctype html>
   <button id="resetBtn" class="danger" onclick="resetLink()">生成链接</button>
   <span class="muted" style="margin-left:8px">重置后旧链接立即失效，已批准的访客不受影响。</span>
 </div>
+<p class="muted">批准一次永久有效，直到你点「撤销」。「设为管理员」让对方拥有和你一样的审批权限；.env 里配置的管理员不能在这里撤销或降级。访客换浏览器/清了缓存进不来时，点「找回链接」生成一条 7 天有效的专属链接发给他。</p>
 <p id="msg" class="muted"></p>
 <table><thead><tr><th>申请人</th><th>类型</th><th>备注</th><th>身份</th><th>状态</th><th>申请时间</th><th>最近登录</th><th>操作</th></tr></thead>
 <tbody id="rows"><tr><td colspan="8" class="muted">加载中…</td></tr></tbody></table>
@@ -739,23 +798,34 @@ function renderLink(link) {
   document.getElementById('copyBtn').style.display = link ? '' : 'none';
   document.getElementById('resetBtn').textContent = link ? '重置链接' : '生成链接';
 }
+function btn(openId, action, cls, text) {
+  return '<button class="' + cls + '" onclick="decide(\\'' + esc(openId) + '\\',\\'' + action + '\\')">' + text + '</button>';
+}
 function load() {
   fetch(API, {headers: {'Accept': 'application/json'}, credentials: 'same-origin'})
     .then(function (r) { if (r.status === 401) { location.href = PREFIX + '/api/auth/feishu/login?next=' + encodeURIComponent(location.pathname); return null; } return r.json(); })
     .then(function (data) {
       if (!data) return;
       if (data.error) { document.getElementById('msg').textContent = data.error; return; }
-      document.getElementById('admin').textContent = data.admin.name + ' (' + data.admin.open_id + ')';
+      document.getElementById('admin').textContent = data.admin.name + ' (' + data.admin.open_id + ')' + (data.admin.env_admin ? ' · .env 管理员' : ' · 页面管理员');
       renderLink(data.guest_link);
       var rows = data.requests;
       var tbody = document.getElementById('rows');
       if (!rows.length) { tbody.innerHTML = '<tr><td colspan="8" class="muted">暂无申请</td></tr>'; return; }
       tbody.innerHTML = rows.map(function (r) {
-        var approve = '<button class="primary" onclick="decide(\\'' + esc(r.open_id) + '\\',\\'approve\\')">' + (r.status === 'rejected' ? '改为批准' : '批准') + '</button>';
-        var reject = '<button class="danger" onclick="decide(\\'' + esc(r.open_id) + '\\',\\'reject\\')">' + (r.status === 'approved' ? '撤销' : '拒绝') + '</button>';
-        var actions = r.status === 'approved' ? reject : (r.status === 'rejected' ? approve : approve + reject);
         var kind = r.kind || 'feishu';
-        return '<tr><td>' + esc(r.name || '（未知）') + '</td>'
+        var isAdmin = r.role === 'admin';
+        var actions = '';
+        if (r.status === 'approved') {
+          actions += isAdmin ? btn(r.open_id, 'demote', '', '取消管理员') : btn(r.open_id, 'promote', '', '设为管理员');
+          if (kind === 'guest') actions += '<button onclick="recoverLink(\\'' + esc(r.open_id) + '\\')">找回链接</button>';
+          actions += btn(r.open_id, 'reject', 'danger', '撤销');
+        } else if (r.status === 'rejected') {
+          actions = btn(r.open_id, 'approve', 'primary', '改为批准');
+        } else {
+          actions = btn(r.open_id, 'approve', 'primary', '批准') + btn(r.open_id, 'reject', 'danger', '拒绝');
+        }
+        return '<tr><td>' + esc(r.name || '（未知）') + (isAdmin ? '<span class="role">管理员</span>' : '') + '</td>'
           + '<td><span class="kind ' + kind + '">' + (KIND[kind] || kind) + '</span></td>'
           + '<td class="note">' + esc(r.note || '—') + '</td>'
           + '<td><code>' + esc(r.open_id) + '</code></td>'
@@ -767,11 +837,27 @@ function load() {
     .catch(function (e) { document.getElementById('msg').textContent = '加载失败：' + e; });
 }
 function decide(openId, action) {
+  if (action === 'reject' && !confirm('撤销/拒绝后对方立即无法访问，确定？')) return;
+  if (action === 'promote' && !confirm('设为管理员后对方可以审批、撤销和设置其他管理员，确定？')) return;
   fetch(API + '/decide', {method: 'POST', credentials: 'same-origin',
     headers: {'Content-Type': 'application/json', 'Accept': 'application/json'},
     body: JSON.stringify({open_id: openId, action: action})})
     .then(function (r) { return r.json(); })
     .then(function (data) { document.getElementById('msg').textContent = data.error || ''; load(); })
+    .catch(function (e) { document.getElementById('msg').textContent = '操作失败：' + e; });
+}
+function recoverLink(openId) {
+  fetch(API + '/guest-link/recover', {method: 'POST', credentials: 'same-origin',
+    headers: {'Content-Type': 'application/json', 'Accept': 'application/json'},
+    body: JSON.stringify({open_id: openId})})
+    .then(function (r) { return r.json(); })
+    .then(function (data) {
+      if (data.error) { document.getElementById('msg').textContent = data.error; return; }
+      var link = data.recover_link;
+      var done = function () { document.getElementById('msg').textContent = '找回链接已复制（7 天内有效，只发给本人）：' + link; };
+      if (navigator.clipboard && navigator.clipboard.writeText) { navigator.clipboard.writeText(link).then(done, function () { prompt('找回链接（7 天内有效）：', link); }); }
+      else { prompt('找回链接（7 天内有效）：', link); }
+    })
     .catch(function (e) { document.getElementById('msg').textContent = '操作失败：' + e; });
 }
 function resetLink() {
@@ -880,6 +966,7 @@ def install_feishu_auth(app: Flask, config: FeishuAuthConfig) -> FeishuAuthConfi
             if not config.access_db_path:
                 raise RuntimeError("飞书审批模式已启用但缺少申请存储路径（access_db_path）")
             store = AccessStore(config.access_db_path)
+            app.extensions["feishu_auth_store"] = store
         # Logged only when enabled: several tests import monitor_server in a
         # subprocess and assert on its exact stdout.
         _log(
@@ -930,7 +1017,7 @@ def install_feishu_auth(app: Flask, config: FeishuAuthConfig) -> FeishuAuthConfi
         if store is not None:
             via = user.get("via")
             if via is None:
-                via = "admin" if _is_admin(user) else "approved"
+                via = "admin" if _is_env_admin(user) else "approved"
             if via in ("approved", "guest") and not store.is_approved(
                 str(user.get("open_id") or "")
             ):
@@ -938,8 +1025,19 @@ def install_feishu_auth(app: Flask, config: FeishuAuthConfig) -> FeishuAuthConfi
                 return None
         return user
 
-    def _is_admin(user: dict[str, Any] | None) -> bool:
+    def _is_env_admin(user: dict[str, Any] | None) -> bool:
+        """Super admin from .env: never goes through the store, cannot be
+        demoted or revoked from the admin page."""
         return user is not None and _user_in(config.admin_users, user)
+
+    def _is_admin(user: dict[str, Any] | None) -> bool:
+        """.env admin, or an approved record promoted to role=admin. The
+        store is consulted per call so a demotion lands on the next request."""
+        if user is None:
+            return False
+        if _is_env_admin(user):
+            return True
+        return store is not None and store.is_admin(str(user.get("open_id") or ""))
 
     def _grant_session(user_info: dict[str, Any], via: str) -> None:
         session.permanent = True
@@ -960,7 +1058,9 @@ def install_feishu_auth(app: Flask, config: FeishuAuthConfig) -> FeishuAuthConfi
         )
 
     def _login_via(user_info: dict[str, Any]) -> str:
-        if _is_admin(user_info):
+        # Only .env admins get the store-exempt "admin" session; a promoted
+        # record logs in as "approved" so revoke/demote keep working per request.
+        if _is_env_admin(user_info):
             return "admin"
         if _user_in(config.allowed_users, user_info):
             return "allowlist"
@@ -1012,6 +1112,27 @@ def install_feishu_auth(app: Flask, config: FeishuAuthConfig) -> FeishuAuthConfi
             path=(config.public_prefix or "") + "/",
         )
         return response
+
+    # -- guest recovery link: "<guest_id>.<exp>.<hmac>", issued from the admin
+    # page so an approved guest who lost the cookie (logged out elsewhere, new
+    # browser, cleared storage) gets it back without a second approval --
+
+    def _guest_recover_token(guest_id: str) -> str:
+        exp = str(int(time.time()) + GUEST_RECOVER_TTL_SECONDS)
+        return f"{guest_id}.{exp}.{_sign(config.secret, f'guest-recover:{guest_id}:{exp}')}"
+
+    def _parse_guest_recover_token(raw: str) -> str:
+        parts = raw.split(".")
+        if len(parts) != 3:
+            return ""
+        guest_id, exp, digest = parts
+        if not guest_id.startswith("guest_") or not exp.isdigit():
+            return ""
+        if int(exp) <= time.time():
+            return ""
+        if not hmac.compare_digest(_sign(config.secret, f"guest-recover:{guest_id}:{exp}"), digest):
+            return ""
+        return guest_id
 
     def _resume_guest_session() -> bool:
         """Re-issue a session for an approved guest whose 72h session lapsed.
@@ -1234,6 +1355,18 @@ def install_feishu_auth(app: Flask, config: FeishuAuthConfig) -> FeishuAuthConfi
         if not config.approval_enabled:
             return jsonify({"error": "飞书审批模式未启用"}), 404
         assert store is not None
+        # A recovery link from the admin page re-attaches the cookie for an
+        # approved guest on this browser, then goes straight in.
+        recover_id = _parse_guest_recover_token((request.args.get("r") or "").strip())
+        if recover_id:
+            record = store.get(recover_id)
+            if record is not None and record["kind"] == KIND_GUEST and record["status"] == STATUS_APPROVED:
+                _grant_session({"open_id": recover_id, "name": record["name"]}, "guest")
+                store.touch_login(recover_id)
+                _log("guest_recovered", open_id=recover_id, name=record["name"])
+                return _attach_guest_cookie(redirect(config.public_prefix + "/"), recover_id)
+            _log("guest_recover_rejected", open_id=recover_id)
+            return _render_page(_GUEST_INVALID_HTML, config.public_prefix, status=403)
         # A returning guest is recognised by the long-lived cookie even when
         # the shared link has since been rotated.
         if _resume_guest_session():
@@ -1314,10 +1447,19 @@ def install_feishu_auth(app: Flask, config: FeishuAuthConfig) -> FeishuAuthConfi
         if error is not None:
             return error
         return jsonify({
-            "admin": {"open_id": user.get("open_id", ""), "name": user.get("name", "")},
+            "admin": {
+                "open_id": user.get("open_id", ""),
+                "name": user.get("name", ""),
+                "env_admin": _is_env_admin(user),
+            },
             "requests": store.list(),
             "guest_link": _guest_link(),
         })
+
+    def _record_is_env_admin(record: dict[str, Any]) -> bool:
+        # A .env admin may also have a row (applied before being listed);
+        # the page must not be able to reject/demote them through that row.
+        return _user_in(config.admin_users, {"open_id": record.get("open_id", "")})
 
     @app.post(ADMIN_API_PATH + "/guest-link/reset")
     def feishu_admin_reset_guest_link():
@@ -1331,6 +1473,27 @@ def install_feishu_auth(app: Flask, config: FeishuAuthConfig) -> FeishuAuthConfi
         _log("guest_link_reset", by=user.get("open_id", ""))
         return jsonify({"ok": True, "guest_link": _guest_link()})
 
+    @app.post(ADMIN_API_PATH + "/guest-link/recover")
+    def feishu_admin_guest_recover_link():
+        """Short-lived personal link for one approved guest (see 找回链接)."""
+        if not config.approval_enabled:
+            return jsonify({"error": "飞书审批模式未启用"}), 404
+        assert store is not None
+        user, error = _require_admin()
+        if error is not None:
+            return error
+        body = request.get_json(silent=True) or {}
+        open_id = str(body.get("open_id") or "").strip()
+        record = store.get(open_id) if open_id else None
+        if record is None or record["kind"] != KIND_GUEST:
+            return jsonify({"error": "没有找到该访客"}), 404
+        if record["status"] != STATUS_APPROVED:
+            return jsonify({"error": "只有已批准的访客才能生成找回链接"}), 409
+        link = f"{_public_base_url()}{GUEST_PAGE_PATH}?r={urllib.parse.quote(_guest_recover_token(open_id), safe='')}"
+        _log("guest_recover_link_issued", open_id=open_id, by=user.get("open_id", ""))
+        return jsonify({"ok": True, "recover_link": link,
+                        "expires_in_seconds": GUEST_RECOVER_TTL_SECONDS})
+
     @app.post(ADMIN_API_PATH + "/decide")
     def feishu_admin_decide():
         if not config.approval_enabled:
@@ -1343,8 +1506,30 @@ def install_feishu_auth(app: Flask, config: FeishuAuthConfig) -> FeishuAuthConfi
         open_id = str(body.get("open_id") or "").strip()
         action = str(body.get("action") or "").strip().lower()
         status = {"approve": STATUS_APPROVED, "reject": STATUS_REJECTED}.get(action)
-        if not open_id or status is None:
-            return jsonify({"error": "参数无效：需要 open_id 和 action=approve|reject"}), 400
+        role = {"promote": ROLE_ADMIN, "demote": ROLE_USER}.get(action)
+        if not open_id or (status is None and role is None):
+            return jsonify({"error": "参数无效：需要 open_id 和 action=approve|reject|promote|demote"}), 400
+        existing = store.get(open_id)
+        if existing is None:
+            return jsonify({"error": "没有找到该申请"}), 404
+        if action in ("reject", "demote") and _record_is_env_admin(existing):
+            _log("feishu_admin_denied", open_id=user.get("open_id", ""), path=request.path,
+                 reason="env_admin_target", target=open_id)
+            return jsonify({"error": ".env 里配置的管理员不能在这里撤销或降级"}), 403
+        if role is not None:
+            record = store.set_role(open_id, role, str(user.get("open_id") or ""))
+            if record is None:
+                return jsonify({"error": "只有已批准的用户才能设为管理员"}), 409
+            _log(
+                "feishu_access_role_changed",
+                open_id=open_id,
+                name=record["name"],
+                kind=record["kind"],
+                role=role,
+                decided_by=user.get("open_id", ""),
+            )
+            return jsonify({"ok": True, "request": record})
+        assert status is not None
         record = store.decide(open_id, status, str(user.get("open_id") or ""))
         if record is None:
             return jsonify({"error": "没有找到该申请"}), 404
@@ -1367,6 +1552,7 @@ def install_feishu_auth(app: Flask, config: FeishuAuthConfig) -> FeishuAuthConfi
                 "open_id": user.get("open_id", ""),
                 "name": user.get("name", ""),
                 "is_admin": _is_admin(user),
+                "env_admin": _is_env_admin(user),
                 "kind": KIND_GUEST if user.get("via") == "guest" else KIND_FEISHU,
             }
         payload: dict[str, Any] = {"enabled": config.enabled, "user": public}
@@ -1380,8 +1566,9 @@ def install_feishu_auth(app: Flask, config: FeishuAuthConfig) -> FeishuAuthConfi
         if config.enabled:
             session.pop(SESSION_KEY, None)
             session.pop(PENDING_SESSION_KEY, None)
-            if request.cookies.get(GUEST_COOKIE_NAME):
-                response.delete_cookie(GUEST_COOKIE_NAME, path=(config.public_prefix or "") + "/")
+            # The guest cookie is deliberately kept: it is the guest's only
+            # identity, and an approved guest must get back in after logging
+            # out until an admin revokes them (see _resume_guest_session).
         return response
 
     @app.route("/api/auth/check")
