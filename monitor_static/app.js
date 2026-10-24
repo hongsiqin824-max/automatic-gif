@@ -458,11 +458,12 @@ function metaText(data) {
   // A match that just left the Playing catalog is kept for a grace period so
   // the operator can still scrub back and clip the final minutes; say so
   // instead of showing a clock that will never move again. Past the grace it
-  // only stays while GIFs await publishing - show that count so the operator
-  // knows why it is still here and what is left to do.
+  // only stays while GIFs await the operator (unsent, or sent but failed) -
+  // show that count so the operator knows why it is still here and what is
+  // left to do.
   const pending = Number(data.pending_clips) || 0;
   const finishedLabel = pending
-    ? `已完赛 · ${pending} 条 GIF 待发布`
+    ? `已完赛 · ${pending} 条 GIF 待处理`
     : '已完赛 · 可回看截取';
   const clock = data.finished ? `<span class="finished-tag">${finishedLabel}</span>` : minute;
   return `<span>${escapeHtml(data.competition_name || '未知赛事')}</span><span>${clock}</span>`;
@@ -1647,7 +1648,7 @@ function matchMatchesSearch(data, needle) {
 }
 
 // A finished row past its grace exists only for its unpublished GIFs; it is
-// filed under the collapsed "已完赛待发布" section so the live list stays
+// filed under the collapsed "已完赛待处理" section so the live list stays
 // clean. Within the grace it stays in the main grid (the operator may still be
 // scrubbing back for a late goal).
 function isArchivedFinished(data) {
@@ -1700,7 +1701,7 @@ function renderFinishedSection(archived) {
     return;
   }
   const summary = $('finished-summary');
-  if (summary) summary.textContent = `已完赛待发布 (${archived.length})`;
+  if (summary) summary.textContent = `已完赛待处理 (${archived.length})`;
   archived.forEach((data) => grid.appendChild(buildMatchCard(data)));
   section.classList.remove('hidden');
   // A search that hits an archived match must not look like a miss: open the

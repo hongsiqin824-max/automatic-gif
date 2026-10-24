@@ -2009,10 +2009,56 @@ class FinishedMatchGraceTests(unittest.TestCase):
                 with mock.patch.object(monitor_server.match_catalog, "snapshot", return_value={"playing": []}):
                     rows = self._matches()
                     self.assertEqual(rows[0]["pending_clips"], 1)
+                    # Sent but not yet delivered: still the operator's problem.
                     queue.records_by_source_name.return_value = {
                         "clip_20261024-220000_aaaaaa.gif": {"status": "published"},
                         "clip_20261024-220100_bbbbbb.gif": {"status": "queued"},
                     }
+                    self.assertEqual(self._matches()[0]["pending_clips"], 1)
+                    # Draft mode ends in ``drafted``: delivered, nothing left.
+                    queue.records_by_source_name.return_value = {
+                        "clip_20261024-220000_aaaaaa.gif": {"status": "published"},
+                        "clip_20261024-220100_bbbbbb.gif": {"status": "drafted"},
+                    }
+                    self.assertEqual(self._matches(), [])
+
+    def test_failed_publish_keeps_finished_match_reachable(self):
+        """A GIF whose publish failed must keep its match listed.
+
+        The 立即重试 button is in the match's stage window. Had the failed record
+        counted as "done", the match would drop off the list 10 min after full
+        time with the GIF stranded: no retry, no re-capture (the buffer is
+        gone), and 放弃 refuses anything that has a record.
+        """
+        with TemporaryDirectory() as tmp:
+            clips = Path(tmp) / "54622319"
+            self._write_clip(clips, "clip_20261024-220000_aaaaaa.gif", {"event_key": "manual_1"})
+            queue = mock.Mock()
+            gone = {"running": False, "resource": None, "playlist_ready": False}
+            with self._real_pending(), \
+                 mock.patch.object(monitor_server, "_clip_dir", side_effect=lambda mid: Path(tmp) / mid), \
+                 mock.patch.object(monitor_server, "manual_draft_queue", queue), \
+                 mock.patch.object(monitor_server.live_preview, "status", return_value=gone), \
+                 mock.patch.object(self.memory, "grace_seconds", -1.0):
+                for status in ("queued", "publishing", "retry_wait", "failed"):
+                    queue.records_by_source_name.return_value = {
+                        "clip_20261024-220000_aaaaaa.gif": {"status": status, "retriable": status != "failed"},
+                    }
+                    with mock.patch.object(monitor_server.match_catalog, "snapshot", return_value={"playing": [dict(self.PLAYING)]}):
+                        self._matches()
+                    with mock.patch.object(monitor_server.match_catalog, "snapshot", return_value={"playing": []}):
+                        rows = self._matches()
+                    self.assertEqual([r["match_id"] for r in rows], ["54622319"], status)
+                    self.assertEqual(rows[0]["pending_clips"], 1, status)
+                    self.assertFalse(rows[0]["grace_active"], status)
+                # A restart re-seeds it from the sidecar as well.
+                memory = monitor_server._FinishedMatchMemory(600.0, retain=lambda mid: self.real_pending(mid) > 0)
+                self.assertEqual(monitor_server._seed_finished_matches_from_clips(memory, Path(tmp), time.time()), ["54622319"])
+                # Retry succeeded -> delivered -> gone.
+                queue.records_by_source_name.return_value = {
+                    "clip_20261024-220000_aaaaaa.gif": {"status": "published"},
+                }
+                with mock.patch.object(monitor_server.match_catalog, "snapshot", return_value={"playing": []}):
                     self.assertEqual(self._matches(), [])
 
     def test_stale_unpublished_gifs_stop_keeping_finished_match(self):

@@ -351,6 +351,10 @@ FINISHED_GRACE_SECONDS = positive_env_float("GIF_MONITOR_FINISHED_GRACE_SECONDS"
 # the GIF itself is never deleted here.
 PENDING_CLIP_MAX_AGE_SECONDS = positive_env_float("GIF_MONITOR_PENDING_CLIP_MAX_AGE_HOURS", 24.0) * 3600.0
 
+# Draft-record statuses that mean the GIF reached the CMS. Everything else
+# (queued, publishing, retry_wait, failed) still needs the operator.
+DELIVERED_CLIP_STATUSES = frozenset({"published", "drafted"})
+
 
 class _FinishedMatchMemory:
     """Remember matches that recently disappeared from the Playing catalog.
@@ -421,7 +425,14 @@ class _FinishedMatchMemory:
 
 
 def _pending_clip_count(match_id: str, now: float | None = None) -> int:
-    """GIFs of a match that are neither published (have a draft record) nor 放弃'd.
+    """GIFs of a match that still need the operator: not delivered, not 放弃'd.
+
+    "Delivered" means the draft record reached a terminal status (``published``
+    / ``drafted`` - the latter is what the default draft delivery mode ends
+    in). A record in ``queued`` / ``publishing`` / ``retry_wait`` / ``failed``
+    still counts: the 重试 button lives in this match's stage window, so a
+    publish that failed at full time must not make the match vanish and strand
+    the GIF with no way to retry it.
 
     Clips older than ``PENDING_CLIP_MAX_AGE_SECONDS`` no longer count: a goal
     GIF nobody sent within a day will not be sent, so the finished match stops
@@ -447,9 +458,12 @@ def _pending_clip_count(match_id: str, now: float | None = None) -> int:
     drafts: dict[str, Any] = {}
     if manual_draft_queue is not None:
         drafts = manual_draft_queue.records_by_source_name(match_id, artifact_kind=MANUAL_ARTIFACT_KIND)
-    return sum(
-        1 for gif in gifs if gif.name not in drafts and not _read_clip_meta(gif).get("discarded")
-    )
+
+    def delivered(name: str) -> bool:
+        record = drafts.get(name)
+        return record is not None and str(record.get("status") or "") in DELIVERED_CLIP_STATUSES
+
+    return sum(1 for gif in gifs if not delivered(gif.name) and not _read_clip_meta(gif).get("discarded"))
 
 
 finished_matches = _FinishedMatchMemory(
