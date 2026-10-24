@@ -822,6 +822,35 @@ class ArticlePublisherTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 article_publisher.article_channelsnew()
 
+    def test_tabs_follow_environment_as_array_field(self):
+        import os
+        import urllib.parse
+
+        import article_publisher
+
+        common = {
+            "match_id": "54478914",
+            "event": {"code": "G", "minute": "19", "score": "1-0"},
+            "gif_url": "https://matchgif.aisportsapp.com/publish-gifs/a.gif",
+            "cover_url": "https://matchgif.aisportsapp.com/publish-gif-covers/a.jpg",
+            "title": "t",
+        }
+        # Default (unset / empty) sends no tabs at all.
+        with patch.dict(os.environ, {"ARTICLE_TABS": ""}):
+            fields = build_article_fields(**common)
+        self.assertNotIn("tabs[]", fields)
+        self.assertNotIn("tabs", fields)
+        with patch.dict(os.environ, {"ARTICLE_TABS": " 1, 284 "}):
+            fields = build_article_fields(**common)
+        self.assertEqual(fields["tabs[]"], ["1", "284"])
+        # The platform wants PHP-style ``tabs[]=1&tabs[]=284``; the client
+        # encodes with doseq=True so each id becomes its own pair.
+        body = urllib.parse.urlencode(fields, doseq=True)
+        self.assertIn("tabs%5B%5D=1&tabs%5B%5D=284", body)
+        with patch.dict(os.environ, {"ARTICLE_TABS": "1,x"}):
+            with self.assertRaises(RuntimeError):
+                article_publisher.article_tabs()
+
     def test_channels_field_validated_and_omitted_when_empty(self):
         common = {
             "match_id": "54478914",

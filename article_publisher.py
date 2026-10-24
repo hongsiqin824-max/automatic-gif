@@ -61,6 +61,16 @@ def article_channelsnew() -> str:
     return ",".join(ids)
 
 
+def article_tabs() -> list[str]:
+    """Column ids (``tabs[]``) from ``ARTICLE_TABS``; empty = not sent."""
+    raw = os.environ.get("ARTICLE_TABS", "")
+    ids = [part.strip() for part in raw.split(",") if part.strip()]
+    for item in ids:
+        if not re.fullmatch(r"\d{1,20}", item):
+            raise RuntimeError("ARTICLE_TABS 必须是逗号分隔的数字栏目 id")
+    return ids
+
+
 LITPIC_SOURCES = frozenset({"gif", "cover"})
 
 
@@ -968,6 +978,7 @@ class ArticlePublisher:
             "archive_level": "B",
             "add_to_tab": article_add_to_tab(),
             "channelsnew": article_channelsnew() or None,
+            "tabs": ",".join(article_tabs()) or None,
             "channels_source": article_channels_source(),
             "type": "article",
             "style": "gif",
@@ -2100,6 +2111,11 @@ def build_article_fields(
     channelsnew = article_channelsnew()
     if channelsnew:
         fields["channelsnew"] = channelsnew
+    tabs = article_tabs()
+    if tabs:
+        # Platform expects PHP-style array params; urlencode(doseq=True) emits
+        # one ``tabs[]=id`` pair per element.
+        fields["tabs[]"] = tabs
     normalized_channels = str(channels or "").strip()
     if normalized_channels:
         if not re.fullmatch(r"\d{1,20}(,\d{1,20})*", normalized_channels):
@@ -2168,6 +2184,7 @@ def _draft_diagnostics(
             "add_to_tab",
             "channels",
             "channelsnew",
+            "tabs[]",
             "archive_id",
             "litpic",
             "user_id",
