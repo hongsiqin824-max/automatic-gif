@@ -648,6 +648,8 @@ class LivePreviewFrozenHistoryTests(unittest.TestCase):
 
     def test_operator_start_on_dead_same_source_relaunches_in_place(self):
         manager = self.manager
+        hook_calls = []
+        manager.on_restart = lambda match_id, resource: hook_calls.append((match_id, resource)) or None
         media = self._start_and_crash_first_run()
         dead_pid = manager.entries["m1"].process.pid
         # The operator (or the browser's self-heal) re-issues preview/start
@@ -662,11 +664,36 @@ class LivePreviewFrozenHistoryTests(unittest.TestCase):
         self.assertTrue(status["running"])
         self.assertTrue(status["history_frozen"])
         self.assertEqual(status["restart_count_total"], 1)
+        # An operator-driven relaunch is not a reaper retry: it neither
+        # consumes the backoff budget nor re-runs the on_restart hook (the
+        # caller has just resolved the resource itself).
+        self.assertEqual(entry.restart_count, 0)
+        self.assertEqual(entry.next_restart_at, 0.0)
+        self.assertFalse(entry.cooling)
+        self.assertEqual(hook_calls, [])
         # Same source, replacement alive: start() stays idempotent.
         pid = entry.process.pid
         manager.start("m1", "rtmp://host/s")
         self.assertEqual(manager.entries["m1"].process.pid, pid)
         self.assertTrue((media / "seg_00001.ts").is_file())
+
+    def test_operator_start_does_not_touch_reaper_backoff(self):
+        # Repeated manual refreshes while the source is dead must not push
+        # the entry into the reaper's cooling state.
+        manager = self.manager
+        manager.restart_max_retries = 2
+        self._start_and_crash_first_run()
+        manager._build_command = _dying_command_factory(
+            "rtmp://host/s: Connection refused\n", write_playlist=False
+        )
+        for _ in range(4):
+            manager.entries["m1"].process.wait(timeout=5)
+            manager.start("m1", "rtmp://host/s")
+        entry = manager.entries["m1"]
+        self.assertEqual(entry.restart_count_total, 4)
+        self.assertEqual(entry.restart_count, 0)
+        self.assertFalse(entry.cooling)
+        self.assertFalse(manager.status("m1")["auto_restart_cooling"])
 
     def test_start_with_new_source_is_a_clean_slate(self):
         manager = self.manager

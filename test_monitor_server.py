@@ -938,6 +938,67 @@ class StageCropMathTests(unittest.TestCase):
         self.assertAlmostEqual(self.run_js(f"applyCropDrag({start}, 'n', -5, -5)")["y"], 0.0)
 
 
+class StageSourceGapTests(unittest.TestCase):
+    """Run the pure source-gap helper from monitor_static/app.js under node.
+
+    After a source drop the relaunched ffmpeg appends to the same playlist,
+    so hls.js sees one fragment list with a hole in PROGRAM-DATE-TIME where
+    the dead air was. The 「结束」 range check uses this to explain why a
+    range that straddles the drop is too long.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.node = shutil.which("node")
+        if not cls.node:
+            raise unittest.SkipTest("node 不可用")
+        source = (Path(monitor_server.__file__).parent / "monitor_static" / "app.js").read_text(encoding="utf-8")
+        import re
+        const = re.search(r"^const SOURCE_GAP_MIN_SECONDS = [^;]+;", source, re.M)
+        func = re.search(r"^function sourceGapSecondsInFragments\([^)]*\) \{.*?^\}", source, re.M | re.S)
+        if const is None or func is None:
+            raise AssertionError("sourceGapSecondsInFragments / SOURCE_GAP_MIN_SECONDS missing from app.js")
+        cls.prelude = const.group(0) + "\n" + func.group(0)
+
+    def run_js(self, expr: str):
+        script = f"{self.prelude}\nprocess.stdout.write(JSON.stringify({expr}));"
+        result = subprocess.run([self.node, "-e", script], capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    @staticmethod
+    def _frags(*pdts_seconds: float, duration: float = 1.0) -> str:
+        return json.dumps([{"programDateTime": int(s * 1000), "duration": duration} for s in pdts_seconds])
+
+    def test_continuous_playlist_has_no_gap(self):
+        frags = self._frags(100, 101, 102, 103, 104)
+        self.assertEqual(self.run_js(f"sourceGapSecondsInFragments({frags}, 100000, 105000)"), 0)
+
+    def test_jitter_below_one_segment_is_ignored(self):
+        frags = self._frags(100, 101.2, 102.3, 103.1)
+        self.assertEqual(self.run_js(f"sourceGapSecondsInFragments({frags}, 100000, 104000)"), 0)
+
+    def test_hole_inside_range_is_counted(self):
+        # 102 -> 103 then nothing until 150: a 47s drop (40s rw_timeout + relaunch).
+        frags = self._frags(100, 101, 102, 150, 151)
+        self.assertAlmostEqual(self.run_js(f"sourceGapSecondsInFragments({frags}, 101000, 151000)"), 47.0)
+
+    def test_hole_outside_range_is_not_counted(self):
+        frags = self._frags(100, 101, 102, 150, 151, 152)
+        self.assertEqual(self.run_js(f"sourceGapSecondsInFragments({frags}, 150000, 153000)"), 0)
+        self.assertEqual(self.run_js(f"sourceGapSecondsInFragments({frags}, 100000, 103000)"), 0)
+
+    def test_hole_partially_inside_range_is_clipped(self):
+        frags = self._frags(100, 101, 102, 150, 151)
+        # Range ends 10s into the hole: only those 10s count.
+        self.assertAlmostEqual(self.run_js(f"sourceGapSecondsInFragments({frags}, 101000, 113000)"), 10.0)
+
+    def test_missing_pdt_and_short_lists_are_safe(self):
+        self.assertEqual(self.run_js("sourceGapSecondsInFragments([], 0, 1)"), 0)
+        self.assertEqual(self.run_js("sourceGapSecondsInFragments(null, 0, 1)"), 0)
+        self.assertEqual(self.run_js('sourceGapSecondsInFragments([{"duration":1},{"duration":1}], 0, 1)'), 0)
+
+
 class ClipEncodingTests(unittest.TestCase):
     def _make_segments(self, directory: Path, count: int) -> list:
         """Produce real 2-second MPEG-TS segments with ffmpeg for a true clip."""

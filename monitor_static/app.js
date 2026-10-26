@@ -1444,6 +1444,35 @@ async function setRangeStart() {
   }
 }
 
+// Seconds of dead air between startMs and endMs (PDT ms) in a fragment list:
+// a source drop leaves a hole where one fragment's PDT+duration does not meet
+// the next fragment's PDT (ffmpeg marks it EXT-X-DISCONTINUITY on relaunch).
+// Pure so it can be unit-tested; gaps under one segment are jitter, not drops.
+const SOURCE_GAP_MIN_SECONDS = 1.5;
+
+function sourceGapSecondsInFragments(fragments, startMs, endMs) {
+  if (!Array.isArray(fragments) || fragments.length < 2) return 0;
+  let gap = 0;
+  for (let i = 1; i < fragments.length; i++) {
+    const prev = fragments[i - 1];
+    const cur = fragments[i];
+    if (typeof prev.programDateTime !== 'number' || typeof cur.programDateTime !== 'number') continue;
+    const holeStart = prev.programDateTime + (prev.duration || 0) * 1000;
+    const holeEnd = cur.programDateTime;
+    if (holeEnd - holeStart < SOURCE_GAP_MIN_SECONDS * 1000) continue;
+    // Only the part of the hole that lies inside [startMs, endMs] counts.
+    const lo = Math.max(holeStart, startMs);
+    const hi = Math.min(holeEnd, endMs);
+    if (hi > lo) gap += (hi - lo) / 1000;
+  }
+  return gap;
+}
+
+function sourceGapSecondsBetween(video, startMs, endMs) {
+  const details = currentLevelDetails(video && video._hls);
+  return details ? sourceGapSecondsInFragments(details.fragments, startMs, endMs) : 0;
+}
+
 async function setRangeEndAndCapture(button) {
   const r = state.range;
   const video = state.stageVideoNode;
@@ -1453,7 +1482,14 @@ async function setRangeEndAndCapture(button) {
   const seconds = (endMs - r.startMs) / 1000;
   if (seconds < 0.5) { addStageNote('终点必须在起点之后，请往后播放再点「结束」', 'fail'); return; }
   if (seconds > state.clipRangeMaxSeconds) {
-    addStageNote(`区间 ${seconds.toFixed(1)}s 超过 ${state.clipRangeMaxSeconds}s 上限，请拖回一些再点「结束」`, 'fail');
+    // The range is wall-clock (PDT) time. If a source drop sits between the
+    // two points, the dead air counts too: say so, because "拖回一些" alone
+    // would send the operator hunting for footage that does not exist.
+    const gap = sourceGapSecondsBetween(video, r.startMs, endMs);
+    const hint = gap > 0
+      ? `；区间跨越了直播源中断，中间缺 ${Math.round(gap)}s 画面，请把终点放在中断前`
+      : '，请拖回一些再点「结束」';
+    addStageNote(`区间 ${seconds.toFixed(1)}s 超过 ${state.clipRangeMaxSeconds}s 上限${hint}`, 'fail');
     return;
   }
   const snapshot = {pinId: r.pinId, startMs: r.startMs, endMs};
@@ -2280,6 +2316,19 @@ function playerCanResume(video, playlistUrl) {
   return !!(nativeHls && video.src === absolute);
 }
 
+// What the stage is actually doing right after the source came back, for the
+// recovery note. A stage that was simply watching live stalls at the edge
+// during the drop and then plays straight on - it never "stops" anywhere.
+const STAGE_RESUME_LIVE_LAG_SECONDS = 10;
+
+function describeStageResume(video) {
+  if (!video) return '';
+  if (video.paused) return '，大窗处于暂停，点播放或「回到直播」';
+  const lag = liveLagSeconds(video);
+  if (lag != null && lag <= STAGE_RESUME_LIVE_LAG_SECONDS) return '，大窗已接着播放';
+  return '，画面停在中断处，点「回到直播」看最新';
+}
+
 function recoverPreview(matchId, status, options = {}) {
   const tile = state.tiles.get(matchId);
   if (!tile) return;
@@ -2338,7 +2387,7 @@ function recoverPreview(matchId, status, options = {}) {
       }
       message += pinned
         ? '，起点仍有效，画面已暂停在原位；截完后点「回到直播」'
-        : '，画面停在中断处，点「回到直播」看最新';
+        : describeStageResume(state.stageVideoNode);
     }
     $('stage-status').textContent = message;
     $('stage-status').className = 'stage-status ok';

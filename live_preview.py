@@ -271,7 +271,7 @@ class LivePreviewManager:
                 # history and any pinned start survive, instead of wiping the
                 # directory as a cold start would.
                 entry.last_access = time.time()
-                self._restart_entry_locked(match_id, time.time())
+                self._restart_entry_locked(match_id, time.time(), operator=True)
                 return self._status_locked(match_id)
             if entry is not None:
                 # The live source changed; restart against the new resource.
@@ -500,7 +500,15 @@ class LivePreviewManager:
                     continue
                 self._restart_entry_locked(match_id, now)
 
-    def _restart_entry_locked(self, match_id: str, now: float) -> None:
+    def _restart_entry_locked(self, match_id: str, now: float, *, operator: bool = False) -> None:
+        """Relaunch a dead ffmpeg into its existing directory.
+
+        ``operator=True`` is the ``start()`` path (the browser or the operator
+        re-asked for the same source): the caller has just (re)resolved the
+        resource itself, so the ``on_restart`` hook is skipped, and the relaunch
+        does not consume the reaper's retry budget (``restart_count`` /
+        ``next_restart_at`` / ``cooling`` stay as they are).
+        """
         entry = self.entries.get(match_id)
         if entry is None:
             return
@@ -528,7 +536,7 @@ class LivePreviewManager:
                 (directory / PREVIEW_PREV_LOG_NAME).write_bytes(prev_log)
             except OSError:
                 pass
-        if self.on_restart is not None:
+        if self.on_restart is not None and not operator:
             try:
                 replacement = self.on_restart(match_id, entry.resource)
             except Exception as exc:  # never let a hook stop the self-heal
@@ -558,18 +566,20 @@ class LivePreviewManager:
         entry.directory = directory
         entry.log_path = log_path
         entry.started_at = now
-        entry.restart_count += 1
         entry.restart_count_total += 1
-        entry.next_restart_at = now + delay
-        if entry.restart_count >= self.restart_max_retries:
-            entry.cooling = True
+        if not operator:
+            entry.restart_count += 1
+            entry.next_restart_at = now + delay
+            if entry.restart_count >= self.restart_max_retries:
+                entry.cooling = True
         _log_event(
             "preview_ffmpeg_restarted",
             match_id=match_id,
             pid=process.pid,
+            operator=operator,
             restart_count=entry.restart_count,
             restart_count_total=entry.restart_count_total,
-            next_retry_in_seconds=delay,
+            next_retry_in_seconds=None if operator else delay,
             cooling=entry.cooling,
         )
 
