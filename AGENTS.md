@@ -38,6 +38,13 @@ The first command runs all tests, the second catches syntax errors, and the
 third starts the local Dashboard at `http://127.0.0.1:8899`. Keep OCR packages
 in `tmp/ocr_venv`; do not commit `.env`, caches, downloaded media, or GIFs.
 
+## Configuration Changes (用户约定)
+
+Whenever a change adds, renames, or re-documents an environment variable,
+update **both** `.env.example` (committed) and the local `.env` (ignored) in
+the same step, at the matching location. The server `.env` is not touched by
+`deploy-gif`; call out in the summary that it must be edited there by hand.
+
 ## Style and Testing
 
 Use four-space indentation, `snake_case` Python names, focused functions, and

@@ -643,10 +643,25 @@ def _build_manual_draft_queue() -> "ArticleDraftQueue | None":
             ArticlePublisher,
             PublishedGifStore,
             RemoteGifUploadClient,
+            competition_publish_accounts,
             environment_boolean,
         )
         from publish_account_pool import PublishAccountPool
         from open_platform_client import OpenPlatformClient, OpenPlatformConfig
+
+        # Fixed author per competition (e.g. 英超/中超 -> 咪咕体育). A bad value
+        # must not take publishing down: log it and fall back to the pool.
+        try:
+            competition_accounts = competition_publish_accounts()
+        except RuntimeError as exc:
+            print(
+                json.dumps(
+                    {"event": "competition_publish_accounts_invalid", "error": str(exc)},
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+            competition_accounts = {}
 
         data_dir = ROOT / "data"
         gif_dir = Path(os.environ.get("ARTICLE_PUBLISH_GIF_DIR", str(data_dir / "published_gifs")))
@@ -681,6 +696,7 @@ def _build_manual_draft_queue() -> "ArticleDraftQueue | None":
                 else None
             ),
             account_pool=PublishAccountPool(accounts_path),
+            competition_accounts=competition_accounts,
         )
         queue = ArticleDraftQueue(
             database_path=publisher.database_path,

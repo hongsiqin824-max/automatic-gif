@@ -175,6 +175,60 @@ def article_body_footer(match_detail: dict[str, Any] | None) -> str:
     return footers.get(competition, "")
 
 
+DEFAULT_COMPETITION_PUBLISH_ACCOUNTS = "英超=12061720:咪咕体育;中超=12061720:咪咕体育"
+
+
+def competition_publish_accounts(raw: str | None = None) -> dict[str, dict[str, Any]]:
+    """Per-competition fixed author, from ``ARTICLE_COMPETITION_PUBLISH_ACCOUNTS``.
+
+    Format ``赛事名=user_id:user_name;赛事名=user_id:user_name`` keyed by the
+    catalog ``competition_name``. A matching competition is bound to this
+    account instead of drawing from the rotating pool. Empty value = no rule.
+    """
+    if raw is None:
+        raw = os.environ.get(
+            "ARTICLE_COMPETITION_PUBLISH_ACCOUNTS", DEFAULT_COMPETITION_PUBLISH_ACCOUNTS
+        )
+    accounts: dict[str, dict[str, Any]] = {}
+    for part in raw.split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            raise RuntimeError(
+                "ARTICLE_COMPETITION_PUBLISH_ACCOUNTS 每项必须是 赛事名=user_id:user_name，用 ; 分隔"
+            )
+        name, account_text = part.split("=", 1)
+        name = name.strip()
+        if ":" not in account_text:
+            raise RuntimeError(
+                "ARTICLE_COMPETITION_PUBLISH_ACCOUNTS 的账号必须是 user_id:user_name"
+            )
+        user_id_text, user_name = account_text.split(":", 1)
+        user_id = _positive_int(user_id_text)
+        user_name = user_name.strip()
+        if not name or user_id is None or not user_name:
+            raise RuntimeError(
+                "ARTICLE_COMPETITION_PUBLISH_ACCOUNTS 的赛事名、user_id（正整数）和 user_name 都不能为空"
+            )
+        accounts[name] = {"user_id": user_id, "user_name": user_name}
+    return accounts
+
+
+def competition_publish_account(
+    rules: dict[str, dict[str, Any]] | None, match_detail: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    """Fixed author for this match's competition; ``None`` when no rule applies."""
+    if not rules:
+        return None
+    detail = match_detail if isinstance(match_detail, dict) else {}
+    competition = str(detail.get("competition_name") or "").strip()
+    if not competition:
+        return None
+    account = rules.get(competition)
+    return dict(account) if account else None
+
+
 def _positive_int(value: Any) -> int | None:
     if isinstance(value, bool):
         return None
@@ -1063,6 +1117,7 @@ class ArticlePublisher:
         remote_upload_client: RemoteGifUploadClient | None = None,
         ocr_image_upload_client: OpenPlatformClient | None = None,
         account_pool: PublishAccountPool | None = None,
+        competition_accounts: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         self.platform_client = platform_client
         self.gif_store = gif_store
@@ -1080,6 +1135,14 @@ class ArticlePublisher:
         # uploader and its existing configuration.
         self.ocr_image_upload_client = ocr_image_upload_client
         self.account_pool = account_pool
+        # Competition -> fixed author. Consulted before the rotating pool on a
+        # match's first assignment only; opt-in per caller so the 8899
+        # Dashboard keeps its pool-only behaviour.
+        self.competition_accounts = (
+            {str(k): dict(v) for k, v in competition_accounts.items()}
+            if competition_accounts
+            else {}
+        )
         self._lock = threading.RLock()
         search = getattr(platform_client, "search_channels", None)
         if not callable(search):
@@ -1208,8 +1271,16 @@ class ArticlePublisher:
             return None
         return _public_record(row) if row else None
 
-    def _account_for_assignment(self, assignment_key: str) -> dict[str, Any]:
-        """Bind one logical article to one account before its first request."""
+    def _account_for_assignment(
+        self, assignment_key: str, match_detail: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Bind one logical article to one account before its first request.
+
+        A competition with a fixed author (``competition_accounts``) binds to
+        that account directly and never touches the rotating pool's balance.
+        An existing binding always wins, so a rule added mid-match does not
+        split one match across two authors.
+        """
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             existing = connection.execute(
@@ -1224,6 +1295,39 @@ class ArticlePublisher:
                 return {
                     "user_id": int(existing["user_id"]),
                     "user_name": str(existing["user_name"]),
+                }
+
+            fixed = competition_publish_account(self.competition_accounts, match_detail)
+            if fixed is not None:
+                connection.execute(
+                    """
+                    INSERT INTO article_publish_account_assignments (
+                        assignment_key, user_id, user_name, assigned_at_unix
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        assignment_key,
+                        int(fixed["user_id"]),
+                        str(fixed["user_name"]),
+                        time.time(),
+                    ),
+                )
+                print(
+                    json.dumps(
+                        {
+                            "event": "publish_account_fixed_by_competition",
+                            "assignment_key": assignment_key,
+                            "competition_name": (match_detail or {}).get("competition_name"),
+                            "user_id": int(fixed["user_id"]),
+                            "user_name": str(fixed["user_name"]),
+                        },
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
+                return {
+                    "user_id": int(fixed["user_id"]),
+                    "user_name": str(fixed["user_name"]),
                 }
 
             try:
@@ -1682,7 +1786,7 @@ class ArticlePublisher:
                 return previous
 
             publish_account = (
-                self._account_for_assignment(f"match:{match_id}")
+                self._account_for_assignment(f"match:{match_id}", match_detail)
                 if self.account_pool is not None
                 else None
             )
@@ -1860,7 +1964,7 @@ class ArticlePublisher:
                 and archive_id is None
                 and self.account_pool is not None
             ):
-                publish_account = self._account_for_assignment(assignment_key)
+                publish_account = self._account_for_assignment(assignment_key, match_detail)
             title = build_article_title(event, match_detail)
             fields = build_article_fields(
                 match_id=match_id,

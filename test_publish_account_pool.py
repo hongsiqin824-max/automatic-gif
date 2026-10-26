@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,6 +12,8 @@ from article_publisher import (
     ArticlePublisher,
     PublishedGifStore,
     build_article_fields,
+    competition_publish_account,
+    competition_publish_accounts,
 )
 from publish_account_pool import (
     DEFAULT_PUBLISH_ACCOUNTS,
@@ -149,7 +152,7 @@ class PublishAccountPoolTests(unittest.TestCase):
 
 
 class PublishAccountIntegrationTests(unittest.TestCase):
-    def make_publisher(self, root, platform, accounts):
+    def make_publisher(self, root, platform, accounts, competition_accounts=None):
         pool = PublishAccountPool(
             root / "publish_accounts.json",
             initial_accounts=accounts,
@@ -163,6 +166,7 @@ class PublishAccountIntegrationTests(unittest.TestCase):
             database_path=root / "publish.sqlite3",
             public_url_checker=lambda _url: None,
             account_pool=pool,
+            competition_accounts=competition_accounts,
         )
         return publisher, pool
 
@@ -289,6 +293,149 @@ class PublishAccountIntegrationTests(unittest.TestCase):
                 "user_id": account["user_id"],
                 "user_name": account["user_name"],
             })
+
+    def test_competition_publish_accounts_parse_default_and_env(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("ARTICLE_COMPETITION_PUBLISH_ACCOUNTS", None)
+            parsed = competition_publish_accounts()
+        self.assertEqual(parsed, {
+            "英超": {"user_id": 12061720, "user_name": "咪咕体育"},
+            "中超": {"user_id": 12061720, "user_name": "咪咕体育"},
+        })
+        with patch.dict(os.environ, {"ARTICLE_COMPETITION_PUBLISH_ACCOUNTS": " 西甲 = 42 : 账号丁 ; "}):
+            self.assertEqual(
+                competition_publish_accounts(),
+                {"西甲": {"user_id": 42, "user_name": "账号丁"}},
+            )
+        with patch.dict(os.environ, {"ARTICLE_COMPETITION_PUBLISH_ACCOUNTS": ""}):
+            self.assertEqual(competition_publish_accounts(), {})
+        for bad in ("英超", "英超=12061720", "英超=abc:咪咕", "=1:咪咕", "英超=1:"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(RuntimeError):
+                    competition_publish_accounts(bad)
+
+    def test_competition_publish_account_matches_exact_competition_name(self):
+        rules = {"英超": {"user_id": 12061720, "user_name": "咪咕体育"}}
+        self.assertEqual(
+            competition_publish_account(rules, {"competition_name": "英超"}),
+            {"user_id": 12061720, "user_name": "咪咕体育"},
+        )
+        for detail in ({"competition_name": "英冠"}, {"competition_name": ""}, {}, None):
+            with self.subTest(detail=detail):
+                self.assertIsNone(competition_publish_account(rules, detail))
+        self.assertIsNone(competition_publish_account({}, {"competition_name": "英超"}))
+        self.assertIsNone(competition_publish_account(None, {"competition_name": "英超"}))
+
+    def test_competition_rule_binds_fixed_author_without_touching_pool(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            accounts = [
+                {"user_id": 1001, "user_name": "账号甲", "enabled": True},
+                {"user_id": 1002, "user_name": "账号乙", "enabled": True},
+            ]
+            rules = {
+                "英超": {"user_id": 12061720, "user_name": "咪咕体育"},
+                "中超": {"user_id": 12061720, "user_name": "咪咕体育"},
+            }
+            platform = SequencePlatformClient()
+            publisher, _pool = self.make_publisher(root, platform, accounts, rules)
+            source = self.write_source(root)
+
+            # Two 英超/中超 matches, both via OCR path and the default path.
+            epl = publisher.create_or_update_article(
+                match_id="60000001",
+                event=self.event("goal-epl"),
+                match_detail={"competition_name": "英超"},
+                source_path=source,
+                delivery_mode="publish",
+            )
+            csl = publisher.publish(
+                match_id="60000002",
+                event=self.event("goal-csl"),
+                match_detail={"competition_name": "中超"},
+                source_path=source,
+                artifact_kind="default",
+            )
+            self.assertEqual(epl["publish_account"], {"user_id": 12061720, "user_name": "咪咕体育"})
+            self.assertEqual(csl["publish_account"], {"user_id": 12061720, "user_name": "咪咕体育"})
+
+            # Same match again -> same fixed author (binding persisted).
+            publisher.create_or_update_article(
+                match_id="60000001",
+                event=self.event("goal-epl-2"),
+                match_detail={"competition_name": "英超"},
+                source_path=source,
+                delivery_mode="publish",
+            )
+
+            # Other competitions still rotate through the pool, and the pool
+            # balance ignores the fixed author: two other matches land on 甲/乙
+            # once each rather than being skewed by the 咪咕 assignments.
+            other_ids = []
+            for index, name in enumerate(("英冠", "墨超")):
+                result = publisher.create_or_update_article(
+                    match_id=f"6000001{index}",
+                    event=self.event(f"goal-other-{index}"),
+                    match_detail={"competition_name": name},
+                    source_path=source,
+                    delivery_mode="publish",
+                )
+                other_ids.append(result["publish_account"]["user_id"])
+            self.assertEqual(sorted(other_ids), [1001, 1002])
+            self.assertEqual(
+                [call["user_id"] for call in platform.calls][:3],
+                [12061720, 12061720, 12061720],
+            )
+            self.assertTrue(all(call["user_name"] == "咪咕体育" for call in platform.calls[:3]))
+
+    def test_existing_pool_binding_wins_over_competition_rule(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            account = {"user_id": 1001, "user_name": "账号甲", "enabled": True}
+            platform = SequencePlatformClient()
+            publisher, _pool = self.make_publisher(root, platform, [account])
+            source = self.write_source(root)
+
+            # First article published before the rule existed.
+            publisher.create_or_update_article(
+                match_id="60000001",
+                event=self.event("goal-1"),
+                match_detail={"competition_name": "英超"},
+                source_path=source,
+                delivery_mode="publish",
+            )
+            # Rule introduced mid-match (e.g. deploy); same DB, new publisher.
+            publisher.competition_accounts = {
+                "英超": {"user_id": 12061720, "user_name": "咪咕体育"}
+            }
+            later = publisher.create_or_update_article(
+                match_id="60000001",
+                event=self.event("goal-2"),
+                match_detail={"competition_name": "英超"},
+                source_path=source,
+                delivery_mode="publish",
+            )
+
+            self.assertEqual([call["user_id"] for call in platform.calls], [1001, 1001])
+            self.assertEqual(later["publish_account"]["user_id"], 1001)
+
+    def test_publisher_without_competition_rules_ignores_competition(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            account = {"user_id": 1001, "user_name": "账号甲", "enabled": True}
+            platform = SequencePlatformClient()
+            publisher, _pool = self.make_publisher(root, platform, [account])
+            source = self.write_source(root)
+
+            result = publisher.create_or_update_article(
+                match_id="60000001",
+                event=self.event(),
+                match_detail={"competition_name": "英超"},
+                source_path=source,
+                delivery_mode="publish",
+            )
+
+            self.assertEqual(result["publish_account"]["user_id"], 1001)
 
     def test_default_publish_retry_keeps_original_account_after_pool_changes(self):
         temporary_error = OpenPlatformError(
