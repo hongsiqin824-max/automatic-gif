@@ -7,6 +7,7 @@ import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 
 from live_preview import LivePreviewManager
 
@@ -418,8 +419,8 @@ class LivePreviewAutoRestartTests(unittest.TestCase):
         self.assertEqual(status["last_exit_code"], 1)
         self.assertIsNotNone(status["last_exit_at_unix"])
         self.assertEqual(status["restart_count_total"], 1)
-        # The dying process's stderr is carried into the replacement's
-        # generation directory (the dead run's own files are kept frozen).
+        # The dying process's stderr is kept next to the replacement's log in
+        # the same directory (the dead run's playlist/segments stay in place).
         prev_log = manager.entries["m1"].directory / "ffmpeg.prev.log"
         self.assertTrue(prev_log.is_file())
         self.assertIn("Connection timed out", prev_log.read_text(encoding="utf-8"))
@@ -457,14 +458,41 @@ class LivePreviewAutoRestartTests(unittest.TestCase):
         self.assertFalse((manager.entries["m1"].directory / "ffmpeg.prev.log").exists())
 
 
+PLAYLIST_WITH_SEGMENTS = (
+    "#EXTM3U\n#EXT-X-VERSION:6\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:0\n"
+    "#EXTINF:1.000000,\n#EXT-X-PROGRAM-DATE-TIME:2026-10-26T11:50:03.374+0800\nseg_00000.ts\n"
+    "#EXTINF:1.000000,\n#EXT-X-PROGRAM-DATE-TIME:2026-10-26T11:50:04.374+0800\nseg_00001.ts\n"
+)
+
+
+def _dying_with_segments_factory():
+    """A child that writes a two-segment playlist and then dies (source dropped)."""
+
+    def _build(resource, directory):
+        playlist = directory / "index.m3u8"
+        script = (
+            "import pathlib, sys\n"
+            f"pathlib.Path(r'{playlist}').write_text({PLAYLIST_WITH_SEGMENTS!r}, encoding='utf-8')\n"
+            f"pathlib.Path(r'{directory / 'seg_00000.ts'}').write_bytes(b'ts')\n"
+            f"pathlib.Path(r'{directory / 'seg_00001.ts'}').write_bytes(b'ts')\n"
+            "sys.exit(1)\n"
+        )
+        return [sys.executable, "-c", script]
+
+    return _build
+
+
 class LivePreviewFrozenHistoryTests(unittest.TestCase):
     """A crashed ffmpeg must not take the ring buffer with it.
 
-    Scenario: the source stops at full time (or drops mid-match). Before, the
-    reaper wiped the media directory before relaunching, so the final minutes
-    vanished within seconds - exactly when the operator wants to scrub back
-    for a stoppage-time goal. Now the dead run's directory is served frozen
-    until the replacement has produced a playlist of its own.
+    Scenario: the source drops mid-match (or stops at full time). The
+    replacement ffmpeg is relaunched into the *same* directory so its
+    ``append_list`` continues the dead run's playlist: old segments, their
+    PROGRAM-DATE-TIME and the sequence numbers are kept and the join is marked
+    with EXT-X-DISCONTINUITY. The browser keeps one continuous timeline, the
+    operator can still scrub back past the gap, and a start pinned before the
+    drop stays clippable. Until the replacement appends a segment the history
+    is reported ``history_frozen``.
     """
 
     def setUp(self):
@@ -487,96 +515,169 @@ class LivePreviewFrozenHistoryTests(unittest.TestCase):
         self._tmp.cleanup()
 
     def _start_and_crash_first_run(self):
-        """g1 writes a playlist plus a segment, then its process dies."""
+        """The first run writes a playlist with two segments, then its process dies."""
         manager = self.manager
-        manager._build_command = _dying_command_factory()
+        manager._build_command = _dying_with_segments_factory()
         manager.start("m1", "rtmp://host/s")
         entry = manager.entries["m1"]
         entry.process.wait(timeout=5)
-        g1 = entry.directory
-        self.assertEqual(g1, manager.match_root("m1") / "g1")
-        self.assertTrue((g1 / "index.m3u8").is_file())
-        (g1 / "seg_00001.ts").write_bytes(b"ts")
-        return g1
+        media = entry.directory
+        self.assertEqual(media, manager.match_root("m1") / "g1")
+        self.assertTrue((media / "index.m3u8").is_file())
+        self.assertTrue((media / "seg_00001.ts").is_file())
+        return media
 
-    def test_relaunch_keeps_serving_frozen_history(self):
+    def test_dead_run_before_relaunch_is_clippable_not_frozen(self):
+        self._start_and_crash_first_run()
+        status = self.manager.status("m1")
+        self.assertFalse(status["running"])
+        self.assertTrue(status["playlist_ready"])
+        self.assertFalse(status["history_frozen"])
+
+    def test_relaunch_reuses_directory_and_freezes_history(self):
         manager = self.manager
-        g1 = self._start_and_crash_first_run()
-        # The replacement is alive but has not produced anything yet.
+        media = self._start_and_crash_first_run()
+        # The replacement is alive but has not appended anything yet.
         manager._build_command = _silent_command_factory()
         manager._reap_tick(time.time())
         entry = manager.entries["m1"]
-        self.assertEqual(entry.directory, manager.match_root("m1") / "g2")
-        self.assertEqual(manager.media_dir("m1"), g1)
-        self.assertTrue((g1 / "index.m3u8").is_file())
-        self.assertTrue((g1 / "seg_00001.ts").is_file())
+        self.assertEqual(entry.directory, media)
+        self.assertEqual(manager.media_dir("m1"), media)
+        self.assertEqual(entry.frozen_tail, "seg_00001.ts")
+        self.assertTrue((media / "index.m3u8").is_file())
+        self.assertTrue((media / "seg_00000.ts").is_file())
+        self.assertTrue((media / "seg_00001.ts").is_file())
+        self.assertEqual(sorted(p.name for p in manager.match_root("m1").iterdir()), ["g1"])
         status = manager.status("m1")
         self.assertTrue(status["running"])
         self.assertTrue(status["history_frozen"])
         self.assertFalse(status["playlist_ready"])
         self.assertEqual(status["resource"], "rtmp://host/s")
 
-    def test_promotion_once_replacement_has_playlist(self):
+    def test_history_resumes_once_replacement_appends_a_segment(self):
         manager = self.manager
-        g1 = self._start_and_crash_first_run()
+        media = self._start_and_crash_first_run()
         manager._build_command = _silent_command_factory()
         manager._reap_tick(time.time())
-        g2 = manager.entries["m1"].directory
-        (g2 / "index.m3u8").write_text("#EXTM3U", encoding="utf-8")
-        # status() promotes eagerly so the browser's keep-alive sees the
+        # A playlist rewrite that does not add a segment keeps it frozen.
+        (media / "index.m3u8").write_text(PLAYLIST_WITH_SEGMENTS + "\n", encoding="utf-8")
+        self.assertTrue(manager.status("m1")["history_frozen"])
+        # ffmpeg appends the first new segment after an EXT-X-DISCONTINUITY.
+        (media / "seg_00002.ts").write_bytes(b"ts")
+        (media / "index.m3u8").write_text(
+            PLAYLIST_WITH_SEGMENTS
+            + "#EXT-X-DISCONTINUITY\n#EXTINF:1.000000,\n"
+            "#EXT-X-PROGRAM-DATE-TIME:2026-10-26T11:50:23.405+0800\nseg_00002.ts\n",
+            encoding="utf-8",
+        )
+        # status() refreshes eagerly so the browser's keep-alive sees the
         # switch without waiting for the next reaper tick.
         status = manager.status("m1")
         self.assertFalse(status["history_frozen"])
         self.assertTrue(status["playlist_ready"])
-        self.assertEqual(manager.media_dir("m1"), g2)
-        self.assertFalse(g1.exists())
+        self.assertIsNone(manager.entries["m1"].frozen_tail)
+        # Old segments are untouched: the timeline is continuous.
+        self.assertTrue((media / "seg_00000.ts").is_file())
+        self.assertEqual(manager.media_dir("m1"), media)
+
+    def test_pdt_drift_after_relaunch_is_logged(self):
+        # An hlsenc build that re-stamps the old segments on append_list
+        # would silently break PDT-anchored clips; the manager must shout.
+        manager = self.manager
+        media = self._start_and_crash_first_run()
+        manager._build_command = _silent_command_factory()
+        manager._reap_tick(time.time())
+        entry = manager.entries["m1"]
+        self.assertEqual(entry.frozen_tail, "seg_00001.ts")
+        self.assertEqual(entry.frozen_tail_pdt, "2026-10-26T11:50:04.374+0800")
+        shifted = PLAYLIST_WITH_SEGMENTS.replace("11:50:03.374", "11:50:40.000").replace("11:50:04.374", "11:50:41.000")
+        (media / "seg_00002.ts").write_bytes(b"ts")
+        (media / "index.m3u8").write_text(
+            shifted + "#EXT-X-DISCONTINUITY\n#EXTINF:1.000000,\n"
+            "#EXT-X-PROGRAM-DATE-TIME:2026-10-26T11:50:42.000+0800\nseg_00002.ts\n",
+            encoding="utf-8",
+        )
+        with mock.patch("live_preview._log_event") as log_event:
+            self.assertFalse(manager.status("m1")["history_frozen"])
+        events = {call.args[0]: call.kwargs for call in log_event.call_args_list}
+        self.assertIn("preview_history_resumed", events)
+        self.assertEqual(
+            events["preview_pdt_drift"],
+            {"match_id": "m1", "segment": "seg_00001.ts",
+             "before": "2026-10-26T11:50:04.374+0800", "after": "2026-10-26T11:50:41.000+0800"},
+        )
+
+    def test_unchanged_pdt_after_relaunch_logs_no_drift(self):
+        manager = self.manager
+        media = self._start_and_crash_first_run()
+        manager._build_command = _silent_command_factory()
+        manager._reap_tick(time.time())
+        (media / "seg_00002.ts").write_bytes(b"ts")
+        (media / "index.m3u8").write_text(
+            PLAYLIST_WITH_SEGMENTS + "#EXT-X-DISCONTINUITY\n#EXTINF:1.000000,\n"
+            "#EXT-X-PROGRAM-DATE-TIME:2026-10-26T11:50:23.405+0800\nseg_00002.ts\n",
+            encoding="utf-8",
+        )
+        with mock.patch("live_preview._log_event") as log_event:
+            manager.status("m1")
+        names = [call.args[0] for call in log_event.call_args_list]
+        self.assertIn("preview_history_resumed", names)
+        self.assertNotIn("preview_pdt_drift", names)
 
     def test_repeated_failed_relaunches_never_touch_history(self):
         manager = self.manager
-        g1 = self._start_and_crash_first_run()
-        # Every relaunch dies before writing a playlist: the source is gone.
+        media = self._start_and_crash_first_run()
+        # Every relaunch dies before writing anything: the source is gone.
         manager._build_command = _dying_command_factory(
             "rtmp://host/s: Connection refused\n", write_playlist=False
         )
-        for generation in (2, 3, 4):
+        for _ in range(3):
             manager._reap_tick(time.time())
             entry = manager.entries["m1"]
-            self.assertEqual(entry.directory.name, f"g{generation}")
+            self.assertEqual(entry.directory, media)
             entry.process.wait(timeout=5)
-            self.assertEqual(manager.media_dir("m1"), g1)
-            self.assertTrue((g1 / "seg_00001.ts").is_file())
+            self.assertEqual(manager.media_dir("m1"), media)
+            self.assertTrue((media / "seg_00001.ts").is_file())
             self.assertTrue(manager.status("m1")["history_frozen"])
-        # Dead empty generations are dropped as they are replaced; only the
-        # frozen history and the newest attempt remain on disk.
-        names = sorted(p.name for p in manager.match_root("m1").iterdir())
-        self.assertEqual(names, ["g1", "g4"])
+            self.assertEqual(entry.frozen_tail, "seg_00001.ts")
         self.assertEqual(manager.status("m1")["last_exit_reason"], "rtmp://host/s: Connection refused")
-        # An explicit stop removes everything, frozen history included.
+        self.assertTrue((media / "ffmpeg.prev.log").is_file())
+        # An explicit stop removes everything, history included.
         manager.stop("m1")
         self.assertFalse(manager.match_root("m1").exists())
 
-    def test_operator_restart_wipes_all_generations(self):
+    def test_operator_start_on_dead_same_source_relaunches_in_place(self):
         manager = self.manager
-        g1 = self._start_and_crash_first_run()
+        media = self._start_and_crash_first_run()
+        dead_pid = manager.entries["m1"].process.pid
+        # The operator (or the browser's self-heal) re-issues preview/start
+        # for the same source while ffmpeg is dead: relaunch without wiping,
+        # so the buffered history and any pinned start survive.
         manager._build_command = _silent_command_factory()
-        manager._reap_tick(time.time())
-        self.assertTrue(g1.exists())
-        # Same resource, replacement still alive: start() stays idempotent and
-        # must not throw the frozen history away.
-        manager.start("m1", "rtmp://host/s")
-        self.assertEqual(manager.media_dir("m1"), g1)
-        self.assertTrue((g1 / "seg_00001.ts").is_file())
-        # Replacement dead too, operator re-issues preview/start: clean slate.
-        manager.entries["m1"].process.terminate()
-        manager.entries["m1"].process.wait(timeout=5)
-        manager._build_command = _stub_command_factory(None)
-        manager.start("m1", "rtmp://host/s")
+        status = manager.start("m1", "rtmp://host/s")
         entry = manager.entries["m1"]
-        self.assertEqual(entry.directory, manager.match_root("m1") / "g1")
-        self.assertEqual(entry.serve_dir, entry.directory)
-        self.assertEqual(entry.generation, 1)
-        self.assertFalse((g1 / "seg_00001.ts").exists())
-        self.assertFalse((manager.match_root("m1") / "g2").exists())
+        self.assertNotEqual(entry.process.pid, dead_pid)
+        self.assertEqual(entry.directory, media)
+        self.assertTrue((media / "seg_00001.ts").is_file())
+        self.assertTrue(status["running"])
+        self.assertTrue(status["history_frozen"])
+        self.assertEqual(status["restart_count_total"], 1)
+        # Same source, replacement alive: start() stays idempotent.
+        pid = entry.process.pid
+        manager.start("m1", "rtmp://host/s")
+        self.assertEqual(manager.entries["m1"].process.pid, pid)
+        self.assertTrue((media / "seg_00001.ts").is_file())
+
+    def test_start_with_new_source_is_a_clean_slate(self):
+        manager = self.manager
+        media = self._start_and_crash_first_run()
+        manager._build_command = _stub_command_factory(None)
+        manager.start("m1", "rtmp://host/other")
+        entry = manager.entries["m1"]
+        self.assertEqual(entry.directory, media)
+        self.assertIsNone(entry.frozen_tail)
+        self.assertEqual(entry.restart_count_total, 0)
+        self.assertFalse((media / "seg_00001.ts").exists())
 
 
 if __name__ == "__main__":

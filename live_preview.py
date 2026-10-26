@@ -52,9 +52,11 @@ def x264_preset_from_env(default: str = "veryfast") -> str:
 PREVIEW_X264_PRESET = x264_preset_from_env()
 PREVIEW_LIST_SIZE = 12
 PREVIEW_HEIGHT = 480
-# Previous ffmpeg stderr is copied here into the replacement's generation
-# directory on restart so the exit reason can be inspected after the fact.
+# Previous ffmpeg stderr is copied here (same directory) on restart so the
+# exit reason can be inspected after the fact.
 PREVIEW_PREV_LOG_NAME = "ffmpeg.prev.log"
+# Sub-directory of the per-match root that holds playlist + segments.
+PREVIEW_MEDIA_SUBDIR = "g1"
 
 
 def resolve_ffmpeg() -> str:
@@ -86,15 +88,25 @@ class _PreviewEntry:
     last_exit_code: int | None = None
     last_exit_reason: str | None = None
     last_exit_at: float | None = None
-    # Relaunch bookkeeping. Each ffmpeg run writes into its own generation
-    # directory (``directory``). After a crash the dead run's files are *not*
-    # wiped: ``serve_dir`` keeps pointing at that frozen playlist so the
-    # operator can still scrub and clip the history (e.g. the final minutes
-    # after the source stops at full time) while the replacement ffmpeg fills
-    # a new generation. Once the replacement has written a playlist it is
-    # promoted (``serve_dir = directory``) and the frozen files are removed.
-    serve_dir: Path | None = None
-    generation: int = 1
+    # Relaunch bookkeeping. Every ffmpeg run of this entry writes into the
+    # *same* directory: the HLS muxer's ``append_list`` reads the playlist the
+    # dead run left behind, keeps its segments (with their original
+    # PROGRAM-DATE-TIME), continues the sequence numbers and inserts an
+    # EXT-X-DISCONTINUITY before the first new segment. The browser therefore
+    # keeps one continuous timeline across a source drop: the operator can
+    # still scrub back past the gap and a start pinned before the drop stays
+    # valid. ``frozen_tail`` is the last segment name at relaunch time; while
+    # the playlist still ends with it the replacement has not delivered a
+    # single new segment yet and the history is "frozen" (served, scrubbable,
+    # clippable, but not advancing).
+    frozen_tail: str | None = None
+    # Raw PROGRAM-DATE-TIME of ``frozen_tail`` at relaunch time. The whole
+    # continuity scheme rests on ffmpeg's append_list re-emitting the old
+    # segments with their original PDT (verified on 8.1; older hlsenc builds
+    # are not guaranteed). When the history resumes, the tail's PDT is
+    # re-read and any change is logged as ``preview_pdt_drift`` so a bad
+    # ffmpeg build is visible in the server log instead of as mis-cut GIFs.
+    frozen_tail_pdt: str | None = None
 
 
 class LivePreviewManager:
@@ -152,24 +164,45 @@ class LivePreviewManager:
             self._reaper.start()
 
     def match_root(self, match_id: str) -> Path:
-        """Per-match directory holding one ``gN`` sub-directory per ffmpeg run."""
+        """Per-match directory; the playlist lives in its ``g1`` sub-directory."""
         return self.root / match_id
 
     def media_dir(self, match_id: str) -> Path:
         """Directory whose playlist/segments are served for this match.
 
-        Normally the running ffmpeg's generation directory. After a crash it
-        stays on the dead run's frozen files until the replacement has
-        produced a playlist, so history survives the relaunch.
+        One directory per match for the whole life of the entry: relaunches
+        append to the same playlist (see ``_PreviewEntry.frozen_tail``), so
+        history survives a source drop without any directory switch. The
+        ``g1`` name is historical (one directory per ffmpeg run) and is kept
+        so server-side tooling and docs stay valid.
         """
         with self.lock:
             entry = self.entries.get(match_id)
-            if entry is not None and entry.serve_dir is not None:
-                return entry.serve_dir
-        return self.match_root(match_id) / "g1"
+            if entry is not None:
+                return entry.directory
+        return self.match_root(match_id) / PREVIEW_MEDIA_SUBDIR
 
-    def _generation_dir(self, match_id: str, generation: int) -> Path:
-        return self.match_root(match_id) / f"g{generation}"
+    @staticmethod
+    def _playlist_entries(directory: Path) -> list[tuple[str, str | None]] | None:
+        """``(segment_name, raw PROGRAM-DATE-TIME)`` per listed segment.
+
+        ``None`` when there is no playlist at all; an empty list when the
+        playlist exists but lists no segment yet.
+        """
+        try:
+            lines = (directory / "index.m3u8").read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return None
+        entries: list[tuple[str, str | None]] = []
+        pdt: str | None = None
+        for line in lines:
+            line = line.strip()
+            if line.startswith("#EXT-X-PROGRAM-DATE-TIME:"):
+                pdt = line[len("#EXT-X-PROGRAM-DATE-TIME:"):]
+            elif line and not line.startswith("#"):
+                entries.append((line, pdt))
+                pdt = None
+        return entries
 
     def playlist_url(self, match_id: str) -> str:
         return f"preview/{urllib.parse.quote(match_id)}/index.m3u8"
@@ -229,21 +262,27 @@ class LivePreviewManager:
             raise ValueError("缺少可用的直播源地址")
         with self.lock:
             entry = self.entries.get(match_id)
-            if entry is not None and entry.process.poll() is None:
-                if entry.resource == resource:
+            if entry is not None and entry.resource == resource:
+                if entry.process.poll() is None:
                     entry.last_access = time.time()
                     return self._status_locked(match_id)
+                # Same source, ffmpeg dead (source dropped, or the reaper's
+                # backoff has not fired yet): relaunch in place so the buffered
+                # history and any pinned start survive, instead of wiping the
+                # directory as a cold start would.
+                entry.last_access = time.time()
+                self._restart_entry_locked(match_id, time.time())
+                return self._status_locked(match_id)
+            if entry is not None:
                 # The live source changed; restart against the new resource.
                 # Replacing is not a stop: the sibling resource (mediamtx
                 # path) was just (re)registered by the caller and the new
                 # ffmpeg is about to read from it, so do not release it.
                 self._stop_entry_locked(match_id, release_sibling=False)
-            else:
-                self._stop_entry_locked(match_id, release_sibling=False)
-            # An operator-driven (re)start is a clean slate: wipe every
-            # generation of this match and begin at g1.
+            # A cold start is a clean slate: wipe whatever this match left
+            # behind and begin a fresh playlist.
             shutil.rmtree(self.match_root(match_id), ignore_errors=True)
-            directory = self._generation_dir(match_id, 1)
+            directory = self.match_root(match_id) / PREVIEW_MEDIA_SUBDIR
             directory.mkdir(parents=True, exist_ok=True)
             log_path = directory / "ffmpeg.log"
             command = self._build_command(resource, directory)
@@ -265,8 +304,6 @@ class LivePreviewManager:
                 log_path=log_path,
                 started_at=now,
                 last_access=now,
-                serve_dir=directory,
-                generation=1,
             )
             return self._status_locked(match_id)
 
@@ -288,10 +325,10 @@ class LivePreviewManager:
         entry = self.entries.get(match_id)
         if entry is None:
             return {"running": False, "resource": None, "playlist_ready": False}
-        self._promote_locked(match_id, entry)
+        self._refresh_frozen_locked(match_id, entry)
         return_code = entry.process.poll()
         running = return_code is None
-        history_frozen = entry.serve_dir != entry.directory
+        history_frozen = entry.frozen_tail is not None
         playlist_ready = (
             not history_frozen and (entry.directory / "index.m3u8").is_file()
         )
@@ -302,9 +339,9 @@ class LivePreviewManager:
             "running": running,
             "resource": entry.resource,
             "playlist_ready": playlist_ready,
-            # True while a relaunched ffmpeg has not yet produced a playlist:
-            # the browser is still being served the previous run's frozen
-            # history (scrubbable and clippable, but no new frames arrive).
+            # True while a relaunched ffmpeg has not yet appended a new segment:
+            # the browser is still being served the previous run's history
+            # (scrubbable and clippable, but no new frames arrive).
             "history_frozen": history_frozen,
             "started_at_unix": entry.started_at,
             "return_code": return_code,
@@ -350,7 +387,7 @@ class LivePreviewManager:
         """Capture why the current process died; return its raw stderr.
 
         The raw log is handed back so the caller can re-write it as
-        ``ffmpeg.prev.log`` inside the replacement's generation directory.
+        ``ffmpeg.prev.log`` next to the replacement's log.
         """
         log_tail = self._read_log_tail(entry.log_path)
         reason = self._summarize_exit_reason(log_tail)
@@ -393,30 +430,44 @@ class LivePreviewManager:
                     process.wait(timeout=3)
                 except subprocess.TimeoutExpired:
                     pass
-        # Every generation (frozen history included) goes with the entry.
+        # The whole match directory (history included) goes with the entry.
         shutil.rmtree(self.match_root(match_id), ignore_errors=True)
 
-    def _promote_locked(self, match_id: str, entry: _PreviewEntry) -> None:
-        """Switch serving to the relaunched ffmpeg once it has a playlist.
+    def _refresh_frozen_locked(self, match_id: str, entry: _PreviewEntry) -> None:
+        """Clear the frozen flag once the relaunched ffmpeg has appended a segment.
 
-        Until then the previous run's frozen directory keeps being served so a
-        crash (or the source ending at full time) never erases the history the
-        operator may still want to scrub back into and clip.
+        Until then the previous run's playlist keeps being served unchanged so
+        a crash (or the source ending at full time) never erases the history
+        the operator may still want to scrub back into and clip.
         """
-        if entry.serve_dir == entry.directory:
+        if entry.frozen_tail is None:
             return
-        if not (entry.directory / "index.m3u8").is_file():
+        entries = self._playlist_entries(entry.directory)
+        if not entries or entries[-1][0] == entry.frozen_tail:
             return
-        frozen = entry.serve_dir
-        entry.serve_dir = entry.directory
-        if frozen is not None:
-            shutil.rmtree(frozen, ignore_errors=True)
+        tail = entries[-1][0]
+        frozen_name = entry.frozen_tail
+        old_pdt = entry.frozen_tail_pdt
+        new_pdt = next((pdt for name, pdt in entries if name == frozen_name), None)
+        entry.frozen_tail = None
+        entry.frozen_tail_pdt = None
         _log_event(
-            "preview_generation_promoted",
+            "preview_history_resumed",
             match_id=match_id,
-            generation=entry.generation,
-            dropped=str(frozen) if frozen is not None else None,
+            restart_count_total=entry.restart_count_total,
+            first_new_segment=tail,
         )
+        if old_pdt and new_pdt and old_pdt != new_pdt:
+            # The relaunched ffmpeg rewrote the old segments' timestamps:
+            # scrubbing still works but PDT-anchored clips of the history
+            # would be cut at the wrong moment. Loud, so it is noticed.
+            _log_event(
+                "preview_pdt_drift",
+                match_id=match_id,
+                segment=frozen_name,
+                before=old_pdt,
+                after=new_pdt,
+            )
 
     def _reap_loop(self) -> None:
         while not self._stop.wait(5.0):
@@ -432,7 +483,7 @@ class LivePreviewManager:
                 if now - entry.last_access > self.idle_timeout_seconds:
                     self._stop_entry_locked(match_id)
                     continue
-                self._promote_locked(match_id, entry)
+                self._refresh_frozen_locked(match_id, entry)
                 if not self.auto_restart:
                     continue
                 if return_code is None:
@@ -458,14 +509,20 @@ class LivePreviewManager:
             self.restart_max_delay,
         )
         prev_log = self._record_exit_locked(match_id, entry, entry.process.poll(), now)
-        if entry.directory != entry.serve_dir:
-            # The previous relaunch never produced a playlist (its stderr was
-            # just captured above); drop that empty generation. The frozen
-            # history in ``serve_dir`` is deliberately left untouched.
-            shutil.rmtree(entry.directory, ignore_errors=True)
-        entry.generation += 1
-        directory = self._generation_dir(match_id, entry.generation)
+        directory = entry.directory
         directory.mkdir(parents=True, exist_ok=True)
+        # Relaunch into the same directory: ffmpeg's ``append_list`` picks the
+        # old playlist up, keeps its segments and sequence numbers and marks
+        # the join with EXT-X-DISCONTINUITY (verified: old PDTs are preserved
+        # byte for byte). Until a new segment lands the history is frozen.
+        if entry.frozen_tail is None:
+            entries = self._playlist_entries(directory)
+            if entries is None:
+                entry.frozen_tail = None
+            elif entries:
+                entry.frozen_tail, entry.frozen_tail_pdt = entries[-1]
+            else:
+                entry.frozen_tail, entry.frozen_tail_pdt = "", None
         if prev_log:
             try:
                 (directory / PREVIEW_PREV_LOG_NAME).write_bytes(prev_log)

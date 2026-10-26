@@ -243,6 +243,59 @@ class ClipPinStoreTests(unittest.TestCase):
             finally:
                 store.shutdown()
 
+    def test_reaper_absorbs_live_playlist_without_a_clip_request(self):
+        # Source drops right after the operator sets a start: the segments
+        # written in between must be linked by the timer, so they survive the
+        # relaunched ffmpeg rolling them out before 「结束」 is clicked.
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            base = 1_000_000.0
+            early = self._segments(directory, base, 4)  # [base, base+8)
+            store = monitor_server._ClipPinStore(ttl_seconds=60.0, max_range_seconds=10.0)
+            with mock.patch.object(monitor_server, "_clip_dir", return_value=directory / "clips"):
+                pin = store.create("1", base + 6.0, early)
+            self.assertEqual(sorted(pin["segments"]), ["seg_00002.ts", "seg_00003.ts"])
+            live = {"segments": early}
+            store.start_reaper(interval_seconds=0.01, live_segments_for=lambda match_id: live["segments"])
+            try:
+                live["segments"] = self._segments(directory, base, 12)
+                deadline = time.time() + 2.0
+                while "seg_00008.ts" not in pin["segments"] and time.time() < deadline:
+                    time.sleep(0.01)
+                self.assertIn("seg_00008.ts", pin["segments"])
+                self.assertNotIn("seg_00009.ts", pin["segments"])
+                # The links outlive the originals being rolled out of the window.
+                for path, _d, _p in live["segments"]:
+                    path.unlink()
+                merged = store.merged_segments(pin, [])
+                self.assertEqual(len(merged), 7)
+                for path, _d, _p in merged:
+                    self.assertTrue(path.is_file(), path)
+            finally:
+                store.shutdown()
+
+    def test_absorb_all_skips_dead_pins_and_broken_readers(self):
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            base = 1_000_000.0
+            segments = self._segments(directory, base, 4)
+            store = monitor_server._ClipPinStore(ttl_seconds=60.0, max_range_seconds=10.0)
+            with mock.patch.object(monitor_server, "_clip_dir", return_value=directory / "clips"):
+                pin = store.create("1", base + 6.0, segments)
+                other = store.create("2", base + 6.0, segments)
+
+            def reader(match_id):
+                if match_id == "2":
+                    raise OSError("playlist unreadable")
+                return self._segments(directory, base, 12)
+
+            store.release(other["pin_id"])
+            self.assertEqual(store.absorb_all(reader), 1)
+            self.assertIn("seg_00008.ts", pin["segments"])
+            # Nothing new on the second pass.
+            self.assertEqual(store.absorb_all(reader), 0)
+            store.shutdown()
+
     def test_sweep_orphans_removes_leftover_pin_dirs_only(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)

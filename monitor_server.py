@@ -92,6 +92,9 @@ CLIP_BEFORE_SECONDS = positive_env_float("GIF_MONITOR_CLIP_SECONDS", 10.0)
 # a chosen start stays pinned (segments hard-linked) while the end is picked.
 CLIP_RANGE_MAX_SECONDS = positive_env_float("GIF_MONITOR_CLIP_RANGE_MAX_SECONDS", 30.0)
 CLIP_PIN_TTL_SECONDS = positive_env_float("GIF_MONITOR_CLIP_PIN_TTL_SECONDS", 180.0)
+# How often live pins re-scan the playlist to hard-link segments written after
+# the start was set (see _ClipPinStore.absorb_all).
+CLIP_PIN_ABSORB_INTERVAL_SECONDS = positive_env_float("GIF_MONITOR_CLIP_PIN_ABSORB_INTERVAL_SECONDS", 5.0)
 CLIP_GIF_WIDTH = positive_env_int("GIF_MONITOR_CLIP_WIDTH", 440)
 # 50/3 ≈ 16.67, matching the automatic pipeline's GIF frame rate. Float rather
 # than int so a non-integer rate like this one is expressible here and in .env.
@@ -1309,8 +1312,19 @@ class _ClipPinStore:
         with self._lock:
             self._expire_locked(time.time())
 
-    def start_reaper(self, interval_seconds: float | None = None) -> None:
-        """Expire pins on a timer so an abandoned start does not live until exit."""
+    def start_reaper(
+        self,
+        interval_seconds: float | None = None,
+        live_segments_for: "Callable[[str], list[tuple[Path, float, float | None]]] | None" = None,
+    ) -> None:
+        """Expire pins on a timer and keep absorbing the live playlist.
+
+        ``live_segments_for`` (match_id -> current playlist segments) makes
+        every tick hard-link the segments written *after* the pin was set, so
+        a start chosen just before the source drops keeps its footage even if
+        the relaunched ffmpeg later rolls those segments out of the window
+        before the operator clicks 「结束」.
+        """
         if self._reaper is not None:
             return
         interval = max(1.0, interval_seconds if interval_seconds is not None else self.ttl_seconds)
@@ -1318,9 +1332,35 @@ class _ClipPinStore:
         def _run() -> None:
             while not self._stop.wait(interval):
                 self.expire()
+                if live_segments_for is not None:
+                    self.absorb_all(live_segments_for)
 
         self._reaper = threading.Thread(target=_run, name="clip-pin-reaper", daemon=True)
         self._reaper.start()
+
+    def absorb_all(self, live_segments_for: "Callable[[str], list[tuple[Path, float, float | None]]]") -> int:
+        """Absorb the current playlist into every live pin; return pins touched."""
+        with self._lock:
+            by_match: dict[str, list[dict[str, Any]]] = {}
+            for pin in self._pins.values():
+                by_match.setdefault(pin["match_id"], []).append(pin)
+        touched = 0
+        for match_id, pins in by_match.items():
+            try:
+                segments = live_segments_for(match_id)
+            except Exception:  # noqa: BLE001 - a bad playlist must not stop the reaper
+                continue
+            if not segments:
+                continue
+            with self._lock:
+                for pin in pins:
+                    if pin["pin_id"] not in self._pins:
+                        continue
+                    before = len(pin["segments"])
+                    self._absorb_locked(pin, segments)
+                    if len(pin["segments"]) != before:
+                        touched += 1
+        return touched
 
     def _expire_locked(self, now: float) -> None:
         for pin_id in [k for k, p in self._pins.items() if now - p["created_at"] > self.ttl_seconds]:
@@ -1412,8 +1452,13 @@ atexit.register(clip_pins.shutdown)
 # Pins from a previous process are useless (their ids are gone); sweep the
 # hard-link dirs a crash left behind, then keep expiring on a timer so a start
 # the operator abandoned is freed within one TTL instead of at process exit.
+# The same tick keeps absorbing the live playlist (every 5s, well under the 1s
+# segment × window) so a start set before a source drop stays clippable.
 _ClipPinStore.sweep_orphans(CLIP_OUTPUT_ROOT)
-clip_pins.start_reaper()
+clip_pins.start_reaper(
+    CLIP_PIN_ABSORB_INTERVAL_SECONDS,
+    live_segments_for=lambda match_id: _read_playlist_segments(live_preview.media_dir(match_id)),
+)
 
 
 def _seed_finished_matches_from_clips(memory: _FinishedMatchMemory, root: Path, now: float) -> list[str]:

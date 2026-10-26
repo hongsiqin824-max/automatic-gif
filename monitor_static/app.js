@@ -2233,12 +2233,16 @@ function markPreviewDown(matchId, status) {
     : cooling ? '直播源中断，后台持续重连中…' : '直播源中断，正在自动重连…';
   const reason = describeExitReason(status);
   if (reason && !finished) message += `（${reason}）`;
-  // The server keeps the dead run's playlist frozen on disk, so the operator
-  // can still scrub back into and clip the last minutes (a stoppage-time goal
-  // right before the source stops at full time is the typical case).
+  // The server keeps the dead run's playlist on disk and relaunches ffmpeg
+  // into the same one, so the operator can still scrub back into and clip
+  // the last minutes, and a start set before the drop stays valid.
   // playlist_ready covers "died, not relaunched yet"; history_frozen covers
-  // "relaunched, replacement has not produced a playlist yet".
-  if (status && (status.history_frozen || status.playlist_ready)) message += '，已缓存画面仍可回看、截取';
+  // "relaunched, replacement has not appended a segment yet".
+  if (status && (status.history_frozen || status.playlist_ready)) {
+    message += state.stageMatchId === matchId && state.range.pinId != null
+      ? '，已缓存画面仍可回看、截取，起点保留'
+      : '，已缓存画面仍可回看、截取';
+  }
   const el = document.querySelector(`.tile[data-match-id="${matchId}"]`);
   if (el) {
     const overlay = el.querySelector('.tile-overlay');
@@ -2251,7 +2255,26 @@ function markPreviewDown(matchId, status) {
   }
 }
 
-function recoverPreview(matchId, status) {
+// True when the player already attached to `video` can simply keep going
+// after a source drop: the server relaunches ffmpeg into the same playlist
+// (segments, PDT and sequence numbers preserved, EXT-X-DISCONTINUITY at the
+// join), so hls.js only has to see the next playlist refresh. Rebuilding it
+// would throw away the buffered history and the operator's playhead - which
+// is exactly what used to lose a GIF whose start was set before the drop.
+function playerCanResume(video, playlistUrl) {
+  if (!video || !playlistUrl) return false;
+  if (video._whep) return false;
+  let absolute;
+  try { absolute = new URL(playlistUrl, window.location.href).href; } catch (e) { return false; }
+  const hls = video._hls;
+  // hls.js stores the manifest URL it was given as an absolute URL.
+  if (hls) return hls.media === video && hls.url === absolute;
+  // Safari native HLS: same src, the element keeps polling the playlist.
+  const nativeHls = !(window.Hls && window.Hls.isSupported()) && video.canPlayType('application/vnd.apple.mpegurl');
+  return !!(nativeHls && video.src === absolute);
+}
+
+function recoverPreview(matchId, status, options = {}) {
   const tile = state.tiles.get(matchId);
   if (!tile) return;
   tile.down = false;
@@ -2260,10 +2283,29 @@ function recoverPreview(matchId, status) {
   const overlay = el ? el.querySelector('.tile-overlay') : null;
   if (overlay && !staged) overlay.classList.add('hidden');
   const video = videoForMatch(matchId);
-  if (video) {
-    // The stage keeps its own HLS player when the tile is on WebRTC; only
-    // re-attach the element that actually belongs to this tile.
-    const target = staged && state.stageOwnVideo ? tileVideoEl(matchId) : video;
+  // The stage keeps its own HLS player when the tile is on WebRTC; the
+  // element that belongs to this tile's playback is then the grid one. The
+  // stage's own player is never touched here: it is polling the same
+  // playlist and simply resumes.
+  const stageOwn = staged && state.stageOwnVideo;
+  const target = stageOwn ? tileVideoEl(matchId) : video;
+  const playlistUrl = status && status.playlist_url ? status.playlist_url : tile.playlistUrl;
+  const wantsWebrtc = !!(status && status.webrtc && status.whep_url);
+  // options.fresh: the server started a brand-new playlist (cold start after
+  // its entry was gone), whose sequence numbers restart at 0 - hls.js must be
+  // re-attached rather than left on a playlist that jumped backwards.
+  let resumed = false;
+  if (target && !options.fresh && !wantsWebrtc && playerCanResume(target, playlistUrl)) {
+    resumed = true;
+    const targetOnStage = staged && !stageOwn;
+    if (!targetOnStage) {
+      // Nobody is scrubbing a grid tile: catch up to the live edge instead of
+      // sitting behind by the length of the outage.
+      if (target.paused) target.play().catch(() => {});
+      seekToLive(target);
+    }
+    console.log(`[PREVIEW] ${matchId} | 直播源恢复，播放器续用（${targetOnStage ? '大窗停在原位' : '小窗跳到直播'}）`);
+  } else if (target) {
     const hls = startTilePlayback(matchId, target, status, (text, cls) => {
       setTileStatus(matchId, text, cls);
       if (cls === 'fail' && overlay) {
@@ -2272,12 +2314,26 @@ function recoverPreview(matchId, status) {
         tile.down = true;
       }
     });
-    if (staged && !state.stageOwnVideo) state.stageHls = hls;
+    if (staged && !stageOwn) state.stageHls = hls;
   }
   const total = status && status.restart_count_total;
-  const message = total ? `直播源已恢复（本场累计重连 ${total} 次）` : '直播源已恢复';
+  let message = total ? `直播源已恢复（本场累计重连 ${total} 次）` : '直播源已恢复';
   setTileStatus(matchId, message, 'ok');
   if (staged) {
+    if (stageOwn || resumed) {
+      const pinned = state.range.pinId != null;
+      // With a start pinned before the drop, hls.js would otherwise play
+      // straight on into the post-outage footage and the operator's 「结束」
+      // would land past the gap (range rejected as too long, or a GIF that
+      // jumps). Hold the frame so "停在原位" is literally true; 「回到直播」
+      // resumes.
+      if (pinned && state.stageVideoNode && !state.stageVideoNode.paused) {
+        state.stageVideoNode.pause();
+      }
+      message += pinned
+        ? '，起点仍有效，画面已暂停在原位；截完后点「回到直播」'
+        : '，画面停在中断处，点「回到直播」看最新';
+    }
     $('stage-status').textContent = message;
     $('stage-status').className = 'stage-status ok';
     addStageNote(message, 'ok');
@@ -2303,10 +2359,10 @@ function keepAlivePreviews() {
         const current = state.tiles.get(matchId);
         if (!current || !status) return;
         if (status.running === false || status.history_frozen) {
-          // history_frozen: a relaunched ffmpeg is alive but has not produced
-          // a playlist yet (still connecting, or the source is gone for good);
-          // the tile is being served the previous run's frozen history, so
-          // keep it marked down until the replacement actually delivers.
+          // history_frozen: a relaunched ffmpeg is alive but has not appended
+          // a segment yet (still connecting, or the source is gone for good);
+          // the tile is being served the previous run's history, so keep it
+          // marked down until the replacement actually delivers.
           markPreviewDown(matchId, status);
           // resource === null means the server has no entry for this match at
           // all (process restart, 90s idle reap, or a stop sent by another
@@ -2332,7 +2388,9 @@ async function restartTilePreview(matchId) {
     });
     if (!state.tiles.get(matchId)) return;
     tile.playlistUrl = data.playlist_url;
-    recoverPreview(matchId, data);
+    // restart_count_total > 0 means the server relaunched into the existing
+    // playlist (history kept); 0 means a cold start with a fresh playlist.
+    recoverPreview(matchId, data, {fresh: !(data.restart_count_total > 0)});
   } catch (error) {
     // Leave the tile in its "down" state; the next keepAlive tick retries.
     setTileStatus(matchId, '重新拉起直播失败：' + error.message, 'warn');
