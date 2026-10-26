@@ -672,11 +672,14 @@ class ClipRetryTests(unittest.TestCase):
         self.assertEqual(delays, tuple(sorted(delays)))
 
     def test_catalog_refresh_matches_list_poll_so_new_kickoffs_show_within_two_minutes(self):
-        # List page polls every 60s; a 60s lazy catalog refresh bounds a new
-        # Playing row at ~120s worst case. The 8899 dashboard has its own copy.
+        # List page polls every 60s; a lazy catalog refresh just under that
+        # bounds a new Playing row at ~2 minutes worst case without the two
+        # periods beating (an early-by-ms poll at exactly 60s would skip a
+        # pull). The 8899 dashboard has its own copy.
         import match_catalog
 
-        self.assertEqual(match_catalog.MATCH_CATALOG_REFRESH_SECONDS, 60.0)
+        self.assertEqual(match_catalog.MATCH_CATALOG_REFRESH_SECONDS, 55.0)
+        self.assertLess(match_catalog.MATCH_CATALOG_REFRESH_SECONDS, 60.0)
         self.assertGreater(match_catalog.MATCH_CATALOG_REFRESH_SECONDS, max(match_catalog.MATCH_CATALOG_BACKOFF_SECONDS))
 
     def test_image_gateway_error_message_says_it_auto_retries(self):
@@ -695,6 +698,20 @@ class ClipRetryTests(unittest.TestCase):
             "official_image_upload", "Not login", platform_code=300002, publishing=True,
         )
         self.assertIn("Not login", other)
+
+    def test_image_gateway_error_message_stops_promising_retry_once_budget_is_spent(self):
+        # The terminal row shows a manual 立即重试 button; the text next to it
+        # must not still claim the system will retry on its own.
+        from article_draft_queue import _friendly_draft_error
+
+        final = _friendly_draft_error(
+            "official_image_upload", "内部接口调用失败",
+            platform_code=50001, publishing=True, will_retry=False, attempts=6,
+        )
+        self.assertNotIn("系统会自动重试", final)
+        self.assertIn("已自动重试 6 次", final)
+        self.assertIn("手动重试", final)
+        self.assertIn("code=50001", final)
 
 
 class ClipDiscardTests(unittest.TestCase):

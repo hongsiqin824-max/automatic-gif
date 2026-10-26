@@ -5,6 +5,8 @@ const WORKSHOP_IDLE_MS = 90000;
 // After a capture succeeds, hold the tile's status line this long before
 // routine player chatter (FRAG_BUFFERED etc.) may overwrite it.
 const TILE_STATUS_STICKY_MS = 5000;
+// How often a workshop tile that found no live source re-asks for one.
+const NO_SOURCE_RETRY_MS = 30000;
 
 const state = {
   tiles: new Map(),      // match_id -> {data, hls, playlistReady, statusTimer}
@@ -19,6 +21,7 @@ const state = {
   // "目录 Ns 前更新" ticker next to the health pill.
   catalogUpdatedAt: null,
   catalogRefreshSeconds: 60,
+  catalogHealthy: false,
   // Mirrors GIF_MONITOR_CATCHUP_ENABLED; false disables tile speed-up and auto seek.
   catchupEnabled: true,
   // Operator-chosen [start, end] range on the stage. ``pinId`` is the server
@@ -558,12 +561,14 @@ async function startTilePreview(matchId) {
   if (!el) return;
   const video = el.querySelector('.tile-video');
   const overlay = el.querySelector('.tile-overlay');
+  tile.starting = true;
   setTileStatus(matchId, '正在拉起直播…');
   try {
     const data = await requestJson('api/monitor/preview/start', {
       method: 'POST', body: JSON.stringify({match_id: matchId}),
     });
     tile.playlistUrl = data.playlist_url;
+    tile.noSourceSince = null;
     overlay.classList.add('hidden');
     el.classList.remove('no-source');
     startTilePlayback(matchId, video, data, (text, cls) => {
@@ -580,7 +585,14 @@ async function startTilePreview(matchId) {
     const noSource = /直播源/.test(error.message);
     overlay.textContent = noSource ? '该比赛暂无直播源' : '直播源加载失败';
     if (noSource) el.classList.add('no-source'); else el.classList.remove('no-source');
+    // Remember when the source was last found missing so keepAlivePreviews
+    // can re-ask every NO_SOURCE_RETRY_MS: the platform often attaches the
+    // stream a few minutes after kick-off, and nothing else ever re-tries a
+    // tile that has no playlistUrl.
+    tile.noSourceSince = noSource ? Date.now() : null;
     setTileStatus(matchId, error.message, 'warn');
+  } finally {
+    tile.starting = false;
   }
 }
 
@@ -2081,7 +2093,9 @@ function renderCatalogAge() {
   if (state.catalogUpdatedAt == null) { node.textContent = ''; return; }
   const ageSeconds = Math.max(0, Math.round((Date.now() - state.catalogUpdatedAt) / 1000));
   const interval = Number(state.catalogRefreshSeconds) || 0;
-  const nextIn = interval > 0 ? Math.max(0, interval - ageSeconds) : null;
+  // While the directory is failing the server keeps serving its last good
+  // copy, so cache age just grows and "新场最晚 Ns 内出现" would be a lie.
+  const nextIn = interval > 0 && state.catalogHealthy ? Math.max(0, interval - ageSeconds) : null;
   node.textContent = nextIn == null
     ? ` · 目录 ${ageSeconds}s 前更新`
     : ` · 目录 ${ageSeconds}s 前更新，新场最晚 ${nextIn + Math.round(REFRESH_MS / 1000)}s 内出现`;
@@ -2125,6 +2139,7 @@ async function refreshMatches() {
     const age = Number(h.cache_age_seconds);
     state.catalogUpdatedAt = Number.isFinite(age) ? Date.now() - age * 1000 : null;
     state.catalogRefreshSeconds = Number(h.refresh_interval_seconds) || state.catalogRefreshSeconds;
+    state.catalogHealthy = h.state === 'healthy';
     renderCatalogAge();
     showNotice('');
   } catch (error) {
@@ -2270,8 +2285,18 @@ function recoverPreview(matchId, status) {
 }
 
 function keepAlivePreviews() {
+  const now = Date.now();
   for (const [matchId, tile] of state.tiles.entries()) {
-    if (!tile.playlistUrl) continue;
+    if (!tile.playlistUrl) {
+      // A tile that opened with "该比赛暂无直播源" has no playlist to poll, so
+      // nothing below would ever revisit it. Re-ask preview/start on a slow
+      // cadence; the stream usually shows up a few minutes after kick-off.
+      if (tile.noSourceSince && !tile.starting && now - tile.noSourceSince >= NO_SOURCE_RETRY_MS) {
+        tile.noSourceSince = now;
+        startTilePreview(matchId);
+      }
+      continue;
+    }
     fetch(`api/monitor/preview/status?match_id=${encodeURIComponent(matchId)}`)
       .then((response) => (response.ok ? response.json() : null))
       .then((status) => {

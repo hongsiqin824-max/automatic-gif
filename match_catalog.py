@@ -24,10 +24,12 @@ from dqd_api import (
 
 MATCH_CATALOG_URL = "https://api.dongqiudi.com/data/tab/new/lotzc"
 # Lazy refresh: re-pulled on the next /matches request once this old. The
-# list page polls every 60s, so 60s here bounds a new kick-off's appearance
-# at ~2 minutes worst case (was ~3 minutes at 120s). One tiny request per
-# minute against the directory; the 8899 dashboard keeps its own copy.
-MATCH_CATALOG_REFRESH_SECONDS = 60.0
+# list page polls every 60s; 55s (not 60s) keeps the two from beating against
+# each other — at exactly 60s a poll arriving a few ms early would find the
+# cache "not yet due" and the pull would slip to the next minute. Bounds a
+# new kick-off's appearance at ~2 minutes worst case (was ~3 at 120s). One
+# tiny request per minute against the directory; 8899 keeps its own copy.
+MATCH_CATALOG_REFRESH_SECONDS = 55.0
 MATCH_CATALOG_BACKOFF_SECONDS = (5.0, 10.0, 20.0, 30.0)
 MATCH_CATALOG_LIMIT = 20
 MATCH_CATALOG_UPCOMING_SECONDS = 15 * 60

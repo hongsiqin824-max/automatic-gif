@@ -1902,6 +1902,8 @@ class ArticleDraftQueue:
             str(exc),
             platform_code=exc.platform_code,
             publishing=str(task.get("status") or "") == "publishing",
+            will_retry=status == "retry_wait",
+            attempts=attempts,
         )
         _log_task_event(
             "article_publish_failed",
@@ -2080,6 +2082,8 @@ def _friendly_draft_error(
     *,
     platform_code: Any = None,
     publishing: bool = False,
+    will_retry: bool = True,
+    attempts: int = 0,
 ) -> str:
     cleaned = str(detail or "").strip()
     if stage == "authorization":
@@ -2116,9 +2120,16 @@ def _friendly_draft_error(
     if stage == "official_image_upload" and str(platform_code) in {
         "50001", "50002", "300007", "300009",
     }:
+        if will_retry:
+            return (
+                f"{action}暂时失败：懂球帝图片服务临时故障"
+                f"（平台 code={platform_code}），系统会自动重试"
+            )
+        # Retry budget spent: the row is now terminal and shows a manual
+        # "立即重试" button, so do not promise an automatic retry here.
         return (
-            f"{action}暂时失败：懂球帝图片服务临时故障"
-            f"（平台 code={platform_code}），系统会自动重试"
+            f"{action}失败：懂球帝图片服务持续故障"
+            f"（平台 code={platform_code}），已自动重试 {max(attempts, 1)} 次仍失败，请稍后手动重试"
         )
     return f"{action}暂时失败：{cleaned or '未说明原因'}"
 
