@@ -30,6 +30,7 @@ body{
 .health.ok i{background:var(--green);box-shadow:0 0 10px var(--green)}
 .health.loading i{background:var(--amber)}
 .health.error i{background:var(--red)}
+.health .catalog-age{color:var(--muted);white-space:nowrap;cursor:help}
 .notice{padding:12px 14px;border-radius:6px;background:#392e18;border:1px solid #705727;color:#ffd98a;margin-bottom:18px;font-size:13px}
 .notice.error{background:#3a1f22;border-color:#6e343b;color:#ff9f9f}
 .hidden{display:none!important}

@@ -671,6 +671,14 @@ class ClipRetryTests(unittest.TestCase):
         self.assertGreaterEqual(sum(delays), 100.0)
         self.assertEqual(delays, tuple(sorted(delays)))
 
+    def test_catalog_refresh_matches_list_poll_so_new_kickoffs_show_within_two_minutes(self):
+        # List page polls every 60s; a 60s lazy catalog refresh bounds a new
+        # Playing row at ~120s worst case. The 8899 dashboard has its own copy.
+        import match_catalog
+
+        self.assertEqual(match_catalog.MATCH_CATALOG_REFRESH_SECONDS, 60.0)
+        self.assertGreater(match_catalog.MATCH_CATALOG_REFRESH_SECONDS, max(match_catalog.MATCH_CATALOG_BACKOFF_SECONDS))
+
     def test_image_gateway_error_message_says_it_auto_retries(self):
         from article_draft_queue import _friendly_draft_error
 

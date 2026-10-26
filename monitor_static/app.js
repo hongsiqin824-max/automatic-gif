@@ -14,6 +14,11 @@ const state = {
   stageVideoHomeWrap: null,  // the .tile-video-wrap to move that node back into on close
   maxPreviews: 16,
   clipRangeMaxSeconds: 30,
+  // When the server last re-pulled the match directory (ms epoch, derived
+  // from health.cache_age_seconds) and how often it does so; feeds the
+  // "目录 Ns 前更新" ticker next to the health pill.
+  catalogUpdatedAt: null,
+  catalogRefreshSeconds: 60,
   // Mirrors GIF_MONITOR_CATCHUP_ENABLED; false disables tile speed-up and auto seek.
   catchupEnabled: true,
   // Operator-chosen [start, end] range on the stage. ``pinId`` is the server
@@ -2066,6 +2071,24 @@ function reconcileTiles(playing) {
 
 // ---- refreshMatches (split for list vs workshop) ----
 
+// "目录 Ns 前更新 · 下次 ≤Ms" next to the health pill. The catalog is pulled
+// lazily on the server (every catalogRefreshSeconds) and this page polls every
+// REFRESH_MS, so a fresh kick-off can take up to the sum to show; saying so
+// stops people hammering refresh or assuming the match is missing.
+function renderCatalogAge() {
+  const node = $('catalog-age');
+  if (!node) return;
+  if (state.catalogUpdatedAt == null) { node.textContent = ''; return; }
+  const ageSeconds = Math.max(0, Math.round((Date.now() - state.catalogUpdatedAt) / 1000));
+  const interval = Number(state.catalogRefreshSeconds) || 0;
+  const nextIn = interval > 0 ? Math.max(0, interval - ageSeconds) : null;
+  node.textContent = nextIn == null
+    ? ` · 目录 ${ageSeconds}s 前更新`
+    : ` · 目录 ${ageSeconds}s 前更新，新场最晚 ${nextIn + Math.round(REFRESH_MS / 1000)}s 内出现`;
+  node.title = `服务器每 ${interval || '?'}s 重拉一次懂球帝赛事目录，本页每 ${Math.round(REFRESH_MS / 1000)}s 自动刷新；`
+    + '新开球的比赛最多约 2 分钟出现，不用反复点刷新。工作台视图不会自动加入新比赛，需返回列表勾选。';
+}
+
 async function refreshMatches() {
   const health = $('health');
   const listSummary = $('list-summary');
@@ -2096,7 +2119,13 @@ async function refreshMatches() {
 
     const h = data.health || {};
     health.className = `health ${h.state === 'healthy' ? 'ok' : h.state === 'error' ? 'error' : 'loading'}`;
-    health.innerHTML = `<i></i>${escapeHtml(h.label || '赛事目录')}`;
+    health.innerHTML = `<i></i>${escapeHtml(h.label || '赛事目录')}<span id="catalog-age" class="catalog-age"></span>`;
+    // Anchor the "目录 Ns 前更新" ticker on the server's own cache age so the
+    // operator can tell "still waiting for the next pull" from "no such match".
+    const age = Number(h.cache_age_seconds);
+    state.catalogUpdatedAt = Number.isFinite(age) ? Date.now() - age * 1000 : null;
+    state.catalogRefreshSeconds = Number(h.refresh_interval_seconds) || state.catalogRefreshSeconds;
+    renderCatalogAge();
     showNotice('');
   } catch (error) {
     health.className = 'health error';
@@ -2331,6 +2360,7 @@ $('auth-logout-btn').addEventListener('click', async () => {
 refreshAuthBar();
 refreshMatches();
 setInterval(refreshMatches, REFRESH_MS);
+setInterval(renderCatalogAge, 5000);
 setInterval(refreshAuthBar, AUTH_BAR_REFRESH_MS);
 setInterval(keepAlivePreviews, 8000);
 
