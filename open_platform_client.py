@@ -32,6 +32,9 @@ OAUTH_STATE_TTL_SECONDS = 10 * 60
 DEFAULT_IMAGE_UPLOAD_TIMEOUT_SECONDS = 120.0
 MIN_IMAGE_UPLOAD_TIMEOUT_SECONDS = 60.0
 MAX_IMAGE_UPLOAD_TIMEOUT_SECONDS = 120.0
+# Our own code for "file rejected by the local size check before any request";
+# kept distinct from the platform's 300007 (see upload_images).
+LOCAL_FILE_SIZE_ERROR_CODE = "local_file_size"
 
 
 class OpenPlatformError(RuntimeError):
@@ -625,10 +628,16 @@ class OpenPlatformClient:
                 if not path.is_file():
                     raise OSError("不是文件")
                 size = path.stat().st_size
+                # Local size check. Deliberately *not* code=300007: that is the
+                # platform's code for the same condition, and the platform only
+                # ever reports it for an already-bounded file when its gateway
+                # truncated the body, so 300007 is treated as a transient
+                # gateway fault downstream. A genuinely oversized file is a
+                # terminal error and must not borrow that code.
                 if size <= 0 or size > max_bytes:
                     raise OpenPlatformError(
                         f"图片文件 {path.name} 大小非法（上限 {max_bytes} 字节）",
-                        code=300007,
+                        code=LOCAL_FILE_SIZE_ERROR_CODE,
                         status_code=400,
                     )
                 content = path.read_bytes()
@@ -642,7 +651,7 @@ class OpenPlatformClient:
             if len(content) == 0 or len(content) > max_bytes:
                 raise traced_error(OpenPlatformError(
                     f"图片文件 {path.name} 大小非法（上限 {max_bytes} 字节）",
-                    code=300007,
+                    code=LOCAL_FILE_SIZE_ERROR_CODE,
                     status_code=400,
                 ))
             file_metadata.append((field_name, path, mime, content))

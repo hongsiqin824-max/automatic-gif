@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from open_platform_client import (
+    LOCAL_FILE_SIZE_ERROR_CODE,
     OpenPlatformClient,
     OpenPlatformConfig,
     OpenPlatformError,
@@ -278,6 +279,9 @@ class OpenPlatformImageUploadTests(unittest.TestCase):
         self.assertFalse(context.exception.auth_required)
 
     def test_upload_rejects_oversized_file_before_request(self):
+        # A genuinely oversized file is terminal: it must not borrow the
+        # platform's 300007 (which the queue treats as a retriable gateway
+        # fault) or the operator would be told "临时故障，系统会自动重试".
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             gif, cover = self.write_images(root)
@@ -287,7 +291,10 @@ class OpenPlatformImageUploadTests(unittest.TestCase):
             ) as request_json:
                 with self.assertRaises(OpenPlatformError) as context:
                     client.upload_images(gif, cover, max_bytes=1)
-            self.assertEqual(context.exception.code, 300007)
+            self.assertEqual(context.exception.code, LOCAL_FILE_SIZE_ERROR_CODE)
+            self.assertNotEqual(str(context.exception.code), "300007")
+            self.assertFalse(context.exception.retriable)
+            self.assertIn("大小非法", str(context.exception))
             request_json.assert_not_called()
 
 

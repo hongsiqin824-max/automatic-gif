@@ -2127,9 +2127,12 @@ def _friendly_draft_error(
             )
         # Retry budget spent: the row is now terminal and shows a manual
         # "立即重试" button, so do not promise an automatic retry here.
+        # ``attempts`` counts every try including the first, so the number of
+        # *automatic retries* is one less.
+        retries = max(int(attempts) - 1, 0)
         return (
             f"{action}失败：懂球帝图片服务持续故障"
-            f"（平台 code={platform_code}），已自动重试 {max(attempts, 1)} 次仍失败，请稍后手动重试"
+            f"（平台 code={platform_code}），已自动重试 {retries} 次仍失败，请稍后手动重试"
         )
     return f"{action}暂时失败：{cleaned or '未说明原因'}"
 

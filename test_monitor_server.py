@@ -762,9 +762,28 @@ class ClipRetryTests(unittest.TestCase):
             platform_code=50001, publishing=True, will_retry=False, attempts=6,
         )
         self.assertNotIn("系统会自动重试", final)
-        self.assertIn("已自动重试 6 次", final)
+        # 6 attempts = first try + 5 automatic retries.
+        self.assertIn("已自动重试 5 次", final)
         self.assertIn("手动重试", final)
         self.assertIn("code=50001", final)
+
+    def test_local_oversized_file_is_reported_verbatim_not_as_gateway_fault(self):
+        # The local size check raises its own code, not the platform's 300007,
+        # so a genuinely oversized GIF must fall through to the plain message
+        # instead of "临时故障 / 已自动重试" (it was never sent and never will be).
+        from article_draft_queue import _friendly_draft_error
+        from open_platform_client import LOCAL_FILE_SIZE_ERROR_CODE
+
+        text = _friendly_draft_error(
+            "official_image_upload",
+            "懂球帝官方图片上传失败：图片文件 x.gif 大小非法（上限 20971520 字节）",
+            platform_code=LOCAL_FILE_SIZE_ERROR_CODE, publishing=True,
+            will_retry=False, attempts=1,
+        )
+        self.assertIn("大小非法", text)
+        self.assertNotIn("临时故障", text)
+        self.assertNotIn("持续故障", text)
+        self.assertNotIn("自动重试", text)
 
 
 class ClipDiscardTests(unittest.TestCase):
