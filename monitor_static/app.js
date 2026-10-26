@@ -2062,16 +2062,15 @@ function leaveWorkshop() {
 function teardownAllTiles() {
   if (state.view !== 'list') return; // operator came back, don't touch
   state.workshopIdleTimer = null;
+  // Only tear down this browser's players. The server-side ffmpeg is shared
+  // by everyone watching the same match, so it is never stopped from here:
+  // once no tab polls preview/status any more, the idle reaper reclaims it.
   for (const matchId of Array.from(state.tiles.keys())) {
     const el = document.querySelector(`.tile[data-match-id="${matchId}"]`);
     if (el) {
       detachPlayer(el.querySelector('.tile-video'));
       el.remove();
     }
-    fetch('api/monitor/preview/stop', {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({match_id: matchId}),
-    }).catch(() => {});
     if (state.stageMatchId === matchId) closeStage();
     state.tiles.delete(matchId);
   }
@@ -2103,7 +2102,9 @@ function reconcileTiles(playing) {
       if (el) updateTileInfo(el, data);
     }
   });
-  // Remove tiles that are no longer in the selected set.
+  // Remove tiles that are no longer in the selected set. Deselecting only
+  // drops this browser's player; the shared ffmpeg stays for other viewers
+  // and is reclaimed by the server's idle reaper when nobody polls it.
   for (const matchId of Array.from(state.tiles.keys())) {
     if (seen.has(matchId)) continue;
     const el = document.querySelector(`.tile[data-match-id="${matchId}"]`);
@@ -2111,10 +2112,6 @@ function reconcileTiles(playing) {
       detachPlayer(el.querySelector('.tile-video'));
       el.remove();
     }
-    fetch('api/monitor/preview/stop', {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({match_id: matchId}),
-    }).catch(() => {});
     if (state.stageMatchId === matchId) closeStage();
     state.tiles.delete(matchId);
   }
@@ -2242,11 +2239,9 @@ document.addEventListener('keydown', (ev) => {
     toggleCropEditing();
   }
 });
-window.addEventListener('beforeunload', () => {
-  for (const matchId of state.tiles.keys()) {
-    navigator.sendBeacon?.('api/monitor/preview/stop', new Blob([JSON.stringify({match_id: matchId})], {type: 'application/json'}));
-  }
-});
+// Closing the tab deliberately does NOT call preview/stop: the ffmpeg behind
+// a match is shared by every operator watching it, and the server's idle
+// reaper already stops it ~90s after the last tab stops polling.
 
 // ---- keepAlive ----
 
