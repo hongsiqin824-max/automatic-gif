@@ -2108,6 +2108,18 @@ def _friendly_draft_error(
     if stage in {"gif_validation", "gif_storage", "source_check"}:
         return f"未创建草稿：{cleaned or 'OCR GIF 文件无法使用'}"
     action = "正式发布" if publishing else "草稿创建"
+    # Image-gateway hiccups: 50001/50002 are the open-platform gateway's own
+    # "upstream failed" codes (HTTP 502), 300009 is the image service's
+    # internal error, and 300007 only reaches us when the gateway truncated
+    # an already size-checked file. All auto-retry; say so instead of echoing
+    # the platform's opaque "内部接口调用失败".
+    if stage == "official_image_upload" and str(platform_code) in {
+        "50001", "50002", "300007", "300009",
+    }:
+        return (
+            f"{action}暂时失败：懂球帝图片服务临时故障"
+            f"（平台 code={platform_code}），系统会自动重试"
+        )
     return f"{action}暂时失败：{cleaned or '未说明原因'}"
 
 

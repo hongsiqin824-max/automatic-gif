@@ -729,9 +729,13 @@ class OpenPlatformClient:
                 code=code,
                 status_code=401 if auth_required else 502,
                 auth_required=auth_required,
+                # 300007 ("file size is illegal") is retriable here on purpose:
+                # the file was already bounded by max_bytes before the request,
+                # so the platform can only report it when its gateway truncated
+                # the body (seen back-to-back with 50001/502 on the same file).
                 retriable=any(
                     _code_matches(code, retry_code)
-                    for retry_code in (4, 5, 10006, 300009, 50001, 50002)
+                    for retry_code in (4, 5, 10006, 300007, 300009, 50001, 50002)
                 ),
                 http_status=payload.get("__http_status"),
                 diagnostics={

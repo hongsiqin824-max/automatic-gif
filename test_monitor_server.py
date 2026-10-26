@@ -662,9 +662,31 @@ class ClipRetryTests(unittest.TestCase):
 
     def test_manual_backoff_is_short_because_someone_is_watching(self):
         # The 8899 default (30/120/300/600s) would leave an operator staring at a
-        # stalled row for minutes after one transient upload error.
-        self.assertEqual(monitor_server.MANUAL_DRAFT_RETRY_DELAYS_SECONDS, (10.0, 30.0, 60.0))
-        self.assertLessEqual(max(monitor_server.MANUAL_DRAFT_RETRY_DELAYS_SECONDS), 60.0)
+        # stalled row for minutes after one transient upload error. Platform 502
+        # bursts last ~45-100s, so start fast and keep going for ~135s total.
+        delays = monitor_server.MANUAL_DRAFT_RETRY_DELAYS_SECONDS
+        self.assertEqual(delays, (5.0, 10.0, 20.0, 40.0, 60.0))
+        self.assertLessEqual(delays[0], 5.0)
+        self.assertLessEqual(max(delays), 60.0)
+        self.assertGreaterEqual(sum(delays), 100.0)
+        self.assertEqual(delays, tuple(sorted(delays)))
+
+    def test_image_gateway_error_message_says_it_auto_retries(self):
+        from article_draft_queue import _friendly_draft_error
+
+        for code in (50001, 300007):
+            text = _friendly_draft_error(
+                "official_image_upload", "懂球帝官方图片上传失败：内部接口调用失败",
+                platform_code=code, publishing=True,
+            )
+            self.assertIn("图片服务临时故障", text)
+            self.assertIn(f"code={code}", text)
+            self.assertIn("自动重试", text)
+            self.assertNotIn("内部接口调用失败", text)
+        other = _friendly_draft_error(
+            "official_image_upload", "Not login", platform_code=300002, publishing=True,
+        )
+        self.assertIn("Not login", other)
 
 
 class ClipDiscardTests(unittest.TestCase):

@@ -247,7 +247,7 @@ class OpenPlatformImageUploadTests(unittest.TestCase):
             root = Path(directory)
             gif, cover = self.write_images(root)
             client = self.make_client(root)
-            for code in (10006, 50001, 50002):
+            for code in (10006, 50001, 50002, 300007, 300009):
                 with self.subTest(code=code), patch.object(
                     client,
                     "_request_json",
@@ -256,6 +256,26 @@ class OpenPlatformImageUploadTests(unittest.TestCase):
                     with self.assertRaises(OpenPlatformError) as context:
                         client.upload_images(gif, cover)
                 self.assertTrue(context.exception.retriable)
+
+    def test_platform_300007_is_retriable_because_size_was_checked_locally(self):
+        # Seen in production: the same ≤20MB file got 50001/502, then 300007
+        # "file size is illegal", then succeeded. The platform only reports
+        # 300007 for a locally-bounded file when its gateway truncated the body,
+        # so it must not strand the row in a terminal "failed" state.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            gif, cover = self.write_images(root)
+            client = self.make_client(root)
+            with patch.object(
+                client,
+                "_request_json",
+                return_value={"code": 300007, "messgae": "file size is illegal", "data": []},
+            ):
+                with self.assertRaises(OpenPlatformError) as context:
+                    client.upload_images(gif, cover)
+        self.assertEqual(context.exception.code, 300007)
+        self.assertTrue(context.exception.retriable)
+        self.assertFalse(context.exception.auth_required)
 
     def test_upload_rejects_oversized_file_before_request(self):
         with tempfile.TemporaryDirectory() as directory:

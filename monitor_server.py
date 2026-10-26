@@ -106,7 +106,9 @@ PREVIEW_LIST_SIZE = positive_env_int("GIF_MONITOR_PREVIEW_SEGMENTS", 180)
 # 600s) suits the unattended 8899 worker; here someone is watching the row, so
 # a transient upload/CMS error should come back within seconds, not minutes.
 # Also caps the auth_required wait (the queue uses the last entry for it).
-MANUAL_DRAFT_RETRY_DELAYS_SECONDS = (10.0, 30.0, 60.0)
+# Observed platform 502 bursts last ~45-100s, so the schedule starts fast and
+# keeps retrying for ~135s in total (6 attempts) before giving up.
+MANUAL_DRAFT_RETRY_DELAYS_SECONDS = (5.0, 10.0, 20.0, 40.0, 60.0)
 
 
 def env_flag(name: str, default: bool) -> bool:
