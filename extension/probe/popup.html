@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<style>
+  body { width: 420px; margin: 0; padding: 12px; font: 13px/1.5 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; color: #222; }
+  h1 { font-size: 14px; margin: 0 0 8px; }
+  .row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
+  input[type=number] { width: 56px; }
+  button { padding: 4px 12px; cursor: pointer; }
+  #status { color: #666; margin-bottom: 6px; min-height: 18px; }
+  pre { margin: 0; padding: 8px; background: #f4f4f4; border-radius: 4px; max-height: 420px; overflow: auto; font-size: 12px; white-space: pre-wrap; word-break: break-all; }
+  .ok { color: #0a7a3c; font-weight: 600; }
+  .bad { color: #c0392b; font-weight: 600; }
+  .hint { color: #888; font-size: 12px; margin-top: 8px; }
+</style>
+</head>
+<body>
+<h1>captureStream 探测</h1>
+<div class="row">
+  录制 <input id="seconds" type="number" min="3" max="60" value="10"> 秒
+  <label><input id="download" type="checkbox" checked> 下载 webm</label>
+  <button id="run">检测并录制</button>
+  <button id="copy" title="复制结果 JSON">复制</button>
+</div>
+<div id="status"></div>
+<pre id="out">先在目标页面把比赛视频播起来，再点「检测并录制」。</pre>
+<div class="hint">录制期间可以关掉这个弹窗、正常操作页面，结果会保存，重新打开弹窗即可查看。</div>
+<script src="popup.js"></script>
+</body>
+</html>

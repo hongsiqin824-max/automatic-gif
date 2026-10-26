@@ -1,0 +1,13 @@
+{
+  "manifest_version": 3,
+  "name": "GIF 工作台 · captureStream 探测",
+  "version": "0.1.0",
+  "description": "验证任意直播页面的 <video> 能否用 captureStream + MediaRecorder 录出干净画面。",
+  "permissions": ["scripting", "activeTab", "storage"],
+  "host_permissions": ["<all_urls>"],
+  "background": { "service_worker": "background.js" },
+  "action": {
+    "default_title": "captureStream 探测",
+    "default_popup": "popup.html"
+  }
+}
