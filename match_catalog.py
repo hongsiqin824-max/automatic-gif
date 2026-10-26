@@ -315,9 +315,10 @@ class MatchCatalog:
     def refresh_for_automation(self, now_unix: float | None = None) -> dict[str, Any]:
         """Refresh the full Playing set on an independent background clock.
 
-        This deliberately does not use ``snapshot``'s 120-second UI cache. A
-        stale catalog is reported to the caller and is never treated as a new
-        authoritative discovery result.
+        This deliberately does not use ``snapshot``'s UI cache
+        (``MATCH_CATALOG_REFRESH_SECONDS``). A stale catalog is reported to
+        the caller and is never treated as a new authoritative discovery
+        result.
         """
         now = time.time() if now_unix is None else float(now_unix)
         with self.lock:

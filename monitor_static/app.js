@@ -5,7 +5,7 @@ const WORKSHOP_IDLE_MS = 90000;
 // After a capture succeeds, hold the tile's status line this long before
 // routine player chatter (FRAG_BUFFERED etc.) may overwrite it.
 const TILE_STATUS_STICKY_MS = 5000;
-// How often a workshop tile that found no live source re-asks for one.
+// How often a workshop tile that found no live source quietly re-asks for one.
 const NO_SOURCE_RETRY_MS = 30000;
 
 const state = {
@@ -554,7 +554,11 @@ function updateTileInfo(el, data) {
   el.classList.toggle('finished', !!data.finished);
 }
 
-async function startTilePreview(matchId) {
+// ``quiet``: a background re-ask from keepAlivePreviews for a tile already
+// showing "该比赛暂无直播源". Leave the status line and overlay alone unless the
+// outcome actually changes, so the tile does not blink "正在拉起直播…" every
+// NO_SOURCE_RETRY_MS.
+async function startTilePreview(matchId, {quiet = false} = {}) {
   const tile = state.tiles.get(matchId);
   if (!tile) return;
   const el = document.querySelector(`.tile[data-match-id="${matchId}"]`);
@@ -562,7 +566,7 @@ async function startTilePreview(matchId) {
   const video = el.querySelector('.tile-video');
   const overlay = el.querySelector('.tile-overlay');
   tile.starting = true;
-  setTileStatus(matchId, '正在拉起直播…');
+  if (!quiet) setTileStatus(matchId, '正在拉起直播…');
   try {
     const data = await requestJson('api/monitor/preview/start', {
       method: 'POST', body: JSON.stringify({match_id: matchId}),
@@ -581,15 +585,17 @@ async function startTilePreview(matchId) {
     });
     setTileStatus(matchId, data.playlist_ready ? '直播加载中…' : '直播源连接中…', 'ok');
   } catch (error) {
-    overlay.classList.remove('hidden');
     const noSource = /直播源/.test(error.message);
-    overlay.textContent = noSource ? '该比赛暂无直播源' : '直播源加载失败';
-    if (noSource) el.classList.add('no-source'); else el.classList.remove('no-source');
     // Remember when the source was last found missing so keepAlivePreviews
     // can re-ask every NO_SOURCE_RETRY_MS: the platform often attaches the
     // stream a few minutes after kick-off, and nothing else ever re-tries a
     // tile that has no playlistUrl.
     tile.noSourceSince = noSource ? Date.now() : null;
+    // Same verdict as last time on a quiet re-ask: nothing to repaint.
+    if (quiet && noSource && el.classList.contains('no-source')) return;
+    overlay.classList.remove('hidden');
+    overlay.textContent = noSource ? '该比赛暂无直播源' : '直播源加载失败';
+    if (noSource) el.classList.add('no-source'); else el.classList.remove('no-source');
     setTileStatus(matchId, error.message, 'warn');
   } finally {
     tile.starting = false;
@@ -2345,11 +2351,16 @@ function keepAlivePreviews() {
   for (const [matchId, tile] of state.tiles.entries()) {
     if (!tile.playlistUrl) {
       // A tile that opened with "该比赛暂无直播源" has no playlist to poll, so
-      // nothing below would ever revisit it. Re-ask preview/start on a slow
-      // cadence; the stream usually shows up a few minutes after kick-off.
-      if (tile.noSourceSince && !tile.starting && now - tile.noSourceSince >= NO_SOURCE_RETRY_MS) {
+      // nothing below would ever revisit it. Quietly re-ask preview/start
+      // every NO_SOURCE_RETRY_MS (the stream usually shows up a few minutes
+      // after kick-off); this hits the in-house source gateway, not a
+      // rate-limited third party, so a 30s cadence is cheap. A finished
+      // match will never grow a source, so leave it alone.
+      const finished = !!(tile.data && tile.data.finished);
+      if (tile.noSourceSince && !tile.starting && !finished
+          && now - tile.noSourceSince >= NO_SOURCE_RETRY_MS) {
         tile.noSourceSince = now;
-        startTilePreview(matchId);
+        startTilePreview(matchId, {quiet: true});
       }
       continue;
     }
