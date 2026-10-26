@@ -2745,5 +2745,120 @@ class FeishuAuthIntegrationTests(unittest.TestCase):
         self.assertEqual(client.get("/api/auth/feishu/login").status_code, 404)
 
 
+class PublishNoticeTests(ClipEndpointAlertMatchTests):
+    """Publish success → Feishu notice on its own bot, with the operator from the session."""
+
+    def _delivered(self, **overrides):
+        base = {
+            "match_id": "54622319",
+            "event_key": "manual_1",
+            "delivery_mode": "publish",
+            "article_id": "6557352",
+            "draft_url": "https://dadmin.dongqiudi.com/admin/archives/articlePublish?articleId=6557352",
+            "duplicate": False,
+            "title": "点球破门",
+            "gif_url": "https://matchgif.aisportsapp.com/g/clip_1.gif",
+            "gif_bytes": 1234,
+            "publish_account_name": "咪咕体育",
+            "delivered_at_unix": 1_700_000_000.0,
+            "event": {
+                "match_event": 2,
+                "minute": "68",
+                "minute_extra": "1",
+                "score": "2-1",
+                "title_override": "点球破门",
+                "operator": {"name": "张三", "open_id": "ou_x"},
+            },
+            "match_detail": {"team_A_name": "甲", "team_B_name": "乙", "competition_name": "英超"},
+        }
+        base.update(overrides)
+        return base
+
+    def test_notice_text_full(self):
+        text = monitor_server._format_publish_notice(self._delivered())
+        when = monitor_server.datetime.fromtimestamp(1_700_000_000.0).strftime("%Y-%m-%d %H:%M:%S")
+        self.assertEqual(
+            text.split("\n"),
+            [
+                "【GIF 已发布】甲 vs 乙（英超）",
+                "事件：点球 68+1' 2-1",
+                "标题：点球破门",
+                "操作人：张三",
+                f"时间：{when}",
+                "文章：https://dadmin.dongqiudi.com/admin/archives/articlePublish?articleId=6557352",
+                "GIF：https://matchgif.aisportsapp.com/g/clip_1.gif",
+            ],
+        )
+
+    def test_notice_text_drops_missing_lines_and_marks_duplicate(self):
+        delivered = self._delivered(
+            duplicate=True,
+            match_detail={},
+            gif_url=None,
+            event={"match_event": 0, "minute": "", "score": "", "title_override": "测试", "operator": None},
+            title="测试",
+        )
+        lines = monitor_server._format_publish_notice(delivered).split("\n")
+        self.assertEqual(lines[0], "【GIF 已发布】")
+        self.assertNotIn("事件：", "\n".join(lines))
+        self.assertIn("标题：测试（懂球帝判定重复文章）", lines)
+        self.assertIn("操作人：未知", lines)
+        self.assertEqual(lines[-1], "文章：https://dadmin.dongqiudi.com/admin/archives/articlePublish?articleId=6557352")
+        self.assertNotIn("GIF：", "\n".join(lines))
+
+    def test_notice_text_draft_mode_header(self):
+        text = monitor_server._format_publish_notice(self._delivered(delivery_mode="draft"))
+        self.assertTrue(text.startswith("【GIF 草稿已建】甲 vs 乙"))
+
+    def test_notify_hook_uses_publish_webhook_only(self):
+        with mock.patch.object(monitor_server, "FEISHU_PUBLISH_WEBHOOK", "https://hook/publish"), \
+             mock.patch.object(monitor_server, "_send_feishu_text", return_value=True) as send:
+            monitor_server._notify_manual_delivered(self._delivered())
+        send.assert_called_once()
+        text, webhook = send.call_args.args
+        self.assertEqual(webhook, "https://hook/publish")
+        self.assertIn("articleId=6557352", text)
+
+    def test_notify_hook_silent_without_webhook(self):
+        with mock.patch.object(monitor_server, "FEISHU_PUBLISH_WEBHOOK", ""), \
+             mock.patch.object(monitor_server, "_send_feishu_text") as send:
+            monitor_server._notify_manual_delivered(self._delivered())
+        send.assert_not_called()
+
+    def test_send_feishu_text_targets_explicit_webhook(self):
+        with mock.patch.object(monitor_server, "FEISHU_WEBHOOK", "https://hook/alert"), \
+             mock.patch.object(monitor_server.urllib.request, "urlopen") as urlopen:
+            urlopen.return_value.__enter__.return_value.read.return_value = b"{}"
+            self.assertTrue(monitor_server._send_feishu_text("hi", "https://hook/publish"))
+            self.assertEqual(urlopen.call_args.args[0].full_url, "https://hook/publish")
+            self.assertTrue(monitor_server._send_feishu_text("hi"))
+            self.assertEqual(urlopen.call_args.args[0].full_url, "https://hook/alert")
+        self.assertFalse(monitor_server._send_feishu_text("hi", ""))
+
+    def test_current_operator_reads_session_when_auth_enabled(self):
+        enabled = mock.PropertyMock(return_value=True)
+        with mock.patch.object(type(monitor_server.FEISHU_AUTH), "enabled", enabled), \
+             mock.patch.object(monitor_server, "session", {"feishu_user": {"name": " 张三 ", "open_id": "ou_x", "exp": 9e12}}):
+            self.assertEqual(monitor_server._current_operator(), {"name": "张三", "open_id": "ou_x"})
+        with mock.patch.object(type(monitor_server.FEISHU_AUTH), "enabled", enabled), \
+             mock.patch.object(monitor_server, "session", {}):
+            self.assertIsNone(monitor_server._current_operator())
+
+    def test_current_operator_none_when_auth_disabled(self):
+        self.assertFalse(monitor_server.FEISHU_AUTH.enabled)
+        with mock.patch.object(monitor_server, "session", {"feishu_user": {"name": "张三", "open_id": "ou_x"}}):
+            self.assertIsNone(monitor_server._current_operator())
+
+    def test_publish_event_carries_operator(self):
+        with mock.patch.object(monitor_server, "_current_operator", return_value={"name": "张三", "open_id": "ou_x"}):
+            self._clip_and_publish(10.0)
+        event = self.queue.enqueue.call_args.kwargs["event"]
+        self.assertEqual(event["operator"], {"name": "张三", "open_id": "ou_x"})
+
+    def test_publish_event_operator_none_without_login(self):
+        self._clip_and_publish(10.0)
+        self.assertIsNone(self.queue.enqueue.call_args.kwargs["event"]["operator"])
+
+
 if __name__ == "__main__":
     unittest.main()

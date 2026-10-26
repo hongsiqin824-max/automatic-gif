@@ -1390,6 +1390,127 @@ class ManualClipQueueTests(ArticleDraftQueueTests):
             self.assertEqual(platform.calls[-1]["status"], 1)
             self.assertFalse(queue.run_once())
 
+    def test_manual_delivered_hook_fires_once_with_article_and_operator(self):
+        """The hook runs after the row is terminal and carries everything the
+        Feishu notice needs; operator rides along inside the event."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            platform = SequencePlatformClient(
+                [{"article_id": "6557352", "duplicate": True, "code": 2}]
+            )
+            seen = []
+            queue = self.make_queue(
+                root,
+                platform,
+                claim_artifact_kinds=(MANUAL_ARTIFACT_KIND,),
+                manual_delivery_mode="publish",
+                on_manual_delivered=seen.append,
+            )
+            source = self._write_manual_source(root)
+            queue.enqueue(
+                match_id="54478914",
+                event={
+                    "event_key": "manual_300",
+                    "code": "G",
+                    "match_event": 1,
+                    "minute": "23",
+                    "score": "1-0",
+                    "title_override": "进球了",
+                    "operator": {"name": "张三", "open_id": "ou_x"},
+                },
+                match_detail={"team_A_name": "主队", "team_B_name": "客队"},
+                source_path=source,
+                artifact_kind=MANUAL_ARTIFACT_KIND,
+                artifact_result=None,
+            )
+            self.assertTrue(queue.run_once())
+            self.assertEqual(len(seen), 1)
+            payload = seen[0]
+            self.assertEqual(payload["article_id"], "6557352")
+            self.assertEqual(
+                payload["draft_url"],
+                "https://dadmin.dongqiudi.com/admin/archives/articlePublish?articleId=6557352",
+            )
+            self.assertTrue(payload["duplicate"])
+            self.assertEqual(payload["delivery_mode"], "publish")
+            self.assertEqual(payload["title"], "进球了")
+            self.assertEqual(payload["event"]["operator"]["name"], "张三")
+            self.assertEqual(payload["match_detail"]["team_A_name"], "主队")
+            self.assertTrue(str(payload["gif_url"]).startswith("https://matchgif.aisportsapp.com/"))
+            self.assertIsInstance(payload["delivered_at_unix"], float)
+            # Row is terminal before the hook ran; operator persisted for audit.
+            record = queue.records_for_match(
+                "54478914", artifact_kind=MANUAL_ARTIFACT_KIND
+            )["manual_300"]
+            self.assertEqual(record["status"], "published")
+            self.assertEqual(record["final_event"]["operator"]["name"], "张三")
+            # No re-delivery, so no second notice.
+            self.assertFalse(queue.run_once())
+            self.assertEqual(len(seen), 1)
+
+    def test_manual_delivered_hook_failure_does_not_undo_delivery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            platform = SequencePlatformClient()
+
+            def boom(_payload):
+                raise RuntimeError("webhook down")
+
+            queue = self.make_queue(
+                root,
+                platform,
+                claim_artifact_kinds=(MANUAL_ARTIFACT_KIND,),
+                manual_delivery_mode="publish",
+                on_manual_delivered=boom,
+            )
+            source = self._write_manual_source(root)
+            queue.enqueue(
+                match_id="54478914",
+                event={"event_key": "manual_400", "code": "G", "title_override": "t"},
+                match_detail={},
+                source_path=source,
+                artifact_kind=MANUAL_ARTIFACT_KIND,
+                artifact_result=None,
+            )
+            self.assertTrue(queue.run_once())
+            record = queue.records_for_match(
+                "54478914", artifact_kind=MANUAL_ARTIFACT_KIND
+            )["manual_400"]
+            self.assertEqual(record["status"], "published")
+            self.assertIsNone(record["error"])
+            self.assertEqual(len(platform.calls), 1)
+            self.assertFalse(queue.run_once())
+
+    def test_manual_delivered_hook_not_fired_on_platform_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            platform = SequencePlatformClient(
+                [OpenPlatformError("平台 500", code=50001, status_code=503, retriable=True)]
+            )
+            seen = []
+            queue = self.make_queue(
+                root,
+                platform,
+                claim_artifact_kinds=(MANUAL_ARTIFACT_KIND,),
+                manual_delivery_mode="publish",
+                on_manual_delivered=seen.append,
+            )
+            source = self._write_manual_source(root)
+            queue.enqueue(
+                match_id="54478914",
+                event={"event_key": "manual_500", "code": "G", "title_override": "t"},
+                match_detail={},
+                source_path=source,
+                artifact_kind=MANUAL_ARTIFACT_KIND,
+                artifact_result=None,
+            )
+            self.assertTrue(queue.run_once())
+            self.assertEqual(seen, [])
+            record = queue.records_for_match(
+                "54478914", artifact_kind=MANUAL_ARTIFACT_KIND
+            )["manual_500"]
+            self.assertNotEqual(record["status"], "published")
+
     def test_invalid_manual_delivery_mode_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

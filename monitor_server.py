@@ -35,7 +35,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from flask import Flask, abort, jsonify, request, send_from_directory
+from flask import Flask, abort, jsonify, request, send_from_directory, session
 
 
 ROOT = Path(__file__).resolve().parent
@@ -81,7 +81,7 @@ from article_draft_queue import (
     DRAFT_DELIVERY_MODE,
     MANUAL_ARTIFACT_KIND,
 )
-from feishu_auth import FeishuAuthConfig, install_feishu_auth
+from feishu_auth import FeishuAuthConfig, SESSION_KEY as FEISHU_SESSION_KEY, install_feishu_auth
 
 
 HOST = os.environ.get("GIF_MONITOR_HOST", "127.0.0.1")
@@ -245,6 +245,9 @@ FEISHU_WEBHOOK = os.environ.get("GIF_MONITOR_FEISHU_WEBHOOK", "").strip()
 # responds before the monitor aborts; otherwise a slow-but-successful push shows
 # up as a false failure in the monitor log. See match_timeline.mjs AbortSignal.
 FEISHU_TIMEOUT = positive_env_float("GIF_MONITOR_FEISHU_TIMEOUT_SECONDS", 2.5)
+# Separate bot for "a GIF article went live" notices so they never land in the
+# goal-alert or access-request groups. Empty = no publish notifications.
+FEISHU_PUBLISH_WEBHOOK = os.environ.get("GIF_MONITOR_FEISHU_PUBLISH_WEBHOOK", "").strip()
 # Optional shared secret for the monitor→8901 loopback call. Empty = no check.
 ALERT_INGEST_TOKEN = os.environ.get("GIF_MONITOR_INGEST_TOKEN", "").strip()
 # Ring size for the page cursor and for clip→alert matching. A busy weekend has
@@ -626,6 +629,93 @@ def _manual_delivery_mode() -> str:
     return mode if mode in {"draft", "publish"} else "draft"
 
 
+def _format_publish_notice(delivered: dict) -> str:
+    """Build the Feishu text for one delivered manual clip.
+
+    ``delivered`` is the payload from ``ArticleDraftQueue.on_manual_delivered``.
+    Lines whose data is missing (no match detail, event type "无") are dropped
+    rather than printed empty so the group message stays readable.
+    """
+    event = delivered.get("event") if isinstance(delivered.get("event"), dict) else {}
+    detail = (
+        delivered.get("match_detail")
+        if isinstance(delivered.get("match_detail"), dict)
+        else {}
+    )
+    mode = str(delivered.get("delivery_mode") or "publish")
+    head = "【GIF 已发布】" if mode == "publish" else "【GIF 草稿已建】"
+    home = str(detail.get("team_A_name") or "").strip()
+    away = str(detail.get("team_B_name") or "").strip()
+    if home or away:
+        head += f"{home or '?'} vs {away or '?'}"
+    competition = str(detail.get("competition_name") or "").strip()
+    if competition:
+        head += f"（{competition}）"
+    lines = [head]
+
+    try:
+        event_type = int(event.get("match_event") or 0)
+    except (TypeError, ValueError):
+        event_type = 0
+    event_parts = []
+    if event_type:
+        event_parts.append(MATCH_EVENT_LABELS.get(event_type, str(event_type)))
+    minute = str(event.get("minute") or "").strip()
+    if minute:
+        extra = str(event.get("minute_extra") or "").strip()
+        event_parts.append(f"{minute}+{extra}'" if extra else f"{minute}'")
+    score = str(event.get("score") or "").strip()
+    if score:
+        event_parts.append(score)
+    if event_parts:
+        lines.append("事件：" + " ".join(event_parts))
+
+    title = str(delivered.get("title") or event.get("title_override") or "").strip()
+    if title:
+        suffix = "（懂球帝判定重复文章）" if delivered.get("duplicate") else ""
+        lines.append(f"标题：{title}{suffix}")
+
+    operator = event.get("operator") if isinstance(event.get("operator"), dict) else {}
+    lines.append("操作人：" + (str(operator.get("name") or "").strip() or "未知"))
+
+    stamp = delivered.get("delivered_at_unix")
+    try:
+        when = datetime.fromtimestamp(float(stamp)).strftime("%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError, OSError, OverflowError):
+        when = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines.append(f"时间：{when}")
+
+    if delivered.get("draft_url"):
+        lines.append(f"文章：{delivered['draft_url']}")
+    if delivered.get("gif_url"):
+        lines.append(f"GIF：{delivered['gif_url']}")
+    return "\n".join(lines)
+
+
+def _notify_manual_delivered(delivered: dict) -> None:
+    """``on_manual_delivered`` hook: push the publish notice to its own bot.
+
+    Runs on the queue worker thread after the row is already terminal, so a
+    slow or failing webhook can only cost this one notice, never the article.
+    """
+    if not FEISHU_PUBLISH_WEBHOOK:
+        return
+    pushed = _send_feishu_text(_format_publish_notice(delivered), FEISHU_PUBLISH_WEBHOOK)
+    print(
+        json.dumps(
+            {
+                "event": "publish_notice_pushed",
+                "match_id": delivered.get("match_id"),
+                "event_key": delivered.get("event_key"),
+                "article_id": delivered.get("article_id"),
+                "ok": pushed,
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
+
+
 def _build_manual_draft_queue() -> "ArticleDraftQueue | None":
     """Build a MANUAL-only draft queue that shares the dashboard's publish DB.
 
@@ -708,6 +798,7 @@ def _build_manual_draft_queue() -> "ArticleDraftQueue | None":
             retry_delays_seconds=MANUAL_DRAFT_RETRY_DELAYS_SECONDS,
             claim_artifact_kinds=(MANUAL_ARTIFACT_KIND,),
             manual_delivery_mode=_manual_delivery_mode(),
+            on_manual_delivered=_notify_manual_delivered,
             start_worker=True,
         )
         return queue
@@ -733,6 +824,25 @@ app = Flask(__name__, static_folder="monitor_static", static_url_path="/static")
 # endpoint (which keeps its own X-Monitor-Token check) stay exempt. See
 # feishu_auth.py for the full contract.
 FEISHU_AUTH = install_feishu_auth(app, FeishuAuthConfig.from_env(ROOT / "data"))
+
+
+def _current_operator() -> dict[str, str] | None:
+    """Identity of the logged-in Feishu user for the current request, or None.
+
+    Only the display name and open_id are kept; this rides along inside the
+    publish ``event`` so the delivery worker (which has no request context)
+    can say who pressed 发布. Without the login wall there is no operator.
+    """
+    if not FEISHU_AUTH.enabled:
+        return None
+    user = session.get(FEISHU_SESSION_KEY)
+    if not isinstance(user, dict):
+        return None
+    name = str(user.get("name") or "").strip()
+    open_id = str(user.get("open_id") or "").strip()
+    if not name and not open_id:
+        return None
+    return {"name": name, "open_id": open_id}
 
 
 def _batch_query_sources(match_ids: list[str]) -> dict[str, str]:
@@ -1984,17 +2094,20 @@ def _format_alert_text(event: dict[str, Any]) -> str:
     return " | ".join(parts)
 
 
-def _send_feishu_text(text: str) -> bool:
-    """POST a plain-text message to the configured Feishu bot webhook.
+def _send_feishu_text(text: str, webhook: str | None = None) -> bool:
+    """POST a plain-text message to a Feishu bot webhook.
 
-    Returns whether the push succeeded; never raises so a webhook outage cannot
-    break event ingestion. No webhook configured means page-only alerts.
+    Defaults to the goal-alert bot (``GIF_MONITOR_FEISHU_WEBHOOK``); pass
+    ``webhook`` to target another group. Returns whether the push succeeded;
+    never raises so a webhook outage cannot break event ingestion or publishing.
+    No webhook configured means the message is silently skipped.
     """
-    if not FEISHU_WEBHOOK:
+    target = FEISHU_WEBHOOK if webhook is None else webhook
+    if not target:
         return False
     payload = json.dumps({"msg_type": "text", "content": {"text": text}}).encode("utf-8")
     request_obj = urllib.request.Request(
-        FEISHU_WEBHOOK,
+        target,
         data=payload,
         headers={"Content-Type": "application/json"},
         method="POST",
@@ -2412,6 +2525,9 @@ def monitor_clip_publish():
         "score": form["match_score"],
         "alert_match_mode": alert_match.get("mode"),
         "alert_seq": form.get("alert_seq"),
+        # Who pressed 发布; travels with the task to the worker for the Feishu
+        # notice and lands in final_event_json for later audit. Not a CMS field.
+        "operator": _current_operator(),
     }
     status: str | None = None
     publish_error: str | None = None

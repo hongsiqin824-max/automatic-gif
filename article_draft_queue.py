@@ -390,10 +390,16 @@ class ArticleDraftQueue:
         | None = None,
         claim_artifact_kinds: Iterable[str] | None = None,
         manual_delivery_mode: str = DRAFT_DELIVERY_MODE,
+        on_manual_delivered: Callable[[dict[str, Any]], None] | None = None,
         start_worker: bool = False,
     ) -> None:
         self.database_path = database_path.expanduser().resolve()
         self.publisher = publisher
+        # Fired once per operator-confirmed clip right after the platform
+        # returned an article_id and the row reached its terminal status. The
+        # queue stays ignorant of what the hook does (e.g. a Feishu push);
+        # exceptions are logged and never affect the delivery itself.
+        self.on_manual_delivered = on_manual_delivered
         self.allowed_output_root = (
             allowed_output_root.expanduser().resolve()
             if allowed_output_root is not None
@@ -1102,6 +1108,9 @@ class ArticleDraftQueue:
                     self._record_manual_drafted(
                         task, result, event=final_event, now=claimed_at
                     )
+                self._fire_manual_delivered(
+                    task, result, event=final_event, detail=detail, mode=mode, now=claimed_at
+                )
                 return True
             eligibility = _json_object(task.get("eligibility_json"))
             if not isinstance(eligibility, dict):
@@ -1747,6 +1756,56 @@ class ArticleDraftQueue:
             self._delete_previous_staged_if_unused(task.get("previous_staged_path"))
         else:
             self._record_stale_article_id(task, result)
+
+    def _fire_manual_delivered(
+        self,
+        task: dict[str, Any],
+        result: dict[str, Any],
+        *,
+        event: dict[str, Any],
+        detail: dict[str, Any],
+        mode: str,
+        now: float,
+    ) -> None:
+        """Hand a settled manual clip to ``on_manual_delivered`` (if any).
+
+        The payload is a flat, JSON-friendly dict so the hook never has to know
+        the task-row or publisher-result shapes. Hook failures are logged only.
+        """
+        hook = self.on_manual_delivered
+        if hook is None:
+            return
+        gif = result.get("gif") if isinstance(result.get("gif"), dict) else {}
+        account = (
+            result.get("publish_account")
+            if isinstance(result.get("publish_account"), dict)
+            else {}
+        )
+        article_id = result.get("article_id")
+        payload = {
+            "match_id": str(task.get("match_id") or ""),
+            "event_key": str(task.get("event_key") or ""),
+            "delivery_mode": mode,
+            "article_id": None if article_id is None else str(article_id),
+            "draft_url": draft_admin_url(article_id),
+            "duplicate": bool(result.get("duplicate")),
+            "title": result.get("title") or event.get("title_override") or "",
+            "gif_url": gif.get("url") or task.get("gif_url"),
+            "gif_bytes": gif.get("bytes"),
+            "publish_account_name": account.get("user_name"),
+            "delivered_at_unix": float(now),
+            "event": dict(event),
+            "match_detail": dict(detail),
+        }
+        try:
+            hook(payload)
+        except Exception as exc:  # noqa: BLE001 - notification must never undo a delivery
+            _log_task_event(
+                "manual_delivered_hook_failed",
+                task,
+                article_id=article_id,
+                error=str(exc),
+            )
 
     def _record_published(
         self,
