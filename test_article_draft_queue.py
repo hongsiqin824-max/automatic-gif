@@ -1511,6 +1511,119 @@ class ManualClipQueueTests(ArticleDraftQueueTests):
             )["manual_500"]
             self.assertNotEqual(record["status"], "published")
 
+    def test_manual_failed_hook_fires_per_attempt_with_auth_flag(self):
+        """Every failed manual attempt reaches on_manual_failed with the attempt
+        number and auth_required, after the row is already in retry_wait."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            platform = SequencePlatformClient(
+                [
+                    OpenPlatformError("需要用户登录", code=10007, status_code=401, auth_required=True),
+                    OpenPlatformError("需要用户登录", code=10007, status_code=401, auth_required=True),
+                ]
+            )
+            failed = []
+            queue = self.make_queue(
+                root,
+                platform,
+                claim_artifact_kinds=(MANUAL_ARTIFACT_KIND,),
+                manual_delivery_mode="publish",
+                retry_delays_seconds=(1.0,),
+                on_manual_failed=failed.append,
+            )
+            source = self._write_manual_source(root)
+            queue.enqueue(
+                match_id="54478914",
+                event={
+                    "event_key": "manual_600",
+                    "code": "G",
+                    "title_override": "进球了",
+                    "operator": {"name": "张三", "open_id": "ou_x"},
+                },
+                match_detail={"team_A_name": "主队", "team_B_name": "客队"},
+                source_path=source,
+                artifact_kind=MANUAL_ARTIFACT_KIND,
+                artifact_result=None,
+            )
+            self.assertTrue(queue.run_once(now=1_000.0))
+            self.assertEqual(len(failed), 1)
+            first = failed[0]
+            self.assertEqual(first["attempt_count"], 1)
+            self.assertTrue(first["auth_required"])
+            self.assertTrue(first["will_retry"])
+            self.assertEqual(first["status"], "retry_wait")
+            self.assertEqual(first["platform_code"], 10007)
+            self.assertEqual(first["title"], "进球了")
+            self.assertEqual(first["event"]["operator"]["name"], "张三")
+            self.assertEqual(first["match_detail"]["team_A_name"], "主队")
+            self.assertEqual(first["failed_at_unix"], 1_000.0)
+            # Row state is independent of the hook.
+            record = queue.records_for_match(
+                "54478914", artifact_kind=MANUAL_ARTIFACT_KIND
+            )["manual_600"]
+            self.assertEqual(record["status"], "retry_wait")
+            self.assertTrue(record["auth_required"])
+            # Second retry → attempt 2.
+            self.assertTrue(queue.run_once(now=1_002.0))
+            self.assertEqual(len(failed), 2)
+            self.assertEqual(failed[1]["attempt_count"], 2)
+
+    def test_manual_failed_hook_failure_keeps_retry_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            platform = SequencePlatformClient(
+                [OpenPlatformError("平台 500", code=50001, status_code=503, retriable=True)]
+            )
+
+            def boom(_payload):
+                raise RuntimeError("webhook down")
+
+            queue = self.make_queue(
+                root,
+                platform,
+                claim_artifact_kinds=(MANUAL_ARTIFACT_KIND,),
+                manual_delivery_mode="publish",
+                on_manual_failed=boom,
+            )
+            source = self._write_manual_source(root)
+            queue.enqueue(
+                match_id="54478914",
+                event={"event_key": "manual_700", "code": "G", "title_override": "t"},
+                match_detail={},
+                source_path=source,
+                artifact_kind=MANUAL_ARTIFACT_KIND,
+                artifact_result=None,
+            )
+            self.assertTrue(queue.run_once())
+            record = queue.records_for_match(
+                "54478914", artifact_kind=MANUAL_ARTIFACT_KIND
+            )["manual_700"]
+            self.assertEqual(record["status"], "retry_wait")
+            self.assertEqual(record["attempt_count"], 1)
+
+    def test_manual_failed_hook_not_fired_on_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            failed = []
+            queue = self.make_queue(
+                root,
+                SequencePlatformClient(),
+                claim_artifact_kinds=(MANUAL_ARTIFACT_KIND,),
+                manual_delivery_mode="publish",
+                on_manual_failed=failed.append,
+            )
+            source = self._write_manual_source(root)
+            queue.enqueue(
+                match_id="54478914",
+                event={"event_key": "manual_800", "code": "G", "title_override": "t"},
+                match_detail={},
+                source_path=source,
+                artifact_kind=MANUAL_ARTIFACT_KIND,
+                artifact_result=None,
+            )
+            self.assertTrue(queue.run_once())
+            self.assertEqual(failed, [])
+
     def test_invalid_manual_delivery_mode_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

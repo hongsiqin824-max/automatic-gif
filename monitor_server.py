@@ -248,6 +248,15 @@ FEISHU_TIMEOUT = positive_env_float("GIF_MONITOR_FEISHU_TIMEOUT_SECONDS", 2.5)
 # Separate bot for "a GIF article went live" notices so they never land in the
 # goal-alert or access-request groups. Empty = no publish notifications.
 FEISHU_PUBLISH_WEBHOOK = os.environ.get("GIF_MONITOR_FEISHU_PUBLISH_WEBHOOK", "").strip()
+# Publish-failure alert: after this many consecutive failed attempts on one
+# manual clip, push a warning to FEISHU_PUBLISH_WEBHOOK (same bot as the
+# success notice, so the team sees both in one group). Authorization failures
+# (10007/10008/300002 → auth_required) retry silently forever and have gone
+# unnoticed for hours; this is the only thing that makes them visible. 0 = off.
+PUBLISH_FAIL_ALERT_AFTER_ATTEMPTS = int(_env_seconds_or_off("GIF_MONITOR_PUBLISH_FAIL_ALERT_ATTEMPTS", 3.0))
+# Minimum gap between two alerts for the same clip, so a clip stuck in
+# retry_wait for an hour does not spam the group once per retry.
+PUBLISH_FAIL_ALERT_COOLDOWN_SECONDS = _env_seconds_or_off("GIF_MONITOR_PUBLISH_FAIL_ALERT_COOLDOWN_SECONDS", 600.0)
 # Optional shared secret for the monitor→8901 loopback call. Empty = no check.
 ALERT_INGEST_TOKEN = os.environ.get("GIF_MONITOR_INGEST_TOKEN", "").strip()
 # Ring size for the page cursor and for clip→alert matching. A busy weekend has
@@ -716,6 +725,100 @@ def _notify_manual_delivered(delivered: dict) -> None:
     )
 
 
+# (match_id, event_key) → unix time of the last failure alert, so one stuck
+# clip alerts once per cooldown instead of once per retry. Process-local on
+# purpose: a restart re-alerting once is fine, cross-restart silence is not.
+_publish_fail_alert_sent: dict[tuple[str, str], float] = {}
+_publish_fail_alert_lock = threading.Lock()
+
+
+def _format_publish_failure_alert(failed: dict) -> str:
+    event = failed.get("event") if isinstance(failed.get("event"), dict) else {}
+    detail = (
+        failed.get("match_detail")
+        if isinstance(failed.get("match_detail"), dict)
+        else {}
+    )
+    head = "【GIF 发布卡住】" if failed.get("will_retry") else "【GIF 发布失败】"
+    home = str(detail.get("team_A_name") or "").strip()
+    away = str(detail.get("team_B_name") or "").strip()
+    if home or away:
+        head += f"{home or '?'} vs {away or '?'}"
+    competition = str(detail.get("competition_name") or "").strip()
+    if competition:
+        head += f"（{competition}）"
+    lines = [head]
+    title = str(failed.get("title") or event.get("title_override") or "").strip()
+    if title:
+        lines.append(f"标题：{title}")
+    attempts = int(failed.get("attempt_count") or 0)
+    reason = str(failed.get("error") or "").strip() or "未知错误"
+    code = failed.get("platform_code")
+    if code not in (None, ""):
+        reason += f"（平台码 {code}）"
+    lines.append(f"已连续失败 {attempts} 次：{reason}")
+    if failed.get("auth_required"):
+        lines.append("原因：开放平台授权失效。请到 8901「开放平台授权」重新授权；授权恢复后会自动重试。")
+    elif failed.get("will_retry"):
+        lines.append("系统仍在自动重试；持续失败请在 8901 发布卡上点「立即重试」或查看日志。")
+    else:
+        lines.append("已停止重试，请在 8901 发布卡上处理。")
+    operator = event.get("operator") if isinstance(event.get("operator"), dict) else {}
+    lines.append("操作人：" + (str(operator.get("name") or "").strip() or "未知"))
+    stamp = failed.get("failed_at_unix")
+    try:
+        when = datetime.fromtimestamp(float(stamp)).strftime("%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError, OSError, OverflowError):
+        when = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines.append(f"时间：{when}")
+    return "\n".join(lines)
+
+
+def _notify_manual_failed(failed: dict) -> None:
+    """``on_manual_failed`` hook: alert the publish group once a clip has
+    failed ``PUBLISH_FAIL_ALERT_AFTER_ATTEMPTS`` times in a row.
+
+    Terminal failures (``will_retry`` False) alert immediately regardless of
+    the attempt threshold, because nothing else will ever retry them. Per-clip
+    cooldown keeps an hour-long auth outage to a handful of messages.
+    """
+    if not FEISHU_PUBLISH_WEBHOOK or PUBLISH_FAIL_ALERT_AFTER_ATTEMPTS <= 0:
+        return
+    attempts = int(failed.get("attempt_count") or 0)
+    will_retry = bool(failed.get("will_retry"))
+    if will_retry and attempts < PUBLISH_FAIL_ALERT_AFTER_ATTEMPTS:
+        return
+    key = (str(failed.get("match_id") or ""), str(failed.get("event_key") or ""))
+    now = float(failed.get("failed_at_unix") or time.time())
+    with _publish_fail_alert_lock:
+        last = _publish_fail_alert_sent.get(key)
+        if (
+            will_retry
+            and last is not None
+            and now - last < PUBLISH_FAIL_ALERT_COOLDOWN_SECONDS
+        ):
+            return
+        _publish_fail_alert_sent[key] = now
+    pushed = _send_feishu_text(_format_publish_failure_alert(failed), FEISHU_PUBLISH_WEBHOOK)
+    print(
+        json.dumps(
+            {
+                "event": "publish_failure_alert_pushed",
+                "match_id": key[0],
+                "event_key": key[1],
+                "attempt": attempts,
+                "auth_required": bool(failed.get("auth_required")),
+                "will_retry": will_retry,
+                "error_code": failed.get("error_code"),
+                "platform_code": failed.get("platform_code"),
+                "ok": pushed,
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
+
+
 def _build_manual_draft_queue() -> "ArticleDraftQueue | None":
     """Build a MANUAL-only draft queue that shares the dashboard's publish DB.
 
@@ -799,6 +902,7 @@ def _build_manual_draft_queue() -> "ArticleDraftQueue | None":
             claim_artifact_kinds=(MANUAL_ARTIFACT_KIND,),
             manual_delivery_mode=_manual_delivery_mode(),
             on_manual_delivered=_notify_manual_delivered,
+            on_manual_failed=_notify_manual_failed,
             start_worker=True,
         )
         return queue

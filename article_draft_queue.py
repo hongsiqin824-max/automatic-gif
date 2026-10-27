@@ -391,6 +391,7 @@ class ArticleDraftQueue:
         claim_artifact_kinds: Iterable[str] | None = None,
         manual_delivery_mode: str = DRAFT_DELIVERY_MODE,
         on_manual_delivered: Callable[[dict[str, Any]], None] | None = None,
+        on_manual_failed: Callable[[dict[str, Any]], None] | None = None,
         start_worker: bool = False,
     ) -> None:
         self.database_path = database_path.expanduser().resolve()
@@ -400,6 +401,11 @@ class ArticleDraftQueue:
         # queue stays ignorant of what the hook does (e.g. a Feishu push);
         # exceptions are logged and never affect the delivery itself.
         self.on_manual_delivered = on_manual_delivered
+        # Fired on every failed attempt of an operator-confirmed clip, after the
+        # row has been moved to retry_wait/failed. Carries attempt_count and
+        # auth_required so the caller can decide when a silent retry loop
+        # (e.g. platform authorization lost) deserves a human alert.
+        self.on_manual_failed = on_manual_failed
         self.allowed_output_root = (
             allowed_output_root.expanduser().resolve()
             if allowed_output_root is not None
@@ -2004,6 +2010,67 @@ class ArticleDraftQueue:
                     task["generation"],
                     task["lease_token"],
                 ),
+            )
+        if str(task.get("artifact_kind") or "") == MANUAL_ARTIFACT_KIND:
+            self._fire_manual_failed(
+                task,
+                exc,
+                status=status,
+                attempts=attempts,
+                friendly_error=friendly_error,
+                next_attempt=next_attempt,
+                now=now,
+            )
+
+    def _fire_manual_failed(
+        self,
+        task: dict[str, Any],
+        exc: ArticlePublishError,
+        *,
+        status: str,
+        attempts: int,
+        friendly_error: str,
+        next_attempt: float | None,
+        now: float,
+    ) -> None:
+        """Hand a failed manual attempt to ``on_manual_failed`` (if any).
+
+        Same contract as ``_fire_manual_delivered``: flat JSON-friendly payload,
+        hook failures are logged only and never touch the task row.
+        """
+        hook = self.on_manual_failed
+        if hook is None:
+            return
+        event = _json_object(task.get("event_json")) or {}
+        detail = _json_object(task.get("match_detail_json")) or {}
+        payload = {
+            "match_id": str(task.get("match_id") or ""),
+            "event_key": str(task.get("event_key") or ""),
+            "delivery_mode": str(task.get("delivery_mode") or ""),
+            "status": status,
+            "stage": exc.stage,
+            "attempt_count": int(attempts),
+            "auth_required": bool(exc.auth_required),
+            "will_retry": status == "retry_wait",
+            "next_attempt_in_seconds": (
+                None if next_attempt is None else round(next_attempt - now, 1)
+            ),
+            "error_code": exc.code,
+            "platform_code": exc.platform_code,
+            "error": friendly_error,
+            "title": event.get("title_override") or "",
+            "failed_at_unix": float(now),
+            "event": dict(event),
+            "match_detail": dict(detail),
+        }
+        try:
+            hook(payload)
+        except Exception as hook_exc:  # noqa: BLE001 - alerting must never change task state
+            _log_task_event(
+                "manual_failed_hook_failed",
+                task,
+                attempt=attempts,
+                error=str(hook_exc),
             )
 
     def _record_stale_article_id(

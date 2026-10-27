@@ -2825,6 +2825,110 @@ class PublishNoticeTests(ClipEndpointAlertMatchTests):
             monitor_server._notify_manual_delivered(self._delivered())
         send.assert_not_called()
 
+    # ---- publish-failure alert (auth lost / stuck retry) ----
+
+    def _failed(self, **overrides):
+        base = {
+            "match_id": "54622319",
+            "event_key": "manual_1",
+            "delivery_mode": "publish",
+            "status": "retry_wait",
+            "stage": "official_image_upload",
+            "attempt_count": 3,
+            "auth_required": True,
+            "will_retry": True,
+            "next_attempt_in_seconds": 60.0,
+            "error_code": "official_image_upload_failed",
+            "platform_code": 10007,
+            "error": "懂球帝官方图片上传失败：需要用户登录",
+            "title": "点球破门",
+            "failed_at_unix": 1_700_000_000.0,
+            "event": {"title_override": "点球破门", "operator": {"name": "张三", "open_id": "ou_x"}},
+            "match_detail": {"team_A_name": "甲", "team_B_name": "乙", "competition_name": "英超"},
+        }
+        base.update(overrides)
+        return base
+
+    def _alert_env(self, *, attempts=3, cooldown=600.0, webhook="https://hook/publish"):
+        monitor_server._publish_fail_alert_sent.clear()
+        return (
+            mock.patch.object(monitor_server, "FEISHU_PUBLISH_WEBHOOK", webhook),
+            mock.patch.object(monitor_server, "PUBLISH_FAIL_ALERT_AFTER_ATTEMPTS", attempts),
+            mock.patch.object(monitor_server, "PUBLISH_FAIL_ALERT_COOLDOWN_SECONDS", cooldown),
+            mock.patch.object(monitor_server, "_send_feishu_text", return_value=True),
+        )
+
+    def test_failure_alert_text_auth_required(self):
+        text = monitor_server._format_publish_failure_alert(self._failed())
+        when = monitor_server.datetime.fromtimestamp(1_700_000_000.0).strftime("%Y-%m-%d %H:%M:%S")
+        self.assertEqual(
+            text.split("\n"),
+            [
+                "【GIF 发布卡住】甲 vs 乙（英超）",
+                "标题：点球破门",
+                "已连续失败 3 次：懂球帝官方图片上传失败：需要用户登录（平台码 10007）",
+                "原因：开放平台授权失效。请到 8901「开放平台授权」重新授权；授权恢复后会自动重试。",
+                "操作人：张三",
+                f"时间：{when}",
+            ],
+        )
+
+    def test_failure_alert_text_terminal_and_retrying(self):
+        terminal = monitor_server._format_publish_failure_alert(
+            self._failed(auth_required=False, will_retry=False, status="failed", platform_code=10010)
+        )
+        self.assertTrue(terminal.startswith("【GIF 发布失败】"))
+        self.assertIn("已停止重试", terminal)
+        self.assertIn("平台码 10010", terminal)
+        retrying = monitor_server._format_publish_failure_alert(
+            self._failed(auth_required=False, platform_code=None)
+        )
+        self.assertIn("仍在自动重试", retrying)
+        self.assertNotIn("平台码", retrying)
+
+    def test_failure_alert_waits_for_threshold_then_pushes_once_per_cooldown(self):
+        patches = self._alert_env(attempts=3, cooldown=600.0)
+        with patches[0], patches[1], patches[2], patches[3] as send:
+            monitor_server._notify_manual_failed(self._failed(attempt_count=1, failed_at_unix=1000.0))
+            monitor_server._notify_manual_failed(self._failed(attempt_count=2, failed_at_unix=1010.0))
+            send.assert_not_called()
+            monitor_server._notify_manual_failed(self._failed(attempt_count=3, failed_at_unix=1020.0))
+            self.assertEqual(send.call_count, 1)
+            self.assertEqual(send.call_args.args[1], "https://hook/publish")
+            self.assertIn("已连续失败 3 次", send.call_args.args[0])
+            # Still inside the cooldown → silent.
+            monitor_server._notify_manual_failed(self._failed(attempt_count=4, failed_at_unix=1080.0))
+            monitor_server._notify_manual_failed(self._failed(attempt_count=9, failed_at_unix=1600.0))
+            self.assertEqual(send.call_count, 1)
+            # Cooldown elapsed → one more.
+            monitor_server._notify_manual_failed(self._failed(attempt_count=10, failed_at_unix=1700.0))
+            self.assertEqual(send.call_count, 2)
+            # A different clip has its own counter.
+            monitor_server._notify_manual_failed(
+                self._failed(event_key="manual_2", attempt_count=3, failed_at_unix=1701.0)
+            )
+            self.assertEqual(send.call_count, 3)
+
+    def test_failure_alert_terminal_failure_pushes_immediately(self):
+        patches = self._alert_env(attempts=3)
+        with patches[0], patches[1], patches[2], patches[3] as send:
+            monitor_server._notify_manual_failed(
+                self._failed(attempt_count=1, will_retry=False, status="failed", auth_required=False)
+            )
+            self.assertEqual(send.call_count, 1)
+            self.assertTrue(send.call_args.args[0].startswith("【GIF 发布失败】"))
+
+    def test_failure_alert_disabled_without_webhook_or_threshold(self):
+        patches = self._alert_env(attempts=3, webhook="")
+        with patches[0], patches[1], patches[2], patches[3] as send:
+            monitor_server._notify_manual_failed(self._failed(attempt_count=5))
+            monitor_server._notify_manual_failed(self._failed(attempt_count=1, will_retry=False))
+        send.assert_not_called()
+        patches = self._alert_env(attempts=0)
+        with patches[0], patches[1], patches[2], patches[3] as send:
+            monitor_server._notify_manual_failed(self._failed(attempt_count=5))
+        send.assert_not_called()
+
     def test_send_feishu_text_targets_explicit_webhook(self):
         with mock.patch.object(monitor_server, "FEISHU_WEBHOOK", "https://hook/alert"), \
              mock.patch.object(monitor_server.urllib.request, "urlopen") as urlopen:
