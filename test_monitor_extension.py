@@ -533,5 +533,80 @@ class ExtensionPickSourceTests(unittest.TestCase):
         self.assertEqual((r["next"], r["reason"]), ("b", "hard"))
 
 
+class ExtensionUnstickTargetTests(unittest.TestCase):
+    """``unstickTarget`` in extension/gif-clipper/content/review.js, run under node.
+
+    The review player calls it on every "seeking" / "waiting" event and seeks
+    to the result, which fires "seeking" again. It must therefore settle: a
+    seek near the end of the buffer once looped ~160k times per second.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import shutil
+
+        cls.node = shutil.which("node")
+        if not cls.node:
+            raise unittest.SkipTest("node 不可用")
+        cls.script = Path(__file__).parent / "extension" / "gif-clipper" / "content" / "review.js"
+        if not cls.script.is_file():
+            raise unittest.SkipTest("review.js missing")
+
+    def settle(self, ranges, t, stalled=False):
+        """Positions visited until the helper says stay (the browser's loop)."""
+        script = (
+            f"const {{unstickTarget}} = require({json.dumps(str(self.script))});"
+            f"const ranges = {json.dumps(ranges)}; let t = {t}; let stalled = {json.dumps(stalled)};"
+            "const seen = [];"
+            "for (let i = 0; i < 10; i++) {"
+            "  const next = unstickTarget(ranges, t, stalled);"
+            "  if (next == null) break;"
+            "  seen.push(next); t = next; stalled = false;"  # our own seek fires "seeking"
+            "}"
+            "process.stdout.write(JSON.stringify(seen));"
+        )
+        result = subprocess.run([self.node, "-e", script], capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_inside_a_range_stays(self):
+        self.assertEqual(self.settle([[0, 10]], 5), [])
+        self.assertEqual(self.settle([[0, 10]], 5, stalled=True), [])
+
+    def test_seek_into_hole_jumps_to_next_range(self):
+        self.assertEqual(self.settle([[0, 5], [6, 10]], 5.5), [6.01])
+        self.assertEqual(self.settle([[1, 5]], 0.2), [1.01])
+
+    def test_stall_at_tail_crosses_small_gap_once(self):
+        self.assertEqual(self.settle([[0, 5], [5.08, 10]], 4.95, stalled=True), [5.09])
+
+    def test_seek_near_tail_is_not_bounced(self):
+        # Frame-stepping up to a gap must not be thrown into the next range.
+        self.assertEqual(self.settle([[0, 5], [5.08, 10]], 4.95), [])
+
+    def test_seek_in_end_zone_does_not_loop(self):
+        # Real numbers from the 2026-10-27 probe: buffer ends at 17.386 s and
+        # dragging the timeline to the right seeks to total - 0.05 = 17.362 s.
+        self.assertEqual(self.settle([[0, 17.386]], 17.362), [])
+        self.assertEqual(self.settle([[0, 17.386]], 17.336), [])
+
+    def test_past_the_end_parks_once(self):
+        seen = self.settle([[0, 17.386]], 18.0)
+        self.assertEqual(len(seen), 1)
+        self.assertAlmostEqual(seen[0], 17.336, places=6)
+
+    def test_always_settles(self):
+        layouts = [
+            [[0, 5], [5.02, 5.03], [5.1, 10]],   # tiny range between holes
+            [[0, 0.004]],                          # degenerate single range
+            [[0, 5], [5.05, 10]],
+        ]
+        for ranges in layouts:
+            for t in (-1, 0, 4.9, 5.0, 5.025, 5.06, 9.9, 10, 11):
+                for stalled in (False, True):
+                    with self.subTest(ranges=ranges, t=t, stalled=stalled):
+                        self.assertLessEqual(len(self.settle(ranges, t, stalled)), 3)
+
+
 if __name__ == "__main__":
     unittest.main()

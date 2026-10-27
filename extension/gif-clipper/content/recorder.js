@@ -30,12 +30,15 @@
       this.bitrate = bitrate;
       this.onStatus = onStatus;
       this.segments = [];        // {blob, startEpochMs, durationMs}
-      this.stream = null;
+      this.captured = null;      // what captureStream() returned (gets the new track on a source swap)
+      this.stream = null;        // video-only stream the MediaRecorder records
+      this.track = null;         // the video track being recorded
       this.recorder = null;
       this.rotateTimer = null;
       this.startMs = null;       // operator-set start (Date.now())
       this.liveStartMs = null;   // Date.now() when the current (open) segment began
-      this.recapturedAt = 0;     // debounce for track-ended recapture
+      this.recapturedAt = 0;     // rate limit for recapture()
+      this.recaptureTimer = null;
       this.pending = false;      // recapture failed (no track yet); retry on ensureLive()
       this.stopped = false;
       this.mimeType = ["video/webm;codecs=vp8", "video/webm;codecs=vp9", "video/webm"]
@@ -49,9 +52,12 @@
       return true;
     }
 
-    // Grab a fresh stream from the same <video>. The track ends when the
-    // player swaps ``src`` / reloads on the same element; we then recapture
-    // in place instead of treating it as a new source (buffer is kept).
+    // Grab a fresh stream from the same <video>. When the player swaps
+    // ``src`` / its MediaSource on the same element, Chrome does NOT end the
+    // old track: it silently stops delivering frames and a new track is added
+    // to the captured stream (verified 2026-10-27, Chrome 156, both kinds of
+    // swap). So follow ``addtrack`` and recapture in place instead of
+    // treating it as a new source (buffer is kept).
     _capture(quiet = false) {
       let captured;
       try {
@@ -68,11 +74,30 @@
       // Video only: GIFs have no sound, and a webm with an opus track would
       // not match the video-only codec string the review overlay hands to MSE.
       const track = videoTracks[0];
+      this.captured = captured;
+      this.track = track;
       this.stream = new MediaStream([track]);
+      captured.addEventListener("addtrack", (e) => {
+        // Chrome also fires addtrack for the track captureStream() returned
+        // with, so only a different video track means a source swap.
+        if (e.track.kind !== "video" || this.captured !== captured) return;
+        if (this.track && e.track.id === this.track.id) return;
+        this.recapture();
+      });
       track.addEventListener("ended", () => {
-        if (this.stream && this.stream.getVideoTracks()[0] === track) this.recapture();
+        if (this.track === track) this.recapture();
       });
       return true;
+    }
+
+    // Stop every captured track (incl. audio and any track a source swap
+    // added) so no capture keeps running behind our back.
+    _release() {
+      if (this.captured) this.captured.getTracks().forEach((t) => t.stop());
+      if (this.stream) this.stream.getTracks().forEach((t) => t.stop());
+      this.captured = null;
+      this.stream = null;
+      this.track = null;
     }
 
     // Close the open segment, drop the dead stream and capture the same
@@ -81,16 +106,22 @@
     // ``pending`` and the finder calls ``ensureLive()`` on loadedmetadata.
     recapture() {
       if (this.stopped || !this.video.isConnected) return false;
-      const now = Date.now();
-      if (!this.pending && now - this.recapturedAt < 500) return true;
-      this.recapturedAt = now;
+      // At most one recapture per 500 ms, but never drop one: a second swap
+      // right after the first must still be followed, so defer instead.
+      const wait = this.recapturedAt + 500 - Date.now();
+      if (!this.pending && wait > 0) {
+        clearTimeout(this.recaptureTimer);
+        this.recaptureTimer = setTimeout(() => this.recapture(), wait);
+        return true;
+      }
+      clearTimeout(this.recaptureTimer);
+      this.recapturedAt = Date.now();
       this.pending = false;
       clearTimeout(this.rotateTimer);
       const live = this.recorder;
       this.recorder = null;
       this._halt(live);
-      if (this.stream) this.stream.getTracks().forEach((t) => t.stop());
-      this.stream = null;
+      this._release();
       if (!this._capture(true)) {
         this.pending = true;
         return false;
@@ -220,8 +251,9 @@
     stop() {
       this.stopped = true;
       clearTimeout(this.rotateTimer);
+      clearTimeout(this.recaptureTimer);
       this._halt(this.recorder);
-      if (this.stream) this.stream.getTracks().forEach((t) => t.stop());
+      this._release();
       this.segments = [];
       this.startMs = null;
     }

@@ -11,7 +11,38 @@
 //
 // Keys while open: Space play/pause, ←/→ ±1 s, Shift+←/→ ±5 s, , . ±1 frame,
 // [ set start, ] set end, C toggle crop box, Enter confirm, Esc close.
+//
+// Pure helper `unstickTarget` is exported for node tests (no DOM needed).
 (() => {
+  // Segments do not always touch: a stall or a paused source leaves a hole
+  // in the wall-clock timeline, and the element sits in "waiting" forever at
+  // a hole. Returns where to move the playhead, or null to leave it.
+  // ``ranges`` = [[start, end], ...] from video.buffered; ``stalled`` = the
+  // element fired "waiting" (playback hit the tail of a range), otherwise
+  // this is a seek and only a position outside every range is moved. Never
+  // returns the current position: setting currentTime fires "seeking" again,
+  // so a target equal to ``t`` would loop forever.
+  function unstickTarget(ranges, t, stalled) {
+    const EPS = 0.15;
+    const n = ranges.length;
+    if (!n) return null;
+    for (let i = 0; i < n; i++) {
+      const [start, end] = ranges[i];
+      if (t < start) return start + 0.01; // in the hole before this range
+      if (t < end) {
+        if (stalled && t >= end - EPS && i + 1 < n) return ranges[i + 1][0] + 0.01;
+        return null;
+      }
+    }
+    // Past the last range: park on its last frame (only if not already there).
+    const last = Math.max(ranges[n - 1][0], ranges[n - 1][1] - 0.05);
+    return t > last + 0.01 ? last : null;
+  }
+
+  if (typeof module !== "undefined" && module.exports) {
+    module.exports = { unstickTarget };
+  }
+  if (typeof window === "undefined") return;
   if (window.__gifClipperReview) return;
 
   const toast = window.__gifClipperToast || (() => {});
@@ -151,8 +182,8 @@
       this.ui = {};
       wrap.querySelectorAll("[data-role]").forEach((el) => (this.ui[el.dataset.role] = el));
       this.video = wrap.querySelector("video");
-      this.video.addEventListener("waiting", () => this._unstick());
-      this.video.addEventListener("seeking", () => this._unstick());
+      this.video.addEventListener("waiting", () => this._unstick(true));
+      this.video.addEventListener("seeking", () => this._unstick(false));
       (document.fullscreenElement || document.documentElement).appendChild(this.host);
       this._place();
     }
@@ -429,37 +460,20 @@
         /* fine */
       }
       this.assembled = true;
-      this._unstick();
+      this._unstick(!this.video.paused);
       this.ui.hint.textContent = `缓冲 ${this._fmt(this.total)}，拖时间轴找画面`;
     }
 
-    // Segments do not always touch: a stall or a paused source leaves a hole
-    // in the wall-clock timeline, and the element will sit in "waiting"
-    // forever at a hole. Jump to the next buffered range instead (or to the
-    // end of the last one when nothing follows).
-    _unstick() {
+    // Move the playhead off a hole / past-the-end position (see unstickTarget).
+    _unstick(stalled) {
       if (!this.assembled || this.closed) return;
       const v = this.video;
-      const b = v.buffered;
-      if (!b.length) return;
-      const t = v.currentTime;
-      const EPS = 0.15;
-      for (let i = 0; i < b.length; i++) {
-        const start = b.start(i);
-        const end = b.end(i);
-        if (t < start - EPS) {
-          v.currentTime = start + 0.01;
-          return;
-        }
-        if (t <= end - EPS) return; // inside a range with footage ahead
-        if (t <= end + EPS && i + 1 < b.length) {
-          v.currentTime = b.start(i + 1) + 0.01;
-          return;
-        }
-      }
-      // Past the end of the last range.
-      v.pause();
-      v.currentTime = Math.max(b.start(b.length - 1), b.end(b.length - 1) - 0.05);
+      const ranges = [];
+      for (let i = 0; i < v.buffered.length; i++) ranges.push([v.buffered.start(i), v.buffered.end(i)]);
+      const target = unstickTarget(ranges, v.currentTime, stalled);
+      if (target == null) return;
+      if (target < v.currentTime) v.pause(); // parked on the last frame
+      v.currentTime = target;
     }
 
     _updateEnd(sb) {
