@@ -56,6 +56,7 @@
       <select data-role="match" title="选择这个标签页正在看的比赛"><option value="">选择比赛…</option></select>
       <button data-role="start" title="把当前画面设为起点（Alt+1）">设起点<kbd>Alt+1</kbd></button>
       <button data-role="finish" class="primary" disabled title="结束并生成 GIF（Alt+2）">结束<kbd>Alt+2</kbd></button>
+      <button data-role="review" title="回看最近几分钟，拖动选起止点（Alt+3）">回看<kbd>Alt+3</kbd></button>
       <span data-role="status" class="status">正在找视频…</span>
       <button data-role="hide" class="hide" title="隐藏小条（Alt+0 再显示）">×</button>
     `;
@@ -65,11 +66,13 @@
       match: bar.querySelector('[data-role="match"]'),
       start: bar.querySelector('[data-role="start"]'),
       finish: bar.querySelector('[data-role="finish"]'),
+      review: bar.querySelector('[data-role="review"]'),
       status: bar.querySelector('[data-role="status"]'),
       hide: bar.querySelector('[data-role="hide"]'),
     };
     ui.start.addEventListener("click", () => send({ type: "command", command: "set-start" }));
     ui.finish.addEventListener("click", () => send({ type: "command", command: "finish" }));
+    ui.review.addEventListener("click", () => send({ type: "command", command: "review" }));
     ui.hide.addEventListener("click", () => setHidden(true, true));
     ui.match.addEventListener("change", async () => {
       await send({ type: "set-match", matchId: ui.match.value });

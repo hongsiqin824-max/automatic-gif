@@ -12,7 +12,7 @@
       "all_frames": true,
       "match_about_blank": true,
       "run_at": "document_idle",
-      "js": ["content/toast.js", "content/recorder.js", "content/finder.js", "content/bar.js"]
+      "js": ["content/toast.js", "content/recorder.js", "content/review.js", "content/finder.js", "content/bar.js"]
     }
   ],
   "side_panel": { "default_path": "panel.html" },
@@ -26,6 +26,10 @@
     "finish": {
       "suggested_key": { "default": "Alt+2" },
       "description": "结束并生成 GIF"
+    },
+    "review": {
+      "suggested_key": { "default": "Alt+3" },
+      "description": "回看缓冲，拖动选起止点"
     },
     "toggle-bar": {
       "suggested_key": { "default": "Alt+0" },

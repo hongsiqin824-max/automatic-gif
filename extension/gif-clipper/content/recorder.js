@@ -119,9 +119,23 @@
     }
 
     // Close the live segment so its footage is included, then pick segments.
-    async finish(endMs = Date.now()) {
-      if (this.startMs == null) throw new Error("还没有设起点");
-      const startMs = this.startMs;
+    // ``range`` = {startMs, endMs} from the review overlay; without it the
+    // operator-set start and "now" are used (Alt+1 / Alt+2 path).
+    async finish(range = null) {
+      const startMs = range ? range.startMs : this.startMs;
+      const endMs = range ? range.endMs : Date.now();
+      if (startMs == null) throw new Error("还没有设起点");
+      await this.closeLiveSegment();
+      const picked = selectSegments(this.segments, startMs, endMs);
+      this.startMs = null;
+      if (!picked.length) throw new Error("起点已超出缓冲，请重新设起点");
+      return { startMs, endMs, segments: picked };
+    }
+
+    // Stop the open segment (so it becomes a playable file) and start a new
+    // one right away. Used before finishing a clip and before a review so the
+    // last few seconds are included.
+    async closeLiveSegment() {
       clearTimeout(this.rotateTimer);
       const live = this.recorder;
       if (live && live.state !== "inactive") {
@@ -134,12 +148,12 @@
           live.stop();
         });
       }
-      // Resume rolling immediately so the next capture has footage.
       if (!this.stopped) this._rotate();
-      const picked = selectSegments(this.segments, startMs, endMs);
-      this.startMs = null;
-      if (!picked.length) throw new Error("起点已超出缓冲，请重新设起点");
-      return { startMs, endMs, segments: picked };
+    }
+
+    // Shallow copy of the closed segments for the review overlay.
+    snapshot() {
+      return this.segments.map((s) => ({ blob: s.blob, startEpochMs: s.startEpochMs, durationMs: s.durationMs }));
     }
 
     stop() {

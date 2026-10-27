@@ -47,6 +47,7 @@
   function report() {
     const v = bestVideo();
     if (v !== current) {
+      if (review && !review.closed) review.close();
       if (recorder) {
         recorder.stop();
         recorder = null;
@@ -140,6 +141,58 @@
     return result;
   }
 
+  let review = null;      // open ReviewOverlay, if any
+
+  // Build and upload a clip. ``range`` = {startMs, endMs} from the review
+  // overlay; null = from the Alt+1 start point to now.
+  async function generateClip(matchId, range) {
+    if (!recorder || busy) return;
+    busy = true;
+    toast("生成中…", "", 10_000);
+    try {
+      const picked = await recorder.finish(range);
+      const result = await uploadClip(matchId, picked);
+      toast(`GIF 已生成（${(result.bytes / 1024 / 1024).toFixed(2)} MB）`, "ok", 3000);
+      await send({ type: "clip-created", matchId, name: result.name });
+    } catch (err) {
+      if (err && err.code === "login_required") {
+        toast("请先登录 8901（已打开登录页）", "fail", 4000);
+        await send({ type: "open-login", loginUrl: err.loginUrl });
+      } else {
+        toast(`失败：${err && err.message}`, "fail", 4000);
+      }
+    } finally {
+      busy = false;
+      send({ type: "bar-relay", payload: { type: "bar-range", startMs: null } });
+    }
+  }
+
+  // Review overlay over the live player: close the open segment first so the
+  // last seconds are playable, then stitch the closed segments.
+  async function openReview(matchId, maxRangeSeconds) {
+    const { ReviewOverlay } = window.__gifClipperReview || {};
+    if (!ReviewOverlay) {
+      toast("回看组件未加载", "fail");
+      return;
+    }
+    await recorder.closeLiveSegment();
+    const segments = recorder.snapshot();
+    if (!segments.length) {
+      toast("缓冲还是空的，再等几秒", "warn");
+      return;
+    }
+    review = new ReviewOverlay({
+      anchor: current,
+      segments,
+      mimeType: recorder.mimeType || "video/webm",
+      maxRangeSeconds,
+      onConfirm: (range) => generateClip(matchId, range),
+      onClose: () => {
+        review = null;
+      },
+    });
+  }
+
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     switch (msg && msg.type) {
       case "recorder-start": {
@@ -178,26 +231,22 @@
           sendResponse({ ok: false });
           return false;
         }
-        busy = true;
-        toast("生成中…", "", 10_000);
-        (async () => {
-          try {
-            const picked = await recorder.finish();
-            const result = await uploadClip(msg.matchId, picked);
-            toast(`GIF 已生成（${(result.bytes / 1024 / 1024).toFixed(2)} MB）`, "ok", 3000);
-            await send({ type: "clip-created", matchId: msg.matchId, name: result.name });
-          } catch (err) {
-            if (err && err.code === "login_required") {
-              toast("请先登录 8901（已打开登录页）", "fail", 4000);
-              await send({ type: "open-login", loginUrl: err.loginUrl });
-            } else {
-              toast(`失败：${err && err.message}`, "fail", 4000);
-            }
-          } finally {
-            busy = false;
-            send({ type: "bar-relay", payload: { type: "bar-range", startMs: null } });
-          }
-        })();
+        generateClip(msg.matchId, null);
+        sendResponse({ ok: true });
+        return false;
+      }
+      case "review-open": {
+        if (!recorder || !current) {
+          toast("还没开始录制", "fail");
+          sendResponse({ ok: false });
+          return false;
+        }
+        if (review && !review.closed) {
+          review.close();
+          sendResponse({ ok: true, closed: true });
+          return false;
+        }
+        openReview(msg.matchId, msg.maxRangeSeconds);
         sendResponse({ ok: true });
         return false;
       }

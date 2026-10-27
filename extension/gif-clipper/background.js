@@ -303,12 +303,21 @@ async function runCommand(command, tabId) {
   }
   if (command === "set-start") {
     sendToFrame(tabId, state.mainFrameId, { type: "recorder-set-start" });
-  } else if (command === "finish") {
+  } else if (command === "finish" || command === "review") {
     if (!state.matchId) {
       broadcastBar(tabId, { type: "bar-status", text: "请先在小条里选择比赛", level: "fail" });
       return;
     }
-    sendToFrame(tabId, state.mainFrameId, { type: "recorder-finish", matchId: state.matchId });
+    if (command === "finish") {
+      sendToFrame(tabId, state.mainFrameId, { type: "recorder-finish", matchId: state.matchId });
+    } else {
+      const config = await getConfig().catch(() => null);
+      sendToFrame(tabId, state.mainFrameId, {
+        type: "review-open",
+        matchId: state.matchId,
+        maxRangeSeconds: (config && config.clip_range_max_seconds) || 30,
+      });
+    }
   }
 }
 
