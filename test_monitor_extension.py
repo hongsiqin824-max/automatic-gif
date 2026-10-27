@@ -400,5 +400,48 @@ class RealFfmpegTests(unittest.TestCase):
             self.assertEqual(list(root.glob(".concat_*")), [])
 
 
+class ExtensionSelectSegmentsTests(unittest.TestCase):
+    """``selectSegments`` in extension/gif-clipper/content/recorder.js, run under node."""
+
+    @classmethod
+    def setUpClass(cls):
+        import shutil
+
+        cls.node = shutil.which("node")
+        if not cls.node:
+            raise unittest.SkipTest("node 不可用")
+        cls.script = Path(__file__).parent / "extension" / "gif-clipper" / "content" / "recorder.js"
+        if not cls.script.is_file():
+            raise unittest.SkipTest("recorder.js missing")
+
+    def run_js(self, start: int, end: int, segments=None):
+        segments = segments if segments is not None else [
+            {"startEpochMs": 0, "durationMs": 30000},
+            {"startEpochMs": 30000, "durationMs": 30000},
+            {"startEpochMs": 60000, "durationMs": 30000},
+        ]
+        script = (
+            f"const {{selectSegments}} = require({json.dumps(str(self.script))});"
+            f"process.stdout.write(JSON.stringify(selectSegments({json.dumps(segments)}, {start}, {end}).map(s => s.startEpochMs)));"
+        )
+        result = subprocess.run([self.node, "-e", script], capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_inside_one_segment(self):
+        self.assertEqual(self.run_js(5000, 20000), [0])
+
+    def test_across_two_segments(self):
+        self.assertEqual(self.run_js(25000, 40000), [0, 30000])
+        self.assertEqual(self.run_js(59500, 85000), [30000, 60000])
+
+    def test_start_within_one_second_before_buffer_is_tolerated(self):
+        self.assertEqual(self.run_js(-500, 5000), [0])
+
+    def test_start_fell_off_buffer_is_empty(self):
+        self.assertEqual(self.run_js(-2000, 5000), [])
+        self.assertEqual(self.run_js(5000, 20000, segments=[{"startEpochMs": 30000, "durationMs": 30000}]), [])
+
+
 if __name__ == "__main__":
     unittest.main()
