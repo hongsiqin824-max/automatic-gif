@@ -7,6 +7,15 @@ const WORKSHOP_IDLE_MS = 90000;
 const TILE_STATUS_STICKY_MS = 5000;
 // How often a workshop tile that found no live source quietly re-asks for one.
 const NO_SOURCE_RETRY_MS = 30000;
+// Panel mode (`?mode=panel&match_id=…`): the browser extension embeds this
+// page in the Chrome side panel and only wants the publish cards. Everything
+// list/stage/preview related is skipped; see initPanelMode() at the bottom.
+const PANEL = (() => {
+  const params = new URLSearchParams(location.search);
+  if (params.get('mode') !== 'panel') return null;
+  return {matchId: String(params.get('match_id') || '').trim()};
+})();
+if (PANEL) document.body.dataset.mode = 'panel';
 
 const state = {
   tiles: new Map(),      // match_id -> {data, hls, playlistReady, statusTimer}
@@ -2217,9 +2226,11 @@ document.addEventListener('keydown', (ev) => {
     if (state.alertPanelOpen) { closeAlertPanel(); return; }
     // First Esc leaves crop editing (keeps the box); the next one closes.
     if (state.crop.editing) { toggleCropEditing(false); return; }
+    if (PANEL) return;  // the side panel has no stage to close
     closeStage();
     return;
   }
+  if (PANEL) return;  // S/E/C drive the stage buttons, which the panel does not show
   // S / E / C drive the capture buttons while the stage is open and the operator
   // is not typing in a form field (the title input handles Enter itself).
   if (!state.stageMatchId || ev.metaKey || ev.ctrlKey || ev.altKey || ev.isComposing) return;
@@ -2496,11 +2507,13 @@ $('auth-logout-btn').addEventListener('click', async () => {
 });
 
 refreshAuthBar();
-refreshMatches();
-setInterval(refreshMatches, REFRESH_MS);
-setInterval(renderCatalogAge, 5000);
 setInterval(refreshAuthBar, AUTH_BAR_REFRESH_MS);
-setInterval(keepAlivePreviews, 8000);
+if (!PANEL) {
+  refreshMatches();
+  setInterval(refreshMatches, REFRESH_MS);
+  setInterval(renderCatalogAge, 5000);
+  setInterval(keepAlivePreviews, 8000);
+}
 
 // ---- Real-time goal/red-card alerts (unchanged) ----
 
@@ -2990,3 +3003,43 @@ function startLagMonitoring() {
 
 pollAlerts();
 setInterval(pollAlerts, ALERT_POLL_MS);
+
+// ---- Panel mode (browser extension side panel) ----
+//
+// The page is embedded as `chrome-extension://…/panel.html → <iframe>` and
+// shows only the publish cards of one match. The extension talks to it with
+// postMessage: {type:'ext-clip-created', match_id, name} after an upload and
+// {type:'ext-set-match', match_id} when the operator picks another match.
+function setPanelMatch(matchId) {
+  const next = String(matchId || '').trim();
+  if (!next) return;
+  if (state.stageMatchId !== next) {
+    stopDraftPoll();
+    state.stageMatchId = next;
+    const title = $('stage-title');
+    if (title) title.textContent = `比赛 ${next}`;
+  }
+  loadStageClips(next, {focusTitle: true});
+}
+
+function initPanelMode() {
+  $('stage').classList.remove('hidden');
+  const title = $('stage-title');
+  if (title) title.textContent = PANEL.matchId ? `比赛 ${PANEL.matchId}` : '未选择比赛';
+  window.addEventListener('message', (ev) => {
+    // Only the extension's own pages may drive the panel.
+    if (!/^(chrome|edge|moz)-extension:\/\//.test(String(ev.origin || ''))) return;
+    const data = ev.data || {};
+    if (data.type === 'ext-clip-created' || data.type === 'ext-set-match') {
+      setPanelMatch(data.match_id || state.stageMatchId);
+    }
+  });
+  if (PANEL.matchId) {
+    setPanelMatch(PANEL.matchId);
+  } else {
+    const list = $('stage-clips');
+    if (list) list.innerHTML = '<div class="stage-clip-empty">请先在页面小条里选择比赛</div>';
+  }
+}
+
+if (PANEL) initPanelMode();

@@ -2822,6 +2822,36 @@ def _exit_on_sigterm(signum, frame):
     raise SystemExit(0)
 
 
+# ---- Browser-extension clip ingest (feature-flagged, see monitor_extension.py) ----
+# Off by default: the routes are not registered at all, so the console behaves
+# exactly as before. Turn on with GIF_MONITOR_EXTENSION_ENABLED=1 in .env.
+from monitor_extension import EXTENSION_ENABLED, ExtensionHooks, install_extension_routes  # noqa: E402
+
+ext_source_store = None
+if EXTENSION_ENABLED:
+    ext_source_store = install_extension_routes(
+        app,
+        ExtensionHooks(
+            clip_dir=_clip_dir,
+            clip_video_filter=_clip_video_filter,
+            parse_clip_crop=_parse_clip_crop,
+            write_clip_meta=_write_clip_meta,
+            read_clip_meta=_read_clip_meta,
+            match_clip_alert=_match_clip_alert,
+            default_clip_form=_default_clip_form,
+            alert_match_public=_alert_match_public,
+            match_detail_for=_match_detail_for,
+            validate_match_id=validate_match_id,
+            clip_name_valid=lambda name: _CLIP_NAME_RE.fullmatch(name) is not None,
+            resolve_ffmpeg=resolve_ffmpeg,
+            clip_range_max_seconds=CLIP_RANGE_MAX_SECONDS,
+            publish_enabled=lambda: manual_draft_queue is not None,
+            delivery_mode=_manual_delivery_mode,
+        ),
+        clip_output_root=CLIP_OUTPUT_ROOT,
+    )
+
+
 if __name__ == "__main__":
     signal.signal(signal.SIGTERM, _exit_on_sigterm)
     print(f"Match monitor console: http://{HOST}:{PORT}")

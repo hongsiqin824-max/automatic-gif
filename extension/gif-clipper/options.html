@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<style>
+  body { max-width: 560px; margin: 32px auto; padding: 0 16px; font: 14px/1.6 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; color: #222; }
+  label { display: block; font-weight: 600; margin-top: 16px; }
+  input { width: 100%; box-sizing: border-box; font: inherit; padding: 8px; border: 1px solid #ccc; border-radius: 6px; margin-top: 6px; }
+  button { margin-top: 16px; font: inherit; padding: 8px 18px; cursor: pointer; }
+  .hint { color: #666; font-size: 13px; }
+  #saved { color: #0a7a3c; margin-left: 10px; }
+</style>
+</head>
+<body>
+<h1 style="font-size:18px">GIF 工作台 · 直播页截取</h1>
+<label for="base">8901 工作台地址</label>
+<input id="base" type="url" placeholder="https://matchgif.aisportsapp.com/gif-monitor/">
+<p class="hint">生产用默认地址即可；本地开发填 <code>http://127.0.0.1:8902/</code>。改完要刷新正在看的直播页。</p>
+<button id="save">保存</button><span id="saved"></span>
+<p class="hint">快捷键在 <code>chrome://extensions/shortcuts</code> 可改：Alt+1 设起点、Alt+2 结束、Alt+0 显示/隐藏小条。</p>
+<script src="options.js"></script>
+</body>
+</html>

@@ -262,4 +262,18 @@ body{
 .source-dot.no-source{background:var(--muted)}
 .source-dot.error{background:var(--red)}
 .source-dot.unknown{background:var(--amber)}
+
+/* ---- Panel mode: the browser extension's side panel (360–420px wide) shows
+   only the publish cards. Everything else is hidden; the stage becomes a
+   static full-size column instead of a modal. ---- */
+body[data-mode="panel"]{padding:0;min-width:0}
+body[data-mode="panel"] .shell,body[data-mode="panel"] #alert-launcher,body[data-mode="panel"] #alert-panel{display:none !important}
+body[data-mode="panel"] .stage{position:static;inset:auto;background:transparent;display:block;padding:0;z-index:auto}
+body[data-mode="panel"] .stage-inner{width:100%;height:100vh;border:0;border-radius:0;box-shadow:none}
+body[data-mode="panel"] .stage-head{padding:10px 12px}
+body[data-mode="panel"] .stage-head-hint,body[data-mode="panel"] .stage-actions{display:none}
+body[data-mode="panel"] .stage-left{display:none}
+body[data-mode="panel"] .stage-right{flex:1 1 auto;max-width:none;min-width:0;width:100%}
+body[data-mode="panel"] .stage-clips-head{padding:10px 12px 0}
+body[data-mode="panel"] .stage-clips{padding:10px 12px 14px}
 .source-label{color:var(--muted);font-size:11px;vertical-align:middle}
