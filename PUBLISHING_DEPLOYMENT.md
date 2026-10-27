@@ -108,10 +108,9 @@ OPEN_PLATFORM_APP_SECRET=<app-secret>
 OPEN_PLATFORM_API_NAME=admin-archive-createarticle
 OPEN_PLATFORM_REDIRECT_URI=<本地发布端可访问的 OAuth 回调地址>
 OPEN_PLATFORM_TOKEN_PATH=./data/open-platform-token.json
-# OCR 自动文章使用 app 内图片上传接口时填写原始登录 token（不要加 Bearer）
+# 官方图片上传走后台接口 image-uploadimage-manage，复用上面的 OAuth token（授权用户需在接口白名单内）。
 # 默认使用自有服务器上传；只有明确改为 official 才调用懂球帝图片接口。
 OCR_IMAGE_UPLOAD_BACKEND=self_hosted
-OPEN_PLATFORM_IMAGE_UPLOAD_TOKEN=<app 登录 token>
 # 官方图片上传单独超时，范围 60～120 秒，默认 120 秒。
 OPEN_PLATFORM_IMAGE_UPLOAD_TIMEOUT_SECONDS=120
 ```

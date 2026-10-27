@@ -23,7 +23,6 @@ class OpenPlatformImageUploadTests(unittest.TestCase):
                 api_name="admin-archive-createarticle",
                 redirect_uri="",
                 token_path=root / "token.json",
-                image_upload_token="raw-image-token",
             )
         )
 
@@ -50,7 +49,7 @@ class OpenPlatformImageUploadTests(unittest.TestCase):
             status = client.image_upload_status()
         self.assertTrue(status["enabled"])
         self.assertTrue(status["configured"])
-        self.assertEqual(status["api_name"], "image-uploadimage-ai")
+        self.assertEqual(status["api_name"], "image-uploadimage-manage")
         self.assertEqual(status["multipart_fields"], ["file1", "file2"])
         self.assertTrue(status["animated_gif_supported"])
         self.assertEqual(status["timeout_seconds"], 120.0)
@@ -111,7 +110,7 @@ class OpenPlatformImageUploadTests(unittest.TestCase):
             self.assertEqual(parsed_url.netloc, "platform.dongqiudi.com")
             self.assertEqual(parsed_url.path, "/open/v1/do")
             query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
-            self.assertEqual(query["api_name"], ["image-uploadimage-ai"])
+            self.assertEqual(query["api_name"], ["image-uploadimage-manage"])
             self.assertEqual(query["type"], ["archive"])
             self.assertNotIn("relate_id", query)
             unsigned = {key: values[0] for key, values in query.items() if key != "sign"}
@@ -121,7 +120,7 @@ class OpenPlatformImageUploadTests(unittest.TestCase):
             self.assertIn(b'name="file1"; filename="goal.gif"', body)
             self.assertIn(b'name="file2"; filename="goal.jpg"', body)
             self.assertEqual(
-                request_args.kwargs["authorization"], "raw-image-token"
+                request_args.kwargs["authorization"], "Bearer token"
             )
             self.assertEqual(request_args.kwargs["timeout_seconds"], 120.0)
             self.assertEqual(result[0]["image_id"], 11)
@@ -130,75 +129,61 @@ class OpenPlatformImageUploadTests(unittest.TestCase):
             self.assertEqual(result[1]["file_name"], "goal.jpg")
             self.assertEqual(result[1]["size"], len(cover.read_bytes()))
 
-    def test_upload_does_not_refresh_oauth_after_expired_image_token_code(self):
+    def test_upload_refreshes_oauth_once_after_expired_code(self):
+        expired_responses = (
+            {"code": 10008, "messgae": "expired", "data": []},
+            OpenPlatformError("expired", code=10008, http_status=401, auth_required=True),
+        )
+        for expired in expired_responses:
+            with self.subTest(expired=type(expired).__name__), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                gif, cover = self.write_images(root)
+                client = self.make_client(root)
+                request_json = Mock(
+                    side_effect=[expired, {"code": 0, "messgae": "success", "data": []}]
+                )
+                with patch.object(
+                    client, "_ensure_access_token", side_effect=["old", "new"]
+                ) as ensure_token, patch.object(client, "_request_json", request_json):
+                    self.assertEqual(client.upload_images(gif, cover), [])
+                self.assertEqual(request_json.call_count, 2)
+                self.assertEqual(ensure_token.call_args_list[1].kwargs, {"force_refresh": True})
+                self.assertEqual(
+                    request_json.call_args_list[1].kwargs["authorization"], "Bearer new"
+                )
+
+    def test_upload_gives_up_after_second_expired_code(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             gif, cover = self.write_images(root)
             client = self.make_client(root)
-            request_json = Mock(
-                side_effect=[
-                    {"code": 10008, "messgae": "expired", "data": []},
-                ]
-            )
-            with patch.object(client, "_ensure_access_token") as ensure_token, patch.object(
+            expired = {"code": 10008, "messgae": "expired", "data": []}
+            request_json = Mock(side_effect=[expired, expired])
+            with patch.object(
+                client, "_ensure_access_token", side_effect=["old", "new"]
+            ), patch.object(client, "_request_json", request_json):
+                with self.assertRaises(OpenPlatformError) as context:
+                    client.upload_images(gif, cover)
+            self.assertEqual(request_json.call_count, 2)
+            self.assertEqual(context.exception.code, 10008)
+            self.assertTrue(context.exception.auth_required)
+
+    def test_upload_does_not_retry_whitelist_rejection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            gif, cover = self.write_images(root)
+            client = self.make_client(root)
+            request_json = Mock(side_effect=OpenPlatformError(
+                "当前用户不在接口白名单中", code=10010, status_code=502, http_status=403,
+            ))
+            with patch.object(client, "_ensure_access_token", return_value="token"), patch.object(
                 client, "_request_json", request_json
             ):
                 with self.assertRaises(OpenPlatformError) as context:
                     client.upload_images(gif, cover)
             self.assertEqual(request_json.call_count, 1)
-            ensure_token.assert_not_called()
-            self.assertEqual(context.exception.code, 10008)
-            self.assertTrue(context.exception.auth_required)
-
-    def test_upload_requires_configured_raw_image_token(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            gif, cover = self.write_images(root)
-            client = OpenPlatformClient(
-                OpenPlatformConfig(
-                    appid="app-1",
-                    app_secret="secret-1",
-                    api_name="admin-archive-createarticle",
-                    redirect_uri="",
-                    token_path=root / "token.json",
-                )
-            )
-            with patch.object(client, "_ensure_access_token") as ensure_token, patch.object(
-                client, "_request_json"
-            ) as request_json:
-                with self.assertRaises(OpenPlatformError) as context:
-                    client.upload_images(gif, cover)
-            ensure_token.assert_not_called()
-            request_json.assert_not_called()
-            self.assertEqual(context.exception.code, "image_upload_token_missing")
-            self.assertTrue(context.exception.auth_required)
-
-    def test_upload_uses_configured_raw_image_token_without_refreshing_oauth(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            gif, cover = self.write_images(root)
-            client = OpenPlatformClient(
-                OpenPlatformConfig(
-                    appid="app-1",
-                    app_secret="secret-1",
-                    api_name="admin-archive-createarticle",
-                    redirect_uri="",
-                    token_path=root / "token.json",
-                    image_upload_token=" raw-image-token ",
-                )
-            )
-            request_json = Mock(
-                return_value={"code": 0, "messgae": "success", "data": []}
-            )
-            with patch.object(client, "_ensure_access_token") as ensure_token, patch.object(
-                client, "_request_json", request_json
-            ):
-                self.assertEqual(client.upload_images(gif, cover), [])
-
-            ensure_token.assert_not_called()
-            self.assertEqual(
-                request_json.call_args.kwargs["authorization"], "raw-image-token"
-            )
+            self.assertEqual(context.exception.code, 10010)
+            self.assertIn("lifecycle", context.exception.diagnostics)
 
     def test_upload_unwraps_nested_response_data(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -250,6 +235,8 @@ class OpenPlatformImageUploadTests(unittest.TestCase):
             client = self.make_client(root)
             for code in (10006, 50001, 50002, 300007, 300009):
                 with self.subTest(code=code), patch.object(
+                    client, "_ensure_access_token", return_value="token"
+                ), patch.object(
                     client,
                     "_request_json",
                     return_value={"code": code, "messgae": "temporary", "data": []},
@@ -268,6 +255,8 @@ class OpenPlatformImageUploadTests(unittest.TestCase):
             gif, cover = self.write_images(root)
             client = self.make_client(root)
             with patch.object(
+                client, "_ensure_access_token", return_value="token"
+            ), patch.object(
                 client,
                 "_request_json",
                 return_value={"code": 300007, "messgae": "file size is illegal", "data": []},

@@ -21,7 +21,7 @@ from typing import Any
 
 PLATFORM_ORIGIN = "https://platform.dongqiudi.com"
 DEFAULT_API_NAME = "admin-archive-createarticle"
-IMAGE_UPLOAD_API_NAME = "image-uploadimage-ai"
+IMAGE_UPLOAD_API_NAME = "image-uploadimage-manage"
 CHANNEL_SEARCH_API_NAME = "admin-archive-channelsearch"
 PLAYER_TEAM_API_NAME = "admin-archive-playerteam"
 # Tag lookup is best-effort and runs inside the publisher lock right before
@@ -79,7 +79,6 @@ class OpenPlatformConfig:
     redirect_uri: str
     token_path: Path
     token_service_url: str = ""
-    image_upload_token: str = ""
     image_upload_timeout_seconds: float = DEFAULT_IMAGE_UPLOAD_TIMEOUT_SECONDS
 
     @classmethod
@@ -99,9 +98,6 @@ class OpenPlatformConfig:
                 )
             ).expanduser(),
             token_service_url=os.environ.get("TOKEN_SERVICE_URL", "").strip().rstrip("/"),
-            image_upload_token=os.environ.get(
-                "OPEN_PLATFORM_IMAGE_UPLOAD_TOKEN", ""
-            ).strip(),
             image_upload_timeout_seconds=_image_upload_timeout_from_environment(),
         )
 
@@ -224,14 +220,16 @@ class OpenPlatformClient:
         }
 
     def image_upload_status(self) -> dict[str, Any]:
-        """Return image-upload readiness without exposing either credential."""
+        """Return image-upload readiness without exposing credentials.
+
+        The backend image endpoint authenticates with the same OAuth token as
+        article creation, so readiness here only covers the gateway config.
+        """
         gateway_configured = bool(self.config.appid and self.config.app_secret)
-        token_configured = bool(self.config.image_upload_token)
         return {
-            "enabled": bool(gateway_configured and token_configured),
-            "configured": bool(gateway_configured and token_configured),
+            "enabled": gateway_configured,
+            "configured": gateway_configured,
             "gateway_configured": gateway_configured,
-            "authorization_configured": token_configured,
             "api_name": IMAGE_UPLOAD_API_NAME,
             "endpoint": f"{PLATFORM_ORIGIN}/open/v1/do",
             "type": "archive",
@@ -596,16 +594,6 @@ class OpenPlatformClient:
         except OpenPlatformError as exc:
             mark("upload_failed", stage="configuration", error=str(exc))
             raise traced_error(exc)
-        configured_image_token = self.config.image_upload_token.strip()
-        if not configured_image_token:
-            exc = OpenPlatformError(
-                "图片上传需要配置 OPEN_PLATFORM_IMAGE_UPLOAD_TOKEN（原始登录 token）",
-                code="image_upload_token_missing",
-                status_code=503,
-                auth_required=True,
-            )
-            mark("upload_failed", stage="configuration", error=str(exc))
-            raise traced_error(exc)
         if not isinstance(gif_path, Path) or not isinstance(cover_path, Path):
             raise traced_error(OpenPlatformError(
                 "图片上传仅支持本地 Path 文件",
@@ -675,44 +663,57 @@ class OpenPlatformClient:
                 body=body,
                 content_type=f"multipart/form-data; boundary={boundary}",
                 timeout_seconds=self.image_upload_timeout_seconds,
-                # This image endpoint expects the original token value, not
-                # the OAuth `Bearer <token>` scheme used by article creation.
-                authorization=access_token,
+                authorization=f"Bearer {access_token}",
             )
 
-        # The app image endpoint uses a raw login token. Keep this credential
-        # separate from the OAuth token used by article APIs; an OAuth access
-        # token cannot identify the logged-in upload user for this endpoint.
-        access_token = configured_image_token
-        mark(
-            "token_acquired",
-            gif_bytes=len(file_metadata[0][3]),
-            cover_bytes=len(file_metadata[1][3]),
-        )
-        try:
+        def attempt(number: int, access_token: str) -> dict[str, Any]:
             mark(
                 "platform_request_sent",
-                attempt=1,
+                attempt=number,
                 body_bytes=len(body),
                 field_names=[item[0] for item in file_metadata],
             )
-            payload = send(access_token)
+            try:
+                payload = send(access_token)
+            except OpenPlatformError as exc:
+                mark(
+                    "platform_response_received",
+                    attempt=number,
+                    http_status=exc.http_status or exc.status_code,
+                    platform_code=exc.code,
+                    error=str(exc),
+                )
+                raise
             mark(
                 "platform_response_received",
-                attempt=1,
+                attempt=number,
                 http_status=payload.get("__http_status"),
-                platform_code=(
-                    _image_upload_result(payload) or {}
-                ).get("code"),
+                platform_code=(_image_upload_result(payload) or {}).get("code"),
             )
-        except OpenPlatformError as exc:
+            return payload
+
+        # The backend image endpoint (need_login=2) shares the OAuth token used
+        # for article creation; the authorized user must be on its whitelist.
+        try:
+            access_token = self._ensure_access_token()
             mark(
-                "platform_response_received",
-                attempt=1,
-                http_status=exc.http_status or exc.status_code,
-                platform_code=exc.code,
-                error=str(exc),
+                "token_acquired",
+                gif_bytes=len(file_metadata[0][3]),
+                cover_bytes=len(file_metadata[1][3]),
             )
+            try:
+                payload = attempt(1, access_token)
+                expired = _code_matches(
+                    (_image_upload_result(payload) or {}).get("code"), 10008
+                )
+            except OpenPlatformError as exc:
+                if not _code_matches(exc.code, 10008):
+                    raise
+                expired = True
+            if expired:
+                access_token = self._ensure_access_token(force_refresh=True)
+                payload = attempt(2, access_token)
+        except OpenPlatformError as exc:
             raise traced_error(exc)
         result = _image_upload_result(payload)
         if not result:
