@@ -40,6 +40,7 @@
       this.recapturedAt = 0;     // rate limit for recapture()
       this.recaptureTimer = null;
       this.pending = false;      // recapture failed (no track yet); retry on ensureLive()
+      this.awaitingFrames = false; // source not playing at rotate time; open a segment on ensureLive()
       this.stopped = false;
       this.mimeType = ["video/webm;codecs=vp8", "video/webm;codecs=vp9", "video/webm"]
         .find((m) => MediaRecorder.isTypeSupported(m)) || "";
@@ -132,12 +133,37 @@
     }
 
     ensureLive() {
-      return this.pending ? this.recapture() : true;
+      if (this.pending) return this.recapture();
+      if (this.awaitingFrames) {
+        this._rotate();
+        return !!this.recorder;
+      }
+      return true;
+    }
+
+    // Frames are flowing: playing, with decoded data ahead. Chrome's webm
+    // muxer stamps a segment relative to its FIRST FRAME, not start(), so a
+    // segment opened while the source is paused / stalled would claim a
+    // wall-clock start earlier than its footage, and the server (which
+    // concatenates by media length) would land on the wrong moment.
+    _sourceLive() {
+      const v = this.video;
+      return !v.paused && !v.ended && v.readyState >= 3;
     }
 
     _rotate() {
       if (this.stopped) return;
       const prev = this.recorder;
+      clearTimeout(this.rotateTimer);
+      if (!this.stream || !this._sourceLive()) {
+        // Close what we have and wait for "playing" (finder → ensureLive()).
+        this.recorder = null;
+        this.liveStartMs = null;
+        this.awaitingFrames = true;
+        this._halt(prev);
+        return;
+      }
+      this.awaitingFrames = false;
       const chunks = [];
       let rec;
       try {
@@ -162,7 +188,9 @@
         // fires after the last data is flushed.
         entry.durationMs = (rec.__stopAt || Date.now()) - entry.startEpochMs;
         entry.blob = new Blob(chunks, { type: this.mimeType || "video/webm" });
-        if (entry.blob.size) {
+        // A header-only stub (two closes within a few ms) would be rejected
+        // by the server's duration > 0 check and fail the whole upload.
+        if (entry.blob.size && entry.durationMs >= 200) {
           this.segments.push(entry);
           this._trim();
         }
