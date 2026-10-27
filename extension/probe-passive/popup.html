@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<style>
+  body { width: 560px; margin: 0; padding: 12px; font: 13px/1.5 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; color: #222; }
+  h1 { font-size: 14px; margin: 0 0 8px; }
+  .row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
+  .row .spacer { flex: 1; }
+  button { padding: 4px 12px; cursor: pointer; }
+  #summary { color: #666; margin-bottom: 8px; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td { text-align: left; padding: 3px 6px; border-bottom: 1px solid #eee; white-space: nowrap; }
+  th { color: #666; font-weight: 500; }
+  td.host { max-width: 180px; overflow: hidden; text-overflow: ellipsis; }
+  .ok { color: #0a7a3c; font-weight: 600; }
+  .bad { color: #c0392b; font-weight: 600; }
+  .warn { color: #b7791f; font-weight: 600; }
+  .wrap { max-height: 360px; overflow: auto; }
+  h2 { font-size: 13px; margin: 12px 0 4px; color: #444; }
+  .hint { color: #888; font-size: 12px; margin-top: 8px; }
+</style>
+</head>
+<body>
+<h1>直播站兼容性采集</h1>
+<div class="row">
+  <span id="summary">还没有记录。</span>
+  <span class="spacer"></span>
+  <button id="copy" title="复制全部 JSON">复制 JSON</button>
+  <button id="clear">清空</button>
+</div>
+<div class="wrap">
+  <table id="sites">
+    <thead><tr>
+      <th>站</th><th>iframe</th><th>方式</th><th>画面</th><th>DRM</th><th>kbps</th><th>亮度</th><th>次</th><th>最近</th>
+    </tr></thead>
+    <tbody></tbody>
+  </table>
+  <h2>换源时 video 元素变化（按站）</h2>
+  <table id="events">
+    <thead><tr><th>站</th><th>新增</th><th>移除</th><th>换源</th><th>最近</th></tr></thead>
+    <tbody></tbody>
+  </table>
+</div>
+<div class="hint">装上后正常看球即可。每天结束时点「复制 JSON」发到群里。插件不上传任何数据、每站只录 5 秒、不下载文件。</div>
+<script src="popup.js"></script>
+</body>
+</html>

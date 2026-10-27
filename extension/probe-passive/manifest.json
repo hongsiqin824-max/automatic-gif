@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "GIF 工作台 · 直播站兼容性采集",
+  "version": "0.2.0",
+  "description": "正常看球即可。对每个开始播放的视频自动做一次 5 秒兼容性探测并记录，不上传、不下载、不影响播放。",
+  "permissions": ["storage"],
+  "host_permissions": ["<all_urls>"],
+  "background": { "service_worker": "background.js" },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "all_frames": true,
+      "match_about_blank": true,
+      "run_at": "document_start",
+      "js": ["content.js"]
+    }
+  ],
+  "action": {
+    "default_title": "直播站兼容性采集",
+    "default_popup": "popup.html"
+  }
+}
