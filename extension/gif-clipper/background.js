@@ -226,13 +226,19 @@ chrome.runtime.onConnect.addListener((port) => {
       return;
     }
     if (msg.type === "chunk") {
-      job.current.push(msg.data);
+      // Decode per chunk: each chunk is independently base64-padded, so the
+      // strings cannot be concatenated and decoded as one.
+      try {
+        job.current.push(base64ToBytes(msg.data));
+      } catch (err) {
+        port.postMessage({ type: "error", error: `chunk decode failed: ${err && err.message}` });
+      }
       return;
     }
     if (msg.type === "file-end") {
-      const bytes = base64ToBytes(job.current.join(""));
+      const parts = job.current;
       job.current = [];
-      job.files.push(new Blob([bytes], { type: "video/webm" }));
+      job.files.push(new Blob(parts, { type: "video/webm" }));
       port.postMessage({ type: "progress", files: job.files.length });
       return;
     }
@@ -263,6 +269,7 @@ function base64ToBytes(b64) {
 
 async function postClip(job) {
   const { meta, files } = job;
+  console.log("[upload] postClip", { files: files.length, sizes: files.map((b) => b.size), segments: meta.segments });
   const form = new FormData();
   form.append("match_id", meta.matchId);
   form.append("start_epoch_ms", String(meta.startMs));

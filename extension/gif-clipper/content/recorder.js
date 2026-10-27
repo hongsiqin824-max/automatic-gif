@@ -34,6 +34,7 @@
       this.recorder = null;
       this.rotateTimer = null;
       this.startMs = null;       // operator-set start (Date.now())
+      this.liveStartMs = null;   // Date.now() when the current (open) segment began
       this.stopped = false;
       this.mimeType = ["video/webm;codecs=vp8", "video/webm;codecs=vp9", "video/webm"]
         .find((m) => MediaRecorder.isTypeSupported(m)) || "";
@@ -75,6 +76,7 @@
       };
       rec.onstart = () => {
         entry.startEpochMs = Date.now();
+        this.liveStartMs = entry.startEpochMs;
       };
       rec.onstop = () => {
         entry.durationMs = Date.now() - entry.startEpochMs;
@@ -99,11 +101,12 @@
     }
 
     bufferedSeconds() {
-      if (!this.segments.length) {
-        return this.recorder && this.recorder.state === "recording" ? 0 : 0;
-      }
-      const first = this.segments[0].startEpochMs;
-      return Math.max(0, Math.round((Date.now() - first) / 1000));
+      // Oldest footage we hold: the first closed segment, or the segment
+      // still being recorded when nothing has rotated out yet.
+      let oldest = this.segments.length ? this.segments[0].startEpochMs : null;
+      if (oldest == null && this.liveStartMs != null) oldest = this.liveStartMs;
+      if (oldest == null) return 0;
+      return Math.max(0, Math.round((Date.now() - oldest) / 1000));
     }
 
     setStart() {
