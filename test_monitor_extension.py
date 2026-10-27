@@ -443,5 +443,95 @@ class ExtensionSelectSegmentsTests(unittest.TestCase):
         self.assertEqual(self.run_js(5000, 20000, segments=[{"startEpochMs": 30000, "durationMs": 30000}]), [])
 
 
+class ExtensionPickSourceTests(unittest.TestCase):
+    """``pickSource`` in extension/gif-clipper/content/finder.js, run under node.
+
+    The recording source must stick to its <video> while it is in the DOM
+    (pause / stall must not drop the buffer); it switches only when the
+    element is gone or a rival keeps playing for CHALLENGE_MS.
+    """
+
+    CHALLENGE_MS = 8000
+
+    @classmethod
+    def setUpClass(cls):
+        import shutil
+
+        cls.node = shutil.which("node")
+        if not cls.node:
+            raise unittest.SkipTest("node 不可用")
+        cls.script = Path(__file__).parent / "extension" / "gif-clipper" / "content" / "finder.js"
+        if not cls.script.is_file():
+            raise unittest.SkipTest("finder.js missing")
+
+    def pick(self, current, candidates, challenger=None, now=100_000, review_open=False):
+        script = (
+            f"const {{pickSource, CHALLENGE_MS}} = require({json.dumps(str(self.script))});"
+            f"const r = pickSource({json.dumps(current)}, {json.dumps(candidates)}, "
+            f"{json.dumps(challenger)}, {now}, {json.dumps(review_open)});"
+            "process.stdout.write(JSON.stringify({r, CHALLENGE_MS}));"
+        )
+        result = subprocess.run([self.node, "-e", script], capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(result.stdout)
+        self.assertEqual(data["CHALLENGE_MS"], self.CHALLENGE_MS)
+        return data["r"]
+
+    def test_first_pick_takes_largest_playing(self):
+        r = self.pick(None, [{"el": "a", "area": 100}, {"el": "b", "area": 300}])
+        self.assertEqual((r["next"], r["reason"], r["challenger"]), ("b", "none", None))
+
+    def test_nothing_to_pick(self):
+        r = self.pick(None, [])
+        self.assertEqual((r["next"], r["reason"]), (None, "none"))
+
+    def test_paused_current_alone_is_kept(self):
+        cur = {"el": "a", "connected": True, "playing": False, "area": 300}
+        r = self.pick(cur, [])
+        self.assertEqual((r["next"], r["reason"], r["challenger"]), ("a", "keep", None))
+
+    def test_removed_current_hard_switches(self):
+        cur = {"el": "a", "connected": False, "playing": False, "area": 300}
+        r = self.pick(cur, [{"el": "b", "area": 50}])
+        self.assertEqual((r["next"], r["reason"]), ("b", "hard"))
+        r = self.pick(cur, [])
+        self.assertEqual((r["next"], r["reason"]), (None, "hard"))
+
+    def test_smaller_rival_never_challenges_playing_current(self):
+        cur = {"el": "a", "connected": True, "playing": True, "area": 300}
+        r = self.pick(cur, [{"el": "b", "area": 100}])
+        self.assertEqual((r["next"], r["reason"], r["challenger"]), ("a", "keep", None))
+
+    def test_rival_starts_challenge_then_switches_after_bar(self):
+        cur = {"el": "a", "connected": True, "playing": False, "area": 300}
+        r = self.pick(cur, [{"el": "b", "area": 100}], now=1000)
+        self.assertEqual((r["next"], r["reason"]), ("a", "keep"))
+        self.assertEqual(r["challenger"], {"el": "b", "since": 1000})
+        r = self.pick(cur, [{"el": "b", "area": 100}], challenger=r["challenger"], now=1000 + self.CHALLENGE_MS - 1)
+        self.assertEqual((r["next"], r["reason"]), ("a", "keep"))
+        self.assertEqual(r["challenger"], {"el": "b", "since": 1000})
+        r = self.pick(cur, [{"el": "b", "area": 100}], challenger=r["challenger"], now=1000 + self.CHALLENGE_MS)
+        self.assertEqual((r["next"], r["reason"], r["challenger"]), ("b", "soft", None))
+
+    def test_bigger_rival_challenges_even_while_current_plays(self):
+        cur = {"el": "a", "connected": True, "playing": True, "area": 100}
+        r = self.pick(cur, [{"el": "b", "area": 300}], now=1000)
+        self.assertEqual(r["challenger"], {"el": "b", "since": 1000})
+
+    def test_challenger_change_restarts_timer(self):
+        cur = {"el": "a", "connected": True, "playing": False, "area": 300}
+        r = self.pick(cur, [{"el": "c", "area": 500}], challenger={"el": "b", "since": 0}, now=50_000)
+        self.assertEqual((r["next"], r["reason"]), ("a", "keep"))
+        self.assertEqual(r["challenger"], {"el": "c", "since": 50_000})
+
+    def test_review_open_blocks_soft_switch_only(self):
+        cur = {"el": "a", "connected": True, "playing": False, "area": 300}
+        r = self.pick(cur, [{"el": "b", "area": 900}], challenger={"el": "b", "since": 0}, now=50_000, review_open=True)
+        self.assertEqual((r["next"], r["reason"], r["challenger"]), ("a", "keep", None))
+        gone = dict(cur, connected=False)
+        r = self.pick(gone, [{"el": "b", "area": 900}], review_open=True)
+        self.assertEqual((r["next"], r["reason"]), ("b", "hard"))
+
+
 if __name__ == "__main__":
     unittest.main()

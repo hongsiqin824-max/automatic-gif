@@ -38,6 +38,7 @@
       this.outS = null;
       this.crop = null;                   // {x,y,w,h} fractions of the frame, or null = full frame
       this.ready = false;
+      this.assembled = false;             // all segments appended; gap-jumping is safe
       this.closed = false;
       this._build();
       this._bind();
@@ -150,6 +151,8 @@
       this.ui = {};
       wrap.querySelectorAll("[data-role]").forEach((el) => (this.ui[el.dataset.role] = el));
       this.video = wrap.querySelector("video");
+      this.video.addEventListener("waiting", () => this._unstick());
+      this.video.addEventListener("seeking", () => this._unstick());
       (document.fullscreenElement || document.documentElement).appendChild(this.host);
       this._place();
     }
@@ -388,15 +391,24 @@
       }
       sb.mode = "segments";
       // Newest first: the default position (now − 10 s) becomes playable
-      // after one append instead of ten.
+      // after one append instead of ten. Each segment's tail runs a few
+      // frames past the next segment's wall-clock start (the new recorder
+      // starts before the old one stops), and a later append overwrites
+      // earlier data at the same time, so without a limit an older segment
+      // would clobber the newer one's only keyframe and freeze that whole
+      // segment. appendWindowEnd clips the older segment at the newer
+      // segment's start instead.
       const order = [...this.segments].reverse();
+      let windowEnd = Infinity;
       for (const seg of order) {
         if (this.closed) return;
+        const offset = (seg.startEpochMs - this.base) / 1000;
         try {
           const buf = await seg.blob.arrayBuffer();
           if (sb.updating) await this._updateEnd(sb);
           sb.abort();
-          sb.timestampOffset = (seg.startEpochMs - this.base) / 1000;
+          sb.timestampOffset = offset;
+          sb.appendWindowEnd = windowEnd;
           const done = this._updateEnd(sb);
           sb.appendBuffer(buf);
           await done;
@@ -404,6 +416,7 @@
           this._fail(`拼接失败：${err && err.message}`);
           return;
         }
+        windowEnd = offset;
         if (!this.ready) {
           this.ready = true;
           this.ui.loading.style.display = "none";
@@ -415,7 +428,38 @@
       } catch (_err) {
         /* fine */
       }
+      this.assembled = true;
+      this._unstick();
       this.ui.hint.textContent = `缓冲 ${this._fmt(this.total)}，拖时间轴找画面`;
+    }
+
+    // Segments do not always touch: a stall or a paused source leaves a hole
+    // in the wall-clock timeline, and the element will sit in "waiting"
+    // forever at a hole. Jump to the next buffered range instead (or to the
+    // end of the last one when nothing follows).
+    _unstick() {
+      if (!this.assembled || this.closed) return;
+      const v = this.video;
+      const b = v.buffered;
+      if (!b.length) return;
+      const t = v.currentTime;
+      const EPS = 0.15;
+      for (let i = 0; i < b.length; i++) {
+        const start = b.start(i);
+        const end = b.end(i);
+        if (t < start - EPS) {
+          v.currentTime = start + 0.01;
+          return;
+        }
+        if (t <= end - EPS) return; // inside a range with footage ahead
+        if (t <= end + EPS && i + 1 < b.length) {
+          v.currentTime = b.start(i + 1) + 0.01;
+          return;
+        }
+      }
+      // Past the end of the last range.
+      v.pause();
+      v.currentTime = Math.max(b.start(b.length - 1), b.end(b.length - 1) - 0.05);
     }
 
     _updateEnd(sb) {

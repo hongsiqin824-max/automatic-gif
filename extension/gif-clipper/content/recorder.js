@@ -35,6 +35,8 @@
       this.rotateTimer = null;
       this.startMs = null;       // operator-set start (Date.now())
       this.liveStartMs = null;   // Date.now() when the current (open) segment began
+      this.recapturedAt = 0;     // debounce for track-ended recapture
+      this.pending = false;      // recapture failed (no track yet); retry on ensureLive()
       this.stopped = false;
       this.mimeType = ["video/webm;codecs=vp8", "video/webm;codecs=vp9", "video/webm"]
         .find((m) => MediaRecorder.isTypeSupported(m)) || "";
@@ -42,23 +44,64 @@
 
     start() {
       this.stopped = false;
+      if (!this._capture()) return false;
+      this._rotate();
+      return true;
+    }
+
+    // Grab a fresh stream from the same <video>. The track ends when the
+    // player swaps ``src`` / reloads on the same element; we then recapture
+    // in place instead of treating it as a new source (buffer is kept).
+    _capture(quiet = false) {
       let captured;
       try {
         captured = this.video.captureStream();
       } catch (err) {
-        this.onStatus(`captureStream 失败：${err.name}`, "fail");
+        if (!quiet) this.onStatus(`captureStream 失败：${err.name}`, "fail");
         return false;
       }
       const videoTracks = captured.getVideoTracks();
       if (!videoTracks.length) {
-        this.onStatus("视频轨道为空", "fail");
+        if (!quiet) this.onStatus("视频轨道为空", "fail");
         return false;
       }
       // Video only: GIFs have no sound, and a webm with an opus track would
       // not match the video-only codec string the review overlay hands to MSE.
-      this.stream = new MediaStream(videoTracks);
-      this._rotate();
+      const track = videoTracks[0];
+      this.stream = new MediaStream([track]);
+      track.addEventListener("ended", () => {
+        if (this.stream && this.stream.getVideoTracks()[0] === track) this.recapture();
+      });
       return true;
+    }
+
+    // Close the open segment, drop the dead stream and capture the same
+    // element again. Segments already recorded stay in the buffer. Right
+    // after a src swap the element may have no track yet; then we mark
+    // ``pending`` and the finder calls ``ensureLive()`` on loadedmetadata.
+    recapture() {
+      if (this.stopped || !this.video.isConnected) return false;
+      const now = Date.now();
+      if (!this.pending && now - this.recapturedAt < 500) return true;
+      this.recapturedAt = now;
+      this.pending = false;
+      clearTimeout(this.rotateTimer);
+      const live = this.recorder;
+      this.recorder = null;
+      this._halt(live);
+      if (this.stream) this.stream.getTracks().forEach((t) => t.stop());
+      this.stream = null;
+      if (!this._capture(true)) {
+        this.pending = true;
+        return false;
+      }
+      this._rotate();
+      this.onStatus("播放器重连，继续录制", "warn");
+      return true;
+    }
+
+    ensureLive() {
+      return this.pending ? this.recapture() : true;
     }
 
     _rotate() {
@@ -80,13 +123,13 @@
         if (e.data && e.data.size) chunks.push(e.data);
       };
       rec.onstart = () => {
-        entry.startEpochMs = Date.now();
-        this.liveStartMs = entry.startEpochMs;
         // What the encoder actually produces (may add codec details).
         if (rec.mimeType) this.mimeType = rec.mimeType;
       };
       rec.onstop = () => {
-        entry.durationMs = Date.now() - entry.startEpochMs;
+        // ``stopAt`` is taken synchronously in _halt(); the stop event only
+        // fires after the last data is flushed.
+        entry.durationMs = (rec.__stopAt || Date.now()) - entry.startEpochMs;
         entry.blob = new Blob(chunks, { type: this.mimeType || "video/webm" });
         if (entry.blob.size) {
           this.segments.push(entry);
@@ -95,9 +138,22 @@
       };
       rec.onerror = () => this.onStatus("录制出错，缓冲重置", "fail");
       this.recorder = rec;
+      // Timestamp taken right here, not in onstart: the start event is a
+      // queued task and lands late whenever the main thread is busy (e.g.
+      // base64-encoding an upload), which would place the segment late on
+      // the review timeline and widen the overlap at the seam.
+      entry.startEpochMs = Date.now();
+      this.liveStartMs = entry.startEpochMs;
       rec.start(1000);
-      if (prev && prev.state !== "inactive") prev.stop();
+      this._halt(prev);
       this.rotateTimer = setTimeout(() => this._rotate(), SEGMENT_MS);
+    }
+
+    _halt(rec) {
+      if (!rec || rec.state === "inactive") return false;
+      rec.__stopAt = Date.now();
+      rec.stop();
+      return true;
     }
 
     _trim() {
@@ -126,17 +182,15 @@
     }
 
     // Close the live segment so its footage is included, then pick segments.
-    // ``range`` = {startMs, endMs} from the review overlay; without it the
-    // operator-set start and "now" are used (Alt+1 / Alt+2 path).
-    async finish(range = null) {
-      const startMs = range ? range.startMs : this.startMs;
-      const endMs = range ? range.endMs : Date.now();
-      if (startMs == null) throw new Error("还没有设起点");
+    // ``range`` = {startMs, endMs, crop?}; the caller resolves the Alt+1
+    // start point and "now" itself (and clears the start point), so a clip
+    // from the review window never consumes a pending Alt+1 start.
+    async finish(range) {
+      const { startMs, endMs } = range;
       await this.closeLiveSegment();
       const picked = selectSegments(this.segments, startMs, endMs);
-      this.startMs = null;
       if (!picked.length) throw new Error("起点已超出缓冲，请重新设起点");
-      return { startMs, endMs, segments: picked, crop: (range && range.crop) || null };
+      return { startMs, endMs, segments: picked, crop: range.crop || null };
     }
 
     // Stop the open segment (so it becomes a playable file) and start a new
@@ -152,7 +206,7 @@
             prevStop(e);
             resolve();
           };
-          live.stop();
+          this._halt(live);
         });
       }
       if (!this.stopped) this._rotate();
@@ -166,7 +220,7 @@
     stop() {
       this.stopped = true;
       clearTimeout(this.rotateTimer);
-      if (this.recorder && this.recorder.state !== "inactive") this.recorder.stop();
+      this._halt(this.recorder);
       if (this.stream) this.stream.getTracks().forEach((t) => t.stop());
       this.segments = [];
       this.startMs = null;

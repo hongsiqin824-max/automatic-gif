@@ -1,7 +1,47 @@
 // Runs in every frame. Finds the largest playing <video>, reports it to the
 // background (which elects one frame per tab to record), owns the recorder
 // when elected, and handles set-start / finish from the background.
+//
+// The recording source is sticky: once a <video> is chosen it stays the
+// source while it is in the document, no matter whether it is paused,
+// stalled or seeking. It is replaced only when it leaves the DOM (hard
+// switch) or another video keeps playing for CHALLENGE_MS and either is
+// bigger or the current one is not playing (soft switch). While the review
+// window is open only the hard switch applies.
+//
+// Pure helper `pickSource` is exported for node tests (no DOM needed).
 (() => {
+  const CHALLENGE_MS = 8000;
+
+  // current:    {el, connected, playing, area} | null — the sticky source
+  // candidates: [{el, area}] — other videos that are playing right now
+  // challenger: {el, since} | null — candidate being timed for a soft switch
+  // Returns {next, reason, challenger}; next is an element or null.
+  function pickSource(current, candidates, challenger, now, reviewOpen) {
+    let best = null;
+    for (const c of candidates) {
+      if (current && c.el === current.el) continue;
+      if (!best || c.area > best.area) best = c;
+    }
+    if (!current || !current.connected) {
+      return { next: best ? best.el : null, reason: current ? "hard" : "none", challenger: null };
+    }
+    if (reviewOpen || !best || (current.playing && best.area <= current.area)) {
+      return { next: current.el, reason: "keep", challenger: null };
+    }
+    if (challenger && challenger.el === best.el) {
+      if (now - challenger.since >= CHALLENGE_MS) {
+        return { next: best.el, reason: "soft", challenger: null };
+      }
+      return { next: current.el, reason: "keep", challenger };
+    }
+    return { next: current.el, reason: "keep", challenger: { el: best.el, since: now } };
+  }
+
+  if (typeof module !== "undefined" && module.exports) {
+    module.exports = { pickSource, CHALLENGE_MS };
+  }
+  if (typeof window === "undefined") return;
   if (window.__gifClipperFinder) return;
   window.__gifClipperFinder = true;
 
@@ -12,6 +52,9 @@
   const CHUNK_BYTES = 2 * 1024 * 1024;
 
   let current = null;     // the <video> we reported / record
+  let currentArea = 0;    // last known size of ``current`` (0 while emptied)
+  let challenger = null;  // {el, since} — see pickSource
+  let challengeTimer = null;
   let recorder = null;
   let recorderOpts = null;
   let elected = false;
@@ -20,15 +63,6 @@
 
   function isPlaying(v) {
     return !v.paused && v.readyState >= 2 && v.videoWidth >= MIN_W && v.videoHeight >= MIN_H;
-  }
-
-  function bestVideo() {
-    let best = null;
-    for (const v of document.querySelectorAll("video")) {
-      if (!isPlaying(v)) continue;
-      if (!best || v.videoWidth * v.videoHeight > best.videoWidth * best.videoHeight) best = v;
-    }
-    return best;
   }
 
   function send(msg) {
@@ -45,21 +79,39 @@
   }
 
   function report() {
-    const v = bestVideo();
-    if (v !== current) {
+    if (current && current.videoWidth && current.videoHeight) {
+      currentArea = current.videoWidth * current.videoHeight;
+    }
+    const candidates = [];
+    for (const v of document.querySelectorAll("video")) {
+      if (v !== current && isPlaying(v)) candidates.push({ el: v, area: v.videoWidth * v.videoHeight });
+    }
+    const cur = current
+      ? { el: current, connected: current.isConnected, playing: isPlaying(current), area: currentArea }
+      : null;
+    const pick = pickSource(cur, candidates, challenger, Date.now(), !!(review && !review.closed));
+    challenger = pick.challenger;
+    clearTimeout(challengeTimer);
+    if (challenger) {
+      // Re-check right when the challenger's playing time reaches the bar
+      // instead of waiting for the next event or 10 s poll.
+      challengeTimer = setTimeout(report, Math.max(0, CHALLENGE_MS - (Date.now() - challenger.since)) + 50);
+    }
+    if (pick.next !== current) {
       if (review && !review.closed) review.close();
       if (recorder) {
         recorder.stop();
         recorder = null;
         if (elected) toast("视频源已切换，缓冲重新开始", "warn");
       }
-      current = v;
-      if (v && elected && recorderOpts) startRecorder();
+      current = pick.next;
+      currentArea = current ? current.videoWidth * current.videoHeight : 0;
+      if (current && elected && recorderOpts) startRecorder();
     }
     send({
       type: "frame-report",
-      playing: !!v,
-      area: v ? v.videoWidth * v.videoHeight : 0,
+      playing: !!current,
+      area: currentArea,
     });
   }
 
@@ -143,11 +195,26 @@
   }
 
   let review = null;      // open ReviewOverlay, if any
+  const pendingClips = []; // [{matchId, range}] confirmed while an upload was running
+  const MAX_PENDING = 3;
 
-  // Build and upload a clip. ``range`` = {startMs, endMs} from the review
-  // overlay; null = from the Alt+1 start point to now.
+  // Build and upload a clip. ``range`` = {startMs, endMs, crop?}; the Alt+2
+  // path passes the operator-set start and "now", resolved at key press so
+  // a queued request does not grow by the time it waited. Uploads are
+  // serialised (two concurrent finish() calls would each close and reopen
+  // the live segment); a request that arrives while one is running is
+  // queued instead of dropped, so a review selection is never lost.
   async function generateClip(matchId, range) {
-    if (!recorder || busy) return;
+    if (!recorder) return;
+    if (busy) {
+      if (pendingClips.length >= MAX_PENDING) {
+        toast("排队的太多了，等上一条传完再试", "fail", 3000);
+        return;
+      }
+      pendingClips.push({ matchId, range });
+      toast(`上一条还在上传，这条已排队（${pendingClips.length}）`, "warn", 3000);
+      return;
+    }
     busy = true;
     toast("生成中…", "", 10_000);
     try {
@@ -164,7 +231,8 @@
       }
     } finally {
       busy = false;
-      send({ type: "bar-relay", payload: { type: "bar-range", startMs: null } });
+      const next = pendingClips.shift();
+      if (next && recorder) generateClip(next.matchId, next.range);
     }
   }
 
@@ -227,12 +295,20 @@
         return false;
       }
       case "recorder-finish": {
-        if (!recorder || busy) {
-          toast(busy ? "正在生成上一条…" : "还没开始录制", "fail");
+        if (!recorder) {
+          toast("还没开始录制", "fail");
           sendResponse({ ok: false });
           return false;
         }
-        generateClip(msg.matchId, null);
+        if (recorder.startMs == null) {
+          toast("还没有设起点", "fail");
+          sendResponse({ ok: false });
+          return false;
+        }
+        const range = { startMs: recorder.startMs, endMs: Date.now() };
+        recorder.clearStart();
+        send({ type: "bar-relay", payload: { type: "bar-range", startMs: null } });
+        generateClip(msg.matchId, range);
         sendResponse({ ok: true });
         return false;
       }
@@ -270,7 +346,12 @@
   // MutationObserver for elements that get swapped on source change.
   ["playing", "pause", "emptied", "ended", "loadedmetadata"].forEach((ev) =>
     document.addEventListener(ev, (e) => {
-      if (e.target && e.target.tagName === "VIDEO") scheduleReport();
+      if (!e.target || e.target.tagName !== "VIDEO") return;
+      // Same element came back with a new source: pick up its new track.
+      if (e.target === current && recorder && (ev === "loadedmetadata" || ev === "playing")) {
+        recorder.ensureLive();
+      }
+      scheduleReport();
     }, true)
   );
   const observer = new MutationObserver((muts) => {
