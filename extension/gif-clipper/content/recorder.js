@@ -42,16 +42,21 @@
 
     start() {
       this.stopped = false;
+      let captured;
       try {
-        this.stream = this.video.captureStream();
+        captured = this.video.captureStream();
       } catch (err) {
         this.onStatus(`captureStream 失败：${err.name}`, "fail");
         return false;
       }
-      if (!this.stream.getVideoTracks().length) {
+      const videoTracks = captured.getVideoTracks();
+      if (!videoTracks.length) {
         this.onStatus("视频轨道为空", "fail");
         return false;
       }
+      // Video only: GIFs have no sound, and a webm with an opus track would
+      // not match the video-only codec string the review overlay hands to MSE.
+      this.stream = new MediaStream(videoTracks);
       this._rotate();
       return true;
     }
@@ -77,6 +82,8 @@
       rec.onstart = () => {
         entry.startEpochMs = Date.now();
         this.liveStartMs = entry.startEpochMs;
+        // What the encoder actually produces (may add codec details).
+        if (rec.mimeType) this.mimeType = rec.mimeType;
       };
       rec.onstop = () => {
         entry.durationMs = Date.now() - entry.startEpochMs;
@@ -129,7 +136,7 @@
       const picked = selectSegments(this.segments, startMs, endMs);
       this.startMs = null;
       if (!picked.length) throw new Error("起点已超出缓冲，请重新设起点");
-      return { startMs, endMs, segments: picked };
+      return { startMs, endMs, segments: picked, crop: (range && range.crop) || null };
     }
 
     // Stop the open segment (so it becomes a playable file) and start a new

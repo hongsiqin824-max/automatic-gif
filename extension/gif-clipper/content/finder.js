@@ -102,6 +102,7 @@
         segments: picked.segments.map((s) => ({ start_epoch_ms: s.startEpochMs, duration_ms: s.durationMs })),
         sourceHost: location.hostname,
         captureMode: "captureStream",
+        crop: picked.crop || null,
       },
     });
     if (!begin || !begin.uploadId) throw new Error((begin && begin.error) || "上传会话建立失败");
