@@ -1515,7 +1515,10 @@ async function loadStageClips(matchId, options = {}) {
   }
   // Append mode is server state; the row buttons are rebuilt below, so set
   // the target first and let the banner re-read the (new) row label after.
-  appendTarget = data.append_target && data.append_target.name ? data.append_target : null;
+  // Go through setAppendTargetState so a fresh page (reload, side panel
+  // reopened) also gets the deadline and ticker from the server's expires_in;
+  // assigning the variable alone showed 「0 秒后自动退出」 and never expired.
+  setAppendTargetState(data.append_target || null);
   list.innerHTML = '';
   if (!clips.length) {
     const empty = document.createElement('div');
