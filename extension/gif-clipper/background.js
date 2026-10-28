@@ -57,7 +57,10 @@ async function getMatches(force = false) {
   }
   const data = await api("api/monitor/matches");
   const playing = Array.isArray(data.playing) ? data.playing : [];
-  const value = playing.map((m) => ({
+  // Same rule as the page: finished matches past the grace window are only
+  // listed for their unpublished GIFs and can no longer be recorded.
+  const recordable = playing.filter((m) => !(m.finished && m.grace_active === false));
+  const value = recordable.map((m) => ({
     match_id: String(m.match_id),
     label: `${m.team_A_name || "?"} vs ${m.team_B_name || "?"}${m.competition_name ? `（${m.competition_name}）` : ""}`,
     score: m.score || "",
