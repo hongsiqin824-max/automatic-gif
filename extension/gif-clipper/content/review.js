@@ -52,10 +52,12 @@
   const MIN_H = 240;
   const MIN_CROP = 0.1;   // smallest crop side as a fraction of the frame
   let lastBox = null;     // remembered window position/size within this page
-  let lastCrop = null;    // remembered crop box {x,y,w,h} (0..1) within this page
 
   class ReviewOverlay {
-    constructor({ anchor, segments, mimeType, maxRangeSeconds, onConfirm, onClose }) {
+    // ``crop`` / ``lastCrop`` = the match's saved box (opened already applied)
+    // and the box C restores after 整幅; ``onCropChange(crop|null)`` saves a
+    // change so the next review and the Alt+2 clips reuse it.
+    constructor({ anchor, segments, mimeType, maxRangeSeconds, crop, lastCrop, onCropChange, onConfirm, onClose }) {
       this.anchor = anchor;               // the live <video>; only used for initial placement
       this.segments = segments;           // [{blob, startEpochMs, durationMs}] in order
       this.mimeType = mimeType;
@@ -67,7 +69,9 @@
       this.total = (last.startEpochMs + last.durationMs - this.base) / 1000;
       this.inS = null;
       this.outS = null;
-      this.crop = null;                   // {x,y,w,h} fractions of the frame, or null = full frame
+      this.crop = crop ? { ...crop } : null; // {x,y,w,h} fractions of the frame, or null = full frame
+      this.lastCrop = lastCrop || crop || null;
+      this.onCropChange = onCropChange;
       this.ready = false;
       this.assembled = false;             // all segments appended; gap-jumping is safe
       this.closed = false;
@@ -184,6 +188,11 @@
       this.video = wrap.querySelector("video");
       this.video.addEventListener("waiting", () => this._unstick(true));
       this.video.addEventListener("seeking", () => this._unstick(false));
+      // The saved box is shown from the start; its layer follows the real
+      // frame shape once the video size is known.
+      this.video.addEventListener("loadedmetadata", () => {
+        if (this.crop) this._renderCrop();
+      });
       (document.fullscreenElement || document.documentElement).appendChild(this.host);
       this._place();
     }
@@ -274,14 +283,15 @@
         this.clearCrop();
         return;
       }
-      this.crop = lastCrop ? { ...lastCrop } : { x: 0.2, y: 0.2, w: 0.6, h: 0.6 };
+      this.crop = this.lastCrop ? { ...this.lastCrop } : { x: 0.2, y: 0.2, w: 0.6, h: 0.6 };
       this._renderCrop();
+      this._commitCrop();
     }
 
     clearCrop() {
       this.crop = null;
-      lastCrop = null;
       this._renderCrop();
+      this._commitCrop();
     }
 
     _setCrop(c) {
@@ -290,8 +300,19 @@
       const x = Math.min(Math.max(0, c.x), 1 - w);
       const y = Math.min(Math.max(0, c.y), 1 - h);
       this.crop = { x, y, w, h };
-      lastCrop = this.crop;
+      this.lastCrop = this.crop;
       this._renderCrop();
+    }
+
+    _cropOut() {
+      const round4 = (v) => Math.round(v * 10000) / 10000;
+      const c = this.crop;
+      return c ? { x: round4(c.x), y: round4(c.y), w: round4(c.w), h: round4(c.h) } : null;
+    }
+
+    // Save the current box (or full frame) for this match.
+    _commitCrop() {
+      if (this.onCropChange) this.onCropChange(this._cropOut());
     }
 
     _renderCrop() {
@@ -332,6 +353,7 @@
           u.cropbox.removeEventListener("pointermove", move);
           u.cropbox.removeEventListener("pointerup", up);
           u.cropbox.removeEventListener("pointercancel", up);
+          this._commitCrop();
         };
         u.cropbox.addEventListener("pointermove", move);
         u.cropbox.addEventListener("pointerup", up);
@@ -545,13 +567,10 @@
         else toast("先用 [ 和 ] 设起点和终点", "warn");
         return;
       }
-      const round4 = (v) => Math.round(v * 10000) / 10000;
       const range = {
         startMs: Math.round(this.base + this.inS * 1000),
         endMs: Math.round(this.base + this.outS * 1000),
-        crop: this.crop
-          ? { x: round4(this.crop.x), y: round4(this.crop.y), w: round4(this.crop.w), h: round4(this.crop.h) }
-          : null,
+        crop: this._cropOut(),
       };
       this.close();
       this.onConfirm(range);

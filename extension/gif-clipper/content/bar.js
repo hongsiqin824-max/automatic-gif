@@ -11,6 +11,8 @@
   let hidden = false;
   let startMs = null;
   let tickTimer = null;
+  let cropEntry = null;   // this match's saved crop {crop, last, aspect} (background), or null
+  let videoAspect = 0;    // recording video width / height, from the status poll
 
   function send(msg) {
     return new Promise((resolve) => {
@@ -48,6 +50,7 @@
       .status.ok { color: #5fd38a; } .status.fail { color: #ff7b7b; } .status.warn { color: #ffc46b; }
       .rec { color: #ff6b6b; font-weight: 600; }
       .hide { background: transparent; color: #7f8ba0; padding: 4px 6px; }
+      .crop.on { color: #ffc46b; } .crop.warn { color: #1a1300; background: #ffc46b; }
     `;
     const bar = document.createElement("div");
     bar.className = "bar";
@@ -57,6 +60,7 @@
       <button data-role="start" title="把当前画面设为起点（Alt+1）">设起点<kbd>Alt+1</kbd></button>
       <button data-role="finish" class="primary" disabled title="结束并生成 GIF（Alt+2）">结束<kbd>Alt+2</kbd></button>
       <button data-role="review" title="回看最近几分钟，拖动选起止点（Alt+3）">回看<kbd>Alt+3</kbd></button>
+      <button data-role="crop" class="crop" style="display:none">整幅</button>
       <span data-role="status" class="status">正在找视频…</span>
       <button data-role="hide" class="hide" title="隐藏小条（Alt+0 再显示）">×</button>
     `;
@@ -67,17 +71,20 @@
       start: bar.querySelector('[data-role="start"]'),
       finish: bar.querySelector('[data-role="finish"]'),
       review: bar.querySelector('[data-role="review"]'),
+      crop: bar.querySelector('[data-role="crop"]'),
       status: bar.querySelector('[data-role="status"]'),
       hide: bar.querySelector('[data-role="hide"]'),
     };
     ui.start.addEventListener("click", () => send({ type: "command", command: "set-start" }));
     ui.finish.addEventListener("click", () => send({ type: "command", command: "finish" }));
     ui.review.addEventListener("click", () => send({ type: "command", command: "review" }));
+    ui.crop.addEventListener("click", toggleCrop);
     ui.hide.addEventListener("click", () => setHidden(true, true));
     ui.match.addEventListener("change", async () => {
       await send({ type: "set-match", matchId: ui.match.value });
       setStatus(ui.match.value ? "已选比赛" : "未选比赛", ui.match.value ? "ok" : "warn");
       updateButtons();
+      loadCrop();
     });
     makeDraggable(bar.querySelector(".grip"));
     (document.fullscreenElement || document.documentElement).appendChild(host);
@@ -128,6 +135,51 @@
     ui.start.innerHTML = `<span class="rec">● ${sec}s</span><kbd>Alt+1</kbd>`;
   }
 
+  // ---- sticky crop: show the match's box; click = full frame / restore ----
+  async function loadCrop() {
+    const matchId = ui.match.value;
+    const entry = matchId ? await send({ type: "get-crop", matchId }) : null;
+    if (matchId !== ui.match.value) return; // match switched while loading
+    cropEntry = entry && !entry.error ? entry : null;
+    renderCrop();
+  }
+
+  function renderCrop() {
+    if (!ui) return;
+    ui.crop.style.display = ui.match.value ? "" : "none";
+    const crop = cropEntry && cropEntry.crop;
+    const last = cropEntry && cropEntry.last;
+    if (crop) {
+      const rule = window.__gifClipperCropForClip;
+      const changed = !!(rule && rule(cropEntry, videoAspect).aspectChanged);
+      ui.crop.textContent = `裁剪 ${Math.round(crop.w * 100)}%×${Math.round(crop.h * 100)}%`;
+      ui.crop.className = changed ? "crop warn" : "crop on";
+      ui.crop.title = changed
+        ? "画面比例变了，截图暂按整幅出图；点一下打开回看（Alt+3）确认裁剪框"
+        : "截图都按这个框出图。点一下改为整幅；在回看（Alt+3）里拖动调整";
+    } else {
+      ui.crop.textContent = "整幅";
+      ui.crop.className = "crop";
+      ui.crop.title = last
+        ? "当前按整幅出图。点一下恢复上次的裁剪框"
+        : "当前按整幅出图。在回看（Alt+3）里按 C 框选，之后每次截图都沿用";
+    }
+  }
+
+  async function toggleCrop() {
+    const matchId = ui.match.value;
+    if (!matchId || !cropEntry) return;
+    // Yellow (box on hold): open the review window to confirm the box there,
+    // instead of silently switching to full frame.
+    if (ui.crop.classList.contains("warn")) {
+      send({ type: "command", command: "review" });
+      return;
+    }
+    if (cropEntry.crop) await send({ type: "set-crop", matchId, crop: null });
+    else if (cropEntry.last) await send({ type: "set-crop", matchId, crop: cropEntry.last });
+    loadCrop();
+  }
+
   async function loadMatches(state) {
     const matches = await send({ type: "get-matches" });
     if (!matches || matches.error) {
@@ -157,6 +209,7 @@
       ui.match.value = keep;
     }
     updateButtons();
+    loadCrop();
   }
 
   async function pollStatus() {
@@ -166,6 +219,12 @@
       setStatus("没有找到正在播放的视频", "warn");
     } else {
       setStatus(`缓冲 ${s.bufferedSeconds}s · ${s.size}`, "ok");
+    }
+    const [w, h] = String(s.size || "").split("x").map(Number);
+    const aspect = w > 0 && h > 0 ? w / h : 0;
+    if (aspect !== videoAspect) {
+      videoAspect = aspect;
+      renderCrop();
     }
     if (s.startMs !== undefined && s.startMs !== startMs && s.startMs == null) startMs = null;
     renderRange();
@@ -193,6 +252,16 @@
         break;
     }
     return false;
+  });
+
+  // The review window (maybe in an iframe) and other tabs on the same match
+  // save through background; follow the stored box directly.
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== "local" || !ui || !ui.match.value) return;
+    const change = changes[`crop:${ui.match.value}`];
+    if (!change) return;
+    cropEntry = change.newValue || null;
+    renderCrop();
   });
 
   document.addEventListener("fullscreenchange", () => {

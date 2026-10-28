@@ -533,6 +533,54 @@ class ExtensionPickSourceTests(unittest.TestCase):
         self.assertEqual((r["next"], r["reason"]), ("b", "hard"))
 
 
+class ExtensionCropForClipTests(unittest.TestCase):
+    """``cropForClip`` in extension/gif-clipper/content/finder.js, run under node.
+
+    The match's saved crop box applies to every clip, but a box drawn on a
+    differently shaped stream is withheld (full frame) and flagged.
+    """
+
+    BOX = {"x": 0.1, "y": 0.2, "w": 0.5, "h": 0.4}
+
+    @classmethod
+    def setUpClass(cls):
+        import shutil
+
+        cls.node = shutil.which("node")
+        if not cls.node:
+            raise unittest.SkipTest("node 不可用")
+        cls.script = Path(__file__).parent / "extension" / "gif-clipper" / "content" / "finder.js"
+        if not cls.script.is_file():
+            raise unittest.SkipTest("finder.js missing")
+
+    def crop_for(self, entry, aspect):
+        script = (
+            f"const {{cropForClip}} = require({json.dumps(str(self.script))});"
+            f"process.stdout.write(JSON.stringify(cropForClip({json.dumps(entry)}, {json.dumps(aspect)})));"
+        )
+        result = subprocess.run([self.node, "-e", script], capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_no_entry_or_full_frame_is_uncropped(self):
+        for entry in (None, {}, {"crop": None, "last": self.BOX, "aspect": 16 / 9}):
+            self.assertEqual(self.crop_for(entry, 16 / 9), {"crop": None, "aspectChanged": False})
+
+    def test_saved_box_applies_on_same_shape(self):
+        entry = {"crop": self.BOX, "aspect": 16 / 9}
+        self.assertEqual(self.crop_for(entry, 1920 / 1080), {"crop": self.BOX, "aspectChanged": False})
+        # Small rounding differences (e.g. 854x480) stay within tolerance.
+        self.assertEqual(self.crop_for(entry, 854 / 480)["crop"], self.BOX)
+
+    def test_changed_shape_withholds_box(self):
+        entry = {"crop": self.BOX, "aspect": 16 / 9}
+        self.assertEqual(self.crop_for(entry, 4 / 3), {"crop": None, "aspectChanged": True})
+
+    def test_unknown_aspect_keeps_box(self):
+        self.assertEqual(self.crop_for({"crop": self.BOX, "aspect": None}, 4 / 3)["crop"], self.BOX)
+        self.assertEqual(self.crop_for({"crop": self.BOX, "aspect": 16 / 9}, 0)["crop"], self.BOX)
+
+
 class ExtensionUnstickTargetTests(unittest.TestCase):
     """``unstickTarget`` in extension/gif-clipper/content/review.js, run under node.
 

@@ -38,10 +38,26 @@
     return { next: current.el, reason: "keep", challenger: { el: best.el, since: now } };
   }
 
+  // The match's saved crop for a clip. ``entry`` = {crop, aspect} from
+  // background (or null); ``aspect`` = current video width / height. A box
+  // drawn on a differently shaped stream would cut the wrong area, so it is
+  // withheld (full frame) and the caller warns instead.
+  const ASPECT_TOLERANCE = 0.02;
+  function cropForClip(entry, aspect) {
+    const crop = entry && entry.crop ? entry.crop : null;
+    if (!crop) return { crop: null, aspectChanged: false };
+    const saved = entry.aspect;
+    if (saved > 0 && aspect > 0 && Math.abs(aspect / saved - 1) > ASPECT_TOLERANCE) {
+      return { crop: null, aspectChanged: true };
+    }
+    return { crop, aspectChanged: false };
+  }
+
   if (typeof module !== "undefined" && module.exports) {
-    module.exports = { pickSource, CHALLENGE_MS };
+    module.exports = { pickSource, CHALLENGE_MS, cropForClip };
   }
   if (typeof window === "undefined") return;
+  window.__gifClipperCropForClip = cropForClip; // the top-frame bar uses the same rule
   if (window.__gifClipperFinder) return;
   window.__gifClipperFinder = true;
 
@@ -252,6 +268,28 @@
     }
   }
 
+  // ---- sticky crop (saved per match by background) ----
+  function videoAspect() {
+    return current && current.videoWidth && current.videoHeight ? current.videoWidth / current.videoHeight : 0;
+  }
+
+  async function loadCrop(matchId) {
+    const entry = await send({ type: "get-crop", matchId });
+    return entry && !entry.error ? entry : null;
+  }
+
+  function saveCrop(matchId, crop) {
+    return send({ type: "set-crop", matchId, crop: crop || null, aspect: videoAspect() });
+  }
+
+  // Crop for an Alt+2 clip: the saved box, or full frame with a warning when
+  // the stream changed shape since the box was drawn.
+  async function clipCrop(matchId) {
+    const { crop, aspectChanged } = cropForClip(await loadCrop(matchId), videoAspect());
+    if (aspectChanged) toast("画面比例变了，这张按整幅出图；按 Alt+3 回看确认裁剪框", "warn", 4000);
+    return crop;
+  }
+
   // Review overlay over the live player: close the open segment first so the
   // last seconds are playable, then stitch the closed segments.
   async function openReview(matchId, maxRangeSeconds) {
@@ -266,12 +304,23 @@
       toast("缓冲还是空的，再等几秒", "warn");
       return;
     }
+    const saved = await loadCrop(matchId);
+    if (cropForClip(saved, videoAspect()).aspectChanged) {
+      toast("画面比例变了，请确认裁剪框位置", "warn", 4000);
+    }
     review = new ReviewOverlay({
       anchor: current,
       segments,
       mimeType: recorder.mimeType || "video/webm",
       maxRangeSeconds,
-      onConfirm: (range) => generateClip(matchId, range),
+      crop: (saved && saved.crop) || null,
+      lastCrop: (saved && saved.last) || null,
+      onCropChange: (crop) => saveCrop(matchId, crop),
+      onConfirm: (range) => {
+        // Generating with the box confirms it for the current stream shape.
+        saveCrop(matchId, range.crop);
+        generateClip(matchId, range);
+      },
       onClose: () => {
         review = null;
       },
@@ -324,7 +373,8 @@
         const range = { startMs: recorder.startMs, endMs: Date.now() };
         recorder.clearStart();
         send({ type: "bar-relay", payload: { type: "bar-range", startMs: null } });
-        generateClip(msg.matchId, range);
+        // Same box as the review window: the match's saved crop applies here too.
+        clipCrop(msg.matchId).then((crop) => generateClip(msg.matchId, { ...range, crop }));
         sendResponse({ ok: true });
         return false;
       }

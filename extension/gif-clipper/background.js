@@ -84,6 +84,32 @@ async function setTabState(tabId, patch) {
   return next;
 }
 
+// ---- sticky crop per match (storage.local: survives reloads and restarts) ----
+// entry = {crop, last, aspect, at}. crop {x,y,w,h} (0..1) or null = full
+// frame (also what a match without an entry gets); last keeps the most recent
+// box so switching back from full frame restores it; aspect = width/height of
+// the video the box was drawn on, so a later stream with another shape is
+// not cropped blindly.
+
+async function getCrop(matchId) {
+  if (!matchId) return null;
+  const key = `crop:${matchId}`;
+  return (await chrome.storage.local.get(key))[key] || null;
+}
+
+async function setCrop(matchId, crop, aspect) {
+  if (!matchId) return null;
+  const prev = (await getCrop(matchId)) || {};
+  const next = {
+    crop: crop || null,
+    last: crop || prev.last || null,
+    aspect: crop && aspect > 0 ? aspect : prev.aspect || null,
+    at: Date.now(),
+  };
+  await chrome.storage.local.set({ [`crop:${matchId}`]: next });
+  return next;
+}
+
 chrome.tabs.onRemoved.addListener((tabId) => {
   chrome.storage.session.remove(`tab:${tabId}`);
   frameReports.delete(tabId);
@@ -202,6 +228,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return await getMatches(!!msg.force);
       case "get-base-url":
         return await baseUrl();
+      case "get-crop":
+        return await getCrop(msg.matchId);
+      case "set-crop":
+        return await setCrop(msg.matchId, msg.crop, msg.aspect);
       case "open-login": {
         const url = msg.loginUrl || (await baseUrl());
         await chrome.tabs.create({ url });
