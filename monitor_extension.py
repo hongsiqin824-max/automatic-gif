@@ -77,6 +77,13 @@ class ExtensionHooks:
     clip_range_max_seconds: float
     publish_enabled: Callable[[], bool]
     delivery_mode: Callable[[], str]
+    # Append mode (「再截一个视角」 armed on the 8901 page). The target is
+    # claimed *before* the slow encode and given back if encoding fails, so a
+    # second upload already in flight never lands in the same group. Optional
+    # so older test fixtures still build.
+    take_append_target: Callable[[str], dict[str, Any] | None] | None = None
+    restore_append_target: Callable[[str, dict[str, Any] | None], None] | None = None
+    attach_pending_clip: Callable[[str, Path, dict[str, Any] | None], dict[str, Any] | None] | None = None
 
 
 # ---- pure helpers (unit-tested without Flask) ----------------------------
@@ -389,6 +396,9 @@ def install_extension_routes(
 
         timestamp = time.strftime("%Y%m%d-%H%M%S")
         output_path = clip_dir / f"clip_{timestamp}_{uuid.uuid4().hex[:6]}.gif"
+        # Claimed before the slow encode, same as the page capture: a second
+        # upload already in flight must find the mode used up.
+        append_claim = hooks.take_append_target(match_id) if hooks.take_append_target else None
         try:
             encode_from_webm(
                 hooks.resolve_ffmpeg(), sources, ss, window,
@@ -396,6 +406,8 @@ def install_extension_routes(
             )
         except Exception as exc:  # noqa: BLE001 - surface ffmpeg detail to the extension
             shutil.rmtree(source_dir, ignore_errors=True)
+            if hooks.restore_append_target:
+                hooks.restore_append_target(match_id, append_claim)
             _log("monitor_ext_clip_failed", match_id=match_id, error=str(exc))
             return jsonify({"error": str(exc), "code": "encode_failed"}), 500
         store.register(source_dir)
@@ -430,6 +442,11 @@ def install_extension_routes(
                 "match_detail": hooks.match_detail_for(match_id),
             },
         )
+        appended = (
+            hooks.attach_pending_clip(match_id, output_path, append_claim)
+            if hooks.attach_pending_clip
+            else None
+        )
         _log(
             "monitor_ext_clip",
             match_id=match_id,
@@ -442,6 +459,7 @@ def install_extension_routes(
             window=window,
             crop=crop,
             source_offset_seconds=source_offset,
+            appended=appended,
             alert_match={
                 "mode": alert_match.get("mode"),
                 "candidates": alert_match.get("candidates"),
@@ -465,6 +483,7 @@ def install_extension_routes(
                 "event_key": event_key,
                 "alert_match": hooks.alert_match_public(alert_match),
                 "form": form,
+                "appended": appended,
             }
         )
 

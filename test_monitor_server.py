@@ -869,6 +869,449 @@ class ClipDiscardTests(unittest.TestCase):
         response = self.client.post("/api/monitor/clip/discard", json={"match_id": "../x", "name": self._NAME})
         self.assertEqual(response.status_code, 400)
 
+    def test_attached_clip_cannot_be_discarded_alone(self):
+        parent = self.dir / "clip_20260101-115900_aaaaaa.gif"
+        parent.write_bytes(b"GIF")
+        monitor_server._write_clip_meta(parent, {"attachments": [self._NAME]})
+        monitor_server._write_clip_meta(self.gif, {"parent": parent.name})
+        with mock.patch.object(monitor_server, "manual_draft_queue", None):
+            response = self._post(name=self._NAME)
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.get_json()["code"], "clip_attached")
+
+
+class ClipGroupTests(unittest.TestCase):
+    """``POST /api/monitor/clip/group`` + ``_list_clips``: attach / detach / set_main over sidecars."""
+
+    A = "clip_20260101-120000_aaaaaa.gif"
+    B = "clip_20260101-120030_bbbbbb.gif"
+    C = "clip_20260101-120100_cccccc.gif"
+    D = "clip_20260101-120130_dddddd.gif"
+    E = "clip_20260101-120200_eeeeee.gif"
+
+    def setUp(self):
+        self.client = monitor_server.app.test_client()
+        self.tmp = TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.queue = mock.Mock()
+        self.queue.records_by_source_name.return_value = {}
+        self._patches = [
+            mock.patch.object(monitor_server, "_clip_dir", return_value=self.dir),
+            mock.patch.object(monitor_server, "manual_draft_queue", self.queue),
+            mock.patch.object(monitor_server, "_clip_candidates", return_value=[]),
+            mock.patch.object(monitor_server, "clip_append", monitor_server._ClipAppendStore(900.0)),
+            # No Feishu session in tests: every request is the "anon" operator.
+            mock.patch.object(monitor_server, "_current_operator", return_value=None),
+        ]
+        for patch in self._patches:
+            patch.start()
+        for index, name in enumerate((self.A, self.B, self.C, self.D, self.E)):
+            path = self.dir / name
+            path.write_bytes(b"GIF" + bytes([index]))
+            monitor_server._write_clip_meta(
+                path,
+                {
+                    "event_key": f"manual_{index}",
+                    "anchor_epoch_ms": 1_000_000 + index * 30_000,
+                    "form": {"alert_seq": None, "match_event": 0, "match_time": "", "match_score": "", "title": f"t{index}"},
+                    "alert_match": {"mode": "none"},
+                },
+            )
+
+    def tearDown(self):
+        for patch in self._patches:
+            patch.stop()
+        self.tmp.cleanup()
+
+    def _group(self, action, name, **extra):
+        return self.client.post(
+            "/api/monitor/clip/group", json={"match_id": "54622319", "action": action, "name": name, **extra}
+        )
+
+    def _meta(self, name):
+        return monitor_server._read_clip_meta(self.dir / name)
+
+    def _rows(self):
+        return {row["name"]: row for row in monitor_server._list_clips("54622319")}
+
+    def test_attach_folds_row_under_target_and_list_hides_it(self):
+        response = self._group("attach", self.B, target=self.A)
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(response.get_json()["main"], self.A)
+        self.assertEqual(self._meta(self.A)["attachments"], [self.B])
+        self.assertEqual(self._meta(self.B)["parent"], self.A)
+        rows = self._rows()
+        self.assertNotIn(self.B, rows)
+        self.assertEqual(rows[self.A]["gif_count"], 2)
+        self.assertEqual([a["name"] for a in rows[self.A]["attachments"]], [self.B])
+        self.assertEqual(rows[self.A]["attachments"][0]["clip_url"], f"clips/54622319/{self.B}")
+        # The main keeps its own form; the attachment's form is simply not used.
+        self.assertEqual(rows[self.A]["form"]["title"], "t0")
+
+    def test_attach_to_an_attachment_joins_its_group(self):
+        self._group("attach", self.B, target=self.A)
+        response = self._group("attach", self.C, target=self.B)
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(response.get_json()["main"], self.A)
+        self.assertEqual(self._meta(self.A)["attachments"], [self.B, self.C])
+        self.assertEqual(self._meta(self.C)["parent"], self.A)
+
+    def test_attach_carries_own_attachments_along(self):
+        self._group("attach", self.B, target=self.A)   # A:[B]
+        self._group("attach", self.D, target=self.C)   # C:[D]
+        response = self._group("attach", self.C, target=self.A)
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(self._meta(self.A)["attachments"], [self.B, self.C, self.D])
+        self.assertEqual(self._meta(self.D)["parent"], self.A)
+        self.assertNotIn("attachments", self._meta(self.C))
+
+    def test_group_max_enforced(self):
+        self._group("attach", self.B, target=self.A)
+        self._group("attach", self.C, target=self.A)
+        self._group("attach", self.D, target=self.A)
+        response = self._group("attach", self.E, target=self.A)
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.get_json()["code"], "group_full")
+        self.assertEqual(self._meta(self.A)["attachments"], [self.B, self.C, self.D])
+        self.assertNotIn("parent", self._meta(self.E))
+
+    def test_attach_refuses_self_published_and_discarded(self):
+        self.assertEqual(self._group("attach", self.A, target=self.A).status_code, 400)
+        self.queue.records_by_source_name.return_value = {self.A: {"event_key": "manual_0"}}
+        response = self._group("attach", self.B, target=self.A)
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.get_json()["code"], "already_published")
+        self.queue.records_by_source_name.return_value = {}
+        monitor_server._write_clip_meta(self.dir / self.C, {**self._meta(self.C), "discarded": True})
+        response = self._group("attach", self.C, target=self.A)
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.get_json()["code"], "clip_discarded")
+
+    def test_attach_refuses_to_move_a_gif_out_of_a_published_group(self):
+        """A GIF already sent inside an article must not be folded into a second one.
+
+        Only the main carries the publish record, so the check has to follow
+        the attachment's parent; otherwise a stale page can publish the same
+        GIF twice.
+        """
+        self._group("attach", self.B, target=self.A)
+        self.queue.records_by_source_name.return_value = {self.A: {"event_key": "manual_0"}}
+        response = self._group("attach", self.B, target=self.C)
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.get_json()["code"], "already_published")
+        # Nothing moved: B stays under A, C is untouched.
+        self.assertEqual(self._meta(self.A)["attachments"], [self.B])
+        self.assertEqual(self._meta(self.B)["parent"], self.A)
+        self.assertNotIn("attachments", self._meta(self.C))
+        # A parent whose file is already gone cannot be a published article.
+        self.queue.records_by_source_name.return_value = {}
+        (self.dir / self.A).unlink()
+        response = self._group("attach", self.B, target=self.C)
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(self._meta(self.B)["parent"], self.C)
+
+    def test_pending_count_is_per_title_not_per_file(self):
+        """An unpublished 3-angle title is one pending article, as on the stage list."""
+        self.queue.records_by_source_name.return_value = {}
+        self.assertEqual(monitor_server._pending_clip_count("54622319"), 5)
+        self._group("attach", self.B, target=self.A)
+        self._group("attach", self.C, target=self.A)
+        self.assertEqual(monitor_server._pending_clip_count("54622319"), 3)  # A(+B,C), D, E
+
+    def test_pending_count_drops_a_published_group_with_its_angles(self):
+        """Attachments have no publish record; the main's record covers them."""
+        self._group("attach", self.B, target=self.A)
+        self.queue.records_by_source_name.return_value = {self.A: {"status": "published"}}
+        self.assertEqual(monitor_server._pending_clip_count("54622319"), 3)  # C, D, E
+        # An orphan (its main deleted) is a row of its own again and counts.
+        (self.dir / self.A).unlink()
+        self.assertEqual(monitor_server._pending_clip_count("54622319"), 4)  # B, C, D, E
+
+    def test_detach_restores_independent_row(self):
+        self._group("attach", self.B, target=self.A)
+        self._group("attach", self.C, target=self.A)
+        response = self._group("detach", self.B)
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(self._meta(self.A)["attachments"], [self.C])
+        self.assertNotIn("parent", self._meta(self.B))
+        rows = self._rows()
+        self.assertIn(self.B, rows)
+        self.assertEqual(rows[self.B]["gif_count"], 1)
+        self.assertEqual(rows[self.A]["gif_count"], 2)
+        not_attached = self._group("detach", self.B)
+        self.assertEqual(not_attached.status_code, 409)
+        self.assertEqual(not_attached.get_json()["code"], "not_attached")
+
+    def test_set_main_moves_article_identity_to_promoted_gif(self):
+        self._group("attach", self.B, target=self.A)
+        self._group("attach", self.C, target=self.A)
+        response = self._group("set_main", self.C)
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(response.get_json()["main"], self.C)
+        c_meta, a_meta = self._meta(self.C), self._meta(self.A)
+        # C now owns the group's form/event key; the others point to C.
+        self.assertEqual(c_meta["form"]["title"], "t0")
+        self.assertEqual(c_meta["event_key"], "manual_0")
+        self.assertEqual(c_meta["attachments"], [self.A, self.B])
+        self.assertNotIn("parent", c_meta)
+        self.assertEqual(a_meta["parent"], self.C)
+        self.assertNotIn("attachments", a_meta)
+        self.assertEqual(a_meta["form"]["title"], "t2")  # A keeps C's old capture-time values
+        self.assertEqual(self._meta(self.B)["parent"], self.C)
+        rows = self._rows()
+        self.assertEqual(set(rows), {self.C, self.D, self.E})
+        self.assertEqual([a["name"] for a in rows[self.C]["attachments"]], [self.A, self.B])
+
+    def test_orphaned_attachment_is_listed_on_its_own(self):
+        self._group("attach", self.B, target=self.A)
+        (self.dir / self.A).unlink()
+        rows = self._rows()
+        self.assertIn(self.B, rows)
+        self.assertEqual(rows[self.B]["gif_count"], 1)
+
+    def test_list_has_no_append_target_by_default(self):
+        body = self.client.get("/api/monitor/clips?match_id=54622319").get_json()
+        self.assertIsNone(body["append_target"])
+        self.assertEqual(body["group_max"], monitor_server.CLIP_GROUP_MAX)
+        self.assertNotIn("merge_hint", body["clips"][0])
+
+    # ---- append mode: 「再截一个视角」 ----
+
+    def _append(self, **body):
+        return self.client.post("/api/monitor/clip/append", json={"match_id": "54622319", **body})
+
+    def test_append_arms_target_and_list_reports_it(self):
+        response = self._append(name=self.A)
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(response.get_json()["append"], {"name": self.A, "gif_count": 1, "max": monitor_server.CLIP_GROUP_MAX, "expires_in": 900})
+        body = self.client.get("/api/monitor/clips?match_id=54622319").get_json()
+        self.assertEqual(body["append_target"]["name"], self.A)
+        cleared = self._append(clear=True)
+        self.assertEqual(cleared.status_code, 200)
+        self.assertIsNone(cleared.get_json()["append"])
+        self.assertIsNone(self.client.get("/api/monitor/clips?match_id=54622319").get_json()["append_target"])
+
+    def test_append_on_attachment_arms_its_main(self):
+        self._group("attach", self.B, target=self.A)
+        response = self._append(name=self.B)
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(response.get_json()["append"]["name"], self.A)
+        self.assertEqual(response.get_json()["append"]["gif_count"], 2)
+
+    def test_append_refuses_published_discarded_full_and_missing(self):
+        self.queue.records_by_source_name.return_value = {self.A: {"event_key": "manual_0"}}
+        self.assertEqual(self._append(name=self.A).get_json()["code"], "already_published")
+        self.queue.records_by_source_name.return_value = {}
+        monitor_server._write_clip_meta(self.dir / self.B, {**self._meta(self.B), "discarded": True})
+        self.assertEqual(self._append(name=self.B).get_json()["code"], "clip_discarded")
+        for extra in (self.C, self.D, self.E):
+            self._group("attach", extra, target=self.A)
+        self.assertEqual(self._append(name=self.A).get_json()["code"], "group_full")
+        self.assertEqual(self._append(name="clip_20260101-120000_ffffff.gif").status_code, 404)
+        self.assertEqual(self._append(name="../x").status_code, 400)
+
+    def _capture(self, name):
+        """One capture: claim the target the way the endpoint does, then attach."""
+        with monitor_server.app.test_request_context("/"):
+            claim = monitor_server._take_append_target("54622319")
+            return monitor_server._attach_pending_clip("54622319", self.dir / name, claim)
+
+    def test_pending_attach_is_single_use(self):
+        """The mode covers exactly one capture: the second lands on its own."""
+        self._append(name=self.A)
+        result = self._capture(self.B)
+        self.assertEqual(result["main"], self.A)
+        self.assertEqual(result["gif_count"], 2)
+        self.assertEqual(self._meta(self.A)["attachments"], [self.B])
+        self.assertEqual(self._meta(self.B)["parent"], self.A)
+        # Consumed: nothing is armed any more, so C is its own row.
+        self.assertIsNone(monitor_server.clip_append.get("54622319", "anon"))
+        self.assertIsNone(self._capture(self.C))
+        self.assertNotIn("parent", self._meta(self.C))
+        # Re-arming is how a third angle is added.
+        self._append(name=self.A)
+        self.assertEqual(self._capture(self.C)["gif_count"], 3)
+        self.assertEqual(self._meta(self.A)["attachments"], [self.B, self.C])
+
+    def test_claim_is_consumed_before_a_concurrent_capture_sees_it(self):
+        """Two captures in flight (double Alt+3): only the first one appends."""
+        self._append(name=self.A)
+        with monitor_server.app.test_request_context("/"):
+            first = monitor_server._take_append_target("54622319")
+            # The second capture starts while the first is still encoding.
+            second = monitor_server._take_append_target("54622319")
+            self.assertIsNotNone(first)
+            self.assertIsNone(second)
+            self.assertEqual(
+                monitor_server._attach_pending_clip("54622319", self.dir / self.B, first)["main"], self.A
+            )
+            self.assertIsNone(monitor_server._attach_pending_clip("54622319", self.dir / self.C, second))
+        self.assertEqual(self._meta(self.A)["attachments"], [self.B])
+        self.assertNotIn("parent", self._meta(self.C))
+
+    def test_failed_capture_gives_the_claim_back_without_extending_it(self):
+        self._append(name=self.A)
+        armed_at = time.time()
+        with monitor_server.app.test_request_context("/"):
+            claim = monitor_server._take_append_target("54622319")
+            monitor_server._restore_append_target("54622319", claim)
+        self.assertEqual(monitor_server.clip_append.get("54622319", "anon"), self.A)
+        # The deadline still runs from arming, so a retry cannot stretch it.
+        with mock.patch.object(monitor_server.time, "time", return_value=armed_at + 901.0):
+            self.assertIsNone(monitor_server.clip_append.get("54622319", "anon"))
+
+    def test_pending_attach_off_returns_none_and_stale_target_clears(self):
+        self.assertIsNone(self._capture(self.B))
+        self._append(name=self.A)
+        # A got published meanwhile: the fresh clip stays on its own and the mode drops.
+        self.queue.records_by_source_name.return_value = {self.A: {"event_key": "manual_0"}}
+        result = self._capture(self.B)
+        self.assertEqual(result["code"], "already_published")
+        self.assertIn("已单独保存", result["error"])
+        self.assertNotIn("parent", self._meta(self.B))
+        self.queue.records_by_source_name.return_value = {}
+        self.assertIsNone(self.client.get("/api/monitor/clips?match_id=54622319").get_json()["append_target"])
+
+    def test_publish_and_discard_disarm_the_row(self):
+        self._append(name=self.A)
+        self.queue.enqueue.return_value = {"status": "queued"}
+        published = self.client.post(
+            "/api/monitor/clip/publish", json={"match_id": "54622319", "name": self.A, "title": "x"}
+        )
+        self.assertEqual(published.status_code, 200, published.get_json())
+        self.assertIsNone(monitor_server.clip_append.get("54622319", "anon"))
+        self._append(name=self.B)
+        self.client.post("/api/monitor/clip/discard", json={"match_id": "54622319", "name": self.B})
+        self.assertIsNone(monitor_server.clip_append.get("54622319", "anon"))
+
+    def test_set_main_keeps_mode_on_the_group(self):
+        self._group("attach", self.B, target=self.A)
+        self._append(name=self.A)
+        response = self._group("set_main", self.B)
+        self.assertEqual(response.get_json()["append"]["name"], self.B)
+        self.assertEqual(monitor_server.clip_append.get("54622319", "anon"), self.B)
+
+    def test_append_store_is_per_operator_and_expires(self):
+        store = monitor_server._ClipAppendStore(ttl_seconds=10.0)
+        store.set("1", "ou_a", self.A)
+        store.set("1", "ou_b", self.B)
+        self.assertEqual(store.get("1", "ou_a"), self.A)
+        self.assertEqual(store.get("1", "ou_b"), self.B)
+        self.assertIsNone(store.get("2", "ou_a"))
+        store.clear("1", name=self.A)  # publish of A: only A's operators drop
+        self.assertIsNone(store.get("1", "ou_a"))
+        self.assertEqual(store.get("1", "ou_b"), self.B)
+        store.retarget("1", self.B, self.C)
+        self.assertEqual(store.get("1", "ou_b"), self.C)
+        with mock.patch.object(monitor_server.time, "time", return_value=time.time() + 11.0):
+            self.assertIsNone(store.get("1", "ou_b"))
+
+    def test_append_store_take_is_single_use_and_restore_keeps_the_deadline(self):
+        store = monitor_server._ClipAppendStore(ttl_seconds=10.0)
+        store.set("1", "ou_a", self.A)
+        self.assertGreater(store.remaining("1", "ou_a"), 0)
+        claim = store.take("1", "ou_a")
+        self.assertEqual(claim["name"], self.A)
+        self.assertIsNone(store.take("1", "ou_a"))  # consumed
+        self.assertIsNone(store.remaining("1", "ou_a"))
+        store.restore("1", "ou_a", claim)
+        self.assertEqual(store.get("1", "ou_a"), self.A)
+        # Restore must not revive an entry the operator has since replaced.
+        taken = store.take("1", "ou_a")
+        store.set("1", "ou_a", self.B)
+        store.restore("1", "ou_a", taken)
+        self.assertEqual(store.get("1", "ou_a"), self.B)
+        # An entry that expired while the capture ran is not claimable.
+        store.set("1", "ou_b", self.C)
+        with mock.patch.object(monitor_server.time, "time", return_value=time.time() + 11.0):
+            self.assertIsNone(store.take("1", "ou_b"))
+
+    # ---- push comparison on an appended angle ----
+
+    def _set_form_alert_seq(self, name, seq):
+        meta = self._meta(name)
+        meta["form"] = {**(meta.get("form") or {}), "alert_seq": seq}
+        monitor_server._write_clip_meta(self.dir / name, meta)
+
+    def _set_alert_match(self, name, **fields):
+        meta = self._meta(name)
+        meta["alert_match"] = {"mode": "alert", "ambiguous": False, "weak": False, **fields}
+        monitor_server._write_clip_meta(self.dir / name, meta)
+
+    def test_append_push_state_flags_a_different_push(self):
+        self._set_form_alert_seq(self.A, 7)
+        self._set_alert_match(self.B, alert_seq=9, minute="63", minute_extra="", score="2-1")
+        self._append(name=self.A)
+        state = self._capture(self.B)["push_state"]
+        self.assertEqual(state["state"], "conflict")
+        self.assertEqual(state["match_time"], "63")
+        self.assertEqual(state["score"], "2-1")
+        # Persisted on the attachment so the row and publish still warn later.
+        rows = self._rows()
+        self.assertEqual(rows[self.A]["attachments"][0]["push_state"]["state"], "conflict")
+
+    def test_append_push_state_is_quiet_when_the_push_agrees(self):
+        self._set_form_alert_seq(self.A, 7)
+        self._set_alert_match(self.B, alert_seq=7, minute="63")
+        self._append(name=self.A)
+        self.assertIsNone(self._capture(self.B)["push_state"])
+        self.assertIsNone(self._rows()[self.A]["attachments"][0]["push_state"])
+
+    def test_append_push_state_unverified_when_the_angle_is_unsure(self):
+        self._set_form_alert_seq(self.A, 7)
+        # Matched the same push but flagged ambiguous: say so quietly, do not block.
+        self._set_alert_match(self.B, alert_seq=7, ambiguous=True)
+        self._append(name=self.A)
+        self.assertEqual(self._capture(self.B)["push_state"]["state"], "unverified")
+
+    def test_append_push_state_skipped_when_the_main_has_no_push(self):
+        """跳过 on the main row means there is no expectation to check against."""
+        self._set_form_alert_seq(self.A, None)
+        self._set_alert_match(self.B, alert_seq=9)
+        self._append(name=self.A)
+        self.assertIsNone(self._capture(self.B)["push_state"])
+
+    def test_append_push_state_follows_the_operators_current_choice(self):
+        """The main's selected push wins over the one it was matched to at capture."""
+        self._set_alert_match(self.A, alert_seq=9)
+        self._set_form_alert_seq(self.A, 7)  # operator corrected it afterwards
+        self._set_alert_match(self.B, alert_seq=9)
+        self._append(name=self.A)
+        self.assertEqual(self._capture(self.B)["push_state"]["state"], "conflict")
+
+    def test_publish_of_attachment_refused_and_main_carries_group(self):
+        self._group("attach", self.B, target=self.A)
+        self.queue.enqueue.return_value = {"status": "queued"}
+        refused = self.client.post(
+            "/api/monitor/clip/publish", json={"match_id": "54622319", "name": self.B, "title": "x"}
+        )
+        self.assertEqual(refused.status_code, 409)
+        self.assertEqual(refused.get_json()["code"], "clip_attached")
+        self.queue.enqueue.assert_not_called()
+        published = self.client.post(
+            "/api/monitor/clip/publish", json={"match_id": "54622319", "name": self.A, "title": "两个角度"}
+        )
+        self.assertEqual(published.status_code, 200, published.get_json())
+        kwargs = self.queue.enqueue.call_args.kwargs
+        self.assertEqual(kwargs["source_path"], self.dir / self.A)
+        self.assertEqual(kwargs["extra_source_paths"], [self.dir / self.B])
+
+    def test_group_edits_refused_after_main_submitted(self):
+        self._group("attach", self.B, target=self.A)
+        self.queue.records_by_source_name.return_value = {self.A: {"event_key": "manual_0"}}
+        for action in ("detach", "set_main"):
+            response = self._group(action, self.B)
+            self.assertEqual(response.status_code, 409, action)
+            self.assertEqual(response.get_json()["code"], "already_published")
+
+    def test_bad_input(self):
+        self.assertEqual(self._group("explode", self.A).status_code, 400)
+        self.assertEqual(self._group("attach", "../x", target=self.A).status_code, 400)
+        self.assertEqual(self._group("attach", self.A, target="nope").status_code, 400)
+        missing = self._group("attach", "clip_20260101-120000_ffffff.gif", target=self.A)
+        self.assertEqual(missing.status_code, 404)
+        self.assertEqual(self._group("attach", self.A, target="clip_20260101-120000_ffffff.gif").status_code, 404)
+
 
 class StageCropMathTests(unittest.TestCase):
     """Run the pure crop helpers from monitor_static/app.js under node.
@@ -1797,12 +2240,38 @@ class ClipPublishEndpointTests(ClipEndpointAlertMatchTests):
         data = self._clip(10.0).get_json()
         self.queue.enqueue.assert_not_called()
         self.assertNotIn("draft", data)
+        self.assertIsNone(data["appended"])
         self.assertTrue(data["event_key"].startswith("manual_"))
         meta = json.loads((self.dir / "clips" / data["name"]).with_suffix(".json").read_text(encoding="utf-8"))
         self.assertEqual(meta["event_key"], data["event_key"])
         self.assertEqual(meta["alert_match"]["mode"], "catalog")
         self.assertEqual(meta["form"]["match_event"], 0)
         self.assertEqual(meta["match_detail"]["team_A_name"], "甲")
+
+    def test_capture_in_append_mode_lands_under_the_armed_row(self):
+        """「再截一个视角」 then S/E: the new GIF is folded under the armed main."""
+        self.queue.records_by_source_name.return_value = {}
+        first = self._clip(10.0).get_json()["name"]
+        with mock.patch.object(monitor_server, "clip_append", monitor_server._ClipAppendStore(900.0)), \
+             mock.patch.object(monitor_server, "_current_operator", return_value={"name": "张三", "open_id": "ou_x"}):
+            armed = self.client.post("/api/monitor/clip/append", json={"match_id": "54622319", "name": first})
+            self.assertEqual(armed.status_code, 200, armed.get_json())
+            second = self._clip(14.0).get_json()
+            self.assertEqual(second["appended"]["main"], first)
+            self.assertEqual(second["appended"]["gif_count"], 2)
+            # Single use: the capture consumed the mode, so a third lands alone.
+            third = self._clip(18.0).get_json()
+            self.assertIsNone(third["appended"])
+            body = self.client.get("/api/monitor/clips?match_id=54622319").get_json()
+            # Consumed by the second capture: the mode is off.
+            self.assertIsNone(body["append_target"])
+            # Another operator on the same match is unaffected.
+            with mock.patch.object(monitor_server, "_current_operator", return_value={"name": "李四", "open_id": "ou_y"}):
+                fourth = self._clip(22.0).get_json()
+            self.assertIsNone(fourth["appended"])
+        rows = {row["name"]: row for row in body["clips"]}
+        self.assertEqual([a["name"] for a in rows[first]["attachments"]], [second["name"]])
+        self.assertNotIn(second["name"], rows)
 
     def test_publish_backfills_team_ids_into_old_clip_match_detail(self):
         """Clips captured before the catalog carried team ids get them from the
@@ -2809,6 +3278,15 @@ class PublishNoticeTests(ClipEndpointAlertMatchTests):
     def test_notice_text_draft_mode_header(self):
         text = monitor_server._format_publish_notice(self._delivered(delivery_mode="draft"))
         self.assertTrue(text.startswith("【GIF 草稿已建】甲 vs 乙"))
+
+    def test_notice_text_counts_group_angles_on_first_gif_only(self):
+        lines = monitor_server._format_publish_notice(
+            self._delivered(gif_count=3, gif_urls=["https://g/1.gif", "https://g/2.gif", "https://g/3.gif"])
+        ).split("\n")
+        self.assertEqual(lines[-1], "GIF：https://matchgif.aisportsapp.com/g/clip_1.gif（共 3 张）")
+        self.assertNotIn("https://g/2.gif", "\n".join(lines))
+        single = monitor_server._format_publish_notice(self._delivered(gif_count=1)).split("\n")
+        self.assertEqual(single[-1], "GIF：https://matchgif.aisportsapp.com/g/clip_1.gif")
 
     def test_notify_hook_uses_publish_webhook_only(self):
         with mock.patch.object(monitor_server, "FEISHU_PUBLISH_WEBHOOK", "https://hook/publish"), \

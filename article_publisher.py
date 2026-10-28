@@ -1937,8 +1937,15 @@ class ArticlePublisher:
         source_path: Path,
         delivery_mode: str = "draft",
         archive_id: str | int | None = None,
+        extra_source_paths: Sequence[Path] = (),
     ) -> dict[str, Any]:
-        """Create or update an OCR GIF article as a draft or published article."""
+        """Create or update an OCR GIF article as a draft or published article.
+
+        ``extra_source_paths`` are further GIFs (other angles of the same
+        event) that go into the article body after the main one; each is
+        uploaded under a derived event key so the per-event upload cache keeps
+        one row per file.
+        """
         event_key = str(event.get("event_key") or "").strip()
         if not event_key:
             raise ArticlePublishError(
@@ -1955,6 +1962,16 @@ class ArticlePublisher:
                 event_key=event_key,
                 artifact_kind="ocr_window",
             )
+            extra_gifs: list[dict[str, Any]] = []
+            for index, extra_path in enumerate(extra_source_paths, start=1):
+                extra_gifs.append(
+                    self._prepare_public_gif(
+                        source_path=Path(extra_path),
+                        match_id=match_id,
+                        event_key=f"{event_key}#{index}",
+                        artifact_kind="ocr_window",
+                    )
+                )
             assignment_key = f"match:{match_id}"
             publish_account = self._existing_account_assignment(assignment_key)
             # An archive_id without a prior assignment identifies a legacy
@@ -1985,9 +2002,12 @@ class ArticlePublisher:
                     gif.get("official_upload")
                     or gif.get("upload_source") == "official"
                 ),
+                extra_gif_urls=[str(extra["url"]) for extra in extra_gifs],
             )
             try:
                 self._verify_public_media(gif)
+                for extra in extra_gifs:
+                    self._verify_public_media(extra)
                 result = self.platform_client.create_article(fields)
             except ArticlePublishError as exc:
                 base_diagnostics = _draft_diagnostics(
@@ -2040,6 +2060,7 @@ class ArticlePublisher:
             return {
                 "article_id": str(result["article_id"]),
                 "gif": gif,
+                "extra_gifs": extra_gifs,
                 "title": title,
                 "delivery_mode": delivery_mode,
                 "updated": archive_id is not None,
@@ -2310,6 +2331,7 @@ def build_article_fields(
     channels: str = "",
     tabs: Sequence[str | int] = (),
     body_footer: str = "",
+    extra_gif_urls: Sequence[str] = (),
 ) -> dict[str, Any]:
     if delivery_mode not in {"publish", "draft"}:
         raise ArticlePublishError(
@@ -2325,19 +2347,18 @@ def build_article_fields(
             stage="request_validation",
             status_code=400,
         )
-    if (
-        not (
-            allow_relative_media
-            and _is_relative_media_reference(gif_url)
-        )
-        and not gif_url.startswith("https://")
-    ):
-        raise ArticlePublishError(
-            "文章使用的 GIF 地址必须是 HTTPS 公网地址或官方 FastDFS url 路径",
-            code="publish_gif_https_required",
-            stage="public_url_check",
-            status_code=503,
-        )
+    gif_urls = [gif_url, *(str(u or "").strip() for u in extra_gif_urls)]
+    for url in gif_urls:
+        if (
+            not (allow_relative_media and _is_relative_media_reference(url))
+            and not url.startswith("https://")
+        ):
+            raise ArticlePublishError(
+                "文章使用的 GIF 地址必须是 HTTPS 公网地址或官方 FastDFS url 路径",
+                code="publish_gif_https_required",
+                stage="public_url_check",
+                status_code=503,
+            )
     normalized_cover_url = str(cover_url or "").strip()
     if not (
         (allow_relative_media and _is_relative_media_reference(normalized_cover_url))
@@ -2372,7 +2393,10 @@ def build_article_fields(
         normalized_archive_id = int(archive_id_text)
     code = str(event.get("code") or "").upper()
     is_draft = delivery_mode == "draft"
-    body = f'<p><img src="{html.escape(gif_url, quote=True)}" alt="比赛 GIF"></p>'
+    # One paragraph per GIF, main angle first, no text between them.
+    body = "".join(
+        f'<p><img src="{html.escape(url, quote=True)}" alt="比赛 GIF"></p>' for url in gif_urls
+    )
     footer_text = str(body_footer or "").strip()
     if footer_text:
         # A separate paragraph so the CMS renders the text on its own line

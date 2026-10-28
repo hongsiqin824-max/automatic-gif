@@ -12,7 +12,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Sequence
 
 from article_publisher import (
     ArticlePublisher,
@@ -531,6 +531,7 @@ class ArticleDraftQueue:
         artifact_kind: str = OCR_ARTIFACT_KIND,
         delivery_mode: str = DRAFT_DELIVERY_MODE,
         artifact_result: dict[str, Any] | None = None,
+        extra_source_paths: Sequence[Path] = (),
     ) -> dict[str, Any]:
         event_key = str(event.get("event_key") or "").strip()
         if not re.fullmatch(r"\d{1,20}", str(match_id)):
@@ -539,12 +540,23 @@ class ArticleDraftQueue:
             raise ValueError("自动草稿缺少事件标识")
         if artifact_kind not in (OCR_ARTIFACT_KIND, MANUAL_ARTIFACT_KIND) or delivery_mode != DRAFT_DELIVERY_MODE:
             raise ValueError("自动草稿仅支持 OCR GIF 或人工截取")
+        if extra_source_paths and artifact_kind != MANUAL_ARTIFACT_KIND:
+            raise ValueError("只有人工截取支持多张 GIF")
 
         resolved_source = source_path.expanduser().resolve()
+        resolved_extras: list[Path] = []
+        for extra in extra_source_paths:
+            resolved_extra = Path(extra).expanduser().resolve()
+            if resolved_extra != resolved_source and resolved_extra not in resolved_extras:
+                resolved_extras.append(resolved_extra)
         if self.allowed_output_root is not None:
             match_root = (self.allowed_output_root / str(match_id)).resolve()
-            if not resolved_source.is_relative_to(match_root):
-                raise ValueError("OCR GIF 路径不属于这场比赛的输出目录")
+            for candidate in (resolved_source, *resolved_extras):
+                if not candidate.is_relative_to(match_root):
+                    raise ValueError("OCR GIF 路径不属于这场比赛的输出目录")
+        extra_json = (
+            json.dumps([str(p) for p in resolved_extras], ensure_ascii=False) if resolved_extras else None
+        )
         task_key = hashlib.sha256(
             (
                 f"{match_id}\n{event_key}\n{artifact_kind}\n{delivery_mode}"
@@ -624,8 +636,8 @@ class ArticleDraftQueue:
                         quality_label, eligibility_json, status, stage, artifact_sha256, staged_path,
                         generation, retriable, auth_required,
                         error_code, error, attempt_count, created_at_unix,
-                        updated_at_unix
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 0, ?, ?, 0, ?, ?)
+                        updated_at_unix, extra_source_paths_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 0, ?, ?, 0, ?, ?, ?)
                     """,
                     (
                         task_key,
@@ -655,6 +667,7 @@ class ArticleDraftQueue:
                         else str(eligibility.get("reason") or "OCR GIF 不符合自动发布条件"),
                         now,
                         now,
+                        extra_json,
                     ),
                 )
             else:
@@ -669,6 +682,8 @@ class ArticleDraftQueue:
                 )
                 assignments = [
                     "source_path=?",
+                    "extra_source_paths_json=?",
+                    "extra_staged_paths_json=NULL",
                     "event_json=?",
                     "match_detail_json=?",
                     "quality_label=?",
@@ -677,6 +692,7 @@ class ArticleDraftQueue:
                 ]
                 values: list[Any] = [
                     str(resolved_source),
+                    extra_json,
                     event_json,
                     detail_json,
                     quality_label,
@@ -1086,6 +1102,7 @@ class ArticleDraftQueue:
                 # manual delivery mode, then settle into a terminal status so
                 # nothing re-publishes it.
                 source_path = self._stage_source(task)
+                extra_paths = self._stage_extra_sources(task)
                 if not self._claim_owned(task):
                     return True
                 final_event = dict(event)
@@ -1101,6 +1118,7 @@ class ArticleDraftQueue:
                     match_detail=detail,
                     source_path=source_path,
                     delivery_mode=mode,
+                    extra_source_paths=extra_paths,
                 )
                 if mode == "publish":
                     self._record_published(
@@ -1392,6 +1410,8 @@ class ArticleDraftQueue:
             ("published_at_unix", "REAL"),
             ("publish_reason", "TEXT"),
             ("final_event_json", "TEXT"),
+            ("extra_source_paths_json", "TEXT"),
+            ("extra_staged_paths_json", "TEXT"),
         ):
             if name not in columns:
                 connection.execute(
@@ -1642,6 +1662,53 @@ class ArticleDraftQueue:
             )
         return staged
 
+    def _stage_extra_sources(self, task: dict[str, Any]) -> list[Path]:
+        """Stage the attached angles of a manual clip (``extra_source_paths_json``).
+
+        Returns their staged copies in body order; an empty list for the usual
+        single-GIF task. A reused staged copy is only trusted while it still
+        exists. Any missing or broken attachment fails the whole task: half an
+        article is worse than none, and the operator can 拆出 the bad GIF.
+        """
+        sources = _json_list(task.get("extra_source_paths_json"))
+        if not sources:
+            return []
+        staged_existing = _json_list(task.get("extra_staged_paths_json"))
+        if len(staged_existing) == len(sources):
+            resolved = [Path(str(p)).expanduser().resolve() for p in staged_existing]
+            if all(p.is_file() for p in resolved):
+                return resolved
+        match_id = str(task["match_id"])
+        match_root = (
+            (self.allowed_output_root / match_id).resolve()
+            if self.allowed_output_root is not None
+            else None
+        )
+        staged: list[Path] = []
+        for raw in sources:
+            source_path = Path(str(raw)).expanduser().resolve()
+            if match_root is not None and not source_path.is_relative_to(match_root):
+                raise ValueError("附属 GIF 路径不属于这场比赛的输出目录")
+            if source_path.suffix.lower() != ".gif" or not source_path.is_file():
+                raise ValueError(f"附属 GIF 文件不存在，无法发布：{source_path.name}")
+            staged.append(Path(str(self._stage_file(source_path)["path"])).resolve())
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE article_delivery_tasks
+                SET extra_staged_paths_json=?, updated_at_unix=?
+                WHERE task_key=? AND generation=? AND lease_token=? AND status='creating'
+                """,
+                (
+                    json.dumps([str(p) for p in staged], ensure_ascii=False),
+                    time.time(),
+                    task["task_key"],
+                    task["generation"],
+                    task["lease_token"],
+                ),
+            )
+        return staged
+
     def _stage_file(self, source_path: Path) -> dict[str, Any]:
         if self.staging_directory is None:
             raise ArticlePublishError(
@@ -1788,6 +1855,9 @@ class ArticleDraftQueue:
             else {}
         )
         article_id = result.get("article_id")
+        extra_gifs = result.get("extra_gifs") if isinstance(result.get("extra_gifs"), list) else []
+        gif_urls = [u for u in [gif.get("url") or task.get("gif_url")] if u]
+        gif_urls.extend(str(g.get("url")) for g in extra_gifs if isinstance(g, dict) and g.get("url"))
         payload = {
             "match_id": str(task.get("match_id") or ""),
             "event_key": str(task.get("event_key") or ""),
@@ -1797,6 +1867,8 @@ class ArticleDraftQueue:
             "duplicate": bool(result.get("duplicate")),
             "title": result.get("title") or event.get("title_override") or "",
             "gif_url": gif.get("url") or task.get("gif_url"),
+            "gif_urls": gif_urls,
+            "gif_count": 1 + len(extra_gifs),
             "gif_bytes": gif.get("bytes"),
             "publish_account_name": account.get("user_name"),
             "delivered_at_unix": float(now),
@@ -2171,6 +2243,16 @@ def _json_object(value: Any) -> dict[str, Any] | None:
     except (TypeError, ValueError, json.JSONDecodeError):
         return None
     return parsed if isinstance(parsed, dict) else None
+
+
+def _json_list(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    try:
+        parsed = json.loads(str(value or ""))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    return parsed if isinstance(parsed, list) else []
 
 
 def _optional_float(value: Any) -> float | None:

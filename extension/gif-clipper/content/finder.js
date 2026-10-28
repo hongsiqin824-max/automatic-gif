@@ -220,8 +220,24 @@
     try {
       const picked = await recorder.finish(range);
       const result = await uploadClip(matchId, picked);
-      toast(`GIF 已生成（${(result.bytes / 1024 / 1024).toFixed(2)} MB）`, "ok", 3000);
-      await send({ type: "clip-created", matchId, name: result.name });
+      const size = `${(result.bytes / 1024 / 1024).toFixed(2)} MB`;
+      // Say where it landed: without the side panel open, this toast is the
+      // only place the operator learns whether 「再截一个视角」 caught this one.
+      const appended = result.appended || null;
+      if (appended && appended.error) {
+        toast(`GIF 已生成（${size}），但未能追加，已单独保存`, "warn", 4000);
+      } else if (appended && appended.main) {
+        const conflict = appended.push_state && appended.push_state.state === "conflict";
+        toast(
+          `GIF 已生成（${size}），已追加为第 ${appended.gif_count} 张` +
+            (conflict ? "；⚠ 对应的推送和主图不是同一条" : ""),
+          conflict ? "warn" : "ok",
+          conflict ? 5000 : 3000,
+        );
+      } else {
+        toast(`GIF 已生成（${size}）`, "ok", 3000);
+      }
+      await send({ type: "clip-created", matchId, name: result.name, appended });
     } catch (err) {
       if (err && err.code === "login_required") {
         toast("请先登录 8901（已打开登录页）", "fail", 4000);

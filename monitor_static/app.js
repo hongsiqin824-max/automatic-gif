@@ -631,25 +631,45 @@ async function captureClip(matchId, button, range) {
     });
     const sizeMb = (data.bytes / (1024 * 1024)).toFixed(2);
     const warn = data.anchored === false;
+    const appended = data.appended || null;
     // Capture never publishes: the operator reviews the GIF in the stage
     // list, checks the pre-filled CMS fields there, and clicks 「发布」.
     const publishNote = data.publish_enabled ? ' · 核对后在下方列表点「发布」' : ' · 仅本地保存';
     const alertNote = alertMatchNote(data.alert_match);
     const cropNote = data.crop ? ` · 裁剪 ${cropPercentLabel(data.crop)}` : '';
+    const appendNote = appended && appended.main ? ` · 已追加为第 ${appended.gif_count} 张` : '';
     const prefix = warn ? '⚠ 未锚定，画面可能不准' : '已生成 GIF';
-    setTileStatus(matchId, `${prefix}（${sizeMb} MB）${cropNote}${publishNote}${alertNote}`, warn ? 'warn' : 'ok', true);
+    setTileStatus(matchId, `${prefix}（${sizeMb} MB）${cropNote}${appendNote}${publishNote}${alertNote}`, warn ? 'warn' : 'ok', true);
+    // Append mode covers exactly one capture and the server has just used it
+    // up, so the banner goes away here rather than lingering as a lie.
+    setAppendTargetState(null);
     if (state.stageMatchId === matchId) {
       const span = ((range.endMs - range.startMs) / 1000).toFixed(1);
       setRangeState(warn ? 'warn' : 'done',
-        `${warn ? '⚠ 已生成但未锚定' : '✓ 已生成 GIF'} ${span}s · ${sizeMb} MB${cropNote}${data.publish_enabled ? '，在右侧列表核对后发布' : ''}`);
+        `${warn ? '⚠ 已生成但未锚定' : '✓ 已生成 GIF'} ${span}s · ${sizeMb} MB${cropNote}${appendNote}${data.publish_enabled ? '，在右侧列表核对后发布' : ''}`);
+      if (appended && appended.error) addStageNote(appended.error, 'warn');
+      else if (appended && appended.main) {
+        addStageNote(
+          `已追加为第 ${appended.gif_count} 张；要再截一个视角，请在该行再点一次「+ 再截一个视角」`, 'ok');
+        if (appended.push_state && appended.push_state.state === 'conflict') {
+          const when = [appended.push_state.match_time ? `${appended.push_state.match_time}'` : '',
+            appended.push_state.score || ''].filter(Boolean).join(' ');
+          addStageNote(
+            `⚠ 这张对应的推送（${when || '另一条'}）和主图选中的不是同一条，可能是另一个事件；` +
+            '如果不该并在一起，请在附属条点「拆出」', 'warn');
+        }
+      }
     }
     // The push-match note is shown on the clip's own row (buildClipForm);
     // the stage notes under the video are kept for errors only.
     const tile = state.tiles.get(matchId);
     setTileClipCount(matchId, ((tile && tile.clipCount) || 0) + 1, true);
     // Jump straight to the new row's title so the operator can type without
-    // reaching for the mouse (S → E → type title → Enter).
-    if (state.stageMatchId === matchId) loadStageClips(matchId, {focusTitle: true});
+    // reaching for the mouse (S → E → type title → Enter). An appended angle
+    // has no row of its own: stay on the main row's title instead.
+    if (state.stageMatchId === matchId) {
+      loadStageClips(matchId, appended && appended.main ? {focusName: appended.main} : {focusTitle: true});
+    }
     return true;
   } catch (error) {
     setTileStatus(matchId, error.message, 'warn');
@@ -820,6 +840,258 @@ function clipDraftRecord(item) {
   };
 }
 
+// ---- clip groups: one title, several angles ----
+//
+// A goal is usually worth more than one GIF (live angle, replay, close-up)
+// and the CMS allows only one gif-article per match_time, so angles are
+// attached to a main GIF and go out together in one article body. The
+// operator declares the group before capturing: 「再截一个视角」 on a row arms
+// append mode (kept on the server per operator + match, so the browser
+// extension's Alt+3 honours it too) and the *next* capture lands under that
+// row. The mode covers exactly one capture, so a third angle means clicking
+// the button again. 并入 (dropdown) / 拆出 / 设为主图 remain as corrections.
+
+let clipGroupMax = 4;
+// {name, gif_count, max, expires_in} from the server, or null. Mirrors the
+// server state; refreshed with every list load so a stale target (published,
+// full) drops.
+let appendTarget = null;
+// Local deadline (ms epoch) mirroring the server's fixed, never-extended one,
+// so the banner disappears on time instead of claiming the mode is still on.
+let appendDeadline = 0;
+let appendTicker = null;
+
+async function groupClip(action, name, extra, options = {}) {
+  const matchId = state.stageMatchId;
+  if (!matchId) return false;
+  try {
+    const data = await requestJson('api/monitor/clip/group', {
+      method: 'POST',
+      body: JSON.stringify({match_id: matchId, action, name, ...(extra || {})}),
+    });
+    if (state.stageMatchId === matchId) {
+      setAppendTargetState(data.append || null);
+      // set_main 让主图换了文件名，未提交的输入要跟着走。
+      const carryTyped = action === 'set_main' && options.fromName
+        ? {from: options.fromName, to: data.main}
+        : null;
+      loadStageClips(matchId, carryTyped ? {carryTyped} : {});
+    }
+    return true;
+  } catch (error) {
+    const code = error.data && error.data.code;
+    const label = action === 'attach' ? '并入' : action === 'detach' ? '拆出' : '设为主图';
+    addStageNote(`${label}失败：` + (code === 'group_full' ? `一个标题最多 ${clipGroupMax} 张 GIF` : error.message), 'fail');
+    return false;
+  }
+}
+
+function clipGroupLabel(item) {
+  const f = item.form || {};
+  const parts = [f.match_time ? `${f.match_time}'` : '', f.title || ''].filter(Boolean);
+  return `${fmtClipTime(item.created_unix)}${parts.length ? ' · ' + parts.join(' ') : ''}`;
+}
+
+// ---- append mode ----
+
+function setAppendTargetState(target) {
+  appendTarget = target && target.name ? target : null;
+  // The server's deadline is fixed at arming time; mirror whatever is left of
+  // it so a reload or a list refresh never resurrects an expired banner.
+  appendDeadline = appendTarget ? Date.now() + Math.max(0, Number(appendTarget.expires_in) || 0) * 1000 : 0;
+  if (appendTicker) { clearInterval(appendTicker); appendTicker = null; }
+  if (appendTarget) appendTicker = setInterval(tickAppendBanner, 1000);
+  renderAppendBanner();
+  // Rows show 「下一张追加到这里」 on the armed one; cheap to refresh in place.
+  document.querySelectorAll('.stage-clip-row[data-name] .stage-clip-append').forEach((btn) => {
+    const armed = !!appendTarget && btn.closest('.stage-clip-row').dataset.name === appendTarget.name;
+    btn.classList.toggle('armed', armed);
+    btn.textContent = armed ? '下一张追加到这里' : '+ 再截一个视角';
+  });
+}
+
+// The mode expires on its own; drop the banner the moment it does, so the
+// operator never trusts a stale 「下一张会追加」 promise.
+function tickAppendBanner() {
+  if (!appendTarget) { if (appendTicker) { clearInterval(appendTicker); appendTicker = null; } return; }
+  if (Date.now() >= appendDeadline) {
+    setAppendTargetState(null);
+    addStageNote('追加已超时退出，接下来截的 GIF 各自独立', 'warn');
+    return;
+  }
+  renderAppendBanner();
+}
+
+function renderAppendBanner() {
+  const banner = $('stage-append-banner');
+  const text = $('stage-append-text');
+  if (!banner || !text) return;
+  if (!appendTarget) { banner.classList.add('hidden'); return; }
+  const row = document.querySelector(`.stage-clip-row[data-name="${appendTarget.name}"]`);
+  const label = row && row._clipItem ? clipGroupLabel(row._clipItem) : appendTarget.name;
+  const next = Math.min(appendTarget.gif_count + 1, appendTarget.max || clipGroupMax);
+  const left = Math.max(0, Math.round((appendDeadline - Date.now()) / 1000));
+  const countdown = left >= 60 ? `${Math.floor(left / 60)} 分 ${left % 60} 秒` : `${left} 秒`;
+  text.textContent =
+    `下一次截取会追加到「${label}」，作为第 ${next} 张（最多 ${appendTarget.max || clipGroupMax} 张）` +
+    ` · 只对下一张生效 · ${countdown}后自动退出`;
+  banner.classList.remove('hidden');
+}
+
+async function armAppend(name, button) {
+  const matchId = state.stageMatchId;
+  if (!matchId) return;
+  if (button) button.disabled = true;
+  try {
+    const data = await requestJson('api/monitor/clip/append', {
+      method: 'POST', body: JSON.stringify({match_id: matchId, name}),
+    });
+    if (state.stageMatchId !== matchId) return;
+    setAppendTargetState(data.append || null);
+    addStageNote('已进入追加：下一次截取会挂到这个标题下，截完即退出', 'ok');
+  } catch (error) {
+    const code = error.data && error.data.code;
+    addStageNote('无法追加：' + (code === 'group_full' ? `一个标题最多 ${clipGroupMax} 张 GIF` : error.message), 'fail');
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+async function clearAppend() {
+  const matchId = state.stageMatchId;
+  setAppendTargetState(null);
+  if (!matchId) return;
+  try {
+    await requestJson('api/monitor/clip/append', {
+      method: 'POST', body: JSON.stringify({match_id: matchId, clear: true}),
+    });
+  } catch (error) {
+    addStageNote('退出追加失败：' + error.message, 'fail');
+  }
+}
+
+// Row button on an unpublished main: arm append mode on it (or show it armed).
+function buildAppendButton(item) {
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'stage-clip-append';
+  const armed = !!appendTarget && appendTarget.name === item.name;
+  const full = item.gif_count >= clipGroupMax;
+  btn.textContent = armed ? '下一张追加到这里' : '+ 再截一个视角';
+  if (armed) btn.classList.add('armed');
+  btn.disabled = full;
+  btn.title = full
+    ? `已满 ${clipGroupMax} 张`
+    : '下一次截取（S/E 或插件 Alt+3）会作为另一视角挂到这个标题下；只对下一张生效，再要一张就再点一次';
+  btn.addEventListener('click', () => { if (!armed) armAppend(item.name, btn); });
+  return btn;
+}
+
+// Correction tool on an unpublished main row: fold it into another open main.
+function buildAttachControls(item, openMains) {
+  const wrap = document.createElement('span');
+  wrap.className = 'stage-clip-group-ctl';
+  wrap.appendChild(buildAppendButton(item));
+  const targets = openMains.filter((o) => o.name !== item.name && (o.gif_count + item.gif_count) <= clipGroupMax);
+  if (!targets.length) return wrap;
+  const pick = document.createElement('select');
+  pick.className = 'stage-input stage-clip-merge-pick';
+  const placeholder = document.createElement('option');
+  placeholder.value = ''; placeholder.textContent = '并入…';
+  pick.appendChild(placeholder);
+  targets.forEach((o) => {
+    const opt = document.createElement('option');
+    opt.value = o.name;
+    opt.textContent = clipGroupLabel(o) + (o.gif_count > 1 ? `（已 ${o.gif_count} 张）` : '');
+    pick.appendChild(opt);
+  });
+  pick.title = '截错了归属时用：把这条 GIF 作为另一视角挂到所选标题下（表单以那条为准）';
+  pick.addEventListener('change', () => {
+    if (!pick.value) return;
+    pick.disabled = true;
+    groupClip('attach', item.name, {target: pick.value}).then((ok) => { if (!ok) { pick.disabled = false; pick.value = ''; } });
+  });
+  wrap.appendChild(pick);
+  return wrap;
+}
+
+// Strip of attached angles under the main GIF (unpublished: editable).
+// Whether an appended angle looks like it belongs to the same event as the
+// main GIF. ``conflict`` is loud (both sides name a push and they differ);
+// ``unverified`` is a quiet aside, because a replay angle's own push match
+// drifts often and is not by itself a problem.
+function buildAttachmentPushNote(pushState) {
+  const state = pushState && pushState.state;
+  if (state !== 'conflict' && state !== 'unverified') return null;
+  const note = document.createElement('span');
+  note.className = `stage-clip-attachment-push ${state}`;
+  if (state === 'conflict') {
+    const when = [pushState.match_time ? `${pushState.match_time}'` : '', pushState.score || '']
+      .filter(Boolean).join(' ');
+    note.textContent = `⚠ 对应另一条推送${when ? `（${when}）` : ''}`;
+    note.title = '这张匹配到的推送和主图选中的不是同一条，可能是另一个进球；确认不该并在一起就点「拆出」';
+  } else {
+    note.textContent = '推送未确认';
+    note.title = '没能确认这张和主图是同一条推送（回放视角常见）；核对画面无误即可忽略';
+  }
+  return note;
+}
+
+function buildAttachmentStrip(item, editable) {
+  const atts = Array.isArray(item.attachments) ? item.attachments : [];
+  if (!atts.length) return null;
+  const strip = document.createElement('div');
+  strip.className = 'stage-clip-attachments';
+  const head = document.createElement('div');
+  head.className = 'stage-clip-attachments-head';
+  head.textContent = `其他视角 ${atts.length} 张（同一篇文章，按顺序排在主图后）`;
+  strip.appendChild(head);
+  atts.forEach((att) => {
+    const cell = document.createElement('div');
+    cell.className = 'stage-clip-attachment';
+    const img = document.createElement('img');
+    img.className = 'stage-clip-attachment-preview';
+    img.loading = 'lazy';
+    img.alt = '另一视角 GIF';
+    img.src = att.clip_url;
+    cell.appendChild(img);
+    const meta = document.createElement('div');
+    meta.className = 'stage-clip-attachment-meta';
+    const label = document.createElement('span');
+    label.textContent = `${fmtClipTime(att.created_unix)} · ${(att.bytes / (1024 * 1024)).toFixed(2)} MB`;
+    meta.appendChild(label);
+    const push = buildAttachmentPushNote(att.push_state);
+    if (push) meta.appendChild(push);
+    const open = document.createElement('a');
+    open.href = att.clip_url; open.target = '_blank'; open.rel = 'noreferrer';
+    open.textContent = '打开';
+    meta.appendChild(open);
+    if (editable) {
+      const main = document.createElement('button');
+      main.type = 'button';
+      main.className = 'stage-clip-attachment-btn';
+      main.textContent = '设为主图';
+      main.title = '让这张成为文章的第一张图和封面；标题等表单跟着保留';
+      main.addEventListener('click', () => {
+        main.disabled = true;
+        // item.name 是当前主图：未提交的输入是按它暂存的，换主图后要搬到新主图名下。
+        groupClip('set_main', att.name, null, {fromName: item.name});
+      });
+      meta.appendChild(main);
+      const detach = document.createElement('button');
+      detach.type = 'button';
+      detach.className = 'stage-clip-attachment-btn';
+      detach.textContent = '拆出';
+      detach.title = '从这个标题移出，恢复为独立一条';
+      detach.addEventListener('click', () => { detach.disabled = true; groupClip('detach', att.name); });
+      meta.appendChild(detach);
+    }
+    cell.appendChild(meta);
+    strip.appendChild(cell);
+  });
+  return strip;
+}
+
 // ---- publish form (mirrors the CMS gif-article fields) ----
 //
 // An unpublished row is a small form: the push the clip belongs to (radio,
@@ -853,6 +1125,8 @@ function buildClipForm(item, row) {
   preview.alt = '本段 GIF 预览';
   preview.src = item.clip_url;
   form.appendChild(preview);
+  const strip = buildAttachmentStrip(item, true);
+  if (strip) form.appendChild(strip);
   const initial = item.form || {};
   const am = item.alert_match || {};
   const candidates = Array.isArray(item.candidates) ? item.candidates : [];
@@ -1038,9 +1312,10 @@ function buildPublishedSummary(item) {
   return el;
 }
 
-function renderClipRow(item, publishEnabled) {
+function renderClipRow(item, publishEnabled, openMains) {
   const row = document.createElement('div');
   row.className = 'stage-clip-row';
+  row._clipItem = item;
   if (item.event_key) row.dataset.eventKey = item.event_key;
   const head = document.createElement('div');
   head.className = 'stage-clip-head';
@@ -1057,6 +1332,13 @@ function renderClipRow(item, publishEnabled) {
     label.title = '截取时没有时间戳，画面可能不准，发布前请打开核对';
   }
   head.appendChild(label);
+  if (item.gif_count > 1) {
+    const badge = document.createElement('span');
+    badge.className = 'stage-clip-group-badge';
+    badge.textContent = `${item.gif_count} 张`;
+    badge.title = '这个标题下有多个视角，会放进同一篇文章';
+    head.appendChild(badge);
+  }
   if (item.crop && typeof item.crop.w === 'number') {
     const badge = document.createElement('span');
     badge.className = 'stage-clip-crop-badge';
@@ -1080,6 +1362,8 @@ function renderClipRow(item, publishEnabled) {
     draftEl.className = 'stage-clip-draft';
     applyDraftState(draftEl, clipDraftRecord(item), state.stageMatchId, item.event_key);
     head.appendChild(draftEl);
+    const strip = buildAttachmentStrip(item, false);
+    if (strip) row.appendChild(strip);
     return row;
   }
   if (item.discarded) {
@@ -1099,6 +1383,7 @@ function renderClipRow(item, publishEnabled) {
     return row;
   }
   row.classList.add('editing');
+  head.appendChild(buildAttachControls(item, openMains || []));
   row.appendChild(buildClipForm(item, row));
   return row;
 }
@@ -1107,6 +1392,23 @@ async function publishClip(name, formValues, button, row, force) {
   const matchId = state.stageMatchId;
   if (!matchId) return;
   if (!formValues.title) { addStageNote('请填写标题后再发布', 'warn'); return; }
+  // Publishing is the one step that cannot be undone, so a group carrying an
+  // angle matched to a *different* push asks once. The quieter "unverified"
+  // note is already on the row and does not block here.
+  const conflicts = (row._clipItem && Array.isArray(row._clipItem.attachments) ? row._clipItem.attachments : [])
+    .filter((att) => att.push_state && att.push_state.state === 'conflict');
+  if (conflicts.length && !force) {
+    const lines = conflicts.map((att) => {
+      const when = [att.push_state.match_time ? `${att.push_state.match_time}'` : '', att.push_state.score || '']
+        .filter(Boolean).join(' ');
+      return `· ${fmtClipTime(att.created_unix)} 对应另一条推送${when ? `（${when}）` : ''}`;
+    });
+    const ok = window.confirm(
+      `这个标题下有 ${conflicts.length} 张视角对应的推送和主图不是同一条，可能是另一个事件：\n` +
+      lines.join('\n') + '\n\n确认它们属于同一篇、一起发布吗？'
+    );
+    if (!ok) return;
+  }
   button.disabled = true;
   button.textContent = '发布中…';
   row.querySelectorAll('input,select').forEach((el) => { el.disabled = true; });
@@ -1193,7 +1495,10 @@ async function loadStageClips(matchId, options = {}) {
   }
   if (state.stageMatchId !== matchId) return;
   if (Array.isArray(data.score_event_types)) scoreEventTypes = new Set(data.score_event_types.map(Number));
+  if (Number(data.group_max) > 0) clipGroupMax = Number(data.group_max);
   const clips = Array.isArray(data.clips) ? data.clips : [];
+  // Rows a new angle can be folded into: unpublished, not discarded mains.
+  const openMains = data.publish_enabled ? clips.filter((c) => !c.event_key && !c.discarded) : [];
   // The list is rebuilt after every capture; keep whatever the operator had
   // already changed in an unpublished row's form.
   const typed = new Map();
@@ -1201,6 +1506,16 @@ async function loadStageClips(matchId, options = {}) {
     const api = formEl._clip;
     if (api && api.dirty.size) typed.set(formEl.closest('.stage-clip-row').dataset.name, {values: api.readForm(), dirty: api.dirty});
   });
+  // 「设为主图」会让这一行换名字：未提交的输入是按旧主图名暂存的，不挪过去
+  // 就会被丢弃，操作员刚打的标题、改过的时间和比分全部回到推送默认值。
+  // 只在新名下还没有输入时才挪，避免覆盖掉操作员恰好在那一行打过的字。
+  const carry = options.carryTyped;
+  if (carry && carry.from && carry.to && carry.from !== carry.to && typed.has(carry.from) && !typed.has(carry.to)) {
+    typed.set(carry.to, typed.get(carry.from));
+  }
+  // Append mode is server state; the row buttons are rebuilt below, so set
+  // the target first and let the banner re-read the (new) row label after.
+  appendTarget = data.append_target && data.append_target.name ? data.append_target : null;
   list.innerHTML = '';
   if (!clips.length) {
     const empty = document.createElement('div');
@@ -1209,7 +1524,7 @@ async function loadStageClips(matchId, options = {}) {
     list.appendChild(empty);
   } else {
     clips.forEach((item) => {
-      const row = renderClipRow(item, !!data.publish_enabled);
+      const row = renderClipRow(item, !!data.publish_enabled, openMains);
       row.dataset.name = item.name;
       const kept = typed.get(item.name);
       const formEl = row.querySelector('.stage-clip-form');
@@ -1220,22 +1535,28 @@ async function loadStageClips(matchId, options = {}) {
       list.appendChild(row);
     });
   }
+  renderAppendBanner();
   const countEl = $('stage-clips-count');
   if (countEl) {
     // Abandoned clips stay in the list but are not waiting to be published.
-    const unpublished = data.publish_enabled
-      ? clips.filter((c) => !c.event_key && !c.discarded).length
-      : 0;
+    const unpublished = openMains.length;
+    const gifTotal = clips.reduce((n, c) => n + (Number(c.gif_count) || 1), 0);
+    const total = gifTotal > clips.length ? `共 ${clips.length} 条 / ${gifTotal} 张` : `共 ${clips.length} 条`;
     countEl.textContent = clips.length
-      ? (unpublished ? `${unpublished} 条待发布 / 共 ${clips.length} 条` : `共 ${clips.length} 条`)
+      ? (unpublished ? `${unpublished} 条待发布 / ${total}` : total)
       : '';
   }
-  if (options.focusTitle) {
+  if (options.focusTitle || options.focusName) {
     // Newest row is first: show it whole, then focus without re-scrolling.
     // In the stacked (<1100px) layout the list itself does not scroll, so
-    // also bring the row into the dialog's view.
-    list.scrollTop = 0;
-    const title = list.querySelector('.stage-clip-row.editing .stage-clip-title');
+    // also bring the row into the dialog's view. An appended capture keeps
+    // the operator on the group's main row instead of a new one.
+    const row = options.focusName
+      ? list.querySelector(`.stage-clip-row.editing[data-name="${options.focusName}"]`)
+      : null;
+    if (!row) list.scrollTop = 0;
+    // Only editing rows carry a title input, so the first match is the newest one.
+    const title = (row || list).querySelector('.stage-clip-title');
     if (title) {
       title.focus({preventScroll: true});
       title.closest('.stage-clip-row').scrollIntoView({block: 'nearest'});
@@ -1884,6 +2205,10 @@ function closeStage() {
   state.stageVideoHomeWrap = null;
   state.stageOwnVideo = false;
   state.stageHls = null;
+  // The server keeps the append target (it times out on its own); only the
+  // page-side mirror is dropped so a different match does not show it.
+  appendTarget = null;
+  renderAppendBanner();
   $('stage').classList.add('hidden');
 }
 
@@ -2211,6 +2536,7 @@ $('back-to-list-btn').addEventListener('click', leaveWorkshop);
 $('stage-close').addEventListener('click', closeStage);
 $('stage-range-start').addEventListener('click', setRangeStart);
 $('stage-range-end').addEventListener('click', (ev) => setRangeEndAndCapture(ev.currentTarget));
+$('stage-append-done').addEventListener('click', () => clearAppend());
 bindCropOverlay();
 $('stage-live').addEventListener('click', () => {
   if (!state.stageVideoNode) return;
@@ -3026,6 +3352,12 @@ function initPanelMode() {
   $('stage').classList.remove('hidden');
   const title = $('stage-title');
   if (title) title.textContent = PANEL.matchId ? `比赛 ${PANEL.matchId}` : '未选择比赛';
+  // The panel hides the video column (where the append banner normally sits
+  // above the capture buttons); show it above the list instead so Alt+3
+  // captures from the extension are visibly going under a title.
+  const banner = $('stage-append-banner');
+  const list = $('stage-clips');
+  if (banner && list) list.before(banner);
   window.addEventListener('message', (ev) => {
     // Only the extension's own pages may drive the panel.
     if (!/^(chrome|edge|moz)-extension:\/\//.test(String(ev.origin || ''))) return;

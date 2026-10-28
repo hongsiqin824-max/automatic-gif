@@ -872,6 +872,24 @@ class ArticlePublisherTests(unittest.TestCase):
             "title": "t",
         }
         gif_p = '<p><img src="https://matchgif.aisportsapp.com/publish-gifs/a.gif" alt="比赛 GIF"></p>'
+        # Several angles: one <p><img> per GIF, main first, footer after the last.
+        fields = build_article_fields(
+            **common,
+            extra_gif_urls=["https://matchgif.aisportsapp.com/publish-gifs/b.gif", "/fastdfs/c.gif"],
+            allow_relative_media=True,
+            body_footer="上咪咕独家看英超",
+        )
+        self.assertEqual(
+            fields["body"],
+            gif_p
+            + '<p><img src="https://matchgif.aisportsapp.com/publish-gifs/b.gif" alt="比赛 GIF"></p>'
+            + '<p><img src="/fastdfs/c.gif" alt="比赛 GIF"></p>'
+            + "<p>上咪咕独家看英超</p>",
+        )
+        self.assertEqual(fields["litpic"], common["cover_url"])  # cover stays the main GIF's
+        with self.assertRaises(ArticlePublishError) as ctx:
+            build_article_fields(**common, extra_gif_urls=["http://insecure/b.gif"])
+        self.assertEqual(ctx.exception.code, "publish_gif_https_required")
         # Default mapping: the three 咪咕 competitions, exact name match.
         self.assertEqual(
             article_publisher.article_body_footer({"competition_name": "英超"}),

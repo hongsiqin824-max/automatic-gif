@@ -480,7 +480,27 @@ def _pending_clip_count(match_id: str, now: float | None = None) -> int:
         record = drafts.get(name)
         return record is not None and str(record.get("status") or "") in DELIVERED_CLIP_STATUSES
 
-    return sum(1 for gif in gifs if not delivered(gif.name) and not _read_clip_meta(gif).get("discarded"))
+    # One title = one article = one pending item, the same rows ``_list_clips``
+    # shows. An attached angle carries no publish record of its own (only its
+    # main does), so counting it by file would keep a published match listed
+    # and turn one 3-angle title into "3 条待发布". It is skipped while its main
+    # is on disk and still lists it; an orphan whose main is gone is its own row.
+    metas: dict[str, dict[str, Any]] = {}
+
+    def meta_of(name: str) -> dict[str, Any]:
+        if name not in metas:
+            metas[name] = _read_clip_meta(directory / name)
+        return metas[name]
+
+    def attached(gif: Path) -> bool:
+        parent = _clip_parent(meta_of(gif.name))
+        return bool(parent) and (directory / parent).is_file() and gif.name in _clip_attachments(meta_of(parent))
+
+    return sum(
+        1
+        for gif in gifs
+        if not attached(gif) and not delivered(gif.name) and not meta_of(gif.name).get("discarded")
+    )
 
 
 finished_matches = _FinishedMatchMemory(
@@ -697,7 +717,12 @@ def _format_publish_notice(delivered: dict) -> str:
     if delivered.get("draft_url"):
         lines.append(f"文章：{delivered['draft_url']}")
     if delivered.get("gif_url"):
-        lines.append(f"GIF：{delivered['gif_url']}")
+        try:
+            gif_count = int(delivered.get("gif_count") or 1)
+        except (TypeError, ValueError):
+            gif_count = 1
+        suffix = f"（共 {gif_count} 张）" if gif_count > 1 else ""
+        lines.append(f"GIF：{delivered['gif_url']}{suffix}")
     return "\n".join(lines)
 
 
@@ -1281,6 +1306,354 @@ def _read_clip_meta(gif_path: Path) -> dict[str, Any]:
     return loaded if isinstance(loaded, dict) else {}
 
 
+# ---- clip groups: one title, several angles ----
+#
+# A goal is often worth two or three GIFs (the live angle, the replay, the
+# close-up) but the CMS refuses a second gif-article for the same match_time,
+# so they have to travel in one article. The group is kept in the sidecars:
+# the main GIF (the first one, or whichever the operator promotes) lists its
+# ``attachments`` in body order, and every attached GIF records its ``parent``.
+# Only the main GIF carries the form / event key / publish record; attached
+# GIFs are folded under it on the page and in the article body. Groups are
+# only edited before publishing.
+#
+# The operator declares the group *before* capturing: 「再截一个视角」 on a
+# row arms append mode for this operator and match, and the *next* capture
+# (stage S/E or the browser extension's Alt+3) lands under that row. The mode
+# is single use — it is consumed the moment the capture request starts
+# encoding, not when the GIF finishes, so a second capture already in flight
+# (a double Alt+3, or the page and the extension overlapping) never lands in
+# the same group by accident. Further angles need the button again. The mode
+# also drops on 取消, when the row is published or discarded, or when it times
+# out with no capture at all. 并入 / 拆出 / 设为主图 remain as corrections.
+
+CLIP_GROUP_MAX = 4
+# Long enough to arm the mode and then go find the replay; the deadline is
+# fixed at arming time and is never extended, because the mode covers exactly
+# one capture.
+CLIP_APPEND_TTL_SECONDS = positive_env_float("GIF_MONITOR_CLIP_APPEND_TTL_SECONDS", 300.0)
+# Sidecar keys that describe the article rather than the file; they move with
+# the main role when the operator promotes another angle.
+_CLIP_GROUP_META_KEYS = ("event_key", "form", "alert_match", "alert_match_public", "match_detail")
+
+
+def _clip_attachments(meta: dict[str, Any]) -> list[str]:
+    raw = meta.get("attachments")
+    if not isinstance(raw, list):
+        return []
+    names: list[str] = []
+    for value in raw:
+        name = str(value or "").strip()
+        if _CLIP_NAME_RE.fullmatch(name) and name not in names:
+            names.append(name)
+    return names
+
+
+def _clip_parent(meta: dict[str, Any]) -> str | None:
+    name = str(meta.get("parent") or "").strip()
+    return name if _CLIP_NAME_RE.fullmatch(name) else None
+
+
+def _clip_group_paths(match_id: str, gif_path: Path, meta: dict[str, Any]) -> list[Path]:
+    """Main GIF first, then the attached GIFs that still exist on disk."""
+    directory = _clip_dir(match_id)
+    paths = [gif_path]
+    for name in _clip_attachments(meta):
+        candidate = directory / name
+        if candidate.is_file() and candidate != gif_path:
+            paths.append(candidate)
+    return paths
+
+
+def _clip_group_main(match_id: str, name: str) -> tuple[str, dict[str, Any]] | None:
+    """Resolve ``name`` to its group's main GIF ``(name, meta)``; ``None`` if missing."""
+    directory = _clip_dir(match_id)
+    path = directory / name
+    if not path.is_file():
+        return None
+    meta = _read_clip_meta(path)
+    parent = _clip_parent(meta)
+    if parent and (directory / parent).is_file():
+        return parent, _read_clip_meta(directory / parent)
+    return name, meta
+
+
+def _clip_group_open_reason(match_id: str, main: str, main_meta: dict[str, Any], *, adding: int = 1) -> str | None:
+    """Why ``main`` cannot take ``adding`` more GIFs right now, or ``None`` if it can."""
+    if main_meta.get("discarded"):
+        return "clip_discarded"
+    if manual_draft_queue is not None and main in manual_draft_queue.records_by_source_name(
+        match_id, artifact_kind=MANUAL_ARTIFACT_KIND
+    ):
+        return "already_published"
+    directory = _clip_dir(match_id)
+    existing = [n for n in _clip_attachments(main_meta) if (directory / n).is_file()]
+    if 1 + len(existing) + adding > CLIP_GROUP_MAX:
+        return "group_full"
+    return None
+
+
+_CLIP_GROUP_REASON_TEXT = {
+    "clip_discarded": "已放弃的 GIF 不能合并，请先恢复",
+    "already_published": "已提交发布的 GIF 不能再合并",
+    "group_full": f"一个标题最多 {CLIP_GROUP_MAX} 张 GIF",
+    "clip_missing": "目标 GIF 不存在或已被清理",
+}
+
+
+def _attach_clip(match_id: str, name: str, target: str) -> tuple[str | None, str | None]:
+    """Fold ``name`` (plus anything attached to it) under ``target``'s group.
+
+    Returns ``(main_name, None)`` on success or ``(None, reason_code)``.
+    Pure sidecar bookkeeping; callers decide how to report the reason.
+    """
+    directory = _clip_dir(match_id)
+    gif_path = directory / name
+    if not gif_path.is_file():
+        return None, "clip_missing"
+    resolved = _clip_group_main(match_id, target)
+    if resolved is None:
+        return None, "clip_missing"
+    main, main_meta = resolved
+    if main == name:
+        return None, "group_self"
+    meta = _read_clip_meta(gif_path)
+    if meta.get("discarded"):
+        return None, "clip_discarded"
+    if manual_draft_queue is not None and name in manual_draft_queue.records_by_source_name(
+        match_id, artifact_kind=MANUAL_ARTIFACT_KIND
+    ):
+        return None, "already_published"
+    parent = _clip_parent(meta)
+    if parent and not (directory / parent).is_file():
+        parent = None
+    # Moving out of a group that already went to the CMS would put the same GIF
+    # in two articles: the published body still references it and cannot be
+    # edited any more. Only the main carries the publish record, so an attached
+    # GIF is checked through its parent — its own name never matches one.
+    if (
+        parent
+        and manual_draft_queue is not None
+        and parent in manual_draft_queue.records_by_source_name(
+            match_id, artifact_kind=MANUAL_ARTIFACT_KIND
+        )
+    ):
+        return None, "already_published"
+    if parent == main:
+        return main, None
+    moving = [name] + [n for n in _clip_attachments(meta) if (directory / n).is_file() and n != main]
+    reason = _clip_group_open_reason(match_id, main, main_meta, adding=len(moving))
+    if reason:
+        return None, reason
+    if parent:
+        # Leaving a previous group: drop it from that main's list.
+        old_parent_path = directory / parent
+        old_meta = _read_clip_meta(old_parent_path)
+        old_meta["attachments"] = [n for n in _clip_attachments(old_meta) if n != name]
+        _write_clip_meta(old_parent_path, old_meta)
+    for moved in moving:
+        moved_path = directory / moved
+        moved_meta = meta if moved == name else _read_clip_meta(moved_path)
+        moved_meta.pop("attachments", None)
+        moved_meta["parent"] = main
+        _write_clip_meta(moved_path, moved_meta)
+    existing = [n for n in _clip_attachments(main_meta) if (directory / n).is_file()]
+    main_meta["attachments"] = existing + [n for n in moving if n not in existing]
+    main_meta.pop("parent", None)
+    _write_clip_meta(directory / main, main_meta)
+    return main, None
+
+
+class _ClipAppendStore:
+    """Append mode: which main GIF this operator's *next* capture goes under.
+
+    Keyed by (match, operator) so two people on the same match never share a
+    target. An entry covers exactly one capture: ``take`` claims and removes
+    it, so a second capture in flight finds nothing. Entries expire after
+    ``CLIP_APPEND_TTL_SECONDS`` measured from ``set`` — the deadline is never
+    extended. Memory only: a restart simply drops the mode.
+    """
+
+    def __init__(self, ttl_seconds: float) -> None:
+        self._lock = threading.Lock()
+        self._targets: dict[tuple[str, str], tuple[str, float]] = {}
+        self.ttl_seconds = ttl_seconds
+
+    def set(self, match_id: str, operator: str, name: str) -> None:
+        with self._lock:
+            self._targets[(match_id, operator)] = (name, time.time())
+
+    def get(self, match_id: str, operator: str) -> str | None:
+        with self._lock:
+            entry = self._targets.get((match_id, operator))
+            if entry is None:
+                return None
+            name, stamp = entry
+            if time.time() - stamp > self.ttl_seconds:
+                del self._targets[(match_id, operator)]
+                return None
+            return name
+
+    def remaining(self, match_id: str, operator: str) -> float | None:
+        """Seconds left on this operator's entry, or ``None`` when there is none."""
+        with self._lock:
+            entry = self._targets.get((match_id, operator))
+            if entry is None:
+                return None
+            left = self.ttl_seconds - (time.time() - entry[1])
+            return left if left > 0 else None
+
+    def take(self, match_id: str, operator: str) -> dict[str, Any] | None:
+        """Claim this operator's entry (removing it) so the mode is single use.
+
+        Returns ``{"name", "stamp"}`` or ``None``. A capture that then fails
+        gives the claim back with ``restore`` so the operator does not have to
+        re-arm; the original stamp is kept, so a retry never extends the window.
+        """
+        with self._lock:
+            entry = self._targets.pop((match_id, operator), None)
+            if entry is None:
+                return None
+            name, stamp = entry
+            if time.time() - stamp > self.ttl_seconds:
+                return None
+            return {"name": name, "stamp": stamp}
+
+    def restore(self, match_id: str, operator: str, claim: dict[str, Any]) -> None:
+        """Put a claimed entry back after a failed capture, unless replaced since."""
+        with self._lock:
+            self._targets.setdefault((match_id, operator), (claim["name"], claim["stamp"]))
+
+    def clear(self, match_id: str, operator: str | None = None, *, name: str | None = None) -> None:
+        """Drop this operator's target, or (``operator=None``) every target on ``name``."""
+        with self._lock:
+            for key in list(self._targets):
+                if key[0] != match_id:
+                    continue
+                if operator is not None and key[1] != operator:
+                    continue
+                if name is not None and self._targets[key][0] != name:
+                    continue
+                del self._targets[key]
+
+    def retarget(self, match_id: str, old: str, new: str) -> None:
+        """The group's main changed (设为主图): keep everyone's mode on the group."""
+        with self._lock:
+            for key, (name, stamp) in list(self._targets.items()):
+                if key[0] == match_id and name == old:
+                    self._targets[key] = (new, stamp)
+
+
+clip_append = _ClipAppendStore(CLIP_APPEND_TTL_SECONDS)
+
+
+def _append_operator_key() -> str:
+    operator = _current_operator() or {}
+    return str(operator.get("open_id") or operator.get("name") or "anon")
+
+
+def _append_target(match_id: str) -> dict[str, Any] | None:
+    """The current operator's live append target as ``{name, gif_count, expires_in}``.
+
+    A target that was published, discarded, deleted or filled up meanwhile is
+    dropped and ``None`` returned, so the page and the capture paths agree.
+    ``expires_in`` is the seconds left on the fixed deadline, so the page can
+    drop its banner on time instead of waiting for the next refresh.
+    """
+    operator = _append_operator_key()
+    name = clip_append.get(match_id, operator)
+    if not name:
+        return None
+    resolved = _clip_group_main(match_id, name)
+    if resolved is None or resolved[0] != name or _clip_group_open_reason(match_id, name, resolved[1]):
+        clip_append.clear(match_id, operator)
+        return None
+    directory = _clip_dir(match_id)
+    count = 1 + sum(1 for n in _clip_attachments(resolved[1]) if (directory / n).is_file())
+    return {
+        "name": name,
+        "gif_count": count,
+        "max": CLIP_GROUP_MAX,
+        "expires_in": round(clip_append.remaining(match_id, operator) or 0),
+    }
+
+
+def _take_append_target(match_id: str) -> dict[str, Any] | None:
+    """Claim (and thereby consume) this operator's append target, if any."""
+    return clip_append.take(match_id, _append_operator_key())
+
+
+def _restore_append_target(match_id: str, claim: dict[str, Any] | None) -> None:
+    """Give a claimed target back after a capture that produced no GIF."""
+    if claim is not None:
+        clip_append.restore(match_id, _append_operator_key(), claim)
+
+
+def _append_push_state(match_id: str, main: str, clip_meta: dict[str, Any]) -> dict[str, Any] | None:
+    """How the appended GIF's matched push relates to the main GIF's *current* one.
+
+    Compared against the push the operator has selected on the main row right
+    now (``form.alert_seq``, which they may have changed since capture), not
+    the push the main GIF was matched to when it was captured. Three outcomes:
+
+    * ``conflict`` — both sides name a push and they differ: the appended angle
+      most likely belongs to another event. Worth a loud warning.
+    * ``unverified`` — the main names a push but this angle's own match is
+      missing or flagged unsure. Quiet note only; replay angles drift often.
+    * ``None`` — nothing to say: the pushes agree, or the main has none
+      selected (the operator chose 跳过, so there is no expectation to check).
+    """
+    main_meta = _read_clip_meta(_clip_dir(match_id) / main)
+    form = main_meta.get("form") if isinstance(main_meta.get("form"), dict) else {}
+    main_seq = form.get("alert_seq")
+    if main_seq in (None, ""):
+        return None
+    alert_match = clip_meta.get("alert_match") if isinstance(clip_meta.get("alert_match"), dict) else {}
+    confident = (
+        alert_match.get("mode") == "alert"
+        and not alert_match.get("ambiguous")
+        and not alert_match.get("weak")
+        and alert_match.get("alert_seq") not in (None, "")
+    )
+    if not confident:
+        return {"state": "unverified"}
+    if str(alert_match.get("alert_seq")) == str(main_seq):
+        return None
+    return {
+        "state": "conflict",
+        "match_time": _join_match_time(alert_match.get("minute"), alert_match.get("minute_extra")),
+        "score": str(alert_match.get("score") or ""),
+    }
+
+
+def _attach_pending_clip(match_id: str, gif_path: Path, claim: dict[str, Any] | None) -> dict[str, Any] | None:
+    """After a capture: fold it under the append target claimed before encoding.
+
+    ``claim`` comes from ``_take_append_target`` and is already consumed, so a
+    capture that started later finds no target. Returns ``{"main", "gif_count",
+    "push_state"}`` when attached, ``{"error"}`` when the target went stale
+    (the clip stays its own row), ``None`` when append mode was off. Shared by
+    the stage capture and the extension upload so Alt+3 honours 「再截一个视角」 too.
+    """
+    if not claim:
+        return None
+    target = claim["name"]
+    main, reason = _attach_clip(match_id, gif_path.name, target)
+    if main is None:
+        text = _CLIP_GROUP_REASON_TEXT.get(reason or "", "无法追加")
+        return {"error": f"未能追加到《{target}》：{text}，这条已单独保存", "code": reason}
+    directory = _clip_dir(match_id)
+    clip_meta = _read_clip_meta(gif_path)
+    push_state = _append_push_state(match_id, main, clip_meta)
+    if push_state is not None:
+        # Persisted so the warning survives a reload and is still there at
+        # publish time, the one moment that cannot be undone.
+        clip_meta["append_push"] = push_state
+        _write_clip_meta(gif_path, clip_meta)
+    count = 1 + sum(1 for n in _clip_attachments(_read_clip_meta(directory / main)) if (directory / n).is_file())
+    return {"main": main, "gif_count": count, "max": CLIP_GROUP_MAX, "push_state": push_state}
+
+
 def _alert_match_public(alert_match: dict[str, Any]) -> dict[str, Any]:
     """The subset of a clip→alert match that the browser displays."""
     return {
@@ -1458,7 +1831,11 @@ def _published_clip_with_match_time(
 
 
 def _list_clips(match_id: str) -> list[dict[str, Any]]:
-    """Newest-first GIFs for a match, joined to their draft records when any."""
+    """Newest-first GIFs for a match, joined to their draft records when any.
+
+    Attached GIFs are folded into their main GIF's ``attachments`` rather than
+    listed as rows; an attachment whose parent is gone is listed on its own.
+    """
     directory = _clip_dir(match_id)
     try:
         gifs = [p for p in directory.iterdir() if p.is_file() and p.suffix == ".gif" and p.name.startswith("clip_")]
@@ -1466,18 +1843,42 @@ def _list_clips(match_id: str) -> list[dict[str, Any]]:
     except OSError:
         return []
     gifs.sort(key=lambda p: stats[p].st_mtime, reverse=True)
-    gifs = gifs[:CLIP_LIST_LIMIT]
+    metas = {p.name: _read_clip_meta(p) for p in gifs}
+    by_name = {p.name: p for p in gifs}
+    attached: set[str] = set()
+    for gif in gifs:
+        for name in _clip_attachments(metas[gif.name]):
+            if name in by_name and name != gif.name and _clip_parent(metas[name]) == gif.name:
+                attached.add(name)
+    mains = [p for p in gifs if p.name not in attached][:CLIP_LIST_LIMIT]
     drafts: dict[str, dict[str, Any]] = {}
-    if manual_draft_queue is not None and gifs:
+    if manual_draft_queue is not None and mains:
         drafts = manual_draft_queue.records_by_source_name(match_id, artifact_kind=MANUAL_ARTIFACT_KIND)
     items: list[dict[str, Any]] = []
     candidates: list[dict[str, Any]] | None = None
-    for gif in gifs:
+    for gif in mains:
         stat = stats[gif]
         record = drafts.get(gif.name)
-        meta = _read_clip_meta(gif)
+        meta = metas[gif.name]
         alert_match = meta.get("alert_match") if isinstance(meta.get("alert_match"), dict) else {}
         form = meta.get("form") if isinstance(meta.get("form"), dict) else _default_clip_form(alert_match)
+        attachments: list[dict[str, Any]] = []
+        for name in _clip_attachments(meta):
+            if name not in attached or _clip_parent(metas[name]) != gif.name:
+                continue
+            sub_meta = metas[name]
+            push_state = sub_meta.get("append_push") if isinstance(sub_meta.get("append_push"), dict) else None
+            attachments.append(
+                {
+                    "name": name,
+                    "clip_url": f"clips/{match_id}/{name}",
+                    "bytes": stats[by_name[name]].st_size,
+                    "created_unix": stats[by_name[name]].st_mtime,
+                    "anchored": sub_meta.get("anchored"),
+                    "crop": sub_meta.get("crop") if isinstance(sub_meta.get("crop"), dict) else None,
+                    "push_state": push_state,
+                }
+            )
         item = {
             "name": gif.name,
             "clip_url": f"clips/{match_id}/{gif.name}",
@@ -1486,9 +1887,12 @@ def _list_clips(match_id: str) -> list[dict[str, Any]]:
             "title": str(form.get("title") or ""),
             "form": form,
             "anchored": meta.get("anchored"),
+            "anchor_epoch_ms": meta.get("anchor_epoch_ms"),
             "crop": meta.get("crop") if isinstance(meta.get("crop"), dict) else None,
             "discarded": bool(meta.get("discarded")),
             "alert_match": meta.get("alert_match_public"),
+            "attachments": attachments,
+            "gif_count": 1 + len(attachments),
             "event_key": record.get("event_key") if record else None,
             "draft_status": record.get("status") if record else None,
             "draft_stage": record.get("stage") if record else None,
@@ -2464,9 +2868,14 @@ def monitor_clip():
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     output_path = _clip_dir(match_id) / f"clip_{timestamp}_{uuid.uuid4().hex[:6]}.gif"
     anchored = anchor_epoch is not None and all(seg[2] is not None for seg in segments)
+    # Claimed before the slow encode, not after: a second capture that starts
+    # while this one is still encoding must find the mode already used up.
+    # A failed encode gives the claim back, so one bad attempt costs nothing.
+    append_claim = _take_append_target(match_id)
     try:
         _encode_clip_gif(segments, before_seconds, output_path, anchor_epoch, start_epoch, crop=crop)
     except Exception as exc:
+        _restore_append_target(match_id, append_claim)
         return jsonify({"error": str(exc)}), 500
     if pin is not None:
         clip_pins.release(pin["pin_id"])
@@ -2527,6 +2936,7 @@ def monitor_clip():
             "match_detail": _match_detail_for(match_id),
         },
     )
+    appended = _attach_pending_clip(match_id, output_path, append_claim)
     return jsonify(
         {
             "ok": True,
@@ -2542,6 +2952,7 @@ def monitor_clip():
             "event_key": event_key,
             "alert_match": _alert_match_public(alert_match),
             "form": form,
+            "appended": appended,
         }
     )
 
@@ -2572,6 +2983,10 @@ def monitor_clip_publish():
         # Abandoned in another tab/window while this page still showed the form:
         # 放弃 means "do not publish", so refuse until the operator 恢复s it.
         return jsonify({"error": "该 GIF 已放弃，请先恢复再发布", "code": "clip_discarded"}), 409
+    parent = _clip_parent(meta)
+    if parent and (_clip_dir(match_id) / parent).is_file():
+        return jsonify({"error": "该 GIF 已并入其他标题，请发布主图或先拆出", "code": "clip_attached"}), 409
+    group_paths = _clip_group_paths(match_id, gif_path, meta)
     alert_match = meta.get("alert_match")
     if not isinstance(alert_match, dict):
         # Pre-sidecar clip: best effort from the file's own timestamp.
@@ -2641,6 +3056,7 @@ def monitor_clip_publish():
             event=event,
             match_detail=match_detail,
             source_path=gif_path,
+            extra_source_paths=group_paths[1:],
             artifact_kind=MANUAL_ARTIFACT_KIND,
             delivery_mode=DRAFT_DELIVERY_MODE,
             artifact_result=None,
@@ -2652,12 +3068,15 @@ def monitor_clip_publish():
     if meta:
         meta["form"] = form
         _write_clip_meta(gif_path, meta)
+    # Once sent, nobody should keep appending angles to this row.
+    clip_append.clear(match_id, name=name)
     print(
         json.dumps(
             {
                 "event": "manual_draft_enqueue",
                 "match_id": match_id,
                 "clip": name,
+                "attachments": [p.name for p in group_paths[1:]],
                 "event_key": event_key,
                 "form": form,
                 "delivery_mode": _manual_delivery_mode(),
@@ -2712,12 +3131,156 @@ def monitor_clip_discard():
         if record is not None:
             return jsonify({"error": "该 GIF 已提交发布，不能放弃", "code": "already_published"}), 409
     meta = _read_clip_meta(gif_path)
+    parent = _clip_parent(meta)
+    if parent and (_clip_dir(match_id) / parent).is_file():
+        # The group follows its main GIF (放弃 the main hides the whole group);
+        # a single angle leaves the group with 拆出 first.
+        return jsonify({"error": "该 GIF 已并入其他标题，请先拆出", "code": "clip_attached"}), 409
     if restore:
         meta.pop("discarded", None)
     else:
         meta["discarded"] = True
+        clip_append.clear(match_id, name=name)
     _write_clip_meta(gif_path, meta)
     return jsonify({"ok": True, "match_id": match_id, "name": name, "discarded": not restore})
+
+
+@app.post("/api/monitor/clip/append")
+def monitor_clip_append():
+    """Arm or disarm append mode: 「再截一个视角」 / 「完成」.
+
+    ``{"match_id", "name"}`` makes ``name``'s group the target of this
+    operator's next captures (stage and extension alike); ``{"match_id",
+    "clear": true}`` turns it off. The target must be an unpublished,
+    non-discarded main GIF with room left.
+    """
+    body = request.get_json(silent=True) or {}
+    try:
+        match_id = validate_match_id(str(body.get("match_id") or ""))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    operator = _append_operator_key()
+    if body.get("clear"):
+        clip_append.clear(match_id, operator)
+        return jsonify({"ok": True, "match_id": match_id, "append": None})
+    name = str(body.get("name") or "").strip()
+    if not _CLIP_NAME_RE.fullmatch(name):
+        return jsonify({"error": "无效的 GIF 文件名"}), 400
+    resolved = _clip_group_main(match_id, name)
+    if resolved is None:
+        return jsonify({"error": "GIF 不存在或已被清理", "code": "clip_missing"}), 404
+    main, main_meta = resolved
+    reason = _clip_group_open_reason(match_id, main, main_meta)
+    if reason:
+        return jsonify({"error": _CLIP_GROUP_REASON_TEXT.get(reason, reason), "code": reason}), 409
+    clip_append.set(match_id, operator, main)
+    print(
+        json.dumps({"event": "monitor_clip_append", "match_id": match_id, "clip": main, "operator": operator}, ensure_ascii=False),
+        flush=True,
+    )
+    return jsonify({"ok": True, "match_id": match_id, "append": _append_target(match_id)})
+
+
+def _clip_capture_order(name: str) -> str:
+    # ``clip_YYYYMMDD-HHMMSS_xxxxxx.gif``: the name sorts by capture time.
+    return name
+
+
+@app.post("/api/monitor/clip/group")
+def monitor_clip_group():
+    """Edit which GIFs share one title: ``attach`` / ``detach`` / ``set_main``.
+
+    ``attach`` folds ``name`` (and anything already attached to it) under
+    ``target``; ``detach`` makes an attached ``name`` its own row again;
+    ``set_main`` promotes an attached ``name`` to be the group's main GIF
+    (the one whose form, cover and publish record the article uses). Only
+    unpublished, non-discarded GIFs of the same match take part, and a group
+    never exceeds ``CLIP_GROUP_MAX`` GIFs.
+    """
+    body = request.get_json(silent=True) or {}
+    try:
+        match_id = validate_match_id(str(body.get("match_id") or ""))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    action = str(body.get("action") or "").strip()
+    if action not in {"attach", "detach", "set_main"}:
+        return jsonify({"error": "action 必须是 attach / detach / set_main"}), 400
+    name = str(body.get("name") or "").strip()
+    if not _CLIP_NAME_RE.fullmatch(name):
+        return jsonify({"error": "无效的 GIF 文件名"}), 400
+    directory = _clip_dir(match_id)
+    gif_path = directory / name
+    if not gif_path.is_file():
+        return jsonify({"error": "GIF 不存在或已被清理", "code": "clip_missing"}), 404
+    records: dict[str, dict[str, Any]] = {}
+    if manual_draft_queue is not None:
+        records = manual_draft_queue.records_by_source_name(match_id, artifact_kind=MANUAL_ARTIFACT_KIND)
+    meta = _read_clip_meta(gif_path)
+    parent = _clip_parent(meta)
+    if parent and not (directory / parent).is_file():
+        parent = None
+
+    if action == "attach":
+        target = str(body.get("target") or "").strip()
+        if not _CLIP_NAME_RE.fullmatch(target):
+            return jsonify({"error": "无效的目标 GIF 文件名"}), 400
+        main, reason = _attach_clip(match_id, name, target)
+        if main is None:
+            if reason == "group_self":
+                return jsonify({"error": "不能并入自己", "code": reason}), 400
+            status = 404 if reason == "clip_missing" else 409
+            return jsonify({"error": _CLIP_GROUP_REASON_TEXT.get(reason or "", reason), "code": reason}), status
+    else:
+        if not parent:
+            return jsonify({"error": "该 GIF 不是附属，无需拆出", "code": "not_attached"}), 409
+        parent_path = directory / parent
+        parent_meta = _read_clip_meta(parent_path)
+        if parent in records:
+            return jsonify({"error": "已提交发布的标题不能再调整", "code": "already_published"}), 409
+        siblings = [n for n in _clip_attachments(parent_meta) if n != name and (directory / n).is_file()]
+        if action == "detach":
+            parent_meta["attachments"] = siblings
+            _write_clip_meta(parent_path, parent_meta)
+            meta.pop("parent", None)
+            _write_clip_meta(gif_path, meta)
+            main = name
+        else:  # set_main
+            # The article identity (form, event key, matched push) stays with the
+            # group, so it moves onto the promoted GIF; the old main keeps the
+            # promoted GIF's own capture-time values in case it is detached later.
+            for key in _CLIP_GROUP_META_KEYS:
+                parent_value, own_value = parent_meta.get(key), meta.get(key)
+                if parent_value is not None:
+                    meta[key] = parent_value
+                else:
+                    meta.pop(key, None)
+                if own_value is not None:
+                    parent_meta[key] = own_value
+                else:
+                    parent_meta.pop(key, None)
+            meta["attachments"] = sorted([parent, *siblings], key=_clip_capture_order)
+            meta.pop("parent", None)
+            parent_meta.pop("attachments", None)
+            parent_meta["parent"] = name
+            _write_clip_meta(gif_path, meta)
+            _write_clip_meta(parent_path, parent_meta)
+            for sibling in siblings:
+                sibling_path = directory / sibling
+                sibling_meta = _read_clip_meta(sibling_path)
+                sibling_meta["parent"] = name
+                _write_clip_meta(sibling_path, sibling_meta)
+            clip_append.retarget(match_id, parent, name)
+            main = name
+    print(
+        json.dumps(
+            {"event": "monitor_clip_group", "match_id": match_id, "action": action, "clip": name, "main": main},
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
+    return jsonify(
+        {"ok": True, "match_id": match_id, "name": name, "main": main, "action": action, "append": _append_target(match_id)}
+    )
 
 
 @app.post("/api/monitor/clip/retry")
@@ -2791,6 +3354,8 @@ def monitor_clips():
             "match_id": match_id,
             "publish_enabled": manual_draft_queue is not None,
             "score_event_types": sorted(SCORE_EVENT_TYPES),
+            "group_max": CLIP_GROUP_MAX,
+            "append_target": _append_target(match_id),
             "clips": _list_clips(match_id),
         }
     )
@@ -2847,6 +3412,9 @@ if EXTENSION_ENABLED:
             clip_range_max_seconds=CLIP_RANGE_MAX_SECONDS,
             publish_enabled=lambda: manual_draft_queue is not None,
             delivery_mode=_manual_delivery_mode,
+            take_append_target=_take_append_target,
+            restore_append_target=_restore_append_target,
+            attach_pending_clip=_attach_pending_clip,
         ),
         clip_output_root=CLIP_OUTPUT_ROOT,
     )

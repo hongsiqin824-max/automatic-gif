@@ -185,6 +185,30 @@ body{
 .stage-clip-publish:disabled{opacity:.45;cursor:not-allowed}
 /* Inline auto-playing preview, only on the row being reviewed. */
 .stage-clip-preview{display:block;max-width:100%;max-height:220px;border-radius:6px;border:1px solid var(--line);background:#000;object-fit:contain}
+/* Clip groups: one title, several angles. */
+.stage-clip-group-badge{display:inline-block;margin-left:6px;font-size:11px;padding:1px 6px;border-radius:3px;border:1px solid var(--cyan);color:var(--cyan);vertical-align:middle}
+.stage-clip-group-ctl{display:inline-flex;align-items:center;gap:6px;margin-left:6px;flex-wrap:wrap}
+.stage-clip-append{font-size:12px;padding:3px 10px;border-radius:5px;border:1px solid var(--cyan);background:transparent;color:var(--cyan);cursor:pointer;white-space:nowrap}
+.stage-clip-append:hover{background:rgba(93,225,208,.12)}
+.stage-clip-append.armed{background:var(--cyan);color:#0b1620;cursor:default}
+.stage-clip-append:disabled{opacity:.45;cursor:not-allowed}
+.stage-clip-merge-pick{font-size:12px;padding:3px 6px;min-height:0;max-width:200px;color:var(--muted)}
+/* Append-mode banner above the capture buttons (above the list in panel mode). */
+.stage-append-banner{display:flex;align-items:center;gap:10px;margin:0 0 8px;padding:8px 12px;border-radius:6px;border:1px solid var(--cyan);background:rgba(93,225,208,.1);color:var(--cyan);font-size:13px}
+.stage-append-banner.hidden{display:none}
+.stage-append-banner span{flex:1;min-width:0}
+.stage-append-done{padding:4px 14px;font-size:13px;min-height:0;white-space:nowrap;border-color:var(--cyan);color:var(--cyan)}
+.stage-clip-attachments{display:flex;flex-direction:column;gap:6px;border:1px solid var(--line);border-radius:6px;padding:8px 10px}
+.stage-clip-attachments-head{font-size:12px;color:var(--muted)}
+.stage-clip-attachment{display:flex;align-items:center;gap:10px}
+.stage-clip-attachment-preview{width:120px;max-height:68px;border-radius:4px;border:1px solid var(--line);background:#000;object-fit:contain;flex:none}
+.stage-clip-attachment-meta{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px;color:var(--muted)}
+.stage-clip-attachment-meta a{color:var(--cyan)}
+.stage-clip-attachment-push.conflict{color:#08221f;background:var(--amber);border-radius:5px;padding:1px 7px;font-weight:700}
+.stage-clip-attachment-push.unverified{color:var(--muted)}
+.stage-clip-attachment-btn{font-size:12px;padding:3px 9px;border-radius:5px;border:1px solid var(--line);background:transparent;color:var(--muted);cursor:pointer;white-space:nowrap}
+.stage-clip-attachment-btn:hover{border-color:var(--cyan);color:var(--cyan)}
+.stage-clip-attachment-btn:disabled{opacity:.5;cursor:default}
 /* 发布 + 放弃 share one row on the editing form. */
 .stage-clip-actions{display:flex;gap:10px;margin-top:2px}
 .stage-clip-actions .stage-clip-publish{width:auto;flex:1;margin-top:0}

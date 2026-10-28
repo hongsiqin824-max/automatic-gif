@@ -1448,6 +1448,105 @@ class ManualClipQueueTests(ArticleDraftQueueTests):
             self.assertFalse(queue.run_once())
             self.assertEqual(len(seen), 1)
 
+    def test_manual_group_publishes_every_angle_in_one_article(self):
+        """A main GIF plus attached angles: every file is staged and uploaded,
+        the body carries one <img> per GIF in order, the hook reports them all."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            platform = SequencePlatformClient()
+            seen = []
+            queue = self.make_queue(
+                root,
+                platform,
+                claim_artifact_kinds=(MANUAL_ARTIFACT_KIND,),
+                manual_delivery_mode="publish",
+                on_manual_delivered=seen.append,
+            )
+            source = self._write_manual_source(root)
+            second = source.with_name("clip_second.gif")
+            second.write_bytes(animated_gif_bytes(b"\x00\xff\x00"))
+            third = source.with_name("clip_third.gif")
+            third.write_bytes(animated_gif_bytes(b"\x00\x00\xff"))
+            task = queue.enqueue(
+                match_id="54478914",
+                event={"event_key": "manual_400", "code": "G", "title_override": "三个角度"},
+                match_detail={"team_A_name": "主队", "team_B_name": "客队"},
+                source_path=source,
+                extra_source_paths=[second, third, second],  # duplicate dropped
+                artifact_kind=MANUAL_ARTIFACT_KIND,
+                artifact_result=None,
+            )
+            self.assertEqual(task["status"], "queued")
+            self.assertTrue(queue.run_once())
+            self.assertEqual(len(platform.calls), 1)
+            body = platform.calls[-1]["body"]
+            self.assertEqual(body.count("<img "), 3)
+            urls = [chunk.split('"')[0] for chunk in body.split('src="')[1:]]
+            self.assertTrue(all(u.startswith("https://matchgif.aisportsapp.com/") for u in urls))
+            self.assertEqual(len(set(urls)), 3)  # three distinct files
+            # Hook: first URL stays ``gif_url`` for old consumers, all of them in ``gif_urls``.
+            payload = seen[0]
+            self.assertEqual(payload["gif_count"], 3)
+            self.assertEqual(payload["gif_urls"], urls)
+            self.assertEqual(payload["gif_urls"][0], payload["gif_url"])
+            record = queue.records_for_match("54478914", artifact_kind=MANUAL_ARTIFACT_KIND)["manual_400"]
+            self.assertEqual(record["status"], "published")
+
+    def test_manual_group_fails_whole_task_when_an_angle_is_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            platform = SequencePlatformClient()
+            queue = self.make_queue(
+                root,
+                platform,
+                claim_artifact_kinds=(MANUAL_ARTIFACT_KIND,),
+                manual_delivery_mode="publish",
+            )
+            source = self._write_manual_source(root)
+            gone = source.with_name("clip_gone.gif")
+            queue.enqueue(
+                match_id="54478914",
+                event={"event_key": "manual_401", "code": "G", "title_override": "缺一张"},
+                match_detail={"team_A_name": "主队", "team_B_name": "客队"},
+                source_path=source,
+                extra_source_paths=[gone],
+                artifact_kind=MANUAL_ARTIFACT_KIND,
+                artifact_result=None,
+            )
+            self.assertTrue(queue.run_once())
+            self.assertEqual(platform.calls, [])
+            record = queue.records_for_match("54478914", artifact_kind=MANUAL_ARTIFACT_KIND)["manual_401"]
+            self.assertNotEqual(record["status"], "published")
+            self.assertIn("clip_gone.gif", str(record["error"]))
+
+    def test_extra_sources_rejected_for_ocr_and_outside_match_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            queue = self.make_queue(root, SequencePlatformClient(), claim_artifact_kinds=(MANUAL_ARTIFACT_KIND,))
+            source = self._write_manual_source(root)
+            with self.assertRaisesRegex(ValueError, "人工截取"):
+                queue.enqueue(
+                    match_id="54478914",
+                    event={"event_key": "ocr_1", "code": "G"},
+                    match_detail={},
+                    source_path=source,
+                    extra_source_paths=[source.with_name("x.gif")],
+                    artifact_result=None,
+                )
+            outside = root / "output" / "99999999" / "clip_other.gif"
+            outside.parent.mkdir(parents=True, exist_ok=True)
+            outside.write_bytes(animated_gif_bytes())
+            with self.assertRaisesRegex(ValueError, "输出目录"):
+                queue.enqueue(
+                    match_id="54478914",
+                    event={"event_key": "manual_402", "code": "G"},
+                    match_detail={},
+                    source_path=source,
+                    extra_source_paths=[outside],
+                    artifact_kind=MANUAL_ARTIFACT_KIND,
+                    artifact_result=None,
+                )
+
     def test_manual_delivered_hook_failure_does_not_undo_delivery(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

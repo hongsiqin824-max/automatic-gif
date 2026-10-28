@@ -130,6 +130,27 @@ function broadcastBar(tabId, msg) {
   return sendToFrame(tabId, 0, msg);
 }
 
+// Where the fresh GIF landed, as one short line for the bar. The bar's status
+// is a single line of plain text with only ok/warn/fail colouring, so the
+// server's wording is boiled down to a verdict rather than passed through:
+// the operator's eyes are on the video, and this line is the only thing that
+// stays put (the toast disappears after a few seconds).
+function clipLandingStatus(appended, name) {
+  if (appended && appended.error) {
+    return { text: "GIF 已生成，但未能追加，已单独保存", level: "warn" };
+  }
+  if (appended && appended.main) {
+    const conflict = appended.push_state && appended.push_state.state === "conflict";
+    return {
+      text:
+        `GIF 已生成，已追加为第 ${appended.gif_count} 张` +
+        (conflict ? "；对应的推送和主图不是同一条" : ""),
+      level: conflict ? "warn" : "ok",
+    };
+  }
+  return { text: `GIF 已生成：${name}`, level: "ok" };
+}
+
 // ---- message router -------------------------------------------------------
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -186,12 +207,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       case "clip-created": {
         // Recorder finished + uploaded; notify the bar and refresh the panel.
         if (tabId == null) return null;
-        broadcastBar(tabId, { type: "bar-status", text: `GIF 已生成：${msg.name}`, level: "ok" });
+        const landed = clipLandingStatus(msg.appended, msg.name);
+        broadcastBar(tabId, { type: "bar-status", text: landed.text, level: landed.level });
         chrome.runtime.sendMessage({ type: "panel-refresh", tabId, matchId: msg.matchId, name: msg.name }).catch(() => null);
         try {
           await chrome.sidePanel.open({ tabId });
         } catch (_err) {
-          broadcastBar(tabId, { type: "bar-status", text: "GIF 已生成，点工具栏图标打开侧栏发布", level: "ok" });
+          // No side panel: the bar is the only thing the operator can see, so
+          // keep the landing result in the text instead of dropping back to a
+          // generic line.
+          broadcastBar(tabId, {
+            type: "bar-status",
+            text: `${landed.text}，点工具栏图标打开侧栏发布`,
+            level: landed.level,
+          });
         }
         return { ok: true };
       }
