@@ -658,6 +658,19 @@ def _manual_delivery_mode() -> str:
     return mode if mode in {"draft", "publish"} else "draft"
 
 
+CLIP_SOURCE_NAMES = {"extension": "插件", "workshop": "工作台"}
+
+
+def _clip_source_of(meta: dict) -> str:
+    """Capture source of a clip from its sidecar; only the extension tags it."""
+    return "extension" if meta.get("source") == "extension" else "workshop"
+
+
+def _clip_source_label(event: dict) -> str:
+    name = CLIP_SOURCE_NAMES.get(str(event.get("clip_source") or ""))
+    return f"·{name}" if name else ""
+
+
 def _format_publish_notice(delivered: dict) -> str:
     """Build the Feishu text for one delivered manual clip.
 
@@ -672,7 +685,8 @@ def _format_publish_notice(delivered: dict) -> str:
         else {}
     )
     mode = str(delivered.get("delivery_mode") or "publish")
-    head = "【GIF 已发布】" if mode == "publish" else "【GIF 草稿已建】"
+    label = _clip_source_label(event)
+    head = f"【GIF 已发布{label}】" if mode == "publish" else f"【GIF 草稿已建{label}】"
     home = str(detail.get("team_A_name") or "").strip()
     away = str(detail.get("team_B_name") or "").strip()
     if home or away:
@@ -764,7 +778,8 @@ def _format_publish_failure_alert(failed: dict) -> str:
         if isinstance(failed.get("match_detail"), dict)
         else {}
     )
-    head = "【GIF 发布卡住】" if failed.get("will_retry") else "【GIF 发布失败】"
+    label = _clip_source_label(event)
+    head = f"【GIF 发布卡住{label}】" if failed.get("will_retry") else f"【GIF 发布失败{label}】"
     home = str(detail.get("team_A_name") or "").strip()
     away = str(detail.get("team_B_name") or "").strip()
     if home or away:
@@ -3047,6 +3062,9 @@ def monitor_clip_publish():
         # Who pressed 发布; travels with the task to the worker for the Feishu
         # notice and lands in final_event_json for later audit. Not a CMS field.
         "operator": _current_operator(),
+        # Where the main GIF was captured, for the Feishu notice label. Extra
+        # angles in the group do not change it (one title = its main image).
+        "clip_source": _clip_source_of(meta),
     }
     status: str | None = None
     publish_error: str | None = None

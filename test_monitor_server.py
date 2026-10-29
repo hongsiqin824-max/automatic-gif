@@ -3299,6 +3299,17 @@ class PublishNoticeTests(ClipEndpointAlertMatchTests):
         self.assertEqual(webhook, "https://hook/publish")
         self.assertIn("articleId=6557352", text)
 
+    def test_notice_head_labels_clip_source(self):
+        def head(source, **overrides):
+            event = dict(self._delivered()["event"], clip_source=source)
+            return monitor_server._format_publish_notice(self._delivered(event=event, **overrides)).split("\n")[0]
+
+        self.assertEqual(head("extension"), "【GIF 已发布·插件】甲 vs 乙（英超）")
+        self.assertEqual(head("workshop"), "【GIF 已发布·工作台】甲 vs 乙（英超）")
+        self.assertEqual(head("extension", delivery_mode="draft"), "【GIF 草稿已建·插件】甲 vs 乙（英超）")
+        # Tasks queued before the source was recorded: no label.
+        self.assertEqual(head(None), "【GIF 已发布】甲 vs 乙（英超）")
+
     def test_notify_hook_silent_without_webhook(self):
         with mock.patch.object(monitor_server, "FEISHU_PUBLISH_WEBHOOK", ""), \
              mock.patch.object(monitor_server, "_send_feishu_text") as send:
@@ -3442,6 +3453,17 @@ class PublishNoticeTests(ClipEndpointAlertMatchTests):
     def test_publish_event_operator_none_without_login(self):
         self._clip_and_publish(10.0)
         self.assertIsNone(self.queue.enqueue.call_args.kwargs["event"]["operator"])
+
+    def test_publish_event_clip_source_follows_main_sidecar(self):
+        self._clip_and_publish(10.0)
+        self.assertEqual(self.queue.enqueue.call_args.kwargs["event"]["clip_source"], "workshop")
+        self.assertEqual(monitor_server._clip_source_of({"source": "extension"}), "extension")
+        self.assertEqual(monitor_server._clip_source_of({}), "workshop")
+
+    def test_failure_alert_head_labels_clip_source(self):
+        failed = self._failed(event={"title_override": "点球破门", "clip_source": "extension"})
+        head = monitor_server._format_publish_failure_alert(failed).split("\n")[0]
+        self.assertEqual(head, "【GIF 发布卡住·插件】甲 vs 乙（英超）")
 
 
 if __name__ == "__main__":
