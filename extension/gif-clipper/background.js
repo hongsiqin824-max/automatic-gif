@@ -60,13 +60,29 @@ async function getMatches(force = false) {
   // Same rule as the page: finished matches past the grace window are only
   // listed for their unpublished GIFs and can no longer be recorded.
   const recordable = playing.filter((m) => !(m.finished && m.grace_active === false));
-  const value = recordable.map((m) => ({
+  const toOption = (m, upcoming) => ({
     match_id: String(m.match_id),
     label: `${m.team_A_name || "?"} vs ${m.team_B_name || "?"}${m.competition_name ? `（${m.competition_name}）` : ""}`,
-    score: m.score || "",
-  }));
+    score: upcoming ? `未开赛 ${kickoffLabel(m.start_play)}`.trim() : (m.score || ""),
+    upcoming,
+  });
+  // Not-yet-started matches (kick-off within the catalog's upcoming window)
+  // come after the live ones, so the operator can pick the match before the
+  // teams walk out instead of waiting for it to flip to Playing.
+  const upcoming = Array.isArray(data.upcoming) ? data.upcoming : [];
+  const seen = new Set(recordable.map((m) => String(m.match_id)));
+  const value = [
+    ...recordable.map((m) => toOption(m, false)),
+    ...upcoming.filter((m) => m && !seen.has(String(m.match_id))).map((m) => toOption(m, true)),
+  ];
   matchesCache = { at: Date.now(), value };
   return value;
+}
+
+// ``start_play`` is "YYYY-MM-DD HH:MM:SS"; only the clock matters in a dropdown.
+function kickoffLabel(startPlay) {
+  const match = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})/.exec(String(startPlay || ""));
+  return match ? `${match[4]}:${match[5]}` : "";
 }
 
 // ---- per-tab state (storage.session survives SW restarts, not browser) ----
@@ -74,14 +90,64 @@ async function getMatches(force = false) {
 async function tabState(tabId) {
   const key = `tab:${tabId}`;
   const stored = (await chrome.storage.session.get(key))[key];
-  return stored || { matchId: null, mainFrameId: null, barHidden: false };
+  return stored || { matchId: null, mainFrameId: null, shown: false };
 }
 
-async function setTabState(tabId, patch) {
-  const key = `tab:${tabId}`;
-  const next = { ...(await tabState(tabId)), ...patch };
-  await chrome.storage.session.set({ [key]: next });
-  return next;
+// Read-modify-write per tab, one at a time: an election landing between the
+// read and the write of another patch must not put back a stale field.
+const tabStateWrites = new Map(); // tabId -> tail of that tab's write chain
+
+function setTabState(tabId, patch) {
+  const run = (tabStateWrites.get(tabId) || Promise.resolve()).then(async () => {
+    const key = `tab:${tabId}`;
+    const next = { ...(await tabState(tabId)), ...patch };
+    await chrome.storage.session.set({ [key]: next });
+    return next;
+  });
+  tabStateWrites.set(tabId, run.catch(() => null));
+  return run;
+}
+
+// ---- bar + side panel shown per tab ---------------------------------------
+// Both stay out of the way until the operator asks for them (toolbar icon or
+// Alt+1/2/3); recording runs in the background either way, so the buffer is
+// already full when they do. Mirrored in memory because sidePanel.open() has
+// to be decided synchronously in the click / key handler: after an await
+// Chrome no longer counts it as the user's gesture.
+
+const shownTabs = new Set();
+const shownTouched = new Set(); // changed since this worker started: storage copy is older
+chrome.storage.session.get(null).then((all) => {
+  for (const [key, value] of Object.entries(all || {})) {
+    const tabId = Number(key.slice(4));
+    if (key.startsWith("tab:") && value && value.shown && !shownTouched.has(tabId)) shownTabs.add(tabId);
+  }
+}).catch(() => null);
+
+async function setShown(tabId, shown) {
+  shownTouched.add(tabId);
+  if (shown) shownTabs.add(tabId);
+  else shownTabs.delete(tabId);
+  await setTabState(tabId, { shown });
+  // Every frame: the top-frame bar shows / hides, and the recording frame
+  // (maybe a cross-origin iframe) only toasts on its own while shown.
+  await chrome.tabs.sendMessage(tabId, { type: "ui-shown", shown }).catch(() => null);
+}
+
+// 8901's own pages are never recorded: it cuts its GIFs server-side, and its
+// preview players would only cost CPU and memory here.
+function isMonitorPage(pageUrl, base) {
+  let page;
+  let root;
+  try {
+    page = new URL(pageUrl);
+    root = new URL(base);
+  } catch (_err) {
+    return false;
+  }
+  if (page.origin !== root.origin) return false;
+  const prefix = root.pathname.replace(/\/+$/, "");
+  return !prefix || page.pathname === prefix || page.pathname.startsWith(prefix + "/");
 }
 
 // ---- sticky crop per match (storage.local: survives reloads and restarts) ----
@@ -113,6 +179,9 @@ async function setCrop(matchId, crop, aspect) {
 chrome.tabs.onRemoved.addListener((tabId) => {
   chrome.storage.session.remove(`tab:${tabId}`);
   frameReports.delete(tabId);
+  shownTabs.delete(tabId);
+  shownTouched.delete(tabId);
+  tabStateWrites.delete(tabId);
 });
 
 // ---- main recording frame election ---------------------------------------
@@ -189,9 +258,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     switch (msg.type) {
       case "frame-report": {
         if (tabId == null) return null;
+        const playing = !!msg.playing && !isMonitorPage(sender.tab.url, await baseUrl());
         if (!frameReports.has(tabId)) frameReports.set(tabId, new Map());
         const reports = frameReports.get(tabId);
-        if (msg.playing) reports.set(frameId, { area: msg.area, playing: true, at: Date.now() });
+        if (playing) reports.set(frameId, { area: msg.area, playing: true, at: Date.now() });
         else reports.delete(frameId);
         await electMainFrame(tabId);
         return { ok: true };
@@ -204,8 +274,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         await chrome.sidePanel.setOptions({ tabId, path: await panelPath(msg.matchId) });
         return { ok: true };
       }
-      case "set-bar-hidden":
-        return tabId == null ? null : await setTabState(tabId, { barHidden: !!msg.hidden });
+      case "set-shown":
+        // The bar's × (hide): recording keeps going, only the UI goes away.
+        if (tabId == null) return null;
+        await setShown(tabId, !!msg.shown);
+        return { ok: true };
       case "bar-relay":
         // A recording frame (maybe a cross-origin iframe) wants the top-frame bar updated.
         if (tabId != null && msg.payload) broadcastBar(tabId, msg.payload);
@@ -346,19 +419,27 @@ async function postClip(job) {
 
 // ---- keyboard commands → main recording frame ---------------------------
 
+// Alt+1/2/3 in a tab whose UI is hidden bring the bar and the side panel up
+// first, so the result of the key press is visible and the clip lands in an
+// open panel. The panel has to be opened right here, before any await.
+const PANEL_COMMANDS = new Set(["set-start", "finish", "review"]);
+
 chrome.commands.onCommand.addListener((command, tab) => {
   const tabId = tab && tab.id;
-  if (tabId != null) runCommand(command, tabId);
+  if (tabId == null) return;
+  if (PANEL_COMMANDS.has(command) && !shownTabs.has(tabId)) {
+    chrome.sidePanel.open({ tabId }).catch(() => null);
+  }
+  runCommand(command, tabId);
 });
 
 async function runCommand(command, tabId) {
   const state = await tabState(tabId);
   if (command === "toggle-bar") {
-    const next = !state.barHidden;
-    await setTabState(tabId, { barHidden: next });
-    broadcastBar(tabId, { type: "bar-visibility", hidden: next });
+    await setShown(tabId, !state.shown);
     return;
   }
+  if (!state.shown) await setShown(tabId, true);
   if (state.mainFrameId == null) {
     broadcastBar(tabId, { type: "bar-status", text: "没有找到正在播放的视频", level: "fail" });
     return;
@@ -391,7 +472,16 @@ async function panelPath(matchId) {
   return `panel.html${params.toString() ? "?" + params.toString() : ""}`;
 }
 
-chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => null);
+// Toolbar icon = "use the clipper in this tab": side panel and bar together.
+// Handled here rather than by openPanelOnActionClick, which would open the
+// panel without telling us (onClicked does not fire then).
+chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: false }).catch(() => null);
+
+chrome.action.onClicked.addListener((tab) => {
+  if (!tab || tab.id == null) return;
+  chrome.sidePanel.open({ tabId: tab.id }).catch(() => null); // first: still the user's click
+  setShown(tab.id, true);
+});
 
 chrome.tabs.onActivated.addListener(async ({ tabId }) => {
   const state = await tabState(tabId);

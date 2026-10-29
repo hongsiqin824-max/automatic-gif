@@ -1,6 +1,8 @@
 // Draggable Shadow-DOM bar in the top frame only: pick match / set start /
 // finish / status. The keyboard shortcuts are the primary path; this is the
-// visible fallback and the only place to choose the match.
+// visible fallback and the only place to choose the match. Not built (and not
+// polling) until the operator brings the clipper up in this tab: toolbar
+// icon, Alt+0 or Alt+1/2/3. Recording runs in the background regardless.
 (() => {
   if (window !== window.top || window.__gifClipperBar) return;
   window.__gifClipperBar = true;
@@ -8,9 +10,9 @@
   const toast = window.__gifClipperToast || (() => {});
   let host = null;
   let ui = null;
-  let hidden = false;
+  let timers = [];        // status poll / range tick / match refresh, only while shown
+  let statusHoldUntil = 0; // a pushed message stays readable over the 2 s status poll
   let startMs = null;
-  let tickTimer = null;
   let cropEntry = null;   // this match's saved crop {crop, last, aspect} (background), or null
   let videoAspect = 0;    // recording video width / height, from the status poll
 
@@ -79,7 +81,11 @@
     ui.finish.addEventListener("click", () => send({ type: "command", command: "finish" }));
     ui.review.addEventListener("click", () => send({ type: "command", command: "review" }));
     ui.crop.addEventListener("click", toggleCrop);
-    ui.hide.addEventListener("click", () => setHidden(true, true));
+    ui.hide.addEventListener("click", () => {
+      // Hide only: recording keeps going; the icon or Alt+0 brings it back.
+      hide();
+      send({ type: "set-shown", shown: false });
+    });
     ui.match.addEventListener("change", async () => {
       await send({ type: "set-match", matchId: ui.match.value });
       setStatus(ui.match.value ? "已选比赛" : "未选比赛", ui.match.value ? "ok" : "warn");
@@ -106,16 +112,30 @@
     grip.addEventListener("pointerup", () => (drag = null));
   }
 
-  function setStatus(text, level = "") {
+  function setStatus(text, level = "", holdMs = 0) {
     if (!ui) return;
     ui.status.textContent = text;
     ui.status.className = `status ${level}`;
+    statusHoldUntil = holdMs ? Date.now() + holdMs : 0;
   }
 
-  function setHidden(next, persist) {
-    hidden = next;
-    if (host) host.style.display = hidden ? "none" : "";
-    if (persist) send({ type: "set-bar-hidden", hidden });
+  async function show(state) {
+    if (!host) build();
+    host.style.display = "";
+    if (timers.length) return; // already running
+    timers = [
+      setInterval(renderRange, 200),
+      setInterval(pollStatus, 2000),
+      setInterval(() => loadMatches({ matchId: ui.match.value }), 60_000),
+    ];
+    await loadMatches(state || (await send({ type: "get-tab-state" })) || {});
+    pollStatus();
+  }
+
+  function hide() {
+    if (host) host.style.display = "none";
+    timers.forEach(clearInterval);
+    timers = [];
   }
 
   function updateButtons() {
@@ -215,7 +235,9 @@
   async function pollStatus() {
     const s = await send({ type: "recorder-status" });
     if (!s) return;
-    if (!s.elected || !s.recording) {
+    if (Date.now() < statusHoldUntil) {
+      // A pushed message (e.g. "请先在小条里选择比赛") is still on show.
+    } else if (!s.elected || !s.recording) {
       setStatus("没有找到正在播放的视频", "warn");
     } else {
       setStatus(`缓冲 ${s.bufferedSeconds}s · ${s.size}`, "ok");
@@ -232,18 +254,20 @@
   }
 
   chrome.runtime.onMessage.addListener((msg) => {
+    if (msg && msg.type === "ui-shown") {
+      if (msg.shown) show();
+      else hide();
+      return false;
+    }
     if (!msg || !ui) return false;
     switch (msg.type) {
       case "bar-status":
-        setStatus(msg.text, msg.level);
+        setStatus(msg.text, msg.level, 4000);
         break;
       case "bar-range":
         startMs = msg.startMs == null ? null : msg.startMs;
         renderRange();
         updateButtons();
-        break;
-      case "bar-visibility":
-        setHidden(!!msg.hidden, false);
         break;
       case "bar-source":
         if (msg.frameId == null) setStatus("没有找到正在播放的视频", "warn");
@@ -271,15 +295,7 @@
   });
 
   (async () => {
-    build();
     const state = (await send({ type: "get-tab-state" })) || {};
-    setHidden(!!state.barHidden, false);
-    await loadMatches(state);
-    pollStatus();
-    tickTimer = setInterval(() => {
-      renderRange();
-    }, 200);
-    setInterval(pollStatus, 2000);
-    setInterval(() => loadMatches({ matchId: ui.match.value }), 60_000);
+    if (state.shown) show(state);
   })();
 })();

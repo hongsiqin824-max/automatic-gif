@@ -1135,10 +1135,18 @@ function buildClipForm(item, row) {
 
   // What the server tied this clip to, shown on the row itself so the
   // operator sees it next to the radio it is about.
-  const hintText = alertMatchNote(am).replace(/^ · /, '');
+  // The server matched a push but left 跳过 pre-filled because that push was
+  // already published: say why, or the green "已关联推送" line would contradict
+  // the radio and read like a bug.
+  const consumedSkip = am.mode === 'alert' && am.alert_seq != null && initial.alert_seq == null
+    && candidates.some((c) => c.seq === am.alert_seq && c.consumed);
+  const hintText = consumedSkip
+    ? `这条 GIF 对应的推送 ${[am.match_time ? `${am.match_time}'` : '', am.score || ''].filter(Boolean).join(' ')} 已发过文章，已按「跳过」预填；确是它的另一个视角再在下方手选`
+    : alertMatchNote(am).replace(/^ · /, '');
   if (hintText) {
     const hint = document.createElement('div');
-    hint.className = 'stage-clip-hint ' + (am.mode === 'alert' && !am.ambiguous && !am.weak ? 'ok' : 'warn');
+    const good = am.mode === 'alert' && !am.ambiguous && !am.weak && !consumedSkip;
+    hint.className = 'stage-clip-hint ' + (good ? 'ok' : 'warn');
     hint.textContent = hintText;
     form.appendChild(hint);
   }
@@ -1157,6 +1165,13 @@ function buildClipForm(item, row) {
     radio.addEventListener('change', () => applySource(radio));
     label.appendChild(radio);
     label.appendChild(document.createTextNode(' ' + (c ? candidateLabel(c) : '跳过（没有对应推送）')));
+    if (c && c.consumed) {
+      const used = document.createElement('span');
+      used.className = 'stage-clip-flag';
+      used.textContent = ' 已发过';
+      used.title = '这条推送已有文章发出，默认不再勾选；确是它的另一个视角再手选';
+      label.appendChild(used);
+    }
     if (flagText) {
       const flag = document.createElement('span');
       flag.className = 'stage-clip-flag';

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "GIF 工作台 · 直播页截取",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "在任意直播页面录最近几分钟画面，Alt+1 设起点、Alt+2 结束生成 GIF，发到 8901 工作台的侧边栏里填表发布。",
   "permissions": ["storage", "sidePanel", "tabs", "commands", "webNavigation"],
   "host_permissions": ["<all_urls>"],
@@ -16,7 +16,7 @@
     }
   ],
   "side_panel": { "default_path": "panel.html" },
-  "action": { "default_title": "GIF 工作台（点击打开侧栏）" },
+  "action": { "default_title": "GIF 工作台（点击打开侧栏和小条）" },
   "options_page": "options.html",
   "commands": {
     "set-start": {

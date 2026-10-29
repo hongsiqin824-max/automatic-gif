@@ -141,7 +141,7 @@ class RouteTests(unittest.TestCase):
             write_clip_meta=lambda p, m: p.with_suffix(".json").write_text(json.dumps(m), encoding="utf-8"),
             read_clip_meta=lambda p: json.loads(p.with_suffix(".json").read_text(encoding="utf-8")),
             match_clip_alert=match_clip_alert,
-            default_clip_form=lambda am: {"alert_seq": am.get("alert_seq"), "match_event": 1, "match_time": "68", "match_score": "1-1", "title": ""},
+            default_clip_form=lambda am, match_id: {"alert_seq": am.get("alert_seq"), "match_event": 1, "match_time": "68", "match_score": "1-1", "title": ""},
             alert_match_public=lambda am: {"mode": am.get("mode"), "alert_seq": am.get("alert_seq")},
             match_detail_for=lambda match_id: {"team_A_name": "甲", "team_B_name": "乙"},
             validate_match_id=self._validate_match_id,
@@ -399,6 +399,103 @@ class RealFfmpegTests(unittest.TestCase):
             self.assertGreater(output.stat().st_size, 0)
             self.assertEqual(list(root.glob(".concat_*")), [])
 
+    # Three 2 s segments, red / lime / blue, so a frame's colour says where
+    # on the concatenated timeline it came from.
+    COLOURS = ("red", "lime", "blue")
+
+    def _encode_rgb(self, root: Path, ss: float, window: float) -> Path:
+        import monitor_server
+
+        sources = []
+        for index, colour in enumerate(self.COLOURS):
+            path = root / f"seg_{index:03d}.webm"
+            self._make_webm(path, 2, colour)
+            sources.append(path)
+        output = root / "clip.gif"
+        encode_from_webm(
+            monitor_server.resolve_ffmpeg(), sources, ss=ss, window=window,
+            video_filter=monitor_server._clip_video_filter(None), output_path=output,
+        )
+        return output
+
+    @staticmethod
+    def _colour(rgb: tuple[int, ...]) -> str:
+        r, g, b = rgb
+        if r > 180 and g < 80 and b < 80:
+            return "red"
+        if g > 180 and r < 80 and b < 80:
+            return "lime"
+        if b > 180 and r < 80 and g < 80:
+            return "blue"
+        return "other"
+
+    def _frame_colours(self, gif: Path) -> list[str]:
+        import monitor_server
+
+        raw = subprocess.run(
+            [monitor_server.resolve_ffmpeg(), "-nostdin", "-loglevel", "error", "-i", str(gif),
+             "-vf", "scale=1:1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+            capture_output=True, check=True,
+        ).stdout
+        return [self._colour(tuple(raw[i:i + 3])) for i in range(0, len(raw), 3)]
+
+    def _palette_colours(self, gif: Path) -> set[str]:
+        """Every entry of the GIF's global and local colour tables, classified."""
+        data = gif.read_bytes()
+        entries: list[tuple[int, ...]] = []
+
+        def table(pos: int, packed: int) -> int:
+            size = 3 * (2 << (packed & 7))
+            entries.extend(tuple(data[i:i + 3]) for i in range(pos, pos + size, 3))
+            return pos + size
+
+        def skip_sub_blocks(pos: int) -> int:
+            while data[pos]:
+                pos += data[pos] + 1
+            return pos + 1
+
+        pos = 13
+        if data[10] & 0x80:
+            pos = table(pos, data[10])
+        while pos < len(data) and data[pos] != 0x3B:
+            if data[pos] == 0x21:  # extension block
+                pos = skip_sub_blocks(pos + 2)
+            elif data[pos] == 0x2C:  # image descriptor
+                packed = data[pos + 9]
+                pos += 10
+                if packed & 0x80:
+                    pos = table(pos, packed)
+                pos = skip_sub_blocks(pos + 1)
+            else:
+                self.fail(f"unexpected GIF block 0x{data[pos]:02x}")
+        return {self._colour(rgb) for rgb in entries}
+
+    def test_cut_lands_on_the_requested_moment(self):
+        # [1.5 s, 2.5 s]: half red, half lime, switching mid-clip.
+        with TemporaryDirectory() as tmp:
+            frames = self._frame_colours(self._encode_rgb(Path(tmp), ss=1.5, window=1.0))
+        self.assertIn(len(frames), (16, 17, 18))  # 1 s at 16.67 fps
+        self.assertEqual(frames[0], "red")
+        self.assertEqual(frames[-1], "lime")
+        self.assertEqual(set(frames), {"red", "lime"})
+        switch = frames.index("lime")
+        self.assertLessEqual(abs(switch - len(frames) / 2), 1.5, frames)
+
+    def test_only_the_clip_is_encoded(self):
+        # [2.4 s, 3.6 s] lies inside the lime segment. Footage outside the
+        # window must not reach palettegen: the old output-side -ss/-t ran
+        # the whole upload through the graph and put red and blue into the
+        # palette (and made the encode cost scale with the upload size).
+        with TemporaryDirectory() as tmp:
+            output = self._encode_rgb(Path(tmp), ss=2.4, window=1.2)
+            frames = self._frame_colours(output)
+            palette = self._palette_colours(output)
+        self.assertIn(len(frames), (19, 20, 21))
+        self.assertEqual(set(frames), {"lime"})
+        self.assertIn("lime", palette)
+        self.assertNotIn("red", palette)
+        self.assertNotIn("blue", palette)
+
 
 class ExtensionSelectSegmentsTests(unittest.TestCase):
     """``selectSegments`` in extension/gif-clipper/content/recorder.js, run under node."""
@@ -654,6 +751,233 @@ class ExtensionUnstickTargetTests(unittest.TestCase):
                 for stalled in (False, True):
                     with self.subTest(ranges=ranges, t=t, stalled=stalled):
                         self.assertLessEqual(len(self.settle(ranges, t, stalled)), 3)
+
+
+class ExtensionBackgroundUiTests(unittest.TestCase):
+    """extension/gif-clipper/background.js under node with a fake ``chrome``.
+
+    The bar and the side panel stay hidden until the toolbar icon or
+    Alt+1/2/3; recording runs regardless, except on 8901's own pages. Chrome
+    only lets ``sidePanel.open`` through while the click / key press is being
+    handled, so it must be called before the handler's first await.
+    """
+
+    HARNESS = r"""
+const vm = require("vm");
+const fs = require("fs");
+function load(session = {}) {
+  const calls = [];
+  const listeners = {};
+  const store = { session: JSON.parse(JSON.stringify(session)), local: {} };
+  const tick = (fn) => new Promise((r) => setTimeout(() => r(fn()), 0));
+  const area = (name) => ({
+    get: (keys) => tick(() => {
+      const data = store[name];
+      if (keys == null) return JSON.parse(JSON.stringify(data));
+      const out = {};
+      for (const k of Array.isArray(keys) ? keys : [keys]) {
+        if (k in data) out[k] = JSON.parse(JSON.stringify(data[k]));
+      }
+      return out;
+    }),
+    set: (obj) => tick(() => { Object.assign(store[name], JSON.parse(JSON.stringify(obj))); }),
+    remove: (k) => tick(() => { delete store[name][k]; }),
+  });
+  const event = (name) => ({ addListener: (fn) => { listeners[name] = fn; } });
+  const rec = (name) => (...args) => { calls.push([name, ...args]); return Promise.resolve(null); };
+  const chrome = {
+    storage: { session: area("session"), local: area("local") },
+    tabs: {
+      sendMessage: rec("tabs.sendMessage"), create: rec("tabs.create"),
+      onRemoved: event("tabs.onRemoved"), onActivated: event("tabs.onActivated"),
+    },
+    sidePanel: {
+      open: rec("sidePanel.open"), setOptions: rec("sidePanel.setOptions"),
+      setPanelBehavior: rec("sidePanel.setPanelBehavior"),
+    },
+    action: { onClicked: event("action.onClicked") },
+    commands: { onCommand: event("commands.onCommand") },
+    runtime: { onMessage: event("runtime.onMessage"), onConnect: event("runtime.onConnect"), sendMessage: rec("runtime.sendMessage") },
+    webNavigation: { onCommitted: event("webNavigation.onCommitted") },
+  };
+  const fetch = async () => ({ ok: true, status: 200, json: async () => ({ buffer_seconds: 300, bitrate: 2000000 }) });
+  const ctx = vm.createContext({ chrome, fetch, console, URL, URLSearchParams, setTimeout, clearTimeout });
+  vm.runInContext(fs.readFileSync(SCRIPT, "utf8"), ctx);
+  const send = (msg, sender) => new Promise((r) => listeners["runtime.onMessage"](msg, sender, r));
+  const named = (name) => calls.filter((c) => c[0] === name);
+  const messages = (tabId) => named("tabs.sendMessage").filter((c) => c[1] === tabId)
+    .map((c) => ({ msg: c[2], frameId: c[3] ? c[3].frameId : null }));
+  return { ctx, calls, listeners, store, send, named, messages };
+}
+const settle = () => new Promise((r) => setTimeout(r, 50));
+const out = (value) => process.stdout.write(JSON.stringify(value));
+(async () => {
+__BODY__
+})().catch((err) => { console.error(err); process.exit(1); });
+"""
+
+    @classmethod
+    def setUpClass(cls):
+        import shutil
+
+        cls.node = shutil.which("node")
+        if not cls.node:
+            raise unittest.SkipTest("node 不可用")
+        cls.script = Path(__file__).parent / "extension" / "gif-clipper" / "background.js"
+        if not cls.script.is_file():
+            raise unittest.SkipTest("background.js missing")
+
+    def run_js(self, body: str):
+        script = f"const SCRIPT = {json.dumps(str(self.script))};" + self.HARNESS.replace("__BODY__", body)
+        result = subprocess.run([self.node, "-e", script], capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_icon_opens_panel_in_the_click_and_shows_the_bar(self):
+        r = self.run_js(
+            """
+const h = load();
+await settle();
+h.listeners["action.onClicked"]({ id: 7 });
+const syncOpen = h.named("sidePanel.open").map((c) => c[1]);
+await settle();
+out({ syncOpen, behavior: h.named("sidePanel.setPanelBehavior").map((c) => c[1]),
+      state: h.store.session["tab:7"], messages: h.messages(7) });
+"""
+        )
+        self.assertEqual(r["syncOpen"], [{"tabId": 7}])
+        self.assertEqual(r["behavior"], [{"openPanelOnActionClick": False}])
+        self.assertTrue(r["state"]["shown"])
+        # To every frame (no frameId): the bar shows, the recorder may toast.
+        self.assertEqual(r["messages"], [{"msg": {"type": "ui-shown", "shown": True}, "frameId": None}])
+
+    def test_new_tab_starts_hidden(self):
+        r = self.run_js(
+            """
+const h = load();
+out(await h.send({ type: "get-tab-state" }, { tab: { id: 4, url: "https://live.example/" }, frameId: 0 }));
+"""
+        )
+        self.assertFalse(r["shown"])
+
+    def test_shortcut_in_hidden_tab_opens_panel_then_answers_in_the_bar(self):
+        r = self.run_js(
+            """
+const h = load();
+await settle();
+h.listeners["commands.onCommand"]("finish", { id: 3 });
+const syncOpen = h.named("sidePanel.open").map((c) => c[1]);
+await settle();
+out({ syncOpen, state: h.store.session["tab:3"], messages: h.messages(3) });
+"""
+        )
+        self.assertEqual(r["syncOpen"], [{"tabId": 3}])
+        self.assertTrue(r["state"]["shown"])
+        # The bar is told to show before the answer to the key press arrives.
+        self.assertEqual(
+            r["messages"],
+            [
+                {"msg": {"type": "ui-shown", "shown": True}, "frameId": None},
+                {"msg": {"type": "bar-status", "text": "没有找到正在播放的视频", "level": "fail"}, "frameId": 0},
+            ],
+        )
+
+    def test_shortcut_in_shown_tab_leaves_panel_alone(self):
+        r = self.run_js(
+            """
+const h = load({ "tab:5": { matchId: null, mainFrameId: null, shown: true } });
+await settle(); // worker restart: shown state comes back from storage.session
+h.listeners["commands.onCommand"]("set-start", { id: 5 });
+const syncOpen = h.named("sidePanel.open").length;
+await settle();
+out({ syncOpen, uiShown: h.messages(5).filter((m) => m.msg.type === "ui-shown").length });
+"""
+        )
+        self.assertEqual(r, {"syncOpen": 0, "uiShown": 0})
+
+    def test_alt0_toggles_bar_without_panel(self):
+        r = self.run_js(
+            """
+const h = load();
+await settle();
+h.listeners["commands.onCommand"]("toggle-bar", { id: 2 });
+await settle();
+const first = h.store.session["tab:2"].shown;
+h.listeners["commands.onCommand"]("toggle-bar", { id: 2 });
+await settle();
+out({ first, second: h.store.session["tab:2"].shown, open: h.named("sidePanel.open").length,
+      shown: h.messages(2).map((m) => m.msg.shown) });
+"""
+        )
+        self.assertEqual(r, {"first": True, "second": False, "open": 0, "shown": [True, False]})
+
+    def test_bar_close_hides_everywhere_in_the_tab(self):
+        r = self.run_js(
+            """
+const h = load();
+await settle();
+h.listeners["action.onClicked"]({ id: 7 });
+await settle();
+await h.send({ type: "set-shown", shown: false }, { tab: { id: 7, url: "https://live.example/" }, frameId: 0 });
+await settle();
+h.listeners["commands.onCommand"]("review", { id: 7 });
+out({ state: h.store.session["tab:7"].shown, last: h.messages(7)[1], reopened: h.named("sidePanel.open").length });
+"""
+        )
+        self.assertFalse(r["state"])
+        self.assertEqual(r["last"], {"msg": {"type": "ui-shown", "shown": False}, "frameId": None})
+        # Hidden again, so the next shortcut brings the panel back.
+        self.assertEqual(r["reopened"], 2)
+
+    def test_monitor_page_is_never_recorded(self):
+        r = self.run_js(
+            """
+const h = load();
+await settle();
+const report = { type: "frame-report", playing: true, area: 1280 * 720 };
+await h.send(report, { tab: { id: 1, url: "https://matchgif.aisportsapp.com/gif-monitor/?match_id=1" }, frameId: 0 });
+await h.send(report, { tab: { id: 2, url: "https://live.example/watch" }, frameId: 4 });
+await settle();
+const starts = h.named("tabs.sendMessage").filter((c) => c[2].type === "recorder-start").map((c) => [c[1], c[3].frameId]);
+out({ starts, monitor: h.store.session["tab:1"].mainFrameId, live: h.store.session["tab:2"].mainFrameId });
+"""
+        )
+        self.assertEqual(r, {"starts": [[2, 4]], "monitor": None, "live": 4})
+
+    def test_is_monitor_page(self):
+        r = self.run_js(
+            """
+const h = load();
+const prod = "https://matchgif.aisportsapp.com/gif-monitor/";
+const local = "http://127.0.0.1:8902/";
+out([
+  h.ctx.isMonitorPage("https://matchgif.aisportsapp.com/gif-monitor/?mode=panel", prod),
+  h.ctx.isMonitorPage("https://matchgif.aisportsapp.com/gif-monitor", prod),
+  h.ctx.isMonitorPage("https://matchgif.aisportsapp.com/gif-monitor/workshop?x=1", prod),
+  h.ctx.isMonitorPage("https://matchgif.aisportsapp.com/gif-monitor-old/", prod),
+  h.ctx.isMonitorPage("https://matchgif.aisportsapp.com/", prod),
+  h.ctx.isMonitorPage("https://live.example/gif-monitor/", prod),
+  h.ctx.isMonitorPage("http://127.0.0.1:8902/anything", local),
+  h.ctx.isMonitorPage("http://127.0.0.1:8901/", local),
+  h.ctx.isMonitorPage(undefined, prod),
+]);
+"""
+        )
+        self.assertEqual(r, [True, True, True, False, False, False, True, False, False])
+
+    def test_concurrent_tab_state_patches_all_land(self):
+        r = self.run_js(
+            """
+const h = load();
+await Promise.all([
+  h.ctx.setTabState(9, { matchId: "123" }),
+  h.ctx.setTabState(9, { mainFrameId: 2 }),
+  h.ctx.setTabState(9, { shown: true }),
+]);
+out(h.store.session["tab:9"]);
+"""
+        )
+        self.assertEqual(r, {"matchId": "123", "mainFrameId": 2, "shown": True})
 
 
 if __name__ == "__main__":

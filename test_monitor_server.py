@@ -2093,6 +2093,60 @@ class ClipAlertMatchTests(unittest.TestCase):
         self.assertEqual(result["score"], "")
 
 
+class ConsumedAlertSeqTests(unittest.TestCase):
+    """A push already published stops pre-filling 进球 on later clips."""
+
+    def _records(self, *entries):
+        queue = mock.Mock()
+        queue.records_for_match.return_value = {
+            f"manual_{i}": {"status": status, "final_event": {"alert_seq": seq}}
+            for i, (status, seq) in enumerate(entries)
+        }
+        return queue
+
+    def test_only_delivered_records_consume_their_push(self):
+        queue = self._records(("published", 3), ("drafted", 4), ("failed", 5), ("queued", 6), ("published", None))
+        with mock.patch.object(monitor_server, "manual_draft_queue", queue):
+            self.assertEqual(monitor_server._consumed_alert_seqs("54622319"), frozenset({"3", "4"}))
+
+    def test_missing_queue_or_broken_read_consumes_nothing(self):
+        with mock.patch.object(monitor_server, "manual_draft_queue", None):
+            self.assertEqual(monitor_server._consumed_alert_seqs("54622319"), frozenset())
+        queue = mock.Mock()
+        queue.records_for_match.side_effect = RuntimeError("db")
+        with mock.patch.object(monitor_server, "manual_draft_queue", queue):
+            self.assertEqual(monitor_server._consumed_alert_seqs("54622319"), frozenset())
+        # A Mock queue (no dict back) must not be read as records either.
+        with mock.patch.object(monitor_server, "manual_draft_queue", mock.Mock()):
+            self.assertEqual(monitor_server._consumed_alert_seqs("54622319"), frozenset())
+
+    def test_consumed_push_falls_back_to_skip(self):
+        alert_match = {"mode": "alert", "alert_seq": 7, "minute": "68", "minute_extra": "", "score": "1-1"}
+        skipped = {"alert_seq": None, "match_event": 0, "match_time": "", "match_score": "", "title": ""}
+        self.assertEqual(monitor_server._default_clip_form(alert_match, frozenset({"7"})), skipped)
+        # Another push of the same match is untouched: still pre-filled as 进球.
+        self.assertEqual(
+            monitor_server._default_clip_form(alert_match, frozenset({"6"})),
+            {"alert_seq": 7, "match_event": 1, "match_time": "68", "match_score": "1-1", "title": ""},
+        )
+        # Default argument keeps the old behaviour for callers that do not pass a set.
+        self.assertEqual(monitor_server._default_clip_form(alert_match)["match_event"], 1)
+
+    def test_candidates_flag_the_consumed_push(self):
+        store = monitor_server._AlertStore(50, None)
+        with mock.patch.object(monitor_server.time, "time", return_value=1000.0):
+            first = store.add({"match_id": "54622319", "event_type": "goal", "team": "A",
+                               "score": "1-0", "minute": "1H 23", "dedup_key": "g1"})
+            second = store.add({"match_id": "54622319", "event_type": "goal", "team": "B",
+                                "score": "1-1", "minute": "1H 30", "dedup_key": "g2"})
+        queue = self._records(("published", first["seq"]))
+        with mock.patch.object(monitor_server, "alert_store", store), \
+             mock.patch.object(monitor_server, "manual_draft_queue", queue):
+            options = monitor_server._clip_candidates("54622319")
+        flags = {opt["seq"]: opt["consumed"] for opt in options}
+        self.assertEqual(flags, {first["seq"]: True, second["seq"]: False})
+
+
 class ClipEndpointAlertMatchTests(unittest.TestCase):
     """``POST /api/monitor/clip`` forwards the matched alert into the draft event."""
 
@@ -2181,6 +2235,25 @@ class ClipEndpointAlertMatchTests(unittest.TestCase):
         self.assertEqual(event["title_override"], "人工标题")
         self.assertNotIn("manual_match_event", event)
         self.assertEqual(event["alert_match_mode"], "alert")
+
+    def test_clip_after_that_goal_was_published_prefills_skip(self):
+        # The replay/celebration clipped minutes later still matches the same
+        # push (600s lookback). Once an article for it is out, pre-filling 进球
+        # again would publish a duplicate goal unless the operator noticed.
+        with mock.patch.object(monitor_server.time, "time", return_value=self.base - 60.0):
+            stored = self.store.add({"match_id": "54622319", "event_type": "goal", "team": "B",
+                                     "score": "1-1", "minute": "2H 68", "dedup_key": "g1"})
+        self.queue.records_for_match.return_value = {
+            "manual_1": {"status": "published", "final_event": {"alert_seq": stored["seq"]}}
+        }
+        data = self._clip(10.0).get_json()
+        # Still reported as matched (the page explains why it is skipped)...
+        self.assertEqual(data["alert_match"]["mode"], "alert")
+        # ...but nothing is pre-filled, so 发布 cannot go out as a goal by default.
+        self.assertEqual(
+            data["form"],
+            {"alert_seq": None, "match_event": 0, "match_time": "", "match_score": "", "title": ""},
+        )
 
     @mock.patch.object(monitor_server, "SCORE_EVENT_TYPES", frozenset({1, 2}))
     def test_red_card_push_prefills_type_4_without_score(self):
@@ -2738,6 +2811,79 @@ class PreviewStartWebRTCTests(unittest.TestCase):
             data = self.app.get("/api/monitor/preview/status?match_id=54477889").get_json()
         self.assertFalse(data["webrtc"])
         self.assertIsNone(data["whep_url"])
+
+
+class UpcomingMatchTests(unittest.TestCase):
+    """Not-yet-started matches are offered to the extension, kept off the page list."""
+
+    PLAYING = {
+        "match_id": "54622319", "team_A_name": "伊尔韦斯", "team_B_name": "里耶卡",
+        "competition_name": "哥伦杯", "status": "Playing",
+        "fs_A": 2, "fs_B": 1, "minute": "90", "minute_period": "2H",
+    }
+    FIXTURE = {
+        "match_id": "54700001", "team_A_name": "甲队", "team_B_name": "乙队",
+        "team_A_id": 11, "team_B_id": 22, "competition_name": "英超", "status": "Fixture",
+        "fs_A": 0, "fs_B": 0, "minute": None, "minute_period": None,
+        "start_play": "2026-10-29 20:00:00",
+    }
+
+    def setUp(self):
+        self.client = monitor_server.app.test_client()
+        self._patches = [
+            mock.patch.object(monitor_server, "_batch_query_sources", return_value={}),
+            mock.patch.object(monitor_server, "finished_matches", monitor_server._FinishedMatchMemory(600.0)),
+            mock.patch.object(
+                monitor_server.match_catalog,
+                "snapshot",
+                return_value={"playing": [dict(self.PLAYING)], "upcoming": [dict(self.FIXTURE)]},
+            ),
+        ]
+        for patch in self._patches:
+            patch.start()
+
+    def tearDown(self):
+        for patch in self._patches:
+            patch.stop()
+
+    def test_upcoming_is_a_separate_key_from_playing(self):
+        body = self.client.get("/api/monitor/matches").get_json()
+        # The page builds its tiles from ``playing``: a match with no stream
+        # must not appear there.
+        self.assertEqual([row["match_id"] for row in body["playing"]], ["54622319"])
+        self.assertEqual([row["match_id"] for row in body["upcoming"]], ["54700001"])
+        row = body["upcoming"][0]
+        self.assertEqual(row["status"], "Fixture")
+        self.assertEqual(row["status_label"], "未开始")
+        self.assertEqual(row["start_play"], "2026-10-29 20:00:00")
+        self.assertEqual(row["team_A_name"], "甲队")
+
+    def test_upcoming_never_duplicates_a_playing_row(self):
+        with mock.patch.object(
+            monitor_server.match_catalog,
+            "snapshot",
+            return_value={"playing": [dict(self.PLAYING)], "upcoming": [dict(self.PLAYING)]},
+        ):
+            body = self.client.get("/api/monitor/matches").get_json()
+        self.assertEqual(body["upcoming"], [])
+
+    def test_missing_upcoming_key_is_tolerated(self):
+        with mock.patch.object(
+            monitor_server.match_catalog, "snapshot", return_value={"playing": []}
+        ):
+            body = self.client.get("/api/monitor/matches").get_json()
+        self.assertEqual(body["upcoming"], [])
+
+    def test_clip_before_kickoff_still_resolves_the_teams(self):
+        # The walk-out clip is taken while the match is still a Fixture; without
+        # it in the lookup the GIF would carry no team names into its title.
+        detail = monitor_server._match_detail_for("54700001")
+        self.assertEqual((detail["team_A_name"], detail["team_B_id"]), ("甲队", 22))
+
+    def test_fixture_row_is_not_read_as_a_0_0_scoreline(self):
+        self.assertEqual(monitor_server._catalog_clock_for("54700001"), {})
+        # A Playing row is unaffected.
+        self.assertEqual(monitor_server._catalog_clock_for("54622319")["score"], "2-1")
 
 
 class FinishedMatchGraceTests(unittest.TestCase):

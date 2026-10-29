@@ -167,10 +167,10 @@
           <div class="row">
             <button data-role="play" title="播放/暂停（空格）">▶</button>
             <span class="time" data-role="time">0:00 / 0:00</span>
-            <button data-role="back5" title="后退 5 秒（Shift+←）">−5s</button>
-            <button data-role="back1" title="后退 1 秒（←）">−1s</button>
-            <button data-role="fwd1" title="前进 1 秒（→）">+1s</button>
-            <button data-role="fwd5" title="前进 5 秒（Shift+→）">+5s</button>
+            <button data-role="back5" title="后退 5 秒（; 或 Shift+←）· 按住连续后退">−5s<kbd>;</kbd></button>
+            <button data-role="back1" title="后退 1 秒（, 或 ←）· 按住连续后退">−1s<kbd>,</kbd></button>
+            <button data-role="fwd1" title="前进 1 秒（. 或 →）· 按住连续前进">+1s<kbd>.</kbd></button>
+            <button data-role="fwd5" title="前进 5 秒（' 或 Shift+→）· 按住连续前进">+5s<kbd>'</kbd></button>
             <button data-role="setin" title="当前画面设为起点（[）">起点<kbd>[</kbd></button>
             <button data-role="setout" title="当前画面设为终点（]）">终点<kbd>]</kbd></button>
             <button data-role="cropbtn" title="框选画面区域（C）">裁剪<kbd>C</kbd></button>
@@ -188,6 +188,11 @@
       this.video = wrap.querySelector("video");
       this.video.addEventListener("waiting", () => this._unstick(true));
       this.video.addEventListener("seeking", () => this._unstick(false));
+      // The accumulated target is only needed while the seek is in flight;
+      // once it lands, the next nudge reads the real position again.
+      this.video.addEventListener("seeked", () => {
+        if (this._seekFrame == null) this._seekTarget = null;
+      });
       // The saved box is shown from the start; its layer follows the real
       // frame shape once the video size is known.
       this.video.addEventListener("loadedmetadata", () => {
@@ -381,10 +386,19 @@
       this._bindCrop();
       const u = this.ui;
       u.play.addEventListener("click", () => this.togglePlay());
-      u.back5.addEventListener("click", () => this.seekBy(-5));
-      u.back1.addEventListener("click", () => this.seekBy(-1));
-      u.fwd1.addEventListener("click", () => this.seekBy(1));
-      u.fwd5.addEventListener("click", () => this.seekBy(5));
+      // Press and hold to keep scrolling. ``pointercancel`` matters: a trackpad
+      // gesture taken over by the browser never sends pointerup, and without it
+      // the repeat would run on with the finger already off.
+      const holdable = [[u.back5, -5], [u.back1, -1], [u.fwd1, 1], [u.fwd5, 5]];
+      for (const [button, delta] of holdable) {
+        button.addEventListener("pointerdown", (e) => {
+          e.preventDefault();          // no focus ring / text selection on hold
+          this._startRepeat(delta);
+        });
+        for (const stop of ["pointerup", "pointerleave", "pointercancel"]) {
+          button.addEventListener(stop, () => this._stopRepeat());
+        }
+      }
       u.setin.addEventListener("click", () => this.setIn());
       u.setout.addEventListener("click", () => this.setOut());
       u.ok.addEventListener("click", () => this.confirm());
@@ -406,27 +420,92 @@
         u.tl.addEventListener("pointermove", move);
         u.tl.addEventListener("pointerup", up);
       });
+      // ``;`` ``'`` = ∓5 s and ``,`` ``.`` = ∓1 s, the two pairs next to the
+      // ``[`` ``]`` in/out keys, so the whole trim is done without leaving that
+      // corner of the keyboard. Frame stepping keeps the same ``,`` ``.`` keys
+      // with Shift. The arrows stay as they were for anyone used to them.
+      const SEEK_KEYS = { ";": -5, "'": 5, ",": -1, ".": 1 };
       this._onKey = (e) => {
         if (this.closed) return;
         const k = e.key;
         let handled = true;
-        if (k === "Escape") this.close();
-        else if (k === "Enter") this.confirm();
-        else if (k === " ") this.togglePlay();
-        else if (k === "ArrowLeft") this.seekBy(e.shiftKey ? -5 : -1);
-        else if (k === "ArrowRight") this.seekBy(e.shiftKey ? 5 : 1);
-        else if (k === ",") this.seekBy(-FRAME_S);
-        else if (k === ".") this.seekBy(FRAME_S);
-        else if (k === "[") this.setIn();
-        else if (k === "]") this.setOut();
-        else if (k === "c" || k === "C") this.toggleCrop();
+        // ``e.repeat`` = the OS's own auto-repeat while the key is held. Our
+        // timer already drives the repeat, so the action is skipped - but the
+        // event must still be swallowed below, or a held ``,`` / arrow would
+        // reach the live player underneath and seek *it*.
+        const held = e.repeat;
+        if (k === "Escape") { if (!held) this.close(); }
+        else if (k === "Enter") { if (!held) this.confirm(); }
+        else if (k === " ") { if (!held) this.togglePlay(); }
+        else if (k === "ArrowLeft") { if (!held) this._startRepeat(e.shiftKey ? -5 : -1, k); }
+        else if (k === "ArrowRight") { if (!held) this._startRepeat(e.shiftKey ? 5 : 1, k); }
+        else if (k === "<") { if (!held) this.seekBy(-FRAME_S); }
+        else if (k === ">") { if (!held) this.seekBy(FRAME_S); }
+        else if (SEEK_KEYS[k] !== undefined) { if (!held) this._startRepeat(SEEK_KEYS[k], k); }
+        else if (k === "[") { if (!held) this.setIn(); }
+        else if (k === "]") { if (!held) this.setOut(); }
+        else if (k === "c" || k === "C") { if (!held) this.toggleCrop(); }
         else handled = false;
         if (handled) {
           e.preventDefault();
           e.stopImmediatePropagation();
         }
       };
+      // Releasing the key that started the repeat stops it; losing focus
+      // (window switch mid-hold) stops it too, so it cannot run on unattended.
+      this._onKeyUp = (e) => {
+        if (this._repeatKey != null && e.key === this._repeatKey) this._stopRepeat();
+      };
+      this._onBlur = () => this._stopRepeat();
       window.addEventListener("keydown", this._onKey, true);
+      window.addEventListener("keyup", this._onKeyUp, true);
+      window.addEventListener("blur", this._onBlur);
+    }
+
+    // ---- seek repeat ----
+    // Holding a nudge key/button must keep moving. Two things make the naive
+    // "call seekBy on a timer" wrong: ``video.currentTime`` does not change
+    // until the seek completes, so every tick would restart from the same
+    // place; and each assignment interrupts the previous seek, which stutters
+    // on an MSE buffer. So the target is accumulated here and handed to the
+    // video at most once per frame.
+    _nudge(delta) {
+      if (!this.ready) return;
+      const limit = Math.max(0, this.total - 0.05);
+      const from = this._seekTarget != null ? this._seekTarget : this.video.currentTime;
+      const next = Math.min(Math.max(0, from + delta), limit);
+      // Already pinned at an end: stop instead of spinning on the spot.
+      if (next === this._seekTarget) {
+        this._stopRepeat();
+        return;
+      }
+      this._seekTarget = next;
+      if (this._seekFrame != null) return;
+      this._seekFrame = requestAnimationFrame(() => {
+        this._seekFrame = null;
+        if (this.closed || this._seekTarget == null) return;
+        this.video.pause();
+        this.video.currentTime = this._seekTarget;
+      });
+    }
+
+    _startRepeat(delta, key = null) {
+      this._stopRepeat();
+      this._repeatKey = key;
+      this._nudge(delta);
+      // Same feel for keyboard and mouse: a short pause to keep a single press
+      // single, then a steady roll.
+      this._repeatDelay = setTimeout(() => {
+        this._repeatTimer = setInterval(() => this._nudge(delta), 80);
+      }, 300);
+    }
+
+    _stopRepeat() {
+      clearTimeout(this._repeatDelay);
+      clearInterval(this._repeatTimer);
+      this._repeatDelay = null;
+      this._repeatTimer = null;
+      this._repeatKey = null;
     }
 
     // ---- MSE ----
@@ -580,7 +659,11 @@
       if (this.closed) return;
       this.closed = true;
       clearInterval(this._tick);
+      this._stopRepeat();
+      if (this._seekFrame != null) cancelAnimationFrame(this._seekFrame);
       window.removeEventListener("keydown", this._onKey, true);
+      window.removeEventListener("keyup", this._onKeyUp, true);
+      window.removeEventListener("blur", this._onBlur);
       window.removeEventListener("resize", this._resize);
       try {
         this.video.pause();

@@ -76,6 +76,15 @@
   let elected = false;
   let busy = false;
   let reportTimer = null;
+  let shown = false;      // the operator has the clipper up in this tab (bar / panel)
+  let shownKnown = false; // a ui-shown message already arrived (newer than the initial read)
+
+  // Toasts nobody asked for (source switch, player reconnect, CORS) appear
+  // only while the clipper is up in this tab: recording also runs in tabs the
+  // operator never opened it in. Answers to key presses always toast.
+  function notify(text, level, ms) {
+    if (shown) toast(text, level, ms);
+  }
 
   function isPlaying(v) {
     return !v.paused && v.readyState >= 2 && v.videoWidth >= MIN_W && v.videoHeight >= MIN_H;
@@ -118,7 +127,7 @@
       if (recorder) {
         recorder.stop();
         recorder = null;
-        if (elected) toast("视频源已切换，缓冲重新开始", "warn");
+        if (elected) notify("视频源已切换，缓冲重新开始", "warn");
       }
       current = pick.next;
       currentArea = current ? current.videoWidth * current.videoHeight : 0;
@@ -140,7 +149,7 @@
     if (!current || recorder) return;
     recorder = new RollingRecorder(current, {
       ...recorderOpts,
-      onStatus: (text, level) => toast(text, level),
+      onStatus: (text, level) => notify(text, level),
     });
     if (!recorder.start()) recorder = null;
   }
@@ -333,10 +342,20 @@
         elected = true;
         recorderOpts = { bufferSeconds: msg.bufferSeconds, bitrate: msg.bitrate };
         if (current && canvasBlocked(current)) {
-          toast("此站画面受限（跨域无 CORS），换个源试试", "fail", 4000);
+          notify("此站画面受限（跨域无 CORS），换个源试试", "fail", 4000);
         }
         startRecorder();
         sendResponse({ ok: !!recorder });
+        return false;
+      }
+      case "ui-shown": {
+        const wasShown = shown;
+        shown = !!msg.shown;
+        shownKnown = true;
+        // Say now what was kept quiet while hidden and still matters.
+        if (shown && !wasShown && elected && current && canvasBlocked(current)) {
+          toast("此站画面受限（跨域无 CORS），换个源试试", "fail", 4000);
+        }
         return false;
       }
       case "recorder-stop": {
@@ -434,6 +453,9 @@
   const install = () => observer.observe(document.documentElement, { childList: true, subtree: true });
   if (document.documentElement) install();
   else document.addEventListener("DOMContentLoaded", install, { once: true });
+  send({ type: "get-tab-state" }).then((state) => {
+    if (!shownKnown && state) shown = !!state.shown;
+  });
   scheduleReport();
   setInterval(report, 10_000);
 })();

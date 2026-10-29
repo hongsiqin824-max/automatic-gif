@@ -1773,10 +1773,50 @@ def _alert_match_event(alert: dict[str, Any]) -> int:
     return 4 if str(alert.get("event_type") or alert.get("code") or "").upper() in {"RED_CARD", "RC"} else 1
 
 
-def _default_clip_form(alert_match: dict[str, Any]) -> dict[str, Any]:
-    """Initial form values: the matched push, or 跳过 (type 0, clock empty) without one."""
+def _consumed_alert_seqs(match_id: str) -> frozenset[str]:
+    """Pushes of this match that a delivered article already used, as ``str`` seqs.
+
+    One goal push is worth one article: the clip→alert window reaches 600s back,
+    so every celebration/replay captured in the minutes after a goal keeps
+    matching the push that was already published and would otherwise be
+    pre-filled as 进球 again (the CMS then rejects the duplicate match_time).
+    Read from the delivered task's ``final_event.alert_seq``, which is the push
+    the operator had selected when they pressed 发布.
+    """
+    if manual_draft_queue is None:
+        return frozenset()
+    try:
+        records = manual_draft_queue.records_for_match(match_id, artifact_kind=MANUAL_ARTIFACT_KIND)
+    except Exception:  # noqa: BLE001 - advisory only, never block capture on it
+        return frozenset()
+    if not isinstance(records, dict):
+        return frozenset()
+    seqs: set[str] = set()
+    for record in records.values():
+        if not isinstance(record, dict) or record.get("status") not in DELIVERED_CLIP_STATUSES:
+            continue
+        final_event = record.get("final_event") if isinstance(record.get("final_event"), dict) else {}
+        seq = final_event.get("alert_seq")
+        if seq not in (None, ""):
+            seqs.add(str(seq))
+    return frozenset(seqs)
+
+
+def _default_clip_form(
+    alert_match: dict[str, Any], consumed_seqs: frozenset[str] = frozenset()
+) -> dict[str, Any]:
+    """Initial form values: the matched push, or 跳过 (type 0, clock empty) without one.
+
+    A push listed in ``consumed_seqs`` has already been published, so this clip
+    is most likely a replay of it rather than a new goal: pre-fill 跳过 instead
+    of 进球 so nothing goes out as a duplicate goal unnoticed. The push stays in
+    the radio list for the operator to pick when it really is another angle.
+    """
+    skipped = {"alert_seq": None, "match_event": 0, "match_time": "", "match_score": "", "title": ""}
     if alert_match.get("mode") != "alert":
-        return {"alert_seq": None, "match_event": 0, "match_time": "", "match_score": "", "title": ""}
+        return skipped
+    if str(alert_match.get("alert_seq")) in consumed_seqs:
+        return skipped
     match_event = _alert_match_event(alert_match)
     return {
         "alert_seq": alert_match.get("alert_seq"),
@@ -1831,8 +1871,13 @@ def _normalize_clip_form(body: dict[str, Any], current: dict[str, Any]) -> dict[
 
 
 def _clip_candidates(match_id: str) -> list[dict[str, Any]]:
-    """Every goal/red-card push of this match, newest first, as the page's radio options."""
+    """Every goal/red-card push of this match, newest first, as the page's radio options.
+
+    ``consumed`` marks a push a delivered article already used, so the page can
+    say so next to the radio instead of letting it look unused.
+    """
     items = alert_store.for_match(match_id, 0.0, float("inf"))
+    consumed = _consumed_alert_seqs(match_id)
     options: list[dict[str, Any]] = []
     for item in reversed(items):
         minute, extra = _alert_minute_parts(item.get("minute"))
@@ -1847,6 +1892,7 @@ def _clip_candidates(match_id: str) -> list[dict[str, Any]]:
                 "match_event": _alert_match_event(item),
                 "match_time": _join_match_time(minute, extra),
                 "score": str(item.get("score") or "").strip(),
+                "consumed": str(item.get("seq")) in consumed,
             }
         )
     return options
@@ -2209,6 +2255,8 @@ def _match_row(item: dict[str, Any], status: str) -> dict[str, Any]:
         "competition_name": item.get("competition_name"),
         "status": status,
         "status_label": MATCH_STATUS_LABELS.get(status, status or "未知"),
+        # Kick-off time, so a not-yet-started row can say when it begins.
+        "start_play": item.get("start_play"),
     }
 
 
@@ -2274,9 +2322,21 @@ def monitor_matches():
         source_states = _batch_query_sources(match_ids)
         for entry in playing:
             entry["source_state"] = source_states.get(entry["match_id"], "unknown")
+    # Matches that have not kicked off yet (catalog ``Fixture`` within its
+    # upcoming window). Deliberately a separate key: the list page builds its
+    # tiles from ``playing`` only, and a not-yet-started match has no stream to
+    # preview. The extension lists them so the operator can pick the match
+    # before kick-off and clip the teams walking out / an early goal, which is
+    # impossible while the match only appears once it is already Playing.
+    upcoming = [
+        _match_row(item, str(item.get("status") or "Fixture"))
+        for item in snapshot.get("upcoming", [])
+        if isinstance(item, dict) and str(item.get("match_id") or "") not in match_ids
+    ]
     return jsonify(
         {
             "playing": playing,
+            "upcoming": upcoming,
             "health": snapshot.get("health", {}),
             "max_previews": MAX_PREVIEWS,
             "clip_before_seconds": CLIP_BEFORE_SECONDS,
@@ -2457,10 +2517,18 @@ def preview_media(match_id, filename):
 
 
 def _catalog_item_for(match_id: str) -> dict[str, Any] | None:
-    """The catalog row for a match: Playing now, or finished within grace."""
-    playing, _snapshot = _catalog_playing()
+    """The catalog row for a match: Playing now, not started yet, or finished within grace.
+
+    The not-yet-started rows matter because the extension can pick a match
+    before kick-off (walk-out / early goal): without them a clip taken then
+    would carry no team names into its title.
+    """
+    playing, snapshot = _catalog_playing()
     for item in playing:
         if str(item.get("match_id") or "") == str(match_id):
+            return item
+    for item in snapshot.get("upcoming", []):
+        if isinstance(item, dict) and str(item.get("match_id") or "") == str(match_id):
             return item
     record = finished_matches.get(match_id, time.time())
     return record["item"] if record else None
@@ -2504,6 +2572,9 @@ def _catalog_clock_for(match_id: str) -> dict[str, Any]:
     """Current minute/score of a match from the catalog snapshot (fallback source)."""
     item = _catalog_item_for(match_id)
     if item is None:
+        return {}
+    if str(item.get("status") or "") == "Fixture":
+        # Not kicked off: the row's 0-0 is not a score yet and there is no clock.
         return {}
     fs_a, fs_b = item.get("fs_A"), item.get("fs_B")
     score = f"{fs_a}-{fs_b}" if fs_a not in (None, "") and fs_b not in (None, "") else ""
@@ -2970,7 +3041,7 @@ def monitor_clip():
     # (``/api/monitor/clip/publish``) taken after they have seen the GIF and
     # checked the pre-filled CMS fields, so persist everything that step needs.
     event_key = f"manual_{int(anchor_epoch if anchor_epoch is not None else time.time())}"
-    form = _default_clip_form(alert_match)
+    form = _default_clip_form(alert_match, _consumed_alert_seqs(match_id))
     _write_clip_meta(
         output_path,
         {
@@ -3480,7 +3551,9 @@ if EXTENSION_ENABLED:
             write_clip_meta=_write_clip_meta,
             read_clip_meta=_read_clip_meta,
             match_clip_alert=_match_clip_alert,
-            default_clip_form=_default_clip_form,
+            default_clip_form=lambda alert_match, match_id: _default_clip_form(
+                alert_match, _consumed_alert_seqs(match_id)
+            ),
             alert_match_public=_alert_match_public,
             match_detail_for=_match_detail_for,
             validate_match_id=validate_match_id,

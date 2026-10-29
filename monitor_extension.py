@@ -68,7 +68,9 @@ class ExtensionHooks:
     write_clip_meta: Callable[[Path, dict[str, Any]], None]
     read_clip_meta: Callable[[Path], dict[str, Any]]
     match_clip_alert: Callable[[str, float], dict[str, Any]]
-    default_clip_form: Callable[[dict[str, Any]], dict[str, Any]]
+    # (alert_match, match_id): the match id lets the form know which pushes
+    # were already published, so a replay clip is not pre-filled as 进球.
+    default_clip_form: Callable[[dict[str, Any], str], dict[str, Any]]
     alert_match_public: Callable[[dict[str, Any]], dict[str, Any]]
     match_detail_for: Callable[[str], dict[str, Any]]
     validate_match_id: Callable[[str], str]
@@ -157,11 +159,16 @@ def encode_from_webm(
     concat_list.write_text(
         "".join(f"file '{src.resolve()}'\n" for src in sources), encoding="utf-8"
     )
-    palette_filter = f"{video_filter},split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse"
+    # Cut at the head of the graph, not with output-side -ss/-t: those apply
+    # after the graph, and palettegen only emits at end of input, so every
+    # uploaded frame (whole 30 s segments) was scaled and fed to the palette.
+    # Same timeline and frame count, a fraction of the work, and the palette
+    # comes from the clip alone.
+    trim = f"trim=start={ss:.3f}:duration={window:.3f},setpts=PTS-STARTPTS"
+    palette_filter = f"{trim},{video_filter},split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse"
     command = [
         ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
         "-f", "concat", "-safe", "0", "-i", str(concat_list),
-        "-ss", f"{ss:.3f}", "-t", f"{window:.3f}",
         "-filter_complex", palette_filter,
         str(output_path),
     ]
@@ -415,7 +422,7 @@ def install_extension_routes(
         anchor_epoch = end_ms / 1000.0 + source_offset
         alert_match = hooks.match_clip_alert(match_id, anchor_epoch)
         event_key = f"manual_{int(anchor_epoch)}"
-        form = hooks.default_clip_form(alert_match)
+        form = hooks.default_clip_form(alert_match, match_id)
         ext_source = {
             "dir": source_dir.name,
             "segments": segments,
