@@ -169,7 +169,14 @@
     }
   }
 
+  function formatMb(bytes) {
+    return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
+  }
+
   async function uploadClip(matchId, picked) {
+    // Total bytes of what actually goes out, so the toast can report the
+    // upload instead of a file count the operator cannot act on.
+    const uploadBytes = picked.segments.reduce((sum, s) => sum + s.blob.size, 0);
     const begin = await send({
       type: "upload-begin",
       meta: {
@@ -193,7 +200,7 @@
           err.loginUrl = m.loginUrl;
           reject(err);
         } else if (m.type === "progress") {
-          toast(`上传中 ${m.files}/${picked.segments.length}…`, "", 10_000);
+          toast(`正在上传 ${formatMb(uploadBytes)}…`, "", 10_000);
         }
       });
       port.onDisconnect.addListener(() => reject(new Error("上传连接断开")));
@@ -216,7 +223,7 @@
       }
     });
     port.disconnect();
-    return result;
+    return { ...result, uploadBytes };
   }
 
   let review = null;      // open ReviewOverlay, if any
@@ -244,23 +251,32 @@
     toast("生成中…", "", 10_000);
     try {
       const picked = await recorder.finish(range);
+      const startedAt = Date.now();
       const result = await uploadClip(matchId, picked);
+      // Split the wait the operator just sat through: how long the upload
+      // took vs how long the server spent encoding. Before this the single
+      // 「上传中」 toast covered both and neither could be told apart.
+      const encodeMs = Number(result.encode_ms) || 0;
+      const uploadSeconds = Math.max(0, Date.now() - startedAt - encodeMs) / 1000;
+      const timing =
+        `上传 ${formatMb(result.uploadBytes)} 用 ${uploadSeconds.toFixed(1)} 秒` +
+        ` · 生成 ${(encodeMs / 1000).toFixed(1)} 秒`;
       const size = `${(result.bytes / 1024 / 1024).toFixed(2)} MB`;
       // Say where it landed: without the side panel open, this toast is the
       // only place the operator learns whether 「再截一个视角」 caught this one.
       const appended = result.appended || null;
       if (appended && appended.error) {
-        toast(`GIF 已生成（${size}），但未能追加，已单独保存`, "warn", 4000);
+        toast(`GIF 已生成（${size}），但未能追加，已单独保存 · ${timing}`, "warn", 4000);
       } else if (appended && appended.main) {
         const conflict = appended.push_state && appended.push_state.state === "conflict";
         toast(
           `GIF 已生成（${size}），已追加为第 ${appended.gif_count} 张` +
-            (conflict ? "；⚠ 对应的推送和主图不是同一条" : ""),
+            (conflict ? "；⚠ 对应的推送和主图不是同一条" : "") + ` · ${timing}`,
           conflict ? "warn" : "ok",
           conflict ? 5000 : 3000,
         );
       } else {
-        toast(`GIF 已生成（${size}）`, "ok", 3000);
+        toast(`GIF 已生成（${size}）· ${timing}`, "ok", 3000);
       }
       await send({ type: "clip-created", matchId, name: result.name, appended });
     } catch (err) {

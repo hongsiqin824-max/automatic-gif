@@ -34,7 +34,7 @@
 manifest.json       MV3；content_scripts all_frames；commands Alt+1/2/0；side_panel
 background.js       唯一和 8901 通信的地方（带 Cookie）；按 tab 记比赛和是否显示；选主录制 frame；上传中转；图标/快捷键打开侧栏
 content/toast.js    每个 frame 的右上角提示
-content/recorder.js 30 s 分段滚动缓冲；selectSegments 纯函数
+content/recorder.js 30 s 分段滚动缓冲；完整画面间隔 2 s；出图时只切出需要的数据块上传；selectSegments / indexClusters / sliceRange 纯函数
 content/finder.js   找最大在播 video、上报、被选中后录制、处理设起点/结束、分块上传
 content/bar.js      顶层 frame 的小条（Shadow DOM，可拖；没显示时不创建、不轮询）
 panel.html/.js      侧栏：iframe 指向 8901 `/?mode=panel&match_id=…`，转发 postMessage

@@ -980,5 +980,229 @@ out(h.store.session["tab:9"]);
         self.assertEqual(r, {"matchId": "123", "mainFrameId": 2, "shown": True})
 
 
+class ExtensionClusterSliceTests(unittest.TestCase):
+    """``indexClusters`` / ``sliceRange`` in recorder.js, run under node.
+
+    The extension uploads only the webm clusters covering the clip instead of
+    whole 30 s segments. Anything that cannot be indexed must return null so
+    the caller falls back to uploading the segment unchanged.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import shutil
+
+        cls.node = shutil.which("node")
+        if not cls.node:
+            raise unittest.SkipTest("node 不可用")
+        cls.script = Path(__file__).parent / "extension" / "gif-clipper" / "content" / "recorder.js"
+        if not cls.script.is_file():
+            raise unittest.SkipTest("recorder.js missing")
+
+    def run_js(self, body: str):
+        script = (
+            f"const {{ indexClusters, sliceRange, buildCut }} = require({json.dumps(str(self.script))});"
+            "const fs = require('fs');"
+            "const out = (v) => process.stdout.write(JSON.stringify(v));"
+            + body
+        )
+        result = subprocess.run([self.node, "-e", script], capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def _make_webm(
+        self, path: Path, seconds: int, keyframe_seconds: int = 2, pattern: str = "testsrc"
+    ) -> None:
+        import monitor_server
+
+        command = [
+            monitor_server.resolve_ffmpeg(), "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "lavfi", "-i", f"{pattern}=s=320x180:d={seconds}:r=30",
+            "-c:v", "libvpx", "-b:v", "500k", "-g", str(keyframe_seconds * 30),
+            "-t", str(seconds), str(path),
+        ]
+        result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        if result.returncode != 0:
+            self.skipTest("本机 ffmpeg 无法生成 webm 测试片段")
+
+    def test_garbage_and_truncated_input_fall_back(self):
+        r = self.run_js(
+            """
+const cases = {
+  empty: indexClusters(new Uint8Array(0)),
+  garbage: indexClusters(new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8])),
+  headerOnly: indexClusters(new Uint8Array([0x1a, 0x45, 0xdf, 0xa3, 0x84, 0, 0, 0, 0])),
+};
+out(Object.fromEntries(Object.entries(cases).map(([k, v]) => [k, v === null])));
+"""
+        )
+        self.assertEqual(r, {"empty": True, "garbage": True, "headerOnly": True})
+        # sliceRange must tolerate a null index (that is the fallback path).
+        self.assertTrue(self.run_js("out(sliceRange(null, 0, 30000, 1000, 2000) === null);"))
+
+    def test_indexes_real_webm_clusters(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "seg.webm"
+            self._make_webm(path, 10, keyframe_seconds=2)
+            r = self.run_js(
+                f"""
+const bytes = new Uint8Array(fs.readFileSync({json.dumps(str(path))}));
+const index = indexClusters(bytes);
+out({{ clusters: index.clusters.length, headerEnd: index.headerEnd,
+       timecodes: index.clusters.map((c) => c.timecodeMs),
+       ordered: index.clusters.every((c, i, a) => i === 0 || c.offset > a[i - 1].offset) }});
+"""
+            )
+        # 10 s at a 2 s keyframe interval: a cluster every 2 s.
+        self.assertEqual(r["clusters"], 5)
+        self.assertEqual(r["timecodes"], [0, 2000, 4000, 6000, 8000])
+        self.assertGreater(r["headerEnd"], 0)
+        self.assertTrue(r["ordered"])
+
+    def test_slice_keeps_only_the_clusters_the_clip_needs(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "seg.webm"
+            self._make_webm(path, 10, keyframe_seconds=2)
+            size = path.stat().st_size
+            r = self.run_js(
+                f"""
+const bytes = new Uint8Array(fs.readFileSync({json.dumps(str(path))}));
+const index = indexClusters(bytes);
+// Segment ran from epoch 100000 for 10 s; ask for 1 s starting at +5.0 s.
+const r = sliceRange(index, 100000, 10000, 105000, 106000);
+out({{ startEpochMs: r.startEpochMs, durationMs: r.durationMs,
+       cut: r.indexHeaderEnd + (r.end - r.start), whole: bytes.length }});
+"""
+            )
+        # The keyframe at +4 s is the one before the clip, so that is where the
+        # upload starts, and it runs to the next keyframe after the end (+6 s).
+        self.assertEqual(r["startEpochMs"], 104000)
+        self.assertEqual(r["durationMs"], 2000)
+        self.assertLess(r["cut"], size // 2)
+
+    def test_whole_segment_request_falls_back(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "seg.webm"
+            self._make_webm(path, 10, keyframe_seconds=2)
+            r = self.run_js(
+                f"""
+const bytes = new Uint8Array(fs.readFileSync({json.dumps(str(path))}));
+const index = indexClusters(bytes);
+// Asking for the entire segment cannot shrink anything: expect null so the
+// caller uploads the original blob untouched.
+out(sliceRange(index, 100000, 10000, 100000, 110000) === null);
+"""
+            )
+        self.assertTrue(r)
+
+    def test_sliced_upload_encodes_the_same_frames_as_the_whole_segment(self):
+        """End-to-end: the GIF from a sliced upload is identical to the whole one."""
+        import monitor_server
+
+        ffmpeg = monitor_server.resolve_ffmpeg()
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            whole_src = root / "seg.webm"
+            self._make_webm(whole_src, 12, keyframe_seconds=2)
+            seg_start, seg_duration = 100_000, 12_000
+            want_start = seg_start + 5_300          # mid-clip, not on a keyframe
+            want_end = want_start + 3_000
+            cut_src = root / "cut.webm"
+            cut = self.run_js(
+                f"""
+const bytes = new Uint8Array(fs.readFileSync({json.dumps(str(whole_src))}));
+const index = indexClusters(bytes);
+const r = sliceRange(index, {seg_start}, {seg_duration}, {want_start}, {want_end});
+fs.writeFileSync({json.dumps(str(cut_src))}, buildCut(bytes, index, r));
+out({{ startEpochMs: r.startEpochMs, durationMs: r.durationMs }});
+"""
+            )
+            self.assertLess(cut_src.stat().st_size, whole_src.stat().st_size)
+
+            def encode(source: Path, segments: list[dict], name: str) -> Path:
+                ss, window = compute_trim(segments, want_start, want_end)
+                output = root / name
+                encode_from_webm(
+                    ffmpeg, [source], ss, window,
+                    monitor_server._clip_video_filter(None), output,
+                )
+                return output
+
+            def frame_hashes(gif: Path) -> list[str]:
+                raw = subprocess.run(
+                    [ffmpeg, "-nostdin", "-v", "error", "-i", str(gif), "-f", "framehash", "-"],
+                    capture_output=True, text=True,
+                )
+                return [l for l in raw.stdout.splitlines() if l and not l.startswith("#")]
+
+            whole_gif = encode(
+                whole_src,
+                [{"start_epoch_ms": seg_start, "duration_ms": seg_duration}],
+                "whole.gif",
+            )
+            cut_gif = encode(
+                cut_src,
+                [{"start_epoch_ms": cut["startEpochMs"], "duration_ms": cut["durationMs"]}],
+                "cut.gif",
+            )
+            whole_frames, cut_frames = frame_hashes(whole_gif), frame_hashes(cut_gif)
+
+        self.assertGreater(len(whole_frames), 0)
+        self.assertEqual(whole_frames, cut_frames)
+
+    def test_clip_across_the_seam_encodes_the_same_frames(self):
+        """A clip spanning two segments: tail of the first + head of the second."""
+        import monitor_server
+
+        ffmpeg = monitor_server.resolve_ffmpeg()
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # Different patterns, so footage landing in the wrong place shows up.
+            sources = [root / "seg_a.webm", root / "seg_b.webm"]
+            self._make_webm(sources[0], 12, keyframe_seconds=2, pattern="testsrc")
+            self._make_webm(sources[1], 12, keyframe_seconds=2, pattern="testsrc2")
+            seg_meta = [
+                {"start_epoch_ms": 100_000, "duration_ms": 12_000},
+                {"start_epoch_ms": 112_000, "duration_ms": 12_000},
+            ]
+            want_start = 109_300   # 2.7 s before the seam
+            want_end = 114_500     # 2.5 s after it
+
+            cuts = []
+            for index, (src, meta) in enumerate(zip(sources, seg_meta)):
+                cut_path = root / f"cut_{index}.webm"
+                r = self.run_js(
+                    f"""
+const bytes = new Uint8Array(fs.readFileSync({json.dumps(str(src))}));
+const index = indexClusters(bytes);
+const r = sliceRange(index, {meta["start_epoch_ms"]}, {meta["duration_ms"]}, {want_start}, {want_end});
+fs.writeFileSync({json.dumps(str(cut_path))}, buildCut(bytes, index, r));
+out({{ start_epoch_ms: r.startEpochMs, duration_ms: r.durationMs }});
+"""
+                )
+                self.assertLess(cut_path.stat().st_size, src.stat().st_size)
+                cuts.append((cut_path, r))
+
+            def encode(files: list[Path], segments: list[dict], name: str) -> list[str]:
+                ss, window = compute_trim(segments, want_start, want_end)
+                output = root / name
+                encode_from_webm(
+                    ffmpeg, files, ss, window,
+                    monitor_server._clip_video_filter(None), output,
+                )
+                raw = subprocess.run(
+                    [ffmpeg, "-nostdin", "-v", "error", "-i", str(output), "-f", "framehash", "-"],
+                    capture_output=True, text=True,
+                )
+                return [l for l in raw.stdout.splitlines() if l and not l.startswith("#")]
+
+            whole_frames = encode(sources, seg_meta, "whole.gif")
+            cut_frames = encode([c[0] for c in cuts], [c[1] for c in cuts], "cut.gif")
+
+        self.assertGreater(len(whole_frames), 0)
+        self.assertEqual(len(whole_frames), len(cut_frames))
+        self.assertEqual(whole_frames, cut_frames)
+
+
 if __name__ == "__main__":
     unittest.main()

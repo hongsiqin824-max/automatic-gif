@@ -406,6 +406,7 @@ def install_extension_routes(
         # Claimed before the slow encode, same as the page capture: a second
         # upload already in flight must find the mode used up.
         append_claim = hooks.take_append_target(match_id) if hooks.take_append_target else None
+        encode_started = time.perf_counter()
         try:
             encode_from_webm(
                 hooks.resolve_ffmpeg(), sources, ss, window,
@@ -462,6 +463,7 @@ def install_extension_routes(
             capture_mode=capture_mode,
             files=len(sources),
             upload_bytes=total_bytes,
+            encode_ms=round((time.perf_counter() - encode_started) * 1000),
             ss=ss,
             window=window,
             crop=crop,
@@ -485,6 +487,8 @@ def install_extension_routes(
                 "crop": crop,
                 "clip_url": f"clips/{match_id}/{output_path.name}",
                 "bytes": output_path.stat().st_size,
+                "upload_bytes": total_bytes,
+                "encode_ms": round((time.perf_counter() - encode_started) * 1000),
                 "publish_enabled": hooks.publish_enabled(),
                 "delivery_mode": hooks.delivery_mode(),
                 "event_key": event_key,
