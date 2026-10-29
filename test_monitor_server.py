@@ -1785,9 +1785,12 @@ class PublishRecordsEndpointTests(unittest.TestCase):
         self.client = monitor_server.app.test_client()
         self.queue = mock.Mock()
         self.queue.delivered_between.return_value = [{"event_key": "manual_1"}]
+        self.alerts = mock.Mock()
+        self.alerts.between.return_value = [{"seq": 7, "event_type": "red_card"}]
         self._patches = [
             mock.patch.object(monitor_server, "REPORT_TOKEN", "secret"),
             mock.patch.object(monitor_server, "manual_draft_queue", self.queue),
+            mock.patch.object(monitor_server, "alert_store", self.alerts),
         ]
         for patch in self._patches:
             patch.start()
@@ -1804,6 +1807,8 @@ class PublishRecordsEndpointTests(unittest.TestCase):
         response = self._get()
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["records"], [{"event_key": "manual_1"}])
+        self.assertEqual(response.get_json()["alerts"], [{"seq": 7, "event_type": "red_card"}])
+        self.alerts.between.assert_called_once_with(100.0, 200.0)
         self.queue.delivered_between.assert_called_once_with(
             100.0, 200.0, artifact_kind=monitor_server.MANUAL_ARTIFACT_KIND
         )
@@ -1843,6 +1848,19 @@ class AlertStorePersistenceTests(unittest.TestCase):
                 "minute": "1H 23", "dedup_key": key}
         body.update(extra)
         return body
+
+    def test_between_reads_beyond_the_ring_from_sqlite(self):
+        store = monitor_server._AlertStore(2, self.db)
+        for i in range(4):
+            store.add(self._event(f"w{i}"))
+        stamps = [e["ts_unix"] for e in store.between(0, time.time() + 1)]
+        # Ring holds 2, SQLite holds all 4; the half-open window cuts the last.
+        self.assertEqual(len(stamps), 4)
+        self.assertEqual(len(store.between(0, stamps[-1])), 3)
+        store.close()
+        memory_only = monitor_server._AlertStore(5)
+        memory_only.add(self._event("m"))
+        self.assertEqual(len(memory_only.between(0, time.time() + 1)), 1)
 
     def test_reload_restores_events_seq_and_dedup(self):
         store = monitor_server._AlertStore(50, self.db)

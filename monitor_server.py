@@ -635,6 +635,36 @@ class _AlertStore:
                 and since_ts <= float(item.get("ts_unix") or 0.0) <= until_ts
             ]
 
+    def between(self, since_ts: float, until_ts: float) -> list[dict[str, Any]]:
+        """All alerts with ``since_ts <= ts_unix < until_ts``, oldest first.
+
+        Read from SQLite when persisted (a busy day can outgrow the ring),
+        otherwise from the in-memory ring.
+        """
+        with self._lock:
+            if self._db is None:
+                return [
+                    dict(item)
+                    for item in self._events
+                    if since_ts <= float(item.get("ts_unix") or 0.0) < until_ts
+                ]
+            try:
+                rows = self._db.execute(
+                    "SELECT event_json FROM monitor_alerts WHERE ts_unix >= ? AND ts_unix < ? ORDER BY seq",
+                    (float(since_ts), float(until_ts)),
+                ).fetchall()
+            except sqlite3.Error:
+                return []
+        alerts = []
+        for (event_json,) in rows:
+            try:
+                event = json.loads(event_json)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(event, dict):
+                alerts.append(event)
+        return alerts
+
     def close(self) -> None:
         with self._lock:
             if self._db is not None:
@@ -3381,10 +3411,13 @@ def monitor_publish_records():
         return jsonify({"error": "since/until 必须是 unix 秒"}), 400
     if not since < until or until - since > REPORT_MAX_RANGE_SECONDS:
         return jsonify({"error": "时间范围无效或超过 3 天"}), 400
+    # Goal / red-card pushes received in the window: their ``ts_unix`` is the
+    # data-source moment for events the CMS change log does not timestamp.
+    alerts = alert_store.between(since, until)
     if manual_draft_queue is None:
-        return jsonify({"enabled": False, "records": []})
+        return jsonify({"enabled": False, "records": [], "alerts": alerts})
     records = manual_draft_queue.delivered_between(since, until, artifact_kind=MANUAL_ARTIFACT_KIND)
-    return jsonify({"enabled": True, "since": since, "until": until, "records": records})
+    return jsonify({"enabled": True, "since": since, "until": until, "records": records, "alerts": alerts})
 
 
 @app.get("/api/monitor/clips")
