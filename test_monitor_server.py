@@ -2114,6 +2114,7 @@ class ClipEndpointAlertMatchTests(unittest.TestCase):
         self.assertNotIn("manual_match_event", event)
         self.assertEqual(event["alert_match_mode"], "alert")
 
+    @mock.patch.object(monitor_server, "SCORE_EVENT_TYPES", frozenset({1, 2}))
     def test_red_card_push_prefills_type_4_without_score(self):
         with mock.patch.object(monitor_server.time, "time", return_value=self.base - 60.0):
             self.store.add({"match_id": "54622319", "event_type": "red_card", "team": "A",
@@ -2124,6 +2125,7 @@ class ClipEndpointAlertMatchTests(unittest.TestCase):
         event = self.queue.enqueue.call_args.kwargs["event"]
         self.assertEqual((event["match_event"], event["code"], event["minute"], event["score"]), (4, "RC", "30", ""))
 
+    @mock.patch.object(monitor_server, "SCORE_EVENT_TYPES", frozenset({1, 2}))
     def test_score_is_dropped_for_types_outside_goal_and_penalty(self):
         with mock.patch.object(monitor_server.time, "time", return_value=self.base - 60.0):
             self.store.add({"match_id": "54622319", "event_type": "goal", "team": "B",
