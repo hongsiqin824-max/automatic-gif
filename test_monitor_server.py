@@ -1778,6 +1778,56 @@ class EventAlertTests(unittest.TestCase):
             self.assertTrue(ok.get_json()["accepted"])
 
 
+class PublishRecordsEndpointTests(unittest.TestCase):
+    """``/api/monitor/publish/records``: token-guarded read-only report feed."""
+
+    def setUp(self):
+        self.client = monitor_server.app.test_client()
+        self.queue = mock.Mock()
+        self.queue.delivered_between.return_value = [{"event_key": "manual_1"}]
+        self._patches = [
+            mock.patch.object(monitor_server, "REPORT_TOKEN", "secret"),
+            mock.patch.object(monitor_server, "manual_draft_queue", self.queue),
+        ]
+        for patch in self._patches:
+            patch.start()
+
+    def tearDown(self):
+        for patch in reversed(self._patches):
+            patch.stop()
+
+    def _get(self, query="since=100&until=200", token="secret"):
+        headers = {"X-Report-Token": token} if token is not None else {}
+        return self.client.get(f"/api/monitor/publish/records?{query}", headers=headers)
+
+    def test_returns_records_for_range(self):
+        response = self._get()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["records"], [{"event_key": "manual_1"}])
+        self.queue.delivered_between.assert_called_once_with(
+            100.0, 200.0, artifact_kind=monitor_server.MANUAL_ARTIFACT_KIND
+        )
+
+    def test_rejects_missing_or_wrong_token(self):
+        self.assertEqual(self._get(token=None).status_code, 401)
+        self.assertEqual(self._get(token="nope").status_code, 401)
+        self.queue.delivered_between.assert_not_called()
+
+    def test_absent_when_token_unset(self):
+        with mock.patch.object(monitor_server, "REPORT_TOKEN", ""):
+            self.assertEqual(self._get().status_code, 404)
+
+    def test_rejects_bad_range(self):
+        self.assertEqual(self._get("since=x&until=200").status_code, 400)
+        self.assertEqual(self._get("since=200&until=100").status_code, 400)
+        self.assertEqual(self._get(f"since=0&until={4 * 24 * 3600}").status_code, 400)
+
+    def test_exempt_from_feishu_login(self):
+        from feishu_auth import EXEMPT_PATHS
+
+        self.assertIn("/api/monitor/publish/records", EXEMPT_PATHS)
+
+
 class AlertStorePersistenceTests(unittest.TestCase):
     """``_AlertStore`` survives a restart via its SQLite mirror."""
 

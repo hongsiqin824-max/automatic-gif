@@ -1329,6 +1329,37 @@ class ManualClipQueueTests(ArticleDraftQueueTests):
             "",
         )
 
+    def test_delivered_between_lists_settled_manual_clips_in_range(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            queue = self.make_queue(
+                root,
+                SequencePlatformClient(),
+                claim_artifact_kinds=(MANUAL_ARTIFACT_KIND,),
+            )
+            source = self._write_manual_source(root)
+            queue.enqueue(
+                match_id="54478914",
+                event={"event_key": "manual_100", "code": "G", "clip_source": "extension"},
+                match_detail={"team_A_name": "主队", "team_B_name": "客队"},
+                source_path=source,
+                artifact_kind=MANUAL_ARTIFACT_KIND,
+                artifact_result=None,
+            )
+            now = time.time()
+            # Still queued: not delivered yet, so not listed.
+            self.assertEqual(queue.delivered_between(now - 60, now + 60), [])
+            self.assertTrue(queue.run_once())
+            records = queue.delivered_between(now - 60, now + 60)
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["event_key"], "manual_100")
+            self.assertEqual(records[0]["match_detail"]["team_A_name"], "主队")
+            self.assertEqual(records[0]["final_event"]["clip_source"], "extension")
+            self.assertIsNotNone(records[0]["draft_created_at_unix"])
+            # Outside the window, and for another artifact kind: nothing.
+            self.assertEqual(queue.delivered_between(now + 60, now + 120), [])
+            self.assertEqual(queue.delivered_between(now - 60, now + 60, artifact_kind="ocr_window"), [])
+
     def test_manual_draft_mode_creates_unpublished_draft(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

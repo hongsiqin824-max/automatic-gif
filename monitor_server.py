@@ -259,6 +259,11 @@ PUBLISH_FAIL_ALERT_AFTER_ATTEMPTS = int(_env_seconds_or_off("GIF_MONITOR_PUBLISH
 PUBLISH_FAIL_ALERT_COOLDOWN_SECONDS = _env_seconds_or_off("GIF_MONITOR_PUBLISH_FAIL_ALERT_COOLDOWN_SECONDS", 600.0)
 # Optional shared secret for the monitor→8901 loopback call. Empty = no check.
 ALERT_INGEST_TOKEN = os.environ.get("GIF_MONITOR_INGEST_TOKEN", "").strip()
+# Shared secret for the read-only publish-records API used by the daily GIF
+# latency report. Empty = the API answers 404, i.e. it does not exist.
+REPORT_TOKEN = os.environ.get("GIF_MONITOR_REPORT_TOKEN", "").strip()
+# One report call may not span more than this, so a typo cannot dump the DB.
+REPORT_MAX_RANGE_SECONDS = 3 * 24 * 3600
 # Ring size for the page cursor and for clip→alert matching. A busy weekend has
 # a dozen concurrent matches, so a few hundred keeps a whole evening in reach.
 ALERT_BUFFER_SIZE = positive_env_int("GIF_MONITOR_ALERT_BUFFER", 500)
@@ -3359,6 +3364,27 @@ def monitor_publish_status():
             "records": records,
         }
     )
+
+
+@app.get("/api/monitor/publish/records")
+def monitor_publish_records():
+    """Delivered manual clips in ``[since, until)`` (unix seconds), for the
+    daily GIF latency report. Token-only (no Feishu login), read-only."""
+    if not REPORT_TOKEN:
+        abort(404)
+    if not hmac.compare_digest(request.headers.get("X-Report-Token", ""), REPORT_TOKEN):
+        return jsonify({"error": "unauthorized"}), 401
+    try:
+        since = float(request.args.get("since", ""))
+        until = float(request.args.get("until", ""))
+    except ValueError:
+        return jsonify({"error": "since/until 必须是 unix 秒"}), 400
+    if not since < until or until - since > REPORT_MAX_RANGE_SECONDS:
+        return jsonify({"error": "时间范围无效或超过 3 天"}), 400
+    if manual_draft_queue is None:
+        return jsonify({"enabled": False, "records": []})
+    records = manual_draft_queue.delivered_between(since, until, artifact_kind=MANUAL_ARTIFACT_KIND)
+    return jsonify({"enabled": True, "since": since, "until": until, "records": records})
 
 
 @app.get("/api/monitor/clips")

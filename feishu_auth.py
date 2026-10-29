@@ -15,8 +15,10 @@ Behaviour contract:
   the Feishu web OAuth flow; ``fetch`` API calls receive
   ``401 {"error": ..., "login_url": ...}`` and the frontend navigates there.
 * ``/api/health`` (release health check), ``/api/monitor/events/ingest``
-  (machine call guarded by its own ``X-Monitor-Token``), ``/static/`` assets
-  and the auth routes themselves stay reachable without a session.
+  (machine call guarded by its own ``X-Monitor-Token``),
+  ``/api/monitor/publish/records`` (report call guarded by ``X-Report-Token``),
+  ``/static/`` assets and the auth routes themselves stay reachable without a
+  session.
 * The signed-cookie secret is read from ``GIF_MONITOR_AUTH_SECRET`` or, when
   empty, generated once and persisted to ``data/monitor_auth_secret`` so a
   restart does not log every operator out.
@@ -121,8 +123,8 @@ GUEST_RECOVER_TTL_SECONDS = 7 * 24 * 3600
 # Reachable without a login session. Prefixes end with "/" on purpose so
 # "/static/x" matches but a hypothetical "/staticfoo" does not.
 EXEMPT_PATHS = frozenset(
-    {"/api/health", "/api/monitor/events/ingest", "/favicon.ico", PENDING_PAGE_PATH,
-     GUEST_PAGE_PATH}
+    {"/api/health", "/api/monitor/events/ingest", "/api/monitor/publish/records",
+     "/favicon.ico", PENDING_PAGE_PATH, GUEST_PAGE_PATH}
 )
 EXEMPT_PREFIXES = ("/static/", "/api/auth/")
 

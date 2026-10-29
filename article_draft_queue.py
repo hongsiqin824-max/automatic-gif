@@ -927,6 +927,42 @@ class ArticleDraftQueue:
             records.setdefault(str(row["event_key"]), _public_task(row))
         return records
 
+    def delivered_between(
+        self,
+        since_unix: float,
+        until_unix: float,
+        artifact_kind: str = MANUAL_ARTIFACT_KIND,
+    ) -> list[dict[str, Any]]:
+        """Delivered (published or terminal-drafted) tasks in ``[since, until)``.
+
+        The delivery moment is ``published_at_unix`` for published rows and
+        ``draft_created_at_unix`` for drafts. Each record also carries the
+        ``match_detail`` captured at enqueue so a reader can name the match
+        without a second lookup. Oldest first.
+        """
+        if not self.database_path.exists():
+            return []
+        try:
+            with self._connect() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT * FROM article_delivery_tasks
+                    WHERE artifact_kind = ? AND status IN ('published', 'drafted')
+                      AND COALESCE(published_at_unix, draft_created_at_unix) >= ?
+                      AND COALESCE(published_at_unix, draft_created_at_unix) < ?
+                    ORDER BY COALESCE(published_at_unix, draft_created_at_unix)
+                    """,
+                    (artifact_kind, float(since_unix), float(until_unix)),
+                ).fetchall()
+        except sqlite3.Error:
+            return []
+        records = []
+        for row in rows:
+            record = _public_task(row)
+            record["match_detail"] = _json_object(row["match_detail_json"]) or {}
+            records.append(record)
+        return records
+
     def records_by_source_name(
         self, match_id: str, artifact_kind: str = OCR_ARTIFACT_KIND
     ) -> dict[str, dict[str, Any]]:
