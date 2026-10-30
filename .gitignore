@@ -37,6 +37,15 @@ Thumbs.db
 # 本机接口密钥和运行配置
 .env
 .env.backup.*
+.env.bak*
+
+# 证书与私钥
+*.key
+*.crt
+*.pem
+
+# 根目录手工测试产物
+/*.gif
 
 # 运行日志
 *.log
