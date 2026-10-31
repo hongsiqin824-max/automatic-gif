@@ -77,6 +77,8 @@ class FakeOfficialImageClient:
                     "url": "/fastdfs8/M00/gif-event.gif",
                     "img1_url": "https://img1.qunliao.info/fastdfs8/M00/gif-event.gif",
                     "file_name": "event.gif",
+                    "width": 440,
+                    "height": 248,
                 },
                 {
                     "image_id": "cover-image",
@@ -220,9 +222,17 @@ class ArticlePublisherTests(unittest.TestCase):
                 "https://img1.qunliao.info/fastdfs8/M00/gif-event.gif",
             )
             self.assertEqual(created["gif"]["cover_url"], "/fastdfs8/M00/cover-event.jpg")
-            self.assertIn(
-                "https://img1.qunliao.info/fastdfs8/M00/gif-event.gif",
+            # The App opens the large image only from a bare FastDFS path plus
+            # the upload's pixel size.
+            self.assertEqual(
                 platform.calls[0]["body"],
+                '<p><img src="/fastdfs8/M00/gif-event.gif" data-width="440" data-height="248" /></p>',
+            )
+            # The reused mapping keeps no width/height: the path is derived from
+            # img1_url and the size is read from the local GIF header (1x1).
+            self.assertEqual(
+                platform.calls[1]["body"],
+                '<p><img src="/fastdfs8/M00/gif-event.gif" data-width="1" data-height="1" /></p>',
             )
             # The GIF's own FastDFS path is the cover; the second call reuses
             # the persisted mapping, which only keeps img1_url, so the path
@@ -741,6 +751,46 @@ class ArticlePublisherTests(unittest.TestCase):
         )
         self.assertEqual(fields["litpic"], "/fastdfs8/M00/a.gif")
 
+    def test_article_gif_src_and_size_fallbacks(self):
+        import article_publisher
+
+        with tempfile.TemporaryDirectory() as directory:
+            gif_path = Path(directory) / "a.gif"
+            gif_path.write_bytes(animated_gif_bytes())
+            official = {
+                "url": "https://img1.qunliao.info/fastdfs8/M00/a.gif",
+                "official_upload": True,
+                "official_gif_path": "/fastdfs8/M00/a.gif",
+                "path": str(gif_path),
+            }
+            # Official upload: bare FastDFS path and the upload's size.
+            self.assertEqual(
+                article_publisher._article_gif_src(official, True), "/fastdfs8/M00/a.gif"
+            )
+            self.assertEqual(
+                article_publisher._gif_size(
+                    {**official, "official_gif_width": "440", "official_gif_height": 248}
+                ),
+                (440, 248),
+            )
+            # Missing or invalid upload size: read the GIF header instead.
+            self.assertEqual(article_publisher._gif_size(official), (1, 1))
+            self.assertEqual(
+                article_publisher._gif_size(
+                    {**official, "official_gif_width": 0, "official_gif_height": "x"}
+                ),
+                (1, 1),
+            )
+            # Self-hosted / legacy uploads keep their full HTTPS URL.
+            legacy = {"url": "https://matchgif.aisportsapp.com/publish-gifs/a.gif", "path": str(gif_path)}
+            self.assertEqual(article_publisher._article_gif_src(legacy, False), legacy["url"])
+            # No readable GIF: no size, the body simply omits data-width/height.
+            self.assertIsNone(article_publisher._gif_size({"path": str(Path(directory) / "gone.gif")}))
+            not_gif = Path(directory) / "x.gif"
+            not_gif.write_bytes(b"not a gif at all")
+            self.assertIsNone(article_publisher._gif_size({"path": str(not_gif)}))
+            self.assertIsNone(article_publisher._gif_size({}))
+
     def test_gif_validation_requires_animation(self):
         info = inspect_animated_gif(animated_gif_bytes())
         self.assertEqual(info["frame_count"], 2)
@@ -871,19 +921,22 @@ class ArticlePublisherTests(unittest.TestCase):
             "cover_url": "https://matchgif.aisportsapp.com/publish-gif-covers/a.jpg",
             "title": "t",
         }
-        gif_p = '<p><img src="https://matchgif.aisportsapp.com/publish-gifs/a.gif" alt="比赛 GIF"></p>'
+        gif_p = '<p><img src="https://matchgif.aisportsapp.com/publish-gifs/a.gif" /></p>'
         # Several angles: one <p><img> per GIF, main first, footer after the last.
+        # Each GIF carries its own size; a missing size omits data-width/height.
         fields = build_article_fields(
             **common,
             extra_gif_urls=["https://matchgif.aisportsapp.com/publish-gifs/b.gif", "/fastdfs/c.gif"],
             allow_relative_media=True,
             body_footer="上咪咕独家看英超",
+            gif_sizes=[(440, 248), None, (360, 202)],
         )
         self.assertEqual(
             fields["body"],
-            gif_p
-            + '<p><img src="https://matchgif.aisportsapp.com/publish-gifs/b.gif" alt="比赛 GIF"></p>'
-            + '<p><img src="/fastdfs/c.gif" alt="比赛 GIF"></p>'
+            '<p><img src="https://matchgif.aisportsapp.com/publish-gifs/a.gif"'
+            ' data-width="440" data-height="248" /></p>'
+            + '<p><img src="https://matchgif.aisportsapp.com/publish-gifs/b.gif" /></p>'
+            + '<p><img src="/fastdfs/c.gif" data-width="360" data-height="202" /></p>'
             + "<p>上咪咕独家看英超</p>",
         )
         self.assertEqual(fields["litpic"], common["cover_url"])  # cover stays the main GIF's

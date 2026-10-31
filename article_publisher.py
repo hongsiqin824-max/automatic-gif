@@ -1727,6 +1727,8 @@ class ArticlePublisher:
             "official_upload": True,
             "official_gif_path": gif_path_url,
             "official_gif_url": gif_url,
+            "official_gif_width": gif_item.get("width"),
+            "official_gif_height": gif_item.get("height"),
             "official_cover_path": cover_url,
             "official_cover_url": cover_public_url,
             "upload_diagnostics": dict(
@@ -1791,10 +1793,11 @@ class ArticlePublisher:
                 else None
             )
             title = build_article_title(event, match_detail)
+            allow_relative_media = artifact_kind == "ocr_window" and _is_official_gif(gif)
             fields = build_article_fields(
                 match_id=match_id,
                 event=event,
-                gif_url=str(gif["url"]),
+                gif_url=_article_gif_src(gif, allow_relative_media),
                 cover_url=str(gif["cover_url"]),
                 litpic_url=_official_gif_litpic(gif),
                 title=title,
@@ -1802,13 +1805,8 @@ class ArticlePublisher:
                 channels=self.team_channels.channels_for(match_detail),
                 tabs=self.team_channels.tabs_for(match_detail),
                 body_footer=article_body_footer(match_detail),
-                allow_relative_media=bool(
-                    artifact_kind == "ocr_window"
-                    and (
-                        gif.get("official_upload")
-                        or gif.get("upload_source") == "official"
-                    )
-                ),
+                allow_relative_media=allow_relative_media,
+                gif_sizes=[_gif_size(gif)],
             )
             self._save_record(
                 stable_id=stable_id,
@@ -1983,10 +1981,13 @@ class ArticlePublisher:
             ):
                 publish_account = self._account_for_assignment(assignment_key, match_detail)
             title = build_article_title(event, match_detail)
+            # A reused DB mapping predates the in-memory marker, so infer
+            # official mode from its persisted upload source marker.
+            allow_relative_media = _is_official_gif(gif)
             fields = build_article_fields(
                 match_id=match_id,
                 event=event,
-                gif_url=str(gif["url"]),
+                gif_url=_article_gif_src(gif, allow_relative_media),
                 cover_url=str(gif["cover_url"]),
                 litpic_url=_official_gif_litpic(gif),
                 title=title,
@@ -1996,13 +1997,12 @@ class ArticlePublisher:
                 channels=self.team_channels.channels_for(match_detail),
                 tabs=self.team_channels.tabs_for(match_detail),
                 body_footer=article_body_footer(match_detail),
-                # A reused DB mapping predates the in-memory marker, so infer
-                # official mode from its persisted upload source marker.
-                allow_relative_media=bool(
-                    gif.get("official_upload")
-                    or gif.get("upload_source") == "official"
-                ),
-                extra_gif_urls=[str(extra["url"]) for extra in extra_gifs],
+                allow_relative_media=allow_relative_media,
+                extra_gif_urls=[
+                    _article_gif_src(extra, allow_relative_media and _is_official_gif(extra))
+                    for extra in extra_gifs
+                ],
+                gif_sizes=[_gif_size(item) for item in (gif, *extra_gifs)],
             )
             try:
                 self._verify_public_media(gif)
@@ -2332,6 +2332,7 @@ def build_article_fields(
     tabs: Sequence[str | int] = (),
     body_footer: str = "",
     extra_gif_urls: Sequence[str] = (),
+    gif_sizes: Sequence[tuple[int, int] | None] = (),
 ) -> dict[str, Any]:
     if delivery_mode not in {"publish", "draft"}:
         raise ArticlePublishError(
@@ -2393,9 +2394,13 @@ def build_article_fields(
         normalized_archive_id = int(archive_id_text)
     code = str(event.get("code") or "").upper()
     is_draft = delivery_mode == "draft"
-    # One paragraph per GIF, main angle first, no text between them.
+    # One paragraph per GIF, main angle first, no text between them. The App
+    # opens the large image only from this exact shape: a FastDFS path plus
+    # the pixel size the image upload returned.
+    sizes = list(gif_sizes)
     body = "".join(
-        f'<p><img src="{html.escape(url, quote=True)}" alt="比赛 GIF"></p>' for url in gif_urls
+        _article_gif_paragraph(url, sizes[index] if index < len(sizes) else None)
+        for index, url in enumerate(gif_urls)
     )
     footer_text = str(body_footer or "").strip()
     if footer_text:
@@ -2623,6 +2628,59 @@ def _is_media_reference(value: Any, *, allow_relative: bool = False) -> bool:
 def _is_relative_media_reference(value: Any) -> bool:
     text = str(value or "").strip()
     return bool(text) and _is_media_reference(text, allow_relative=True) and not _is_absolute_http_url(text)
+
+
+def _is_official_gif(gif: dict[str, Any]) -> bool:
+    return bool(gif.get("official_upload") or gif.get("upload_source") == "official")
+
+
+def _article_gif_src(gif: dict[str, Any], allow_relative_media: bool) -> str:
+    """``src`` for the article body: the bare FastDFS path when official.
+
+    Falls back to the full URL when the path cannot be derived or the GIF was
+    not uploaded through the official endpoint.
+    """
+    if allow_relative_media:
+        path = _official_gif_litpic(gif)
+        if path:
+            return path
+    return str(gif["url"])
+
+
+def _gif_size(gif: dict[str, Any]) -> tuple[int, int] | None:
+    """Pixel size: the upload response first, else the local GIF header.
+
+    A mapping reused from ``article_uploaded_gifs`` does not keep the upload
+    response's width/height; the logical screen size in the GIF header is the
+    same value.
+    """
+    width = gif.get("official_gif_width")
+    height = gif.get("official_gif_height")
+    try:
+        size = (int(width), int(height))
+    except (TypeError, ValueError):
+        size = (0, 0)
+    if size[0] > 0 and size[1] > 0:
+        return size
+    try:
+        with open(str(gif.get("path") or ""), "rb") as handle:
+            header = handle.read(10)
+    except OSError:
+        return None
+    if len(header) < 10 or header[:6] not in GIF_HEADERS:
+        return None
+    size = (
+        int.from_bytes(header[6:8], "little"),
+        int.from_bytes(header[8:10], "little"),
+    )
+    return size if size[0] > 0 and size[1] > 0 else None
+
+
+def _article_gif_paragraph(url: str, size: tuple[int, int] | None) -> str:
+    attrs = f'src="{html.escape(url, quote=True)}"'
+    if size:
+        attrs += f' data-width="{size[0]}" data-height="{size[1]}"'
+    return f"<p><img {attrs} /></p>"
 
 
 def _official_gif_litpic(gif: dict[str, Any]) -> str:
