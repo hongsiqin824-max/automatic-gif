@@ -46,6 +46,7 @@ from publish_account_pool import (
 )
 from article_draft_queue import ArticleDraftQueue, ocr_publication_eligibility
 from disk_lifecycle import DiskLifecycleManager, DiskLifecyclePolicy
+from dqd_api import read_response_body
 from event_api_response import EventApiResponseError, normalize_event_api_response
 from heavy_task_coordinator import HeavyTaskCoordinator, HeavyTaskCoordinatorError
 from match_event_identity import events_represent_same_incident
@@ -218,7 +219,10 @@ DEFAULT_SOURCE_URL = (
     "https://openapi.dongqiudi.com/internal/sport-data/inner/tool/"
     "match/live_source/query"
 )
-MATCH_CATALOG_URL = "https://api.dongqiudi.com/data/tab/new/lotzc"
+# Same internal-gateway catalog as 8901's match_catalog.py (byte-identical to
+# the old public api.dongqiudi.com/data/tab/new/lotzc); fetched gzipped.
+MATCH_CATALOG_URL = "https://openapi.dongqiudi.com/internal/api/data/tab/new/whole"
+MATCH_CATALOG_TIMEOUT_SECONDS = 15.0
 MATCH_CATALOG_REFRESH_SECONDS = 120.0
 MATCH_CATALOG_BACKOFF_SECONDS = (5.0, 10.0, 20.0, 30.0)
 MATCH_CATALOG_LIMIT = 20
@@ -447,20 +451,19 @@ def _json_request(
     method: str = "GET",
     body: dict[str, Any] | None = None,
     timeout: float = 8.0,
+    accept_gzip: bool = False,
 ) -> dict[str, Any]:
     payload = None if body is None else json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=payload,
-        method=method,
-        headers={
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-            "User-Agent": "football-gif-dashboard/1.0",
-        },
-    )
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": "football-gif-dashboard/1.0",
+    }
+    if accept_gzip:
+        headers["Accept-Encoding"] = "gzip"
+    req = urllib.request.Request(url, data=payload, method=method, headers=headers)
     with urllib.request.urlopen(req, timeout=timeout) as response:
-        value = json.loads(response.read().decode("utf-8"))
+        value = json.loads(read_response_body(response).decode("utf-8"))
     if not isinstance(value, dict):
         raise ValueError("API response must be a JSON object")
     return value
@@ -671,7 +674,9 @@ class MatchCatalog:
         url = MATCH_CATALOG_URL + "?" + urllib.parse.urlencode(
             {"start": query_start, "init": "1", "user": _user()}
         )
-        payload = _json_request(url)
+        payload = _json_request(
+            url, timeout=MATCH_CATALOG_TIMEOUT_SECONDS, accept_gzip=True
+        )
         rows = payload.get("list")
         if not isinstance(rows, list):
             raise ValueError("赛事目录响应缺少有效的 list 数组")

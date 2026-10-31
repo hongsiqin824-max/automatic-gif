@@ -22,13 +22,18 @@ from dqd_api import (
 )
 
 
-MATCH_CATALOG_URL = "https://api.dongqiudi.com/data/tab/new/lotzc"
+# Internal-gateway copy of the old public ``api.dongqiudi.com/data/tab/new/lotzc``:
+# same query (start/init/user) and byte-identical body (verified 2026-10-31).
+# The body is ~2.2 MB of six days of matches, so it is fetched gzipped
+# (~190 KB on the wire); an uncached answer takes 3-5 s, hence the timeout.
+MATCH_CATALOG_URL = "https://openapi.dongqiudi.com/internal/api/data/tab/new/whole"
+MATCH_CATALOG_TIMEOUT_SECONDS = 15.0
 # Lazy refresh: re-pulled on the next /matches request once this old. The
 # list page polls every 60s; 55s (not 60s) keeps the two from beating against
 # each other — at exactly 60s a poll arriving a few ms early would find the
 # cache "not yet due" and the pull would slip to the next minute. Bounds a
 # new kick-off's appearance at ~2 minutes worst case (was ~3 at 120s). One
-# tiny request per minute against the directory; 8899 keeps its own copy.
+# request per minute at most against the directory; 8899 keeps its own copy.
 MATCH_CATALOG_REFRESH_SECONDS = 55.0
 MATCH_CATALOG_BACKOFF_SECONDS = (5.0, 10.0, 20.0, 30.0)
 MATCH_CATALOG_LIMIT = 20
@@ -123,7 +128,9 @@ class MatchCatalog:
         url = MATCH_CATALOG_URL + "?" + urllib.parse.urlencode(
             {"start": query_start, "init": "1", "user": match_user()}
         )
-        payload = request_json(url)
+        payload = request_json(
+            url, timeout=MATCH_CATALOG_TIMEOUT_SECONDS, accept_gzip=True
+        )
         rows = payload.get("list")
         if not isinstance(rows, list):
             raise ValueError("赛事目录响应缺少有效的 list 数组")
