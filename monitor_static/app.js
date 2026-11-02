@@ -45,6 +45,8 @@ const state = {
   stageUserActionAt: 0,
   stageOpenedAt: 0,      // Date.now() of the last openStage (ignore its own pause/seek noise)
   draftPoll: null,       // {matchId, timer, polls} while awaiting draft links
+  playerPoll: null,      // {matchId, timer, inFlight} while push players are pending
+  stagePlayers: null,    // Map seq -> {status, player, opponent_name} for the stage match
   alertSeq: 0,           // cursor: last event seq the page has rendered
   alertBootId: null,     // server boot id; a change means 8901 restarted
   alertInit: false,      // skip replaying history on the first poll
@@ -1108,10 +1110,69 @@ const MATCH_EVENT_OPTIONS = [
 // field is cleared and locked for the rest and the server drops it too.
 let scoreEventTypes = new Set([1, 2]);
 
+// "43' 进球 克赖切尔-佩雷斯 阿拉胡埃拉人2-0莫塔瓜": the side the push is about
+// first, with its own goals first, then the other side — the shape operators
+// write titles in, so the line can be copied as is. Pushes carry the score as
+// home-away, so an away-side push flips it. ``c.player`` (from the overview
+// API, arrives later) adds the scorer and swaps 进球 for 点球/乌龙. A red card
+// is only "38' 两黄变红 卡洛斯-桑托斯" — no score (the side's name stands in
+// until the player is known). Without a known side or both names a goal keeps
+// the plain "1' 进球 巴塞罗那 1-0".
 function candidateLabel(c) {
   const clock = c.match_time ? `${c.match_time}'` : '?';
-  const team = c.team_name || (c.team === 'A' ? '主队' : c.team === 'B' ? '客队' : '');
-  return [clock, c.event_cn || c.event_type, team, c.score].filter(Boolean).join(' ');
+  const player = c.player && c.player.person ? c.player : null;
+  const event = (player && player.event_cn) || c.event_cn || c.event_type;
+  const sideName = c.team_name || (c.team === 'A' ? '主队' : c.team === 'B' ? '客队' : '');
+  if (c.event_type === 'red_card') {
+    return [clock, event, player ? player.person : sideName].filter(Boolean).join(' ');
+  }
+  const who = player ? player.person : '';
+  const parts = /^(\d+)-(\d+)$/.exec(String(c.score || '').trim());
+  if ((c.team === 'A' || c.team === 'B') && c.team_name && c.opponent_name && parts) {
+    const score = c.team === 'A' ? `${parts[1]}-${parts[2]}` : `${parts[2]}-${parts[1]}`;
+    return [clock, event, who, `${c.team_name}${score}${c.opponent_name}`].filter(Boolean).join(' ');
+  }
+  return [clock, event, who, sideName, c.score].filter(Boolean).join(' ');
+}
+
+// Clipboard API first; the extension side panel shows this page in an iframe
+// where it may be blocked, so fall back to a hidden textarea + execCommand.
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch (err) {
+    const area = document.createElement('textarea');
+    area.value = text;
+    area.setAttribute('readonly', '');
+    area.style.position = 'fixed';
+    area.style.opacity = '0';
+    document.body.appendChild(area);
+    area.select();
+    let ok = false;
+    try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+    area.remove();
+    return ok;
+  }
+}
+
+// ``getText`` is read on click: the line changes when the player arrives.
+function buildCopyButton(getText) {
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'stage-clip-copy';
+  btn.textContent = '复制';
+  btn.title = '复制这一行';
+  btn.addEventListener('click', async (e) => {
+    // Inside the radio's <label>: copying must not also pick this push.
+    e.preventDefault();
+    e.stopPropagation();
+    const ok = await copyText(getText());
+    btn.textContent = ok ? '已复制' : '复制失败';
+    btn.classList.toggle('done', ok);
+    setTimeout(() => { btn.textContent = '复制'; btn.classList.remove('done'); }, 1500);
+  });
+  return btn;
 }
 
 function buildClipForm(item, row) {
@@ -1153,7 +1214,10 @@ function buildClipForm(item, row) {
 
   const sources = document.createElement('div');
   sources.className = 'stage-clip-sources';
-  const addOption = (c, flagText, isNew) => {
+  // seq -> {c, radio, text, status}: what applyPlayers updates in place.
+  const optionEls = new Map();
+  const addOption = (source, flagText, isNew) => {
+    const c = source ? {...source} : null;
     const label = document.createElement('label');
     label.className = 'stage-clip-source';
     const radio = document.createElement('input');
@@ -1164,7 +1228,13 @@ function buildClipForm(item, row) {
     radio.dataset.score = c ? (c.score || '') : '';
     radio.addEventListener('change', () => applySource(radio));
     label.appendChild(radio);
-    label.appendChild(document.createTextNode(' ' + (c ? candidateLabel(c) : '跳过（没有对应推送）')));
+    const text = document.createElement('span');
+    text.className = 'stage-clip-source-text';
+    text.textContent = c ? candidateLabel(c) : '跳过（没有对应推送）';
+    label.appendChild(text);
+    const status = document.createElement('span');
+    status.className = 'stage-clip-player-status';
+    if (c) label.appendChild(status);
     if (c && c.consumed) {
       const used = document.createElement('span');
       used.className = 'stage-clip-flag';
@@ -1180,8 +1250,36 @@ function buildClipForm(item, row) {
       label.appendChild(flag);
     }
     if (isNew) label.classList.add('new');
+    if (c) {
+      label.appendChild(buildCopyButton(() => candidateLabel(c)));
+      optionEls.set(String(c.seq), {c, radio, text, status});
+    }
     return label;
   };
+  // One push's overview result: fill the scorer into the line, show whether it
+  // is still coming, and when the type turns out to be 点球/乌龙/两黄变红 move
+  // the 类型 dropdown along — only for the picked push and only if the
+  // operator has not chosen a type by hand.
+  function applyPlayerTo(seq, info) {
+    const el = optionEls.get(seq);
+    if (!el || !info) return;
+    if (info.opponent_name && !el.c.opponent_name) el.c.opponent_name = info.opponent_name;
+    el.c.player = info.player || null;
+    el.text.textContent = candidateLabel(el.c);
+    el.status.textContent = info.status === 'pending' ? '球员获取中' : info.status === 'missing' ? '无球员信息' : '';
+    el.status.title = info.status === 'pending' ? '球员信息比推送慢，拿到后这一行会自动补上' : '';
+    if (!info.player) return;
+    const matchEvent = String(info.player.match_event);
+    if (el.radio.dataset.matchEvent === matchEvent) return;
+    el.radio.dataset.matchEvent = matchEvent;
+    if (el.radio.checked && !dirty.has('match_event')) {
+      typeSel.value = matchEvent;
+      syncScoreField();
+    }
+  }
+  function applyPlayers(players) {
+    players.forEach((info, seq) => applyPlayerTo(seq, info));
+  }
   candidates.forEach((c) => {
     const picked = initial.alert_seq != null && c.seq === initial.alert_seq;
     const flag = picked && (am.weak || am.ambiguous) ? '⚠ 请核对' : '';
@@ -1310,9 +1408,12 @@ function buildClipForm(item, row) {
   function addCandidate(c) {
     if (form.querySelector(`input[name="${radioName}"][value="${c.seq}"]`)) return;
     sources.insertBefore(addOption(c, '新', true), sources.firstChild);
+    const known = state.stagePlayers && state.stagePlayers.get(String(c.seq));
+    if (known) applyPlayerTo(String(c.seq), known);
   }
   writeForm(initial);
-  form._clip = {readForm, writeForm, addCandidate, syncScoreField, dirty};
+  if (state.stagePlayers) applyPlayers(state.stagePlayers);
+  form._clip = {readForm, writeForm, addCandidate, applyPlayers, syncScoreField, dirty};
   return form;
 }
 
@@ -1586,6 +1687,7 @@ async function loadStageClips(matchId, options = {}) {
     || (c.draft_status === 'failed' && !c.draft_retriable)
   ));
   if (pending) startDraftPoll(matchId); else stopDraftPoll();
+  if (list.querySelector('.stage-clip-form')) startPlayerPoll(matchId);
 }
 
 // A push for the stage match arrived after capture: offer it on every
@@ -1606,7 +1708,69 @@ function offerAlertToClipForms(ev) {
   document.querySelectorAll('#stage-clips .stage-clip-form').forEach((formEl) => {
     if (formEl._clip) formEl._clip.addCandidate(candidate);
   });
+  if (document.querySelector('#stage-clips .stage-clip-form')) startPlayerPoll(state.stageMatchId);
 }
+
+// Player names come from the overview API, which lags the push. While the
+// stage has unpublished rows, ask /clip/players every PLAYER_POLL_MS until no
+// push is still 'pending' (found, or given up server-side after 5 minutes);
+// a new push restarts it. Results live in state.stagePlayers (seq -> info) so
+// a rebuilt list shows them at once.
+const PLAYER_POLL_MS = 5000;
+
+function startPlayerPoll(matchId) {
+  if (!matchId) return;
+  if (!state.playerPoll || state.playerPoll.matchId !== matchId) {
+    stopPlayerPoll();
+    state.stagePlayers = new Map();
+    state.playerPoll = {matchId, timer: null, inFlight: false};
+  }
+  if (state.playerPoll.timer || state.playerPoll.inFlight) return;
+  pollPlayers(matchId);
+}
+
+function stopPlayerPoll() {
+  if (state.playerPoll && state.playerPoll.timer) clearTimeout(state.playerPoll.timer);
+  state.playerPoll = null;
+}
+
+async function pollPlayers(matchId) {
+  const poll = state.playerPoll;
+  if (!poll || poll.matchId !== matchId) return;
+  if (state.stageMatchId !== matchId) { stopPlayerPoll(); state.stagePlayers = null; return; }
+  poll.timer = null;
+  poll.inFlight = true;
+  let data = null;
+  try {
+    data = await requestJson(`api/monitor/clip/players?match_id=${encodeURIComponent(matchId)}`);
+  } catch (error) {
+    data = null;
+  }
+  if (state.playerPoll !== poll) return;
+  poll.inFlight = false;
+  if (data && data.pushes) {
+    Object.entries(data.pushes).forEach(([seq, info]) => state.stagePlayers.set(seq, info));
+    document.querySelectorAll('#stage-clips .stage-clip-form').forEach((formEl) => {
+      if (formEl._clip && formEl._clip.applyPlayers) formEl._clip.applyPlayers(state.stagePlayers);
+    });
+  }
+  if (!data || Number(data.pending) > 0) poll.timer = setTimeout(() => pollPlayers(matchId), PLAYER_POLL_MS);
+}
+
+// Chrome slows timers in a background tab (to about once a minute after 5
+// minutes hidden), so an operator watching the stream in another tab would
+// come back to a stale line. Ask once right away when the tab is shown again.
+// Separate from onVisibilityRestored, which only handles the video players.
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden || !state.stageMatchId) return;
+  if (!document.querySelector('#stage-clips .stage-clip-form')) return;
+  const poll = state.playerPoll;
+  if (poll && poll.matchId === state.stageMatchId && poll.timer) {
+    clearTimeout(poll.timer);
+    poll.timer = null;
+  }
+  startPlayerPoll(state.stageMatchId);
+});
 
 function startDraftPoll(matchId) {
   if (state.draftPoll && state.draftPoll.matchId === matchId) return;

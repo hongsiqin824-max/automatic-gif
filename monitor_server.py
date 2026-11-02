@@ -73,6 +73,7 @@ _load_dotenv(ROOT / ".env")
 from dqd_api import MATCH_STATUS_LABELS, positive_env_float, positive_env_int, validate_match_id  # noqa: E402
 from source_client import classify_source_response, query_source
 from match_catalog import MATCH_CATALOG_EXCLUDED_COMPETITION_NAMES, MatchCatalog
+from match_players import MatchPlayerLookup, resolve_player
 from live_preview import LivePreviewManager, resolve_ffmpeg
 import live_preview as live_preview_module
 from webrtc_gateway import WebRTCGateway
@@ -1870,17 +1871,26 @@ def _normalize_clip_form(body: dict[str, Any], current: dict[str, Any]) -> dict[
     return form
 
 
-def _clip_candidates(match_id: str) -> list[dict[str, Any]]:
+def _clip_candidates(
+    match_id: str, fallback_detail: dict[str, Any] | None = None
+) -> list[dict[str, Any]]:
     """Every goal/red-card push of this match, newest first, as the page's radio options.
 
     ``consumed`` marks a push a delivered article already used, so the page can
     say so next to the radio instead of letting it look unused.
+    ``opponent_name`` is the other side's name, so the page can write the line
+    as a title-ready ``巴塞罗那1-0皇家马德里``; it comes from the catalog, or
+    from a clip's saved ``match_detail`` once the match has left the catalog.
     """
     items = alert_store.for_match(match_id, 0.0, float("inf"))
     consumed = _consumed_alert_seqs(match_id)
+    detail = _match_detail_for(match_id)
+    if not (detail.get("team_A_name") and detail.get("team_B_name")) and isinstance(fallback_detail, dict):
+        detail = fallback_detail
     options: list[dict[str, Any]] = []
     for item in reversed(items):
         minute, extra = _alert_minute_parts(item.get("minute"))
+        other_side = {"A": "B", "B": "A"}.get(str(item.get("team") or ""))
         options.append(
             {
                 "seq": item.get("seq"),
@@ -1889,6 +1899,7 @@ def _clip_candidates(match_id: str) -> list[dict[str, Any]]:
                 "event_cn": item.get("event_cn") or EVENT_CN.get(str(item.get("event_type") or ""), ""),
                 "team": item.get("team"),
                 "team_name": item.get("team_name") or "",
+                "opponent_name": _alert_team_name(detail, other_side) if other_side else "",
                 "match_event": _alert_match_event(item),
                 "match_time": _join_match_time(minute, extra),
                 "score": str(item.get("score") or "").strip(),
@@ -2001,7 +2012,7 @@ def _list_clips(match_id: str) -> list[dict[str, Any]]:
         if record is None and manual_draft_queue is not None:
             # Unpublished rows get the radio options; computed once per listing.
             if candidates is None:
-                candidates = _clip_candidates(match_id)
+                candidates = _clip_candidates(match_id, meta.get("match_detail"))
             item["candidates"] = candidates
         items.append(item)
     return items
@@ -3507,6 +3518,96 @@ def monitor_clips():
             "clips": _list_clips(match_id),
         }
     )
+
+
+# A push older than this with no player found shows 「无球员信息」 and the
+# page stops asking for it.
+PLAYER_WAIT_SECONDS = 300.0
+match_players = MatchPlayerLookup()
+_player_pending_seen: set[str] = set()
+_player_pending_lock = threading.Lock()
+
+
+def _saved_match_detail(match_id: str) -> dict[str, Any]:
+    """Team names from the newest clip sidecar, for a match gone from the catalog."""
+    try:
+        sidecars = sorted(_clip_dir(match_id).glob("clip_*.json"), reverse=True)
+    except OSError:
+        return {}
+    for sidecar in sidecars:
+        detail = _read_clip_meta(sidecar.with_suffix(".gif")).get("match_detail")
+        if isinstance(detail, dict) and detail.get("team_A_name") and detail.get("team_B_name"):
+            return detail
+    return {}
+
+
+@app.get("/api/monitor/clip/players")
+def monitor_clip_players():
+    """Player behind each goal/red-card push of a match, polled by the page.
+
+    ``status`` per push: ``found`` (``player`` set), ``pending`` (overview has
+    not listed it yet, ask again) or ``missing`` (gave up after
+    ``PLAYER_WAIT_SECONDS``). ``opponent_name`` lets a push that arrived after
+    the list was built still show the full 「甲1-0乙」 line.
+    """
+    try:
+        match_id = validate_match_id(str(request.args.get("match_id") or ""))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    pushes = alert_store.for_match(match_id, 0.0, float("inf"))
+    if not pushes:
+        return jsonify({"match_id": match_id, "pushes": {}, "pending": 0})
+    detail = _match_detail_for(match_id)
+    if not (detail.get("team_A_name") and detail.get("team_B_name")):
+        detail = _saved_match_detail(match_id) or detail
+    events = match_players.events_for(match_id)
+    now = time.time()
+    result: dict[str, dict[str, Any]] = {}
+    pending = 0
+    for push in pushes:
+        seq = str(push.get("seq"))
+        side = str(push.get("team") or "")
+        other = {"A": "B", "B": "A"}.get(side)
+        player = resolve_player(push, events)
+        age = now - float(push.get("ts_unix") or 0.0)
+        if player:
+            status = "found"
+            with _player_pending_lock:
+                waited = seq in _player_pending_seen
+                _player_pending_seen.discard(seq)
+            if waited:
+                # Upper bound of the overview's lag behind the push (page polls every ~5s).
+                print(
+                    json.dumps(
+                        {
+                            "event": "alert_player_resolved",
+                            "match_id": match_id,
+                            "seq": push.get("seq"),
+                            "event_type": push.get("event_type"),
+                            "code": player["code"],
+                            "lag_seconds": round(age, 1),
+                        },
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
+        elif age < PLAYER_WAIT_SECONDS:
+            status = "pending"
+            pending += 1
+            with _player_pending_lock:
+                if len(_player_pending_seen) > 4096:
+                    _player_pending_seen.clear()
+                _player_pending_seen.add(seq)
+        else:
+            status = "missing"
+            with _player_pending_lock:
+                _player_pending_seen.discard(seq)
+        result[seq] = {
+            "status": status,
+            "player": player,
+            "opponent_name": _alert_team_name(detail, other) if other else "",
+        }
+    return jsonify({"match_id": match_id, "pushes": result, "pending": pending})
 
 
 @app.get("/clips/<match_id>/<path:filename>")

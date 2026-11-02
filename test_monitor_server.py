@@ -1313,6 +1313,157 @@ class ClipGroupTests(unittest.TestCase):
         self.assertEqual(self._group("attach", self.A, target="clip_20260101-120000_ffffff.gif").status_code, 404)
 
 
+class CandidateLabelTests(unittest.TestCase):
+    """``candidateLabel`` in app.js: the copyable "1' 进球 巴塞罗那1-0皇家马德里" line."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.node = shutil.which("node")
+        if not cls.node:
+            raise unittest.SkipTest("node 不可用")
+        source = (Path(monitor_server.__file__).parent / "monitor_static" / "app.js").read_text(encoding="utf-8")
+        import re
+        match = re.search(r"^function candidateLabel\([^)]*\) \{.*?^\}", source, re.M | re.S)
+        if match is None:
+            raise AssertionError("candidateLabel missing from app.js")
+        cls.prelude = match.group(0)
+
+    def label(self, candidate: dict) -> str:
+        script = f"{self.prelude}\nprocess.stdout.write(candidateLabel({json.dumps(candidate, ensure_ascii=False)}));"
+        result = subprocess.run([self.node, "-e", script], capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout
+
+    def test_home_side_keeps_home_away_score(self):
+        self.assertEqual(
+            self.label({"match_time": "1", "event_cn": "进球", "team": "A", "team_name": "巴塞罗那",
+                        "opponent_name": "皇家马德里", "score": "1-0"}),
+            "1' 进球 巴塞罗那1-0皇家马德里",
+        )
+
+    def test_away_side_flips_score_to_put_its_own_goals_first(self):
+        self.assertEqual(
+            self.label({"match_time": "67", "event_cn": "进球", "team": "B", "team_name": "皇家马德里",
+                        "opponent_name": "巴塞罗那", "score": "1-2"}),
+            "67' 进球 皇家马德里2-1巴塞罗那",
+        )
+
+    def test_red_card_is_time_event_and_side_without_score(self):
+        self.assertEqual(
+            self.label({"match_time": "38", "event_cn": "红牌", "event_type": "red_card", "team": "B",
+                        "team_name": "乙", "opponent_name": "甲", "score": "2-0"}),
+            "38' 红牌 乙",
+        )
+
+    def test_red_card_player_replaces_side_and_event_word(self):
+        self.assertEqual(
+            self.label({"match_time": "61", "event_cn": "红牌", "event_type": "red_card", "team": "A",
+                        "team_name": "甲", "opponent_name": "乙", "score": "0-0",
+                        "player": {"person": "卡洛斯-桑托斯", "event_cn": "两黄变红"}}),
+            "61' 两黄变红 卡洛斯-桑托斯",
+        )
+
+    def test_goal_player_goes_before_the_teams(self):
+        self.assertEqual(
+            self.label({"match_time": "43", "event_cn": "进球", "event_type": "goal", "team": "A",
+                        "team_name": "阿拉胡埃拉人", "opponent_name": "莫塔瓜", "score": "2-0",
+                        "player": {"person": "克赖切尔-佩雷斯", "event_cn": "进球"}}),
+            "43' 进球 克赖切尔-佩雷斯 阿拉胡埃拉人2-0莫塔瓜",
+        )
+        # Own goal: the word changes, the line stays from the benefiting side.
+        self.assertEqual(
+            self.label({"match_time": "75", "event_cn": "进球", "event_type": "goal", "team": "B",
+                        "team_name": "莫塔瓜", "opponent_name": "阿拉胡埃拉人", "score": "2-1",
+                        "player": {"person": "A-甘博亚", "event_cn": "乌龙"}}),
+            "75' 乌龙 A-甘博亚 莫塔瓜1-2阿拉胡埃拉人",
+        )
+
+    def test_unknown_side_or_missing_name_keeps_the_old_line(self):
+        self.assertEqual(
+            self.label({"match_time": "90+3", "event_cn": "进球", "team": "?", "team_name": "",
+                        "opponent_name": "", "score": "2-0"}),
+            "90+3' 进球 2-0",
+        )
+        self.assertEqual(
+            self.label({"match_time": "5", "event_cn": "进球", "team": "B", "team_name": "乙",
+                        "opponent_name": "", "score": "0-1"}),
+            "5' 进球 乙 0-1",
+        )
+
+
+class ClipPlayersEndpointTests(unittest.TestCase):
+    """``GET /api/monitor/clip/players``: overview players behind each push."""
+
+    def setUp(self):
+        self.client = monitor_server.app.test_client()
+        self.store = monitor_server._AlertStore(50, None)
+        self.now = 10_000.0
+        with mock.patch.object(monitor_server.time, "time", return_value=self.now - 30):
+            self.goal = self.store.add({"match_id": "54627168", "event_type": "goal", "team": "B",
+                                        "score": "2-1", "minute": "2H 75", "dedup_key": "p1"})
+        with mock.patch.object(monitor_server.time, "time", return_value=self.now - 20):
+            self.red = self.store.add({"match_id": "54627168", "event_type": "red_card", "team": "A",
+                                       "score": "2-1", "minute": "2H 80", "dedup_key": "p2"})
+        with mock.patch.object(monitor_server.time, "time", return_value=self.now - 600):
+            self.old = self.store.add({"match_id": "54627168", "event_type": "red_card", "team": "A",
+                                       "score": "0-0", "minute": "1H 38", "dedup_key": "p3"})
+        self.events = [{"side": "B", "code": "OG", "minute": 74, "score": "2-1",
+                        "person": "A-甘博亚", "person_id": "50450691"}]
+        self.lookup = mock.Mock()
+        self.lookup.events_for.side_effect = lambda match_id: self.events
+        self._patches = [
+            mock.patch.object(monitor_server, "alert_store", self.store),
+            mock.patch.object(monitor_server, "match_players", self.lookup),
+            mock.patch.object(monitor_server, "_match_detail_for",
+                              return_value={"team_A_name": "阿拉胡埃拉人", "team_B_name": "莫塔瓜"}),
+            mock.patch.object(monitor_server.time, "time", return_value=self.now),
+        ]
+        for patcher in self._patches:
+            patcher.start()
+
+    def tearDown(self):
+        for patcher in reversed(self._patches):
+            patcher.stop()
+
+    def _get(self):
+        response = self.client.get("/api/monitor/clip/players?match_id=54627168")
+        self.assertEqual(response.status_code, 200, response.get_json())
+        return response.get_json()
+
+    def test_found_pending_and_missing(self):
+        body = self._get()
+        pushes = body["pushes"]
+        self.assertEqual(pushes[str(self.goal["seq"])]["status"], "found")
+        self.assertEqual(pushes[str(self.goal["seq"])]["player"]["event_cn"], "乌龙")
+        self.assertEqual(pushes[str(self.goal["seq"])]["opponent_name"], "阿拉胡埃拉人")
+        self.assertEqual(pushes[str(self.red["seq"])]["status"], "pending")
+        self.assertIsNone(pushes[str(self.red["seq"])]["player"])
+        self.assertEqual(pushes[str(self.old["seq"])]["status"], "missing")
+        self.assertEqual(body["pending"], 1)
+
+    def test_logs_lag_once_a_pending_push_resolves(self):
+        self._get()
+        self.events.append({"side": "A", "code": "RC", "minute": 81, "score": "",
+                            "person": "某某", "person_id": "7"})
+        with mock.patch("builtins.print") as printed:
+            body = self._get()
+            self._get()
+        self.assertEqual(body["pending"], 0)
+        logs = [json.loads(call.args[0]) for call in printed.call_args_list]
+        resolved = [entry for entry in logs if entry.get("event") == "alert_player_resolved"]
+        self.assertEqual(len(resolved), 1)
+        self.assertEqual(resolved[0]["seq"], self.red["seq"])
+        self.assertEqual(resolved[0]["lag_seconds"], 20.0)
+
+    def test_no_pushes_skips_the_overview_call(self):
+        response = self.client.get("/api/monitor/clip/players?match_id=99999999")
+        self.assertEqual(response.get_json()["pushes"], {})
+        self.lookup.events_for.assert_not_called()
+
+    def test_bad_match_id(self):
+        self.assertEqual(self.client.get("/api/monitor/clip/players?match_id=../x").status_code, 400)
+
+
 class StageCropMathTests(unittest.TestCase):
     """Run the pure crop helpers from monitor_static/app.js under node.
 
@@ -2146,6 +2297,35 @@ class ConsumedAlertSeqTests(unittest.TestCase):
         flags = {opt["seq"]: opt["consumed"] for opt in options}
         self.assertEqual(flags, {first["seq"]: True, second["seq"]: False})
 
+    def test_candidates_carry_opponent_name(self):
+        store = monitor_server._AlertStore(50, None)
+        with mock.patch.object(monitor_server.time, "time", return_value=1000.0):
+            home = store.add({"match_id": "54622319", "event_type": "goal", "team": "A",
+                              "score": "1-0", "minute": "1H 1", "dedup_key": "o1"})
+            away = store.add({"match_id": "54622319", "event_type": "red_card", "team": "B",
+                              "score": "1-0", "minute": "1H 30", "dedup_key": "o2"})
+            unknown = store.add({"match_id": "54622319", "event_type": "goal", "team": "?",
+                                 "score": "2-0", "minute": "2H 50", "dedup_key": "o3"})
+        catalog = {"team_A_name": "巴塞罗那", "team_B_name": "皇家马德里"}
+        with mock.patch.object(monitor_server, "alert_store", store), \
+             mock.patch.object(monitor_server, "manual_draft_queue", None), \
+             mock.patch.object(monitor_server, "_match_detail_for", return_value=catalog):
+            options = {o["seq"]: o["opponent_name"] for o in monitor_server._clip_candidates("54622319")}
+        self.assertEqual(options, {home["seq"]: "皇家马德里", away["seq"]: "巴塞罗那", unknown["seq"]: ""})
+
+    def test_candidates_fall_back_to_saved_detail_once_out_of_catalog(self):
+        store = monitor_server._AlertStore(50, None)
+        with mock.patch.object(monitor_server.time, "time", return_value=1000.0):
+            store.add({"match_id": "54622319", "event_type": "goal", "team": "B",
+                       "score": "0-1", "minute": "1H 5", "dedup_key": "f1"})
+        saved = {"team_A_name": "甲", "team_B_name": "乙"}
+        with mock.patch.object(monitor_server, "alert_store", store), \
+             mock.patch.object(monitor_server, "manual_draft_queue", None), \
+             mock.patch.object(monitor_server, "_match_detail_for", return_value={}):
+            self.assertEqual(monitor_server._clip_candidates("54622319", saved)[0]["opponent_name"], "甲")
+            # No saved detail either: no opponent, the page keeps the old line.
+            self.assertEqual(monitor_server._clip_candidates("54622319")[0]["opponent_name"], "")
+
 
 class ClipEndpointAlertMatchTests(unittest.TestCase):
     """``POST /api/monitor/clip`` forwards the matched alert into the draft event."""
@@ -2462,6 +2642,8 @@ class ClipPublishEndpointTests(ClipEndpointAlertMatchTests):
             {k: row["candidates"][1][k] for k in ("event_type", "team_name", "match_event", "match_time", "score")},
             {"event_type": "goal", "team_name": "甲", "match_event": 1, "match_time": "12", "score": "1-0"},
         )
+        # The other side's name, so the page can write "甲1-0乙" / "乙0-1甲".
+        self.assertEqual([c["opponent_name"] for c in row["candidates"]], ["甲", "乙"])
 
     def test_published_rows_carry_no_candidates(self):
         name = self._clip(10.0).get_json()["name"]

@@ -174,6 +174,10 @@ body{
 .stage-clip-source input{margin:0;width:16px;height:16px;accent-color:var(--cyan)}
 .stage-clip-source.new{color:var(--cyan)}
 .stage-clip-flag{font-size:12px;color:#ffb454;font-weight:600}
+.stage-clip-player-status{font-size:12px;color:var(--muted)}
+.stage-clip-copy{margin-left:auto;flex:none;padding:3px 10px;font-size:12px;border-radius:5px;border:1px solid var(--line, rgba(255,255,255,.18));background:transparent;color:var(--muted);cursor:pointer}
+.stage-clip-copy:hover{color:var(--text);border-color:rgba(93,225,208,.5)}
+.stage-clip-copy.done{color:var(--cyan);border-color:rgba(93,225,208,.5)}
 .stage-clip-fields{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .stage-clip-field{display:flex;align-items:center;gap:6px;font-size:13px;color:var(--muted);white-space:nowrap}
 .stage-clip-field:has(.stage-clip-title){flex:1 1 100%}
