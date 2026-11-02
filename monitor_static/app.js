@@ -639,7 +639,9 @@ async function captureClip(matchId, button, range) {
     const publishNote = data.publish_enabled ? ' · 核对后在下方列表点「发布」' : ' · 仅本地保存';
     const alertNote = alertMatchNote(data.alert_match);
     const cropNote = data.crop ? ` · 裁剪 ${cropPercentLabel(data.crop)}` : '';
-    const appendNote = appended && appended.main ? ` · 已追加为第 ${appended.gif_count} 张` : '';
+    const appendNote = appended && appended.main
+      ? (appended.supplement ? ` · 已补到已发布帖子（第 ${appended.gif_count} 张，待补发）` : ` · 已追加为第 ${appended.gif_count} 张`)
+      : '';
     const prefix = warn ? '⚠ 未锚定，画面可能不准' : '已生成 GIF';
     setTileStatus(matchId, `${prefix}（${sizeMb} MB）${cropNote}${appendNote}${publishNote}${alertNote}`, warn ? 'warn' : 'ok', true);
     // Append mode covers exactly one capture and the server has just used it
@@ -652,7 +654,9 @@ async function captureClip(matchId, button, range) {
       if (appended && appended.error) addStageNote(appended.error, 'warn');
       else if (appended && appended.main) {
         addStageNote(
-          `已追加为第 ${appended.gif_count} 张；要再截一个视角，请在该行再点一次「+ 再截一个视角」`, 'ok');
+          appended.supplement
+            ? `已补到已发布的帖子（第 ${appended.gif_count} 张），核对后在该行点「更新帖子」才会发出`
+            : `已追加为第 ${appended.gif_count} 张；要再截一个视角，请在该行再点一次「+ 再截一个视角」`, 'ok');
         if (appended.push_state && appended.push_state.state === 'conflict') {
           const when = [appended.push_state.match_time ? `${appended.push_state.match_time}'` : '',
             appended.push_state.score || ''].filter(Boolean).join(' ');
@@ -668,9 +672,13 @@ async function captureClip(matchId, button, range) {
     setTileClipCount(matchId, ((tile && tile.clipCount) || 0) + 1, true);
     // Jump straight to the new row's title so the operator can type without
     // reaching for the mouse (S → E → type title → Enter). An appended angle
-    // has no row of its own: stay on the main row's title instead.
+    // has no row of its own: stay on the main row's title instead. A 补图 lands
+    // on a published row, which has no title to type into.
     if (state.stageMatchId === matchId) {
-      loadStageClips(matchId, appended && appended.main ? {focusName: appended.main} : {focusTitle: true});
+      const focus = appended && appended.main
+        ? (appended.supplement ? {} : {focusName: appended.main})
+        : {focusTitle: true};
+      loadStageClips(matchId, focus);
     }
     return true;
   } catch (error) {
@@ -852,11 +860,12 @@ function clipDraftRecord(item) {
 // extension's Alt+3 honours it too) and the *next* capture lands under that
 // row. The mode covers exactly one capture, so a third angle means clicking
 // the button again. 并入 (dropdown) / 拆出 / 设为主图 remain as corrections.
+// A published row takes more angles the same way (「+ 补图」 / 并入); they
+// wait as 待补发 until the operator presses 「更新帖子」.
 
-let clipGroupMax = 4;
-// {name, gif_count, max, expires_in} from the server, or null. Mirrors the
-// server state; refreshed with every list load so a stale target (published,
-// full) drops.
+// {name, gif_count, supplement, expires_in} from the server, or null. Mirrors
+// the server state; refreshed with every list load so a stale target
+// (publishing, discarded) drops.
 let appendTarget = null;
 // Local deadline (ms epoch) mirroring the server's fixed, never-extended one,
 // so the banner disappears on time instead of claiming the mode is still on.
@@ -881,9 +890,8 @@ async function groupClip(action, name, extra, options = {}) {
     }
     return true;
   } catch (error) {
-    const code = error.data && error.data.code;
     const label = action === 'attach' ? '并入' : action === 'detach' ? '拆出' : '设为主图';
-    addStageNote(`${label}失败：` + (code === 'group_full' ? `一个标题最多 ${clipGroupMax} 张 GIF` : error.message), 'fail');
+    addStageNote(`${label}失败：` + error.message, 'fail');
     return false;
   }
 }
@@ -908,7 +916,7 @@ function setAppendTargetState(target) {
   document.querySelectorAll('.stage-clip-row[data-name] .stage-clip-append').forEach((btn) => {
     const armed = !!appendTarget && btn.closest('.stage-clip-row').dataset.name === appendTarget.name;
     btn.classList.toggle('armed', armed);
-    btn.textContent = armed ? '下一张追加到这里' : '+ 再截一个视角';
+    btn.textContent = armed ? btn.dataset.armedText : btn.dataset.idleText;
   });
 }
 
@@ -931,12 +939,13 @@ function renderAppendBanner() {
   if (!appendTarget) { banner.classList.add('hidden'); return; }
   const row = document.querySelector(`.stage-clip-row[data-name="${appendTarget.name}"]`);
   const label = row && row._clipItem ? clipGroupLabel(row._clipItem) : appendTarget.name;
-  const next = Math.min(appendTarget.gif_count + 1, appendTarget.max || clipGroupMax);
+  const next = appendTarget.gif_count + 1;
   const left = Math.max(0, Math.round((appendDeadline - Date.now()) / 1000));
   const countdown = left >= 60 ? `${Math.floor(left / 60)} 分 ${left % 60} 秒` : `${left} 秒`;
-  text.textContent =
-    `下一次截取会追加到「${label}」，作为第 ${next} 张（最多 ${appendTarget.max || clipGroupMax} 张）` +
-    ` · 只对下一张生效 · ${countdown}后自动退出`;
+  const what = appendTarget.supplement
+    ? `下一次截取会补到已发布的「${label}」，作为第 ${next} 张（待补发，点「更新帖子」才发出）`
+    : `下一次截取会追加到「${label}」，作为第 ${next} 张`;
+  text.textContent = `${what} · 只对下一张生效 · ${countdown}后自动退出`;
   banner.classList.remove('hidden');
 }
 
@@ -949,11 +958,13 @@ async function armAppend(name, button) {
       method: 'POST', body: JSON.stringify({match_id: matchId, name}),
     });
     if (state.stageMatchId !== matchId) return;
-    setAppendTargetState(data.append || null);
-    addStageNote('已进入追加：下一次截取会挂到这个标题下，截完即退出', 'ok');
+    const target = data.append || null;
+    setAppendTargetState(target);
+    addStageNote(target && target.supplement
+      ? '已进入补图：下一次截取会挂到这篇已发布的帖子下（待补发），截完即退出'
+      : '已进入追加：下一次截取会挂到这个标题下，截完即退出', 'ok');
   } catch (error) {
-    const code = error.data && error.data.code;
-    addStageNote('无法追加：' + (code === 'group_full' ? `一个标题最多 ${clipGroupMax} 张 GIF` : error.message), 'fail');
+    addStageNote('无法追加：' + error.message, 'fail');
   } finally {
     if (button) button.disabled = false;
   }
@@ -972,29 +983,31 @@ async function clearAppend() {
   }
 }
 
-// Row button on an unpublished main: arm append mode on it (or show it armed).
-function buildAppendButton(item) {
+// Row button: arm append mode on this main (or show it armed). On a published
+// row it is 「+ 补图」: the capture waits as 待补发 under the article.
+function buildAppendButton(item, supplement) {
   const btn = document.createElement('button');
   btn.type = 'button';
   btn.className = 'stage-clip-append';
+  btn.dataset.idleText = supplement ? '+ 补图' : '+ 再截一个视角';
+  btn.dataset.armedText = supplement ? '下一张补到这里' : '下一张追加到这里';
   const armed = !!appendTarget && appendTarget.name === item.name;
-  const full = item.gif_count >= clipGroupMax;
-  btn.textContent = armed ? '下一张追加到这里' : '+ 再截一个视角';
+  btn.textContent = armed ? btn.dataset.armedText : btn.dataset.idleText;
   if (armed) btn.classList.add('armed');
-  btn.disabled = full;
-  btn.title = full
-    ? `已满 ${clipGroupMax} 张`
+  btn.title = supplement
+    ? '下一次截取（S/E 或插件 Alt+3）会补到这篇已发布的帖子下，先显示为「待补发」；点「更新帖子」才会发到文章里'
     : '下一次截取（S/E 或插件 Alt+3）会作为另一视角挂到这个标题下；只对下一张生效，再要一张就再点一次';
-  btn.addEventListener('click', () => { if (!armed) armAppend(item.name, btn); });
+  btn.addEventListener('click', () => { if (!btn.classList.contains('armed')) armAppend(item.name, btn); });
   return btn;
 }
 
-// Correction tool on an unpublished main row: fold it into another open main.
-function buildAttachControls(item, openMains) {
+// Correction tool on an unpublished main row: fold it into another open main,
+// or into a published one as 补图 (待补发).
+function buildAttachControls(item, attachTargets) {
   const wrap = document.createElement('span');
   wrap.className = 'stage-clip-group-ctl';
-  wrap.appendChild(buildAppendButton(item));
-  const targets = openMains.filter((o) => o.name !== item.name && (o.gif_count + item.gif_count) <= clipGroupMax);
+  wrap.appendChild(buildAppendButton(item, false));
+  const targets = attachTargets.filter((o) => o.name !== item.name);
   if (!targets.length) return wrap;
   const pick = document.createElement('select');
   pick.className = 'stage-input stage-clip-merge-pick';
@@ -1004,10 +1017,12 @@ function buildAttachControls(item, openMains) {
   targets.forEach((o) => {
     const opt = document.createElement('option');
     opt.value = o.name;
-    opt.textContent = clipGroupLabel(o) + (o.gif_count > 1 ? `（已 ${o.gif_count} 张）` : '');
+    const count = o.gif_count > 1 ? `已 ${o.gif_count} 张` : '';
+    const tags = [o.event_key ? '已发布·补图' : '', count].filter(Boolean).join('，');
+    opt.textContent = clipGroupLabel(o) + (tags ? `（${tags}）` : '');
     pick.appendChild(opt);
   });
-  pick.title = '截错了归属时用：把这条 GIF 作为另一视角挂到所选标题下（表单以那条为准）';
+  pick.title = '截错了归属时用：把这条 GIF 作为另一视角挂到所选标题下（表单以那条为准）；选已发布的帖子就是补图，点那一行的「更新帖子」才发出';
   pick.addEventListener('change', () => {
     if (!pick.value) return;
     pick.disabled = true;
@@ -1039,6 +1054,9 @@ function buildAttachmentPushNote(pushState) {
   return note;
 }
 
+// 补图 rows tag each angle: 已在文章 / 更新中 / 待补发 (only the last can 拆出).
+const ATTACHMENT_STATE_LABELS = {sent: '已在文章', updating: '更新中', pending: '待补发'};
+
 function buildAttachmentStrip(item, editable) {
   const atts = Array.isArray(item.attachments) ? item.attachments : [];
   if (!atts.length) return null;
@@ -1051,6 +1069,7 @@ function buildAttachmentStrip(item, editable) {
   atts.forEach((att) => {
     const cell = document.createElement('div');
     cell.className = 'stage-clip-attachment';
+    if (att.state) cell.classList.add(`state-${att.state}`);
     const img = document.createElement('img');
     img.className = 'stage-clip-attachment-preview';
     img.loading = 'lazy';
@@ -1062,6 +1081,12 @@ function buildAttachmentStrip(item, editable) {
     const label = document.createElement('span');
     label.textContent = `${fmtClipTime(att.created_unix)} · ${(att.bytes / (1024 * 1024)).toFixed(2)} MB`;
     meta.appendChild(label);
+    if (ATTACHMENT_STATE_LABELS[att.state]) {
+      const tag = document.createElement('span');
+      tag.className = `stage-clip-attachment-state ${att.state}`;
+      tag.textContent = ATTACHMENT_STATE_LABELS[att.state];
+      meta.appendChild(tag);
+    }
     const push = buildAttachmentPushNote(att.push_state);
     if (push) meta.appendChild(push);
     const open = document.createElement('a');
@@ -1080,11 +1105,15 @@ function buildAttachmentStrip(item, editable) {
         groupClip('set_main', att.name, null, {fromName: item.name});
       });
       meta.appendChild(main);
+    }
+    if (editable || att.state === 'pending') {
       const detach = document.createElement('button');
       detach.type = 'button';
       detach.className = 'stage-clip-attachment-btn';
       detach.textContent = '拆出';
-      detach.title = '从这个标题移出，恢复为独立一条';
+      detach.title = att.state === 'pending'
+        ? '不补这张了：从这篇帖子移出，恢复为独立一条'
+        : '从这个标题移出，恢复为独立一条';
       detach.addEventListener('click', () => { detach.disabled = true; groupClip('detach', att.name); });
       meta.appendChild(detach);
     }
@@ -1093,6 +1122,93 @@ function buildAttachmentStrip(item, editable) {
   });
   return strip;
 }
+
+// 「更新帖子」 on a published row: resend the article with its 待补发 GIFs.
+async function updateArticle(item, button) {
+  const matchId = state.stageMatchId;
+  if (!matchId) return;
+  const pending = item.supplement ? item.supplement.pending : 0;
+  // The CMS rewrites the article body as we send it; an edit made in the CMS
+  // editor since (e.g. a retyped title) would be overwritten, so say so once.
+  const ok = window.confirm(
+    `把 ${pending} 张待补发的 GIF 补进这篇已发布的帖子？\n\n` +
+    '会按原来的标题、事件、时间、比分重新提交整篇文章；如果有人在懂球帝后台改过这篇，后台的改动会被覆盖。'
+  );
+  if (!ok) return;
+  button.disabled = true;
+  button.textContent = '提交中…';
+  try {
+    const data = await requestJson('api/monitor/clip/update', {
+      method: 'POST',
+      body: JSON.stringify({match_id: matchId, name: item.name}),
+    });
+    addStageNote(`已提交补图：新增 ${data.added} 张，共 ${data.gif_count} 张`, 'ok');
+    if (state.stageMatchId === matchId) loadStageClips(matchId);
+  } catch (error) {
+    addStageNote('补图提交失败：' + error.message, 'fail');
+    button.disabled = false;
+    button.textContent = `更新帖子（补 ${pending} 张）`;
+  }
+}
+
+function clipEditRecord(sup) {
+  return {
+    status: sup.edit_status,
+    stage: sup.edit_stage,
+    error: sup.edit_error,
+    retriable: sup.edit_retriable,
+    attempt_count: sup.edit_attempt,
+    next_attempt_at_unix: sup.edit_next_attempt_unix,
+  };
+}
+
+// Status of the newest 更新帖子 on a row. Delivered shows a short 「已补图」;
+// the rest (queued / publishing / failed + 立即重试) reuses the publish states.
+// Returns true while it still needs polling.
+function applyEditState(el, rec, matchId, editKey) {
+  if (rec.status === 'published' || rec.status === 'drafted') {
+    el.textContent = '补图已更新 ✓';
+    el.className = 'stage-clip-edit ok';
+    return false;
+  }
+  const busy = applyDraftState(el, rec, matchId, editKey);
+  el.classList.remove('stage-clip-draft');
+  el.classList.add('stage-clip-edit');
+  if (el.firstChild && el.firstChild.nodeType === Node.TEXT_NODE) el.firstChild.textContent = '补图' + el.firstChild.textContent;
+  return busy;
+}
+
+// 补图 controls on a delivered row: 「+ 补图」, 「更新帖子」 and the 更新 status.
+function buildSupplementControls(item) {
+  const sup = item.supplement;
+  const wrap = document.createElement('span');
+  wrap.className = 'stage-clip-group-ctl';
+  wrap.appendChild(buildAppendButton(item, true));
+  if (sup.pending > 0) {
+    const update = document.createElement('button');
+    update.type = 'button';
+    update.className = 'stage-clip-update';
+    update.textContent = sup.busy ? '更新中…' : `更新帖子（补 ${sup.pending} 张）`;
+    update.disabled = !!sup.busy;
+    update.title = sup.busy ? '上一次更新还没完成' : '把待补发的 GIF 补进这篇帖子';
+    update.addEventListener('click', () => updateArticle(item, update));
+    wrap.appendChild(update);
+  }
+  // A settled 「补图已更新」 is stale once new GIFs wait for the next 更新.
+  const editDone = sup.edit_status === 'published' || sup.edit_status === 'drafted';
+  if (sup.edit_key && sup.edit_status && !(editDone && sup.pending > 0)) {
+    const status = document.createElement('span');
+    status.dataset.editKey = sup.edit_key;
+    // The draft poll rebuilds the list once this leaves the in-flight states.
+    if (sup.busy) status.dataset.wasBusy = '1';
+    applyEditState(status, clipEditRecord(sup), state.stageMatchId, sup.edit_key);
+    wrap.appendChild(status);
+  }
+  return wrap;
+}
+
+// Same set as the server's _EDIT_IN_FLIGHT_STATUSES.
+const EDIT_IN_FLIGHT = new Set(['queued', 'creating', 'creating_draft', 'publishing', 'retry_wait']);
 
 // ---- publish form (mirrors the CMS gif-article fields) ----
 //
@@ -1428,7 +1544,7 @@ function buildPublishedSummary(item) {
   return el;
 }
 
-function renderClipRow(item, publishEnabled, openMains) {
+function renderClipRow(item, publishEnabled, attachTargets) {
   const row = document.createElement('div');
   row.className = 'stage-clip-row';
   row._clipItem = item;
@@ -1478,6 +1594,8 @@ function renderClipRow(item, publishEnabled, openMains) {
     draftEl.className = 'stage-clip-draft';
     applyDraftState(draftEl, clipDraftRecord(item), state.stageMatchId, item.event_key);
     head.appendChild(draftEl);
+    // Delivered: more angles can still go in (补图).
+    if (item.supplement) head.appendChild(buildSupplementControls(item));
     const strip = buildAttachmentStrip(item, false);
     if (strip) row.appendChild(strip);
     return row;
@@ -1499,7 +1617,7 @@ function renderClipRow(item, publishEnabled, openMains) {
     return row;
   }
   row.classList.add('editing');
-  head.appendChild(buildAttachControls(item, openMains || []));
+  head.appendChild(buildAttachControls(item, attachTargets || []));
   row.appendChild(buildClipForm(item, row));
   return row;
 }
@@ -1611,10 +1729,11 @@ async function loadStageClips(matchId, options = {}) {
   }
   if (state.stageMatchId !== matchId) return;
   if (Array.isArray(data.score_event_types)) scoreEventTypes = new Set(data.score_event_types.map(Number));
-  if (Number(data.group_max) > 0) clipGroupMax = Number(data.group_max);
   const clips = Array.isArray(data.clips) ? data.clips : [];
-  // Rows a new angle can be folded into: unpublished, not discarded mains.
+  // Rows waiting for 发布: unpublished, not discarded mains.
   const openMains = data.publish_enabled ? clips.filter((c) => !c.event_key && !c.discarded) : [];
+  // Rows a new angle can be folded into: those, plus delivered articles (补图).
+  const attachTargets = data.publish_enabled ? clips.filter((c) => (!c.event_key && !c.discarded) || c.supplement) : [];
   // The list is rebuilt after every capture; keep whatever the operator had
   // already changed in an unpublished row's form.
   const typed = new Map();
@@ -1643,7 +1762,7 @@ async function loadStageClips(matchId, options = {}) {
     list.appendChild(empty);
   } else {
     clips.forEach((item) => {
-      const row = renderClipRow(item, !!data.publish_enabled, openMains);
+      const row = renderClipRow(item, !!data.publish_enabled, attachTargets);
       row.dataset.name = item.name;
       const kept = typed.get(item.name);
       const formEl = row.querySelector('.stage-clip-form');
@@ -1659,11 +1778,12 @@ async function loadStageClips(matchId, options = {}) {
   if (countEl) {
     // Abandoned clips stay in the list but are not waiting to be published.
     const unpublished = openMains.length;
+    const toSupplement = clips.filter((c) => c.supplement && c.supplement.pending > 0).length;
     const gifTotal = clips.reduce((n, c) => n + (Number(c.gif_count) || 1), 0);
     const total = gifTotal > clips.length ? `共 ${clips.length} 条 / ${gifTotal} 张` : `共 ${clips.length} 条`;
-    countEl.textContent = clips.length
-      ? (unpublished ? `${unpublished} 条待发布 / ${total}` : total)
-      : '';
+    const waiting = [unpublished ? `${unpublished} 条待发布` : '', toSupplement ? `${toSupplement} 条待补发` : '']
+      .filter(Boolean).join(' / ');
+    countEl.textContent = clips.length ? (waiting ? `${waiting} / ${total}` : total) : '';
   }
   if (options.focusTitle || options.focusName) {
     // Newest row is first: show it whole, then focus without re-scrolling.
@@ -1682,10 +1802,10 @@ async function loadStageClips(matchId, options = {}) {
     }
   }
   setTileClipCount(matchId, clips.length);
-  const pending = clips.some((c) => c.event_key && !(
+  const pending = clips.some((c) => (c.event_key && !(
     ((c.draft_status === 'published' || c.draft_status === 'drafted') && c.draft_url)
     || (c.draft_status === 'failed' && !c.draft_retriable)
-  ));
+  )) || (c.supplement && c.supplement.busy));
   if (pending) startDraftPoll(matchId); else stopDraftPoll();
   if (list.querySelector('.stage-clip-form')) startPlayerPoll(matchId);
 }
@@ -1829,6 +1949,17 @@ function refreshDraftLinks(matchId) {
         if (!rec || !draftEl) { pending += 1; return; }
         if (applyDraftState(draftEl, rec, matchId, row.dataset.eventKey)) pending += 1;
       });
+      // 补图 in flight: once it settles, rebuild the list so the angle tags
+      // (待补发 → 已在文章) and the 更新帖子 button follow.
+      let settled = false;
+      document.querySelectorAll('#stage-clips [data-edit-key]').forEach((el) => {
+        const rec = (data.edit_records || {})[el.dataset.editKey];
+        if (!rec) return;
+        applyEditState(el, rec, matchId, el.dataset.editKey);
+        if (EDIT_IN_FLIGHT.has(rec.status)) { pending += 1; el.dataset.wasBusy = '1'; }
+        else if (el.dataset.wasBusy) settled = true;
+      });
+      if (settled) { loadStageClips(matchId); return; }
       if (pending === 0) stopDraftPoll();
     })
     .catch(() => {})

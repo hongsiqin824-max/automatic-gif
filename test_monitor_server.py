@@ -895,6 +895,7 @@ class ClipGroupTests(unittest.TestCase):
         self.dir = Path(self.tmp.name)
         self.queue = mock.Mock()
         self.queue.records_by_source_name.return_value = {}
+        self.queue.records_for_match.return_value = {}
         self._patches = [
             mock.patch.object(monitor_server, "_clip_dir", return_value=self.dir),
             mock.patch.object(monitor_server, "manual_draft_queue", self.queue),
@@ -965,22 +966,20 @@ class ClipGroupTests(unittest.TestCase):
         self.assertEqual(self._meta(self.D)["parent"], self.A)
         self.assertNotIn("attachments", self._meta(self.C))
 
-    def test_group_max_enforced(self):
-        self._group("attach", self.B, target=self.A)
-        self._group("attach", self.C, target=self.A)
-        self._group("attach", self.D, target=self.A)
-        response = self._group("attach", self.E, target=self.A)
-        self.assertEqual(response.status_code, 409)
-        self.assertEqual(response.get_json()["code"], "group_full")
-        self.assertEqual(self._meta(self.A)["attachments"], [self.B, self.C, self.D])
-        self.assertNotIn("parent", self._meta(self.E))
+    def test_group_has_no_size_limit(self):
+        for extra in (self.B, self.C, self.D, self.E):
+            response = self._group("attach", extra, target=self.A)
+            self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(self._meta(self.A)["attachments"], [self.B, self.C, self.D, self.E])
+        self.assertEqual(self._rows()[self.A]["gif_count"], 5)
 
-    def test_attach_refuses_self_published_and_discarded(self):
+    def test_attach_refuses_self_publishing_and_discarded(self):
         self.assertEqual(self._group("attach", self.A, target=self.A).status_code, 400)
-        self.queue.records_by_source_name.return_value = {self.A: {"event_key": "manual_0"}}
+        # Still being published: its body is on its way, a new GIF would be lost.
+        self.queue.records_by_source_name.return_value = {self.A: {"event_key": "manual_0", "status": "queued"}}
         response = self._group("attach", self.B, target=self.A)
         self.assertEqual(response.status_code, 409)
-        self.assertEqual(response.get_json()["code"], "already_published")
+        self.assertEqual(response.get_json()["code"], "publish_in_progress")
         self.queue.records_by_source_name.return_value = {}
         monitor_server._write_clip_meta(self.dir / self.C, {**self._meta(self.C), "discarded": True})
         response = self._group("attach", self.C, target=self.A)
@@ -1072,7 +1071,7 @@ class ClipGroupTests(unittest.TestCase):
     def test_list_has_no_append_target_by_default(self):
         body = self.client.get("/api/monitor/clips?match_id=54622319").get_json()
         self.assertIsNone(body["append_target"])
-        self.assertEqual(body["group_max"], monitor_server.CLIP_GROUP_MAX)
+        self.assertNotIn("group_max", body)
         self.assertNotIn("merge_hint", body["clips"][0])
 
     # ---- append mode: 「再截一个视角」 ----
@@ -1083,7 +1082,7 @@ class ClipGroupTests(unittest.TestCase):
     def test_append_arms_target_and_list_reports_it(self):
         response = self._append(name=self.A)
         self.assertEqual(response.status_code, 200, response.get_json())
-        self.assertEqual(response.get_json()["append"], {"name": self.A, "gif_count": 1, "max": monitor_server.CLIP_GROUP_MAX, "expires_in": 900})
+        self.assertEqual(response.get_json()["append"], {"name": self.A, "gif_count": 1, "supplement": False, "expires_in": 900})
         body = self.client.get("/api/monitor/clips?match_id=54622319").get_json()
         self.assertEqual(body["append_target"]["name"], self.A)
         cleared = self._append(clear=True)
@@ -1098,15 +1097,16 @@ class ClipGroupTests(unittest.TestCase):
         self.assertEqual(response.get_json()["append"]["name"], self.A)
         self.assertEqual(response.get_json()["append"]["gif_count"], 2)
 
-    def test_append_refuses_published_discarded_full_and_missing(self):
-        self.queue.records_by_source_name.return_value = {self.A: {"event_key": "manual_0"}}
-        self.assertEqual(self._append(name=self.A).get_json()["code"], "already_published")
+    def test_append_refuses_publishing_discarded_and_missing(self):
+        self.queue.records_by_source_name.return_value = {self.A: {"event_key": "manual_0", "status": "publishing"}}
+        self.assertEqual(self._append(name=self.A).get_json()["code"], "publish_in_progress")
         self.queue.records_by_source_name.return_value = {}
         monitor_server._write_clip_meta(self.dir / self.B, {**self._meta(self.B), "discarded": True})
         self.assertEqual(self._append(name=self.B).get_json()["code"], "clip_discarded")
         for extra in (self.C, self.D, self.E):
             self._group("attach", extra, target=self.A)
-        self.assertEqual(self._append(name=self.A).get_json()["code"], "group_full")
+        # No size limit any more: a 4-GIF title still takes another angle.
+        self.assertEqual(self._append(name=self.A).status_code, 200)
         self.assertEqual(self._append(name="clip_20260101-120000_ffffff.gif").status_code, 404)
         self.assertEqual(self._append(name="../x").status_code, 400)
 
@@ -1163,14 +1163,171 @@ class ClipGroupTests(unittest.TestCase):
     def test_pending_attach_off_returns_none_and_stale_target_clears(self):
         self.assertIsNone(self._capture(self.B))
         self._append(name=self.A)
-        # A got published meanwhile: the fresh clip stays on its own and the mode drops.
-        self.queue.records_by_source_name.return_value = {self.A: {"event_key": "manual_0"}}
+        # A went into publishing meanwhile: the fresh clip stays on its own and the mode drops.
+        self.queue.records_by_source_name.return_value = {self.A: {"event_key": "manual_0", "status": "queued"}}
         result = self._capture(self.B)
-        self.assertEqual(result["code"], "already_published")
+        self.assertEqual(result["code"], "publish_in_progress")
         self.assertIn("已单独保存", result["error"])
         self.assertNotIn("parent", self._meta(self.B))
         self.queue.records_by_source_name.return_value = {}
         self.assertIsNone(self.client.get("/api/monitor/clips?match_id=54622319").get_json()["append_target"])
+
+    # ---- 补图: more GIFs for an article that is already out ----
+
+    def _deliver(self, main, attachments=(), **record):
+        """A as a delivered article whose original body held ``attachments``."""
+        for name in attachments:
+            self._group("attach", name, target=main)
+        meta = self._meta(main)
+        meta["published_attachments"] = list(attachments)
+        monitor_server._write_clip_meta(self.dir / main, meta)
+        delivered = {
+            "event_key": "manual_0",
+            "status": "published",
+            "article_id": "6594814",
+            "published_at_unix": 1_700_000_000.0,
+            "final_event": {"event_key": "manual_0", "title_override": "t0", "minute": 43, "match_event": 1},
+            **record,
+        }
+        self.queue.records_by_source_name.return_value = {main: delivered}
+        return delivered
+
+    def _edits(self, records):
+        def by_kind(match_id, artifact_kind=None):
+            return records if artifact_kind == monitor_server.MANUAL_EDIT_ARTIFACT_KIND else {}
+        self.queue.records_for_match.side_effect = by_kind
+
+    def _update(self, name):
+        return self.client.post("/api/monitor/clip/update", json={"match_id": "54622319", "name": name})
+
+    def test_supplement_append_lands_as_pending(self):
+        self._deliver(self.A, [self.B])
+        armed = self._append(name=self.A)
+        self.assertEqual(armed.status_code, 200, armed.get_json())
+        self.assertTrue(armed.get_json()["append"]["supplement"])
+        result = self._capture(self.C)
+        self.assertEqual(result["main"], self.A)
+        self.assertTrue(result["supplement"])
+        row = self._rows()[self.A]
+        self.assertEqual([(a["name"], a["state"]) for a in row["attachments"]], [(self.B, "sent"), (self.C, "pending")])
+        self.assertEqual(row["supplement"]["pending"], 1)
+        self.assertFalse(row["supplement"]["busy"])
+        # The match stays listed until the 待补发 GIF goes out.
+        self.assertEqual(monitor_server._pending_clip_count("54622319"), 3)  # A(补图), D, E
+
+    def test_supplement_freezes_the_original_body_for_legacy_rows(self):
+        """A row published before 补图 has no published_attachments: its angles count as sent."""
+        self._group("attach", self.B, target=self.A)
+        self.queue.records_by_source_name.return_value = {
+            self.A: {"event_key": "manual_0", "status": "published", "article_id": "1"}
+        }
+        response = self._group("attach", self.C, target=self.A)
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(self._meta(self.A)["published_attachments"], [self.B])
+        states = {a["name"]: a["state"] for a in self._rows()[self.A]["attachments"]}
+        self.assertEqual(states, {self.B: "sent", self.C: "pending"})
+
+    def test_pending_supplement_can_be_detached_but_sent_ones_cannot(self):
+        self._deliver(self.A, [self.B])
+        self._group("attach", self.C, target=self.A)
+        refused = self._group("detach", self.B)
+        self.assertEqual(refused.status_code, 409)
+        self.assertEqual(refused.get_json()["code"], "already_published")
+        self.assertEqual(self._group("set_main", self.C).status_code, 409)
+        detached = self._group("detach", self.C)
+        self.assertEqual(detached.status_code, 200, detached.get_json())
+        self.assertEqual(self._meta(self.A)["attachments"], [self.B])
+        self.assertNotIn("parent", self._meta(self.C))
+        # Folding the pending one into another row works as well.
+        self._group("attach", self.C, target=self.A)
+        moved = self._group("attach", self.C, target=self.D)
+        self.assertEqual(moved.status_code, 200, moved.get_json())
+        self.assertEqual(self._meta(self.C)["parent"], self.D)
+
+    def test_update_enqueues_an_edit_of_the_same_article(self):
+        self._deliver(self.A, [self.B])
+        self._group("attach", self.C, target=self.A)
+        self._group("attach", self.D, target=self.A)
+        self.queue.enqueue.return_value = {"status": "queued"}
+        response = self._update(self.A)
+        self.assertEqual(response.status_code, 200, response.get_json())
+        body = response.get_json()
+        self.assertEqual((body["event_key"], body["added"], body["gif_count"]), ("manual_0~edit1", 2, 4))
+        kwargs = self.queue.enqueue.call_args.kwargs
+        self.assertEqual(kwargs["artifact_kind"], monitor_server.MANUAL_EDIT_ARTIFACT_KIND)
+        self.assertEqual(kwargs["archive_id"], "6594814")
+        self.assertEqual(kwargs["source_path"], self.dir / self.A)
+        self.assertEqual([p.name for p in kwargs["extra_source_paths"]], [self.B, self.C, self.D])
+        event = kwargs["event"]
+        self.assertEqual(event["event_key"], "manual_0~edit1")
+        self.assertEqual(event["article_event_key"], "manual_0")
+        self.assertEqual((event["title_override"], event["minute"], event["match_event"]), ("t0", 43, 1))
+        self.assertEqual(event["supplement_added"], 2)
+        self.assertEqual(event["first_delivered_at_unix"], 1_700_000_000.0)
+        # No match_time clash check: the article being edited is that article.
+        self.assertEqual(
+            self._meta(self.A)["edits"][0]["attachments"], [self.B, self.C, self.D]
+        )
+        # While the edit runs: no second 更新, and its GIFs cannot move.
+        self._edits({"manual_0~edit1": {"event_key": "manual_0~edit1", "status": "publishing"}})
+        busy = self._update(self.A)
+        self.assertEqual(busy.get_json()["code"], "edit_in_progress")
+        self.assertEqual(self._group("detach", self.C).status_code, 409)
+        row = self._rows()[self.A]
+        self.assertTrue(row["supplement"]["busy"])
+        self.assertEqual({a["name"]: a["state"] for a in row["attachments"]}[self.C], "updating")
+
+    def test_delivered_edit_marks_gifs_sent_and_clears_pending(self):
+        self._deliver(self.A, [self.B])
+        self._group("attach", self.C, target=self.A)
+        self.queue.enqueue.return_value = {"status": "queued"}
+        self._update(self.A)
+        self._edits({"manual_0~edit1": {"event_key": "manual_0~edit1", "status": "published", "article_id": "6594814"}})
+        row = self._rows()[self.A]
+        self.assertEqual([a["state"] for a in row["attachments"]], ["sent", "sent"])
+        self.assertEqual(row["supplement"]["pending"], 0)
+        self.assertEqual(monitor_server._pending_clip_count("54622319"), 2)  # D, E
+        nothing = self._update(self.A)
+        self.assertEqual(nothing.get_json()["code"], "nothing_to_update")
+        # A later 补图 gets the next key and resends everything.
+        self._group("attach", self.D, target=self.A)
+        self.queue.enqueue.reset_mock()
+        second = self._update(self.A)
+        self.assertEqual(second.get_json()["event_key"], "manual_0~edit2")
+        self.assertEqual([p.name for p in self.queue.enqueue.call_args.kwargs["extra_source_paths"]], [self.B, self.C, self.D])
+
+    def test_failed_edit_leaves_gifs_pending_and_allows_a_new_update(self):
+        self._deliver(self.A)
+        self._group("attach", self.B, target=self.A)
+        self.queue.enqueue.return_value = {"status": "queued"}
+        self._update(self.A)
+        self._edits({"manual_0~edit1": {"event_key": "manual_0~edit1", "status": "failed", "error": "x"}})
+        row = self._rows()[self.A]
+        self.assertEqual(row["attachments"][0]["state"], "pending")
+        self.assertEqual(row["supplement"]["edit_status"], "failed")
+        self.assertEqual(self._update(self.A).get_json()["event_key"], "manual_0~edit2")
+
+    def test_update_refuses_rows_not_delivered(self):
+        self.assertEqual(self._update(self.A).get_json()["code"], "not_delivered")
+        self.queue.records_by_source_name.return_value = {self.A: {"event_key": "manual_0", "status": "retry_wait"}}
+        self.assertEqual(self._update(self.A).get_json()["code"], "not_delivered")
+        self.queue.enqueue.assert_not_called()
+
+    def test_retry_routes_edit_keys_to_the_edit_kind(self):
+        self.queue.retry.return_value = {"status": "queued"}
+        self.client.post("/api/monitor/clip/retry", json={"match_id": "54622319", "event_key": "manual_0~edit1"})
+        self.assertEqual(self.queue.retry.call_args.kwargs["artifact_kind"], monitor_server.MANUAL_EDIT_ARTIFACT_KIND)
+        self.client.post("/api/monitor/clip/retry", json={"match_id": "54622319", "event_key": "manual_0"})
+        self.assertEqual(self.queue.retry.call_args.kwargs["artifact_kind"], monitor_server.MANUAL_ARTIFACT_KIND)
+
+    def test_publish_records_the_original_body(self):
+        self._group("attach", self.B, target=self.A)
+        self.queue.enqueue.return_value = {"status": "queued"}
+        response = self.client.post(
+            "/api/monitor/clip/publish", json={"match_id": "54622319", "name": self.A, "title": "x"}
+        )
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(self._meta(self.A)["published_attachments"], [self.B])
 
     def test_publish_and_discard_disarm_the_row(self):
         self._append(name=self.A)
@@ -3685,6 +3842,24 @@ class PublishNoticeTests(ClipEndpointAlertMatchTests):
         self.assertNotIn("https://g/2.gif", "\n".join(lines))
         single = monitor_server._format_publish_notice(self._delivered(gif_count=1)).split("\n")
         self.assertEqual(single[-1], "GIF：https://matchgif.aisportsapp.com/g/clip_1.gif")
+
+    def test_supplement_notice_keeps_first_publish_time(self):
+        event = {**self._delivered()["event"], "supplement_added": 2, "first_delivered_at_unix": 1_699_999_000.0}
+        lines = monitor_server._format_publish_notice(
+            self._delivered(supplement=True, gif_count=3, event=event)
+        ).split("\n")
+        fmt = lambda t: monitor_server.datetime.fromtimestamp(t).strftime("%Y-%m-%d %H:%M:%S")  # noqa: E731
+        self.assertEqual(lines[0], "【GIF 已补图】甲 vs 乙（英超）")
+        self.assertIn("补图：新增 2 张，共 3 张", lines)
+        self.assertIn(f"时间：{fmt(1_699_999_000.0)}（首次发布）", lines)
+        self.assertIn(f"补图时间：{fmt(1_700_000_000.0)}", lines)
+        self.assertNotIn(f"时间：{fmt(1_700_000_000.0)}", lines)
+
+    def test_supplement_failure_alert_head(self):
+        alert = monitor_server._format_publish_failure_alert(
+            {"supplement": True, "will_retry": False, "event": {}, "match_detail": {}, "attempt_count": 1}
+        )
+        self.assertTrue(alert.startswith("【GIF 补图失败】"))
 
     def test_notify_hook_uses_publish_webhook_only(self):
         with mock.patch.object(monitor_server, "FEISHU_PUBLISH_WEBHOOK", "https://hook/publish"), \

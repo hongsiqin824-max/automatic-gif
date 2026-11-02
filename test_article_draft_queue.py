@@ -10,6 +10,7 @@ from unittest.mock import patch
 from article_draft_queue import (
     ArticleDraftQueue,
     MANUAL_ARTIFACT_KIND,
+    MANUAL_EDIT_ARTIFACT_KIND,
     _event_with_team_fallback,
     draft_admin_url,
     has_reliable_person,
@@ -1522,6 +1523,103 @@ class ManualClipQueueTests(ArticleDraftQueueTests):
             self.assertEqual(payload["gif_urls"][0], payload["gif_url"])
             record = queue.records_for_match("54478914", artifact_kind=MANUAL_ARTIFACT_KIND)["manual_400"]
             self.assertEqual(record["status"], "published")
+
+    def test_manual_edit_resends_the_whole_body_to_the_same_article(self):
+        """补图: an edit task updates the delivered article (archive_id) with
+        every GIF, settles on its own row and stays out of the daily report."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            platform = SequencePlatformClient(
+                [
+                    {"article_id": "6594814", "duplicate": False, "code": 0},
+                    {"article_id": "6594814", "duplicate": False, "code": 0},
+                ]
+            )
+            seen = []
+            queue = self.make_queue(
+                root,
+                platform,
+                claim_artifact_kinds=(MANUAL_ARTIFACT_KIND, MANUAL_EDIT_ARTIFACT_KIND),
+                manual_delivery_mode="publish",
+                on_manual_delivered=seen.append,
+            )
+            source = self._write_manual_source(root)
+            second = source.with_name("clip_second.gif")
+            second.write_bytes(animated_gif_bytes(b"\x00\xff\x00"))
+            third = source.with_name("clip_third.gif")
+            third.write_bytes(animated_gif_bytes(b"\x00\x00\xff"))
+            base_event = {"event_key": "manual_500", "code": "G", "title_override": "补图", "minute": "43"}
+            queue.enqueue(
+                match_id="54478914",
+                event=base_event,
+                match_detail={"team_A_name": "主队", "team_B_name": "客队"},
+                source_path=source,
+                extra_source_paths=[second],
+                artifact_kind=MANUAL_ARTIFACT_KIND,
+            )
+            self.assertTrue(queue.run_once())
+            first_body = platform.calls[-1]["body"]
+            self.assertNotIn("archive_id", platform.calls[-1])
+            edit = queue.enqueue(
+                match_id="54478914",
+                event={
+                    **base_event,
+                    "event_key": "manual_500~edit1",
+                    "article_event_key": "manual_500",
+                    "supplement_added": 1,
+                },
+                match_detail={"team_A_name": "主队", "team_B_name": "客队"},
+                source_path=source,
+                extra_source_paths=[second, third],
+                artifact_kind=MANUAL_EDIT_ARTIFACT_KIND,
+                archive_id="6594814",
+            )
+            self.assertEqual(edit["status"], "queued")
+            self.assertEqual(edit["article_id"], "6594814")
+            self.assertTrue(queue.run_once())
+            self.assertEqual(len(platform.calls), 2)
+            call = platform.calls[-1]
+            self.assertEqual(call["archive_id"], 6594814)
+            self.assertEqual(call["title"], "补图")
+            self.assertEqual(call["match_time"], "43")
+            urls = [chunk.split('"')[0] for chunk in call["body"].split('src="')[1:]]
+            first_urls = [chunk.split('"')[0] for chunk in first_body.split('src="')[1:]]
+            self.assertEqual(len(urls), 3)
+            self.assertEqual(urls[:2], first_urls)  # existing GIFs keep their place and URL
+            # The edit has its own record; the original publish record is untouched.
+            edits = queue.records_for_match("54478914", artifact_kind=MANUAL_EDIT_ARTIFACT_KIND)
+            self.assertEqual(edits["manual_500~edit1"]["status"], "published")
+            original = queue.records_for_match("54478914", artifact_kind=MANUAL_ARTIFACT_KIND)["manual_500"]
+            self.assertEqual(original["status"], "published")
+            self.assertEqual(seen[0]["supplement"], False)
+            self.assertEqual(seen[1]["supplement"], True)
+            self.assertEqual(seen[1]["gif_count"], 3)
+            now = time.time()
+            report = queue.delivered_between(now - 600, now + 600)
+            self.assertEqual([r["event_key"] for r in report], ["manual_500"])
+
+    def test_manual_edit_requires_an_article_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            queue = self.make_queue(root, SequencePlatformClient(), claim_artifact_kinds=(MANUAL_EDIT_ARTIFACT_KIND,))
+            source = self._write_manual_source(root)
+            with self.assertRaises(ValueError):
+                queue.enqueue(
+                    match_id="54478914",
+                    event={"event_key": "manual_1~edit1"},
+                    match_detail={},
+                    source_path=source,
+                    artifact_kind=MANUAL_EDIT_ARTIFACT_KIND,
+                )
+            with self.assertRaises(ValueError):
+                queue.enqueue(
+                    match_id="54478914",
+                    event={"event_key": "manual_1"},
+                    match_detail={},
+                    source_path=source,
+                    artifact_kind=MANUAL_ARTIFACT_KIND,
+                    archive_id="123",
+                )
 
     def test_manual_group_fails_whole_task_when_an_angle_is_missing(self):
         with tempfile.TemporaryDirectory() as tmp:

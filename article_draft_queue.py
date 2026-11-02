@@ -25,6 +25,11 @@ from match_event_identity import merge_event_metadata
 
 OCR_ARTIFACT_KIND = "ocr_window"
 MANUAL_ARTIFACT_KIND = "manual_clip"
+# 补图: re-send an already delivered manual article (``archive_id``) with more
+# GIFs in its body. A kind of its own so the publish record of the original
+# article, the per-file lookups and the daily report never see these tasks.
+MANUAL_EDIT_ARTIFACT_KIND = "manual_edit"
+MANUAL_ARTIFACT_KINDS = (MANUAL_ARTIFACT_KIND, MANUAL_EDIT_ARTIFACT_KIND)
 DRAFT_DELIVERY_MODE = "draft"
 DRAFT_ADMIN_ORIGIN = "https://dadmin.dongqiudi.com"
 DEFAULT_RETRY_DELAYS_SECONDS = (30.0, 120.0, 300.0, 600.0)
@@ -168,7 +173,7 @@ def ocr_publication_eligibility(
             **details,
         }
 
-    if artifact_kind == MANUAL_ARTIFACT_KIND:
+    if artifact_kind in MANUAL_ARTIFACT_KINDS:
         return allow("manual_confirmed", "人工在直播画面确认事件后触发截取")
 
     if not value:
@@ -532,16 +537,26 @@ class ArticleDraftQueue:
         delivery_mode: str = DRAFT_DELIVERY_MODE,
         artifact_result: dict[str, Any] | None = None,
         extra_source_paths: Sequence[Path] = (),
+        archive_id: str | int | None = None,
     ) -> dict[str, Any]:
         event_key = str(event.get("event_key") or "").strip()
         if not re.fullmatch(r"\d{1,20}", str(match_id)):
             raise ValueError("自动草稿需要有效的数字比赛 ID")
         if not event_key:
             raise ValueError("自动草稿缺少事件标识")
-        if artifact_kind not in (OCR_ARTIFACT_KIND, MANUAL_ARTIFACT_KIND) or delivery_mode != DRAFT_DELIVERY_MODE:
+        if (
+            artifact_kind not in (OCR_ARTIFACT_KIND, *MANUAL_ARTIFACT_KINDS)
+            or delivery_mode != DRAFT_DELIVERY_MODE
+        ):
             raise ValueError("自动草稿仅支持 OCR GIF 或人工截取")
-        if extra_source_paths and artifact_kind != MANUAL_ARTIFACT_KIND:
+        if extra_source_paths and artifact_kind not in MANUAL_ARTIFACT_KINDS:
             raise ValueError("只有人工截取支持多张 GIF")
+        archive_text = str(archive_id or "").strip()
+        if artifact_kind == MANUAL_EDIT_ARTIFACT_KIND:
+            if not re.fullmatch(r"\d{1,20}", archive_text):
+                raise ValueError("补图需要原文章的数字 ID")
+        elif archive_text:
+            raise ValueError("只有补图任务可以指定文章 ID")
 
         resolved_source = source_path.expanduser().resolve()
         resolved_extras: list[Path] = []
@@ -636,8 +651,8 @@ class ArticleDraftQueue:
                         quality_label, eligibility_json, status, stage, artifact_sha256, staged_path,
                         generation, retriable, auth_required,
                         error_code, error, attempt_count, created_at_unix,
-                        updated_at_unix, extra_source_paths_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 0, ?, ?, 0, ?, ?, ?)
+                        updated_at_unix, extra_source_paths_json, article_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 0, ?, ?, 0, ?, ?, ?, ?)
                     """,
                     (
                         task_key,
@@ -668,6 +683,7 @@ class ArticleDraftQueue:
                         now,
                         now,
                         extra_json,
+                        archive_text or None,
                     ),
                 )
             else:
@@ -1132,7 +1148,7 @@ class ArticleDraftQueue:
             event, detail = self._reload_claim_payload(task)
             if not isinstance(event, dict) or not isinstance(detail, dict):
                 raise ValueError("草稿任务中的比赛信息损坏")
-            if str(task.get("artifact_kind") or "") == MANUAL_ARTIFACT_KIND:
+            if str(task.get("artifact_kind") or "") in MANUAL_ARTIFACT_KINDS:
                 # Operator-confirmed clips skip the OCR person-wait/auto-publish
                 # state machine. Deliver exactly once per the worker's configured
                 # manual delivery mode, then settle into a terminal status so
@@ -1148,13 +1164,24 @@ class ArticleDraftQueue:
                     "publishing" if mode == "publish" else "creating_draft",
                     now=claimed_at,
                 )
+                is_edit = str(task.get("artifact_kind")) == MANUAL_EDIT_ARTIFACT_KIND
+                publisher_event = final_event
+                if is_edit:
+                    # 补图 re-sends the whole body. Upload the GIFs under the
+                    # original article's event key so the ones already in the
+                    # article are reused from the upload cache, not re-uploaded.
+                    publisher_event = dict(final_event)
+                    publisher_event["event_key"] = str(
+                        final_event.get("article_event_key") or task["event_key"]
+                    )
                 result = self.publisher.create_or_update_article(
                     match_id=str(task["match_id"]),
-                    event=final_event,
+                    event=publisher_event,
                     match_detail=detail,
                     source_path=source_path,
                     delivery_mode=mode,
                     extra_source_paths=extra_paths,
+                    archive_id=(str(task.get("article_id")) if is_edit else None),
                 )
                 if mode == "publish":
                     self._record_published(
@@ -1897,6 +1924,8 @@ class ArticleDraftQueue:
         payload = {
             "match_id": str(task.get("match_id") or ""),
             "event_key": str(task.get("event_key") or ""),
+            "artifact_kind": str(task.get("artifact_kind") or ""),
+            "supplement": str(task.get("artifact_kind") or "") == MANUAL_EDIT_ARTIFACT_KIND,
             "delivery_mode": mode,
             "article_id": None if article_id is None else str(article_id),
             "draft_url": draft_admin_url(article_id),
@@ -2119,7 +2148,7 @@ class ArticleDraftQueue:
                     task["lease_token"],
                 ),
             )
-        if str(task.get("artifact_kind") or "") == MANUAL_ARTIFACT_KIND:
+        if str(task.get("artifact_kind") or "") in MANUAL_ARTIFACT_KINDS:
             self._fire_manual_failed(
                 task,
                 exc,
@@ -2154,6 +2183,7 @@ class ArticleDraftQueue:
         payload = {
             "match_id": str(task.get("match_id") or ""),
             "event_key": str(task.get("event_key") or ""),
+            "supplement": str(task.get("artifact_kind") or "") == MANUAL_EDIT_ARTIFACT_KIND,
             "delivery_mode": str(task.get("delivery_mode") or ""),
             "status": status,
             "stage": exc.stage,

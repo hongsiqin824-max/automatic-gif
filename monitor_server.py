@@ -81,6 +81,7 @@ from article_draft_queue import (
     ArticleDraftQueue,
     DRAFT_DELIVERY_MODE,
     MANUAL_ARTIFACT_KIND,
+    MANUAL_EDIT_ARTIFACT_KIND,
 )
 from feishu_auth import FeishuAuthConfig, SESSION_KEY as FEISHU_SESSION_KEY, install_feishu_auth
 
@@ -502,10 +503,27 @@ def _pending_clip_count(match_id: str, now: float | None = None) -> int:
         parent = _clip_parent(meta_of(gif.name))
         return bool(parent) and (directory / parent).is_file() and gif.name in _clip_attachments(meta_of(parent))
 
+    edit_records: dict[str, Any] | None = None
+
+    def awaiting_supplement(name: str) -> bool:
+        # A delivered article with 待补发 GIFs (or a 更新 not settled yet)
+        # still needs the operator, so its match must stay listed.
+        nonlocal edit_records
+        meta = meta_of(name)
+        on_disk = [n for n in _clip_attachments(meta) if (directory / n).is_file()]
+        if not on_disk:
+            return False
+        if edit_records is None:
+            edit_records = _clip_edit_records(match_id)
+        state = _supplement_state(meta, edit_records)
+        return any(n not in state["sent"] for n in on_disk)
+
     return sum(
         1
         for gif in gifs
-        if not attached(gif) and not delivered(gif.name) and not meta_of(gif.name).get("discarded")
+        if not attached(gif)
+        and not meta_of(gif.name).get("discarded")
+        and (not delivered(gif.name) or awaiting_supplement(gif.name))
     )
 
 
@@ -722,7 +740,11 @@ def _format_publish_notice(delivered: dict) -> str:
     )
     mode = str(delivered.get("delivery_mode") or "publish")
     label = _clip_source_label(event)
-    head = f"【GIF 已发布{label}】" if mode == "publish" else f"【GIF 草稿已建{label}】"
+    supplement = bool(delivered.get("supplement"))
+    if supplement:
+        head = f"【GIF 已补图{label}】" if mode == "publish" else f"【GIF 草稿已补图{label}】"
+    else:
+        head = f"【GIF 已发布{label}】" if mode == "publish" else f"【GIF 草稿已建{label}】"
     home = str(detail.get("team_A_name") or "").strip()
     away = str(detail.get("team_B_name") or "").strip()
     if home or away:
@@ -757,12 +779,31 @@ def _format_publish_notice(delivered: dict) -> str:
     operator = event.get("operator") if isinstance(event.get("operator"), dict) else {}
     lines.append("操作人：" + (str(operator.get("name") or "").strip() or "未知"))
 
-    stamp = delivered.get("delivered_at_unix")
-    try:
-        when = datetime.fromtimestamp(float(stamp)).strftime("%Y-%m-%d %H:%M:%S")
-    except (TypeError, ValueError, OSError, OverflowError):
-        when = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    lines.append(f"时间：{when}")
+    def _fmt(stamp: Any) -> str | None:
+        try:
+            return datetime.fromtimestamp(float(stamp)).strftime("%Y-%m-%d %H:%M:%S")
+        except (TypeError, ValueError, OSError, OverflowError):
+            return None
+
+    when = _fmt(delivered.get("delivered_at_unix")) or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if supplement:
+        # The article keeps its first publish time (notices and the daily
+        # report count from it); the 补图 moment is only an extra line.
+        try:
+            added = int(event.get("supplement_added") or 0)
+        except (TypeError, ValueError):
+            added = 0
+        try:
+            total = int(delivered.get("gif_count") or 1)
+        except (TypeError, ValueError):
+            total = 1
+        lines.append(f"补图：新增 {added} 张，共 {total} 张" if added else f"补图：共 {total} 张")
+        first = _fmt(event.get("first_delivered_at_unix"))
+        if first:
+            lines.append(f"时间：{first}（首次发布）")
+        lines.append(f"补图时间：{when}")
+    else:
+        lines.append(f"时间：{when}")
 
     if delivered.get("draft_url"):
         lines.append(f"文章：{delivered['draft_url']}")
@@ -815,7 +856,8 @@ def _format_publish_failure_alert(failed: dict) -> str:
         else {}
     )
     label = _clip_source_label(event)
-    head = f"【GIF 发布卡住{label}】" if failed.get("will_retry") else f"【GIF 发布失败{label}】"
+    action = "补图" if failed.get("supplement") else "发布"
+    head = f"【GIF {action}卡住{label}】" if failed.get("will_retry") else f"【GIF {action}失败{label}】"
     home = str(detail.get("team_A_name") or "").strip()
     away = str(detail.get("team_B_name") or "").strip()
     if home or away:
@@ -975,7 +1017,7 @@ def _build_manual_draft_queue() -> "ArticleDraftQueue | None":
             lease_seconds=positive_env_float("GIF_MONITOR_DRAFT_LEASE_SECONDS", 180.0),
             person_wait_seconds=positive_env_float("GIF_MONITOR_PERSON_WAIT_SECONDS", 5.0),
             retry_delays_seconds=MANUAL_DRAFT_RETRY_DELAYS_SECONDS,
-            claim_artifact_kinds=(MANUAL_ARTIFACT_KIND,),
+            claim_artifact_kinds=(MANUAL_ARTIFACT_KIND, MANUAL_EDIT_ARTIFACT_KIND),
             manual_delivery_mode=_manual_delivery_mode(),
             on_manual_delivered=_notify_manual_delivered,
             on_manual_failed=_notify_manual_failed,
@@ -1365,8 +1407,8 @@ def _read_clip_meta(gif_path: Path) -> dict[str, Any]:
 # the main GIF (the first one, or whichever the operator promotes) lists its
 # ``attachments`` in body order, and every attached GIF records its ``parent``.
 # Only the main GIF carries the form / event key / publish record; attached
-# GIFs are folded under it on the page and in the article body. Groups are
-# only edited before publishing.
+# GIFs are folded under it on the page and in the article body. There is no
+# limit on how many GIFs one title carries.
 #
 # The operator declares the group *before* capturing: 「再截一个视角」 on a
 # row arms append mode for this operator and match, and the *next* capture
@@ -1375,10 +1417,20 @@ def _read_clip_meta(gif_path: Path) -> dict[str, Any]:
 # encoding, not when the GIF finishes, so a second capture already in flight
 # (a double Alt+3, or the page and the extension overlapping) never lands in
 # the same group by accident. Further angles need the button again. The mode
-# also drops on 取消, when the row is published or discarded, or when it times
-# out with no capture at all. 并入 / 拆出 / 设为主图 remain as corrections.
+# also drops on 取消, when the row is discarded, or when it times out with no
+# capture at all. 并入 / 拆出 / 设为主图 remain as corrections.
+#
+# 补图: a row whose article is already out keeps taking angles the same way
+# (「+ 补图」 arms append mode, 并入 targets it too). They wait as 待补发 until
+# the operator presses 「更新帖子」, which re-sends the whole body to the same
+# article (``archive_id``). ``published_attachments`` (written at publish) and
+# the ``edits`` log (``{event_key, attachments}`` per 更新) in the main sidecar
+# tell which attachments already went out; only the rest can still be 拆出.
 
-CLIP_GROUP_MAX = 4
+# 补图 tasks the worker has not settled yet: no second 更新 while one runs, or
+# the older body could land after the newer one.
+_EDIT_IN_FLIGHT_STATUSES = frozenset({"queued", "creating", "creating_draft", "publishing", "retry_wait"})
+
 # Long enough to arm the mode and then go find the replay; the deadline is
 # fixed at arming time and is never extended, because the mode covers exactly
 # one capture.
@@ -1429,25 +1481,117 @@ def _clip_group_main(match_id: str, name: str) -> tuple[str, dict[str, Any]] | N
     return name, meta
 
 
-def _clip_group_open_reason(match_id: str, main: str, main_meta: dict[str, Any], *, adding: int = 1) -> str | None:
-    """Why ``main`` cannot take ``adding`` more GIFs right now, or ``None`` if it can."""
+def _clip_publish_records(match_id: str) -> dict[str, dict[str, Any]]:
+    """Publish records of this match's main GIFs, keyed by file name."""
+    if manual_draft_queue is None:
+        return {}
+    return manual_draft_queue.records_by_source_name(match_id, artifact_kind=MANUAL_ARTIFACT_KIND)
+
+
+def _clip_edit_records(match_id: str) -> dict[str, dict[str, Any]]:
+    """补图 task records of this match, keyed by their event key."""
+    if manual_draft_queue is None:
+        return {}
+    return manual_draft_queue.records_for_match(match_id, artifact_kind=MANUAL_EDIT_ARTIFACT_KIND)
+
+
+def _record_delivered(record: dict[str, Any] | None) -> bool:
+    return (
+        isinstance(record, dict)
+        and str(record.get("status") or "") in DELIVERED_CLIP_STATUSES
+        and bool(record.get("article_id"))
+    )
+
+
+def _published_attachments(meta: dict[str, Any]) -> list[str]:
+    """Angles that went out with the original article.
+
+    Written at publish time; a row published before 补图 existed has no such
+    key, and then every attachment it has was in the original body.
+    """
+    raw = meta.get("published_attachments")
+    if not isinstance(raw, list):
+        return _clip_attachments(meta)
+    return [str(n) for n in raw if _CLIP_NAME_RE.fullmatch(str(n or ""))]
+
+
+def _clip_edits(meta: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = meta.get("edits")
+    if not isinstance(raw, list):
+        return []
+    return [e for e in raw if isinstance(e, dict) and str(e.get("event_key") or "").strip()]
+
+
+def _supplement_state(meta: dict[str, Any], edit_records: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Where a delivered main's attachments stand.
+
+    ``sent``: already in the article (original body or a delivered 更新).
+    ``updating``: in a 更新 the worker has not settled; they cannot move.
+    ``latest``: ``(event_key, record)`` of the newest 更新, or ``None``.
+    Anything else in ``attachments`` is 待补发.
+    """
+    sent = set(_published_attachments(meta))
+    latest: tuple[str, dict[str, Any] | None] | None = None
+    latest_names: set[str] = set()
+    for edit in _clip_edits(meta):
+        key = str(edit["event_key"])
+        record = edit_records.get(key)
+        names = {str(n) for n in edit.get("attachments") or []}
+        if _record_delivered(record):
+            sent |= names
+        latest, latest_names = (key, record), names
+    updating: set[str] = set()
+    if latest is not None and latest[1] is not None:
+        if str(latest[1].get("status") or "") in _EDIT_IN_FLIGHT_STATUSES:
+            updating = latest_names - sent
+    return {"sent": sent, "updating": updating, "latest": latest}
+
+
+def _edit_busy(state: dict[str, Any]) -> bool:
+    latest = state.get("latest")
+    return bool(latest and latest[1] and str(latest[1].get("status") or "") in _EDIT_IN_FLIGHT_STATUSES)
+
+
+def _attachment_movable(
+    parent_meta: dict[str, Any], name: str, record: dict[str, Any] | None, edit_records: dict[str, dict[str, Any]]
+) -> bool:
+    """Can ``name`` leave its group? Always before publish; after it, only a 待补发 one.
+
+    A GIF that is in the article (or on its way there) would end up in two
+    articles if it moved, and the article body is only rewritten on 更新.
+    """
+    if record is None:
+        return True
+    if not _record_delivered(record):
+        return False
+    state = _supplement_state(parent_meta, edit_records)
+    return name not in state["sent"] and name not in state["updating"]
+
+
+def _freeze_published_attachments(meta: dict[str, Any]) -> None:
+    """Pin what the original article held before a delivered group changes."""
+    if not isinstance(meta.get("published_attachments"), list):
+        meta["published_attachments"] = _clip_attachments(meta)
+
+
+def _clip_group_open_reason(match_id: str, main: str, main_meta: dict[str, Any]) -> str | None:
+    """Why ``main`` cannot take more GIFs right now, or ``None`` if it can.
+
+    A delivered article can (补图); one still being published cannot, because
+    its body is being sent right now and the new GIF would be left out silently.
+    """
     if main_meta.get("discarded"):
         return "clip_discarded"
-    if manual_draft_queue is not None and main in manual_draft_queue.records_by_source_name(
-        match_id, artifact_kind=MANUAL_ARTIFACT_KIND
-    ):
-        return "already_published"
-    directory = _clip_dir(match_id)
-    existing = [n for n in _clip_attachments(main_meta) if (directory / n).is_file()]
-    if 1 + len(existing) + adding > CLIP_GROUP_MAX:
-        return "group_full"
+    record = _clip_publish_records(match_id).get(main)
+    if record is not None and not _record_delivered(record):
+        return "publish_in_progress"
     return None
 
 
 _CLIP_GROUP_REASON_TEXT = {
     "clip_discarded": "已放弃的 GIF 不能合并，请先恢复",
-    "already_published": "已提交发布的 GIF 不能再合并",
-    "group_full": f"一个标题最多 {CLIP_GROUP_MAX} 张 GIF",
+    "already_published": "已发进文章的 GIF 不能再移动",
+    "publish_in_progress": "这条还没发布成功，发布成功后才能补图",
     "clip_missing": "目标 GIF 不存在或已被清理",
 }
 
@@ -1471,29 +1615,22 @@ def _attach_clip(match_id: str, name: str, target: str) -> tuple[str | None, str
     meta = _read_clip_meta(gif_path)
     if meta.get("discarded"):
         return None, "clip_discarded"
-    if manual_draft_queue is not None and name in manual_draft_queue.records_by_source_name(
-        match_id, artifact_kind=MANUAL_ARTIFACT_KIND
-    ):
+    records = _clip_publish_records(match_id)
+    if name in records:
         return None, "already_published"
     parent = _clip_parent(meta)
     if parent and not (directory / parent).is_file():
         parent = None
-    # Moving out of a group that already went to the CMS would put the same GIF
-    # in two articles: the published body still references it and cannot be
-    # edited any more. Only the main carries the publish record, so an attached
-    # GIF is checked through its parent — its own name never matches one.
-    if (
-        parent
-        and manual_draft_queue is not None
-        and parent in manual_draft_queue.records_by_source_name(
-            match_id, artifact_kind=MANUAL_ARTIFACT_KIND
-        )
-    ):
-        return None, "already_published"
+    # Moving a GIF that is already in an article (or on its way there) would
+    # put it in two articles. Only the main carries the publish record, so an
+    # attached GIF is checked through its parent; a 待补发 one may still move.
+    if parent and parent != main and parent in records:
+        if not _attachment_movable(_read_clip_meta(directory / parent), name, records[parent], _clip_edit_records(match_id)):
+            return None, "already_published"
     if parent == main:
         return main, None
     moving = [name] + [n for n in _clip_attachments(meta) if (directory / n).is_file() and n != main]
-    reason = _clip_group_open_reason(match_id, main, main_meta, adding=len(moving))
+    reason = _clip_group_open_reason(match_id, main, main_meta)
     if reason:
         return None, reason
     if parent:
@@ -1508,6 +1645,9 @@ def _attach_clip(match_id: str, name: str, target: str) -> tuple[str | None, str
         moved_meta.pop("attachments", None)
         moved_meta["parent"] = main
         _write_clip_meta(moved_path, moved_meta)
+    if main in records:
+        # 补图 onto a delivered article: remember what the article already holds.
+        _freeze_published_attachments(main_meta)
     existing = [n for n in _clip_attachments(main_meta) if (directory / n).is_file()]
     main_meta["attachments"] = existing + [n for n in moving if n not in existing]
     main_meta.pop("parent", None)
@@ -1624,7 +1764,8 @@ def _append_target(match_id: str) -> dict[str, Any] | None:
     return {
         "name": name,
         "gif_count": count,
-        "max": CLIP_GROUP_MAX,
+        # The target's article is already out: the capture waits as 待补发.
+        "supplement": name in _clip_publish_records(match_id),
         "expires_in": round(clip_append.remaining(match_id, operator) or 0),
     }
 
@@ -1702,7 +1843,12 @@ def _attach_pending_clip(match_id: str, gif_path: Path, claim: dict[str, Any] | 
         clip_meta["append_push"] = push_state
         _write_clip_meta(gif_path, clip_meta)
     count = 1 + sum(1 for n in _clip_attachments(_read_clip_meta(directory / main)) if (directory / n).is_file())
-    return {"main": main, "gif_count": count, "max": CLIP_GROUP_MAX, "push_state": push_state}
+    return {
+        "main": main,
+        "gif_count": count,
+        "supplement": main in _clip_publish_records(match_id),
+        "push_state": push_state,
+    }
 
 
 def _alert_match_public(alert_match: dict[str, Any]) -> dict[str, Any]:
@@ -1963,10 +2109,17 @@ def _list_clips(match_id: str) -> list[dict[str, Any]]:
         drafts = manual_draft_queue.records_by_source_name(match_id, artifact_kind=MANUAL_ARTIFACT_KIND)
     items: list[dict[str, Any]] = []
     candidates: list[dict[str, Any]] | None = None
+    edit_records: dict[str, dict[str, Any]] | None = None
     for gif in mains:
         stat = stats[gif]
         record = drafts.get(gif.name)
         meta = metas[gif.name]
+        delivered = _record_delivered(record)
+        supplement_state: dict[str, Any] | None = None
+        if delivered:
+            if edit_records is None:
+                edit_records = _clip_edit_records(match_id)
+            supplement_state = _supplement_state(meta, edit_records)
         alert_match = meta.get("alert_match") if isinstance(meta.get("alert_match"), dict) else {}
         form = meta.get("form") if isinstance(meta.get("form"), dict) else _default_clip_form(alert_match)
         attachments: list[dict[str, Any]] = []
@@ -1975,6 +2128,14 @@ def _list_clips(match_id: str) -> list[dict[str, Any]]:
                 continue
             sub_meta = metas[name]
             push_state = sub_meta.get("append_push") if isinstance(sub_meta.get("append_push"), dict) else None
+            if supplement_state is None:
+                att_state = None
+            elif name in supplement_state["sent"]:
+                att_state = "sent"
+            elif name in supplement_state["updating"]:
+                att_state = "updating"
+            else:
+                att_state = "pending"
             attachments.append(
                 {
                     "name": name,
@@ -1984,6 +2145,8 @@ def _list_clips(match_id: str) -> list[dict[str, Any]]:
                     "anchored": sub_meta.get("anchored"),
                     "crop": sub_meta.get("crop") if isinstance(sub_meta.get("crop"), dict) else None,
                     "push_state": push_state,
+                    # 补图 rows only: sent / updating / pending (待补发).
+                    "state": att_state,
                 }
             )
         item = {
@@ -2009,6 +2172,20 @@ def _list_clips(match_id: str) -> list[dict[str, Any]]:
             "draft_attempt": int(record.get("attempt_count") or 0) if record else 0,
             "draft_next_attempt_unix": record.get("next_attempt_at_unix") if record else None,
         }
+        if supplement_state is not None:
+            latest = supplement_state["latest"]
+            edit = latest[1] if latest else None
+            item["supplement"] = {
+                "pending": sum(1 for att in attachments if att["state"] == "pending"),
+                "busy": _edit_busy(supplement_state),
+                "edit_key": latest[0] if latest else None,
+                "edit_status": edit.get("status") if edit else None,
+                "edit_stage": edit.get("stage") if edit else None,
+                "edit_error": edit.get("error") if edit else None,
+                "edit_retriable": bool(edit.get("retriable")) if edit else False,
+                "edit_attempt": int(edit.get("attempt_count") or 0) if edit else 0,
+                "edit_next_attempt_unix": edit.get("next_attempt_at_unix") if edit else None,
+            }
         if record is None and manual_draft_queue is not None:
             # Unpublished rows get the radio options; computed once per listing.
             if candidates is None:
@@ -3202,6 +3379,9 @@ def monitor_clip_publish():
     # Remember what was actually sent so the published row shows it after reload.
     if meta:
         meta["form"] = form
+        if status is not None:
+            # The original body; anything attached later is 补图 (待补发).
+            meta["published_attachments"] = [p.name for p in group_paths[1:]]
         _write_clip_meta(gif_path, meta)
     # Once sent, nobody should keep appending angles to this row.
     clip_append.clear(match_id, name=name)
@@ -3282,12 +3462,12 @@ def monitor_clip_discard():
 
 @app.post("/api/monitor/clip/append")
 def monitor_clip_append():
-    """Arm or disarm append mode: 「再截一个视角」 / 「完成」.
+    """Arm or disarm append mode: 「再截一个视角」 / 「+ 补图」 / 「完成」.
 
     ``{"match_id", "name"}`` makes ``name``'s group the target of this
     operator's next captures (stage and extension alike); ``{"match_id",
-    "clear": true}`` turns it off. The target must be an unpublished,
-    non-discarded main GIF with room left.
+    "clear": true}`` turns it off. The target must be a non-discarded main
+    GIF that is either unpublished or already delivered (补图).
     """
     body = request.get_json(silent=True) or {}
     try:
@@ -3329,8 +3509,9 @@ def monitor_clip_group():
     ``target``; ``detach`` makes an attached ``name`` its own row again;
     ``set_main`` promotes an attached ``name`` to be the group's main GIF
     (the one whose form, cover and publish record the article uses). Only
-    unpublished, non-discarded GIFs of the same match take part, and a group
-    never exceeds ``CLIP_GROUP_MAX`` GIFs.
+    non-discarded GIFs of the same match take part. After publishing, a group
+    still takes 补图 (attach) and lets a 待补发 GIF go (detach), but its main
+    and the GIFs already in the article stay put.
     """
     body = request.get_json(silent=True) or {}
     try:
@@ -3370,7 +3551,12 @@ def monitor_clip_group():
             return jsonify({"error": "该 GIF 不是附属，无需拆出", "code": "not_attached"}), 409
         parent_path = directory / parent
         parent_meta = _read_clip_meta(parent_path)
-        if parent in records:
+        if parent in records and (
+            action == "set_main"
+            or not _attachment_movable(parent_meta, name, records[parent], _clip_edit_records(match_id))
+        ):
+            if action == "detach" and _record_delivered(records[parent]):
+                return jsonify({"error": "这张已经发进文章（或正在更新），不能再拆出", "code": "already_published"}), 409
             return jsonify({"error": "已提交发布的标题不能再调整", "code": "already_published"}), 409
         siblings = [n for n in _clip_attachments(parent_meta) if n != name and (directory / n).is_file()]
         if action == "detach":
@@ -3436,7 +3622,9 @@ def monitor_clip_retry():
     if manual_draft_queue is None:
         return jsonify({"error": "发文未启用（GIF 仅本地保存）", "code": "publish_disabled"}), 409
     record = manual_draft_queue.retry(
-        match_id=match_id, event_key=event_key, artifact_kind=MANUAL_ARTIFACT_KIND
+        match_id=match_id,
+        event_key=event_key,
+        artifact_kind=MANUAL_EDIT_ARTIFACT_KIND if _EDIT_KEY_MARK in event_key else MANUAL_ARTIFACT_KIND,
     )
     if record is None:
         return jsonify({"error": "没有找到对应的发布任务", "code": "task_missing"}), 404
@@ -3455,18 +3643,133 @@ def monitor_clip_retry():
     return jsonify({"ok": True, "match_id": match_id, "event_key": event_key, "status": record.get("status")})
 
 
+# 补图 task keys are ``<article event key>~edit<n>``: unique per 更新, so each
+# press is its own task, and recognisable for 立即重试.
+_EDIT_KEY_MARK = "~edit"
+
+
+@app.post("/api/monitor/clip/update")
+def monitor_clip_update():
+    """「更新帖子」: send a delivered article again with its 待补发 GIFs.
+
+    The whole body goes out (main, the GIFs already in it, then the new ones)
+    to the same article via ``archive_id``, with the fields of the original
+    publish unchanged. One 更新 at a time per article, so an older body can
+    never land after a newer one. The original publish record is untouched:
+    its time stays the article's publish time for notices and the daily report.
+    """
+    body = request.get_json(silent=True) or {}
+    try:
+        match_id = validate_match_id(str(body.get("match_id") or ""))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    name = str(body.get("name") or "").strip()
+    if not _CLIP_NAME_RE.fullmatch(name):
+        return jsonify({"error": "无效的 GIF 文件名"}), 400
+    gif_path = _clip_dir(match_id) / name
+    if not gif_path.is_file():
+        return jsonify({"error": "GIF 不存在或已被清理", "code": "clip_missing"}), 404
+    if manual_draft_queue is None:
+        return jsonify({"error": "发文未启用（GIF 仅本地保存）", "code": "publish_disabled"}), 409
+    meta = _read_clip_meta(gif_path)
+    record = _clip_publish_records(match_id).get(name)
+    if not _record_delivered(record):
+        return jsonify({"error": "这条还没发布成功，不能补图", "code": "not_delivered"}), 409
+    final_event = record.get("final_event") if isinstance(record.get("final_event"), dict) else None
+    article_event_key = str(record.get("event_key") or "")
+    if not final_event or not article_event_key:
+        return jsonify({"error": "找不到原文章的发布内容，无法补图", "code": "publish_record_incomplete"}), 409
+    edit_records = _clip_edit_records(match_id)
+    state = _supplement_state(meta, edit_records)
+    if _edit_busy(state):
+        return jsonify({"error": "上一次更新还没完成，请稍候", "code": "edit_in_progress"}), 409
+    group_paths = _clip_group_paths(match_id, gif_path, meta)
+    names = [p.name for p in group_paths[1:]]
+    added = [n for n in names if n not in state["sent"]]
+    if not added:
+        return jsonify({"error": "没有待补发的 GIF", "code": "nothing_to_update"}), 409
+    edits = _clip_edits(meta)
+    event_key = f"{article_event_key}{_EDIT_KEY_MARK}{len(edits) + 1}"
+    event = dict(final_event)
+    event.update(
+        {
+            "event_key": event_key,
+            # Upload cache key of the article's GIFs (reused, not re-uploaded).
+            "article_event_key": article_event_key,
+            # Who pressed 更新帖子; the original publisher stays in the record.
+            "operator": _current_operator(),
+            "supplement_added": len(added),
+            "first_delivered_at_unix": record.get("published_at_unix") or record.get("draft_created_at_unix"),
+        }
+    )
+    match_detail = meta.get("match_detail") if isinstance(meta.get("match_detail"), dict) else _match_detail_for(match_id)
+    try:
+        task = manual_draft_queue.enqueue(
+            match_id=match_id,
+            event=event,
+            match_detail=match_detail,
+            source_path=gif_path,
+            extra_source_paths=group_paths[1:],
+            artifact_kind=MANUAL_EDIT_ARTIFACT_KIND,
+            delivery_mode=DRAFT_DELIVERY_MODE,
+            artifact_result=None,
+            archive_id=str(record.get("article_id")),
+        )
+    except Exception as exc:  # noqa: BLE001 - nothing was sent; the operator can press again
+        print(
+            json.dumps(
+                {"event": "manual_edit_enqueue", "match_id": match_id, "clip": name, "event_key": event_key, "error": str(exc)},
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+        return jsonify({"error": f"补图提交失败：{exc}", "event_key": event_key}), 500
+    _freeze_published_attachments(meta)
+    meta["edits"] = [*edits, {"event_key": event_key, "attachments": names, "submitted_at_unix": time.time()}]
+    _write_clip_meta(gif_path, meta)
+    print(
+        json.dumps(
+            {
+                "event": "manual_edit_enqueue",
+                "match_id": match_id,
+                "clip": name,
+                "article_id": record.get("article_id"),
+                "event_key": event_key,
+                "attachments": names,
+                "added": added,
+                "status": task.get("status"),
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
+    return jsonify(
+        {
+            "ok": True,
+            "match_id": match_id,
+            "name": name,
+            "event_key": event_key,
+            "added": len(added),
+            "gif_count": 1 + len(names),
+            "status": task.get("status"),
+        }
+    )
+
+
 @app.get("/api/monitor/publish/status")
 def monitor_publish_status():
     if manual_draft_queue is None:
         return jsonify({"enabled": False, "records": {}})
     match_id = str(request.args.get("match_id") or "").strip()
     records: dict[str, Any] = {}
+    edit_records: dict[str, Any] = {}
     if match_id:
         try:
             match_id = validate_match_id(match_id)
             records = manual_draft_queue.records_for_match(
                 match_id, artifact_kind=MANUAL_ARTIFACT_KIND
             )
+            edit_records = _clip_edit_records(match_id)
         except ValueError:
             records = {}
     return jsonify(
@@ -3474,6 +3777,8 @@ def monitor_publish_status():
             "enabled": True,
             "queue": manual_draft_queue.status(),
             "records": records,
+            # 补图 (更新帖子) tasks, keyed by their ``~edit<n>`` event key.
+            "edit_records": edit_records,
         }
     )
 
@@ -3513,7 +3818,6 @@ def monitor_clips():
             "match_id": match_id,
             "publish_enabled": manual_draft_queue is not None,
             "score_event_types": sorted(SCORE_EVENT_TYPES),
-            "group_max": CLIP_GROUP_MAX,
             "append_target": _append_target(match_id),
             "clips": _list_clips(match_id),
         }
