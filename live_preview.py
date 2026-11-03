@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -368,19 +369,30 @@ class LivePreviewManager:
             return None
         return text[-limit:]
 
-    @staticmethod
-    def _summarize_exit_reason(log_tail: str | None) -> str | None:
+    _REPEATED_RE = re.compile(r"^(?:\[[^\]]*\]\s*)?Last message repeated (\d+) times?$")
+
+    @classmethod
+    def _summarize_exit_reason(cls, log_tail: str | None) -> str | None:
         """Collapse ffmpeg stderr into the single most informative line.
 
         ffmpeg's last line is almost always the real cause (``Connection timed
         out``, ``Server returned 404``, ``Error reading header`` ...); earlier
-        lines are usually decode warnings that are not the exit reason.
+        lines are usually decode warnings that are not the exit reason. The
+        exception is ffmpeg's own ``Last message repeated N times``, which says
+        nothing by itself: the line it repeats is the one before, so that line
+        is reported with the count (e.g. a flood of an unsupported-codec warning
+        while the picture stays black).
         """
         if not log_tail:
             return None
         lines = [line.strip() for line in log_tail.splitlines() if line.strip()]
         if not lines:
             return None
+        repeated = cls._REPEATED_RE.match(lines[-1])
+        if repeated:
+            earlier = [line for line in lines[:-1] if not cls._REPEATED_RE.match(line)]
+            if earlier:
+                return f"{earlier[-1][:180]} (x{int(repeated.group(1)) + 1})"
         return lines[-1][:200]
 
     def _record_exit_locked(self, match_id: str, entry: _PreviewEntry, return_code: int | None, now: float) -> bytes:
@@ -389,7 +401,7 @@ class LivePreviewManager:
         The raw log is handed back so the caller can re-write it as
         ``ffmpeg.prev.log`` next to the replacement's log.
         """
-        log_tail = self._read_log_tail(entry.log_path)
+        log_tail = self._read_log_tail(entry.log_path, limit=3000)
         reason = self._summarize_exit_reason(log_tail)
         entry.last_exit_code = return_code
         entry.last_exit_reason = reason
@@ -407,8 +419,28 @@ class LivePreviewManager:
             restart_count=entry.restart_count,
             restart_count_total=entry.restart_count_total,
             reason=reason,
+            stderr_tail=self._distinct_tail(log_tail),
         )
         return raw_log
+
+    @classmethod
+    def _distinct_tail(cls, log_tail: str | None, count: int = 5) -> list[str]:
+        """The last ``count`` different stderr lines, oldest first, for the log.
+
+        ``Last message repeated`` lines and exact repeats are dropped so a
+        flood of one warning cannot push the other clues out.
+        """
+        if not log_tail:
+            return []
+        picked: list[str] = []
+        for line in reversed(log_tail.splitlines()):
+            line = line.strip()
+            if not line or cls._REPEATED_RE.match(line) or line[:160] in picked:
+                continue
+            picked.append(line[:160])
+            if len(picked) == count:
+                break
+        return picked[::-1]
 
     def _stop_entry_locked(self, match_id: str, *, release_sibling: bool = True) -> None:
         entry = self.entries.pop(match_id, None)

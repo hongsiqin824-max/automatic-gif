@@ -31,6 +31,18 @@ def _stub_command_factory(directory_playlist_writer):
 
 
 class LivePreviewClassificationTests(unittest.TestCase):
+    def test_exit_reason_summary(self):
+        summarize = LivePreviewManager._summarize_exit_reason
+        self.assertIsNone(summarize(None))
+        self.assertEqual(summarize("noise\nrtmp://h/s: Operation not permitted\n"), "rtmp://h/s: Operation not permitted")
+        self.assertEqual(summarize("warn A\nLast message repeated 3 times\n"), "warn A (x4)")
+        # Nothing before the marker: keep the marker rather than invent a cause.
+        self.assertEqual(summarize("Last message repeated 1 times"), "Last message repeated 1 times")
+        self.assertEqual(
+            LivePreviewManager._distinct_tail("a\nb\nb\nLast message repeated 9 times\nc\n", count=2),
+            ["b", "c"],
+        )
+
     def test_rtmp_is_not_local_file(self):
         self.assertFalse(LivePreviewManager._is_local_file("rtmp://host/app/stream"))
         self.assertFalse(LivePreviewManager._is_local_file("https://host/x.m3u8"))
@@ -424,6 +436,29 @@ class LivePreviewAutoRestartTests(unittest.TestCase):
         prev_log = manager.entries["m1"].directory / "ffmpeg.prev.log"
         self.assertTrue(prev_log.is_file())
         self.assertIn("Connection timed out", prev_log.read_text(encoding="utf-8"))
+
+    def test_repeated_warning_is_reported_instead_of_the_repeat_marker(self):
+        # The 54475663 black-screen night logged only "Last message repeated 16
+        # times"; the warning it repeats is what tells the cause apart.
+        manager = self._make()
+        manager._build_command = _dying_command_factory(
+            "[flv @ 0x1] Input #0 opened\n"
+            "[flv @ 0x1] Video codec 12 not supported\n"
+            "    Last message repeated 16 times\n"
+        )
+        manager.start("m1", "rtmp://host/s")
+        manager.entries["m1"].process.wait(timeout=5)
+        with mock.patch("live_preview._log_event") as logged:
+            manager._reap_tick(time.time())
+        self.assertEqual(
+            manager.status("m1")["last_exit_reason"],
+            "[flv @ 0x1] Video codec 12 not supported (x17)",
+        )
+        exited = [c.kwargs for c in logged.call_args_list if c.args[0] == "preview_ffmpeg_exited"]
+        self.assertEqual(
+            exited[0]["stderr_tail"],
+            ["[flv @ 0x1] Input #0 opened", "[flv @ 0x1] Video codec 12 not supported"],
+        )
 
     def test_restart_total_survives_budget_reset(self):
         manager = self._make()
