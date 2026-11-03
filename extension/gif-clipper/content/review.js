@@ -9,7 +9,8 @@
 // webm leaves its last cluster open, so the SourceBuffer must be abort()ed
 // before changing the offset (verified 2026-10-27 in a probe page).
 //
-// Keys while open: Space play/pause, ←/→ ±1 s, Shift+←/→ ±5 s, , . ±1 frame,
+// Keys while open: Space play/pause, ; ' ±5 s, . / ±1 s (also ←/→, Shift+←/→
+// ±5 s), > ? (Shift+. Shift+/) ±1 frame,
 // [ set start, ] set end, C toggle crop box, Enter confirm, Esc close.
 //
 // Pure helper `unstickTarget` is exported for node tests (no DOM needed).
@@ -168,8 +169,8 @@
             <button data-role="play" title="播放/暂停（空格）">▶</button>
             <span class="time" data-role="time">0:00 / 0:00</span>
             <button data-role="back5" title="后退 5 秒（; 或 Shift+←）· 按住连续后退">−5s<kbd>;</kbd></button>
-            <button data-role="back1" title="后退 1 秒（, 或 ←）· 按住连续后退">−1s<kbd>,</kbd></button>
-            <button data-role="fwd1" title="前进 1 秒（. 或 →）· 按住连续前进">+1s<kbd>.</kbd></button>
+            <button data-role="back1" title="后退 1 秒（. 或 ←）· 按住连续后退 · Shift+. 后退一帧">−1s<kbd>.</kbd></button>
+            <button data-role="fwd1" title="前进 1 秒（/ 或 →）· 按住连续前进 · Shift+/ 前进一帧">+1s<kbd>/</kbd></button>
             <button data-role="fwd5" title="前进 5 秒（' 或 Shift+→）· 按住连续前进">+5s<kbd>'</kbd></button>
             <button data-role="setin" title="当前画面设为起点（[）">起点<kbd>[</kbd></button>
             <button data-role="setout" title="当前画面设为终点（]）">终点<kbd>]</kbd></button>
@@ -420,18 +421,19 @@
         u.tl.addEventListener("pointermove", move);
         u.tl.addEventListener("pointerup", up);
       });
-      // ``;`` ``'`` = ∓5 s and ``,`` ``.`` = ∓1 s, the two pairs next to the
-      // ``[`` ``]`` in/out keys, so the whole trim is done without leaving that
-      // corner of the keyboard. Frame stepping keeps the same ``,`` ``.`` keys
-      // with Shift. The arrows stay as they were for anyone used to them.
-      const SEEK_KEYS = { ";": -5, "'": 5, ",": -1, ".": 1 };
+      // ``;`` ``'`` = ∓5 s and ``.`` ``/`` = ∓1 s: with ``[`` ``]`` (in/out)
+      // the three pairs run down the keyboard diagonally (operator's ask,
+      // 2026-11), so the whole trim is done without leaving that corner.
+      // Frame stepping keeps the same ``.`` ``/`` keys with Shift (``>`` ``?``).
+      // ``,`` is left unbound on purpose. The arrows stay as they were.
+      const SEEK_KEYS = { ";": -5, "'": 5, ".": -1, "/": 1 };
       this._onKey = (e) => {
         if (this.closed) return;
         const k = e.key;
         let handled = true;
         // ``e.repeat`` = the OS's own auto-repeat while the key is held. Our
         // timer already drives the repeat, so the action is skipped - but the
-        // event must still be swallowed below, or a held ``,`` / arrow would
+        // event must still be swallowed below, or a held ``.`` / arrow would
         // reach the live player underneath and seek *it*.
         const held = e.repeat;
         if (k === "Escape") { if (!held) this.close(); }
@@ -439,8 +441,8 @@
         else if (k === " ") { if (!held) this.togglePlay(); }
         else if (k === "ArrowLeft") { if (!held) this._startRepeat(e.shiftKey ? -5 : -1, k); }
         else if (k === "ArrowRight") { if (!held) this._startRepeat(e.shiftKey ? 5 : 1, k); }
-        else if (k === "<") { if (!held) this.seekBy(-FRAME_S); }
-        else if (k === ">") { if (!held) this.seekBy(FRAME_S); }
+        else if (k === ">") { if (!held) this.seekBy(-FRAME_S); }
+        else if (k === "?") { if (!held) this.seekBy(FRAME_S); }
         else if (SEEK_KEYS[k] !== undefined) { if (!held) this._startRepeat(SEEK_KEYS[k], k); }
         else if (k === "[") { if (!held) this.setIn(); }
         else if (k === "]") { if (!held) this.setOut(); }
