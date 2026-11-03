@@ -183,6 +183,7 @@ body{
 .stage-clip-field:has(.stage-clip-title){flex:1 1 100%}
 .stage-clip-input,.stage-clip-select{padding:9px 10px;font-size:14px;border-radius:6px;min-height:38px}
 .stage-clip-time,.stage-clip-score{width:96px}
+.stage-clip-time.warn{border-color:var(--amber);background:rgba(245,185,76,.12)}
 .stage-clip-title{flex:1;min-width:160px}
 .stage-clip-title:focus{outline:none;border-color:var(--cyan);box-shadow:0 0 0 2px rgba(93,225,208,.25)}
 .stage-clip-publish{padding:11px 22px;font-size:15px;min-height:42px;width:100%;margin-top:2px}

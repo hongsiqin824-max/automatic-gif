@@ -1226,6 +1226,19 @@ const MATCH_EVENT_OPTIONS = [
 // field is cleared and locked for the rest and the server drops it too.
 let scoreEventTypes = new Set([1, 2]);
 
+// Pushes report every stoppage-time event as 45 or 90 (no "+N"), and the CMS
+// refuses a second gif article with the same match_time in one match.
+const CAPPED_MATCH_TIME_RE = /^(45|90)$/;
+
+// The overview's "90+6" for a push that only said "90": same base minute and
+// the push has no stoppage of its own. '' when nothing should change.
+function stoppageTimeFor(pushTime, overviewTime) {
+  const full = /^(\d{1,3})\+(\d{1,2})$/.exec(String(overviewTime || ''));
+  const push = String(pushTime || '').trim();
+  if (!full || !/^\d{1,3}$/.test(push) || Number(push) !== Number(full[1])) return '';
+  return overviewTime;
+}
+
 // "43' 进球 克赖切尔-佩雷斯 阿拉胡埃拉人2-0莫塔瓜": the side the push is about
 // first, with its own goals first, then the other side — the shape operators
 // write titles in, so the line can be copied as is. Pushes carry the score as
@@ -1375,15 +1388,24 @@ function buildClipForm(item, row) {
   // One push's overview result: fill the scorer into the line, show whether it
   // is still coming, and when the type turns out to be 点球/乌龙/两黄变红 move
   // the 类型 dropdown along — only for the picked push and only if the
-  // operator has not chosen a type by hand.
+  // operator has not chosen a type by hand. The push caps stoppage time at
+  // 45/90; the overview's "90+6" replaces it in the line and, on the same
+  // terms as the type, in the 时间 field.
   function applyPlayerTo(seq, info) {
     const el = optionEls.get(seq);
     if (!el || !info) return;
     if (info.opponent_name && !el.c.opponent_name) el.c.opponent_name = info.opponent_name;
     el.c.player = info.player || null;
+    const fullTime = info.player ? stoppageTimeFor(el.c.match_time, info.player.match_time) : '';
+    if (fullTime) {
+      el.c.match_time = fullTime;
+      el.radio.dataset.matchTime = fullTime;
+      if (el.radio.checked && !dirty.has('match_time')) timeEl.value = fullTime;
+    }
     el.text.textContent = candidateLabel(el.c);
     el.status.textContent = info.status === 'pending' ? '球员获取中' : info.status === 'missing' ? '无球员信息' : '';
     el.status.title = info.status === 'pending' ? '球员信息比推送慢，拿到后这一行会自动补上' : '';
+    syncTimeWarning();
     if (!info.player) return;
     const matchEvent = String(info.player.match_event);
     if (el.radio.dataset.matchEvent === matchEvent) return;
@@ -1433,6 +1455,12 @@ function buildClipForm(item, row) {
   scoreEl.type = 'text'; scoreEl.placeholder = '3-1 主队在前'; scoreEl.maxLength = 7;
   mk(fields, 'match_score', scoreEl, '比分');
   form.appendChild(fields);
+  const timeWarn = document.createElement('div');
+  timeWarn.className = 'stage-clip-hint warn stage-clip-time-warn';
+  timeWarn.hidden = true;
+  timeWarn.textContent = "可能是补时：部分推送会把补时记成 45'/90'，同场时间重复会发布失败。完整时间（如 90+3）拿到后自动填，急发请先手动改";
+  form.appendChild(timeWarn);
+  timeEl.addEventListener('input', syncTimeWarning);
 
   const titleRow = document.createElement('div');
   titleRow.className = 'stage-clip-fields';
@@ -1474,7 +1502,21 @@ function buildClipForm(item, row) {
     if (!dirty.has('match_time')) timeEl.value = radio.dataset.matchTime;
     if (!dirty.has('match_score')) scoreEl.value = radio.dataset.score;
     syncScoreField();
+    syncTimeWarning();
     syncPublishButton();
+  }
+  // Fallback while the overview has not answered: a bare 45/90 from a push is
+  // probably capped stoppage time. Quiet once the overview confirmed the
+  // picked push (a found player with no stoppage = a real 90') or the operator
+  // has typed in the field.
+  function syncTimeWarning() {
+    const checked = form.querySelector(`input[name="${radioName}"]:checked`);
+    const info = checked && checked.value && state.stagePlayers ? state.stagePlayers.get(checked.value) : null;
+    const confirmed = dirty.has('match_time') || Boolean(info && info.status === 'found');
+    const warn = CAPPED_MATCH_TIME_RE.test(timeEl.value.trim()) && !confirmed;
+    timeEl.classList.toggle('warn', warn);
+    timeEl.title = warn ? '推送里的补时只到 45/90，请核对' : '';
+    timeWarn.hidden = !warn;
   }
   // 比分 only applies to 进球/点球: lock and clear it for every other type,
   // and when the type comes back, restore the picked push's score unless the
@@ -1518,6 +1560,7 @@ function buildClipForm(item, row) {
     scoreEl.value = values.match_score || '';
     titleEl.value = values.title || '';
     syncScoreField();
+    syncTimeWarning();
     syncPublishButton();
   }
   // Append a push that arrived after capture; selection and fields untouched.
@@ -1529,7 +1572,7 @@ function buildClipForm(item, row) {
   }
   writeForm(initial);
   if (state.stagePlayers) applyPlayers(state.stagePlayers);
-  form._clip = {readForm, writeForm, addCandidate, applyPlayers, syncScoreField, dirty};
+  form._clip = {readForm, writeForm, addCandidate, applyPlayers, syncScoreField, syncTimeWarning, dirty};
   return form;
 }
 
@@ -1769,6 +1812,7 @@ async function loadStageClips(matchId, options = {}) {
       if (kept && formEl && formEl._clip) {
         formEl._clip.writeForm(kept.values);
         kept.dirty.forEach((k) => formEl._clip.dirty.add(k));
+        formEl._clip.syncTimeWarning();
       }
       list.appendChild(row);
     });

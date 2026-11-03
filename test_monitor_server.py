@@ -1621,6 +1621,46 @@ class ClipPlayersEndpointTests(unittest.TestCase):
         self.assertEqual(self.client.get("/api/monitor/clip/players?match_id=../x").status_code, 400)
 
 
+class StoppageTimeJsTests(unittest.TestCase):
+    """``stoppageTimeFor`` / ``CAPPED_MATCH_TIME_RE`` from app.js under node."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.node = shutil.which("node")
+        if not cls.node:
+            raise unittest.SkipTest("node 不可用")
+        import re
+        source = (Path(monitor_server.__file__).parent / "monitor_static" / "app.js").read_text(encoding="utf-8")
+        const = re.search(r"^const CAPPED_MATCH_TIME_RE = [^;]+;", source, re.M)
+        func = re.search(r"^function stoppageTimeFor\([^)]*\) \{.*?^\}", source, re.M | re.S)
+        if const is None or func is None:
+            raise AssertionError("stoppage helpers missing from app.js")
+        cls.prelude = f"{const.group(0)}\n{func.group(0)}"
+
+    def run_js(self, expr: str):
+        script = f"{self.prelude}\nprocess.stdout.write(JSON.stringify({expr}));"
+        result = subprocess.run([self.node, "-e", script], capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_capped_push_takes_the_overview_time(self):
+        self.assertEqual(self.run_js("stoppageTimeFor('90', '90+6')"), "90+6")
+        self.assertEqual(self.run_js("stoppageTimeFor('45', '45+2')"), "45+2")
+
+    def test_nothing_changes_otherwise(self):
+        # Regular time, a different base minute, a push that already had its stoppage.
+        self.assertEqual(self.run_js("stoppageTimeFor('74', '')"), "")
+        self.assertEqual(self.run_js("stoppageTimeFor('89', '90+1')"), "")
+        self.assertEqual(self.run_js("stoppageTimeFor('90+3', '90+4')"), "")
+        self.assertEqual(self.run_js("stoppageTimeFor('', '90+4')"), "")
+
+    def test_only_bare_45_and_90_warn(self):
+        self.assertEqual(
+            self.run_js("['45','90','90+3','89','190','4'].map((v) => CAPPED_MATCH_TIME_RE.test(v))"),
+            [True, True, False, False, False, False],
+        )
+
+
 class StageCropMathTests(unittest.TestCase):
     """Run the pure crop helpers from monitor_static/app.js under node.
 

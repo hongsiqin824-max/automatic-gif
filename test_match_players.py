@@ -44,6 +44,41 @@ class ParseOverviewTests(unittest.TestCase):
         self.assertEqual(parse_overview_events({}), [])
         self.assertEqual(parse_overview_events({"events": []}), [])
 
+    def test_stoppage_time_comes_from_the_bucket_key(self):
+        times = {e["person"]: e["match_time"] for e in parse_overview_events(_payload())}
+        self.assertEqual(times["萨尔迪瓦"], "90+2")
+        self.assertEqual(times["阿尼奥尔"], "")
+        # Odd spacing / a trailing ' still normalise; a key without "+" never invents one.
+        payload = {"events": {
+            "45 + 1'": {"minute": "45", "teamAEvents": [{"code": "G", "person": "甲", "score": "1-0"}]},
+            "x": {"minute": "90+4", "teamBEvents": [{"code": "RC", "person": "乙", "score": ""}]},
+            "88": {"minute": "88", "teamBEvents": [{"code": "G", "person": "丙", "score": "1-1"}]},
+        }}
+        times = {e["person"]: e["match_time"] for e in parse_overview_events(payload)}
+        self.assertEqual(times, {"甲": "45+1", "乙": "90+4", "丙": ""})
+
+
+class StoppageTimeTests(unittest.TestCase):
+    """The 54610084 (厄瓜杯半决赛) case of 2026-11: both late goals were pushed as
+    "2H 90", the CMS refused the second article for the same match_time."""
+
+    def setUp(self):
+        self.events = parse_overview_events({"events": {
+            "14": {"minute": "14", "teamAEvents": [{"code": "G", "person": "法哈多", "score": "1-0"}]},
+            "90+6": {"minute": "90", "teamBEvents": [{"code": "G", "person": "卢卡斯-罗德里格斯", "score": "1-2"}]},
+            "90+13": {"minute": "90", "teamAEvents": [{"code": "G", "person": "隆多尼奥", "score": "2-2"}]},
+        }})
+
+    def test_two_capped_pushes_get_their_own_full_time(self):
+        first = resolve_player({"event_type": "goal", "team": "B", "score": "1-2", "minute": "2H 90"}, self.events)
+        second = resolve_player({"event_type": "goal", "team": "A", "score": "2-2", "minute": "2H 90"}, self.events)
+        self.assertEqual((first["person"], first["match_time"]), ("卢卡斯-罗德里格斯", "90+6"))
+        self.assertEqual((second["person"], second["match_time"]), ("隆多尼奥", "90+13"))
+
+    def test_regular_time_has_no_match_time(self):
+        found = resolve_player({"event_type": "goal", "team": "A", "score": "1-0", "minute": "1H 14"}, self.events)
+        self.assertEqual(found["match_time"], "")
+
 
 class ResolvePlayerTests(unittest.TestCase):
     def setUp(self):

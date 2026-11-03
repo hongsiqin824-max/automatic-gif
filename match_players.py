@@ -48,6 +48,7 @@ RED_CARD_CODES = frozenset({"RC", "Y2C"})
 
 _SCORE_RE = re.compile(r"^\s*(\d+)\s*-\s*(\d+)\s*$")
 _MINUTE_RE = re.compile(r"(\d{1,3})(?:\s*\+\s*\d{1,2})?\s*'?\s*$")
+_STOPPAGE_RE = re.compile(r"^\s*(\d{1,3})\s*\+\s*(\d{1,2})\s*'?\s*$")
 
 
 def _score_key(value: Any) -> str:
@@ -61,8 +62,22 @@ def _base_minute(value: Any) -> int | None:
     return int(match.group(1)) if match else None
 
 
+def _stoppage_time(*values: Any) -> str:
+    """The first ``"90+6"``-style value, normalised; ``""`` when none has a ``+``."""
+    for value in values:
+        match = _STOPPAGE_RE.match(str(value or ""))
+        if match:
+            return f"{int(match.group(1))}+{int(match.group(2))}"
+    return ""
+
+
 def parse_overview_events(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    """Goals and red cards of an overview payload, one flat dict each."""
+    """Goals and red cards of an overview payload, one flat dict each.
+
+    A bucket's ``minute`` is capped (``"90"``) while its key keeps the
+    stoppage (``"90+6"``); the push is capped the same way, so ``match_time``
+    carries the full clock the CMS needs to tell two stoppage-time events apart.
+    """
     buckets = payload.get("events")
     if not isinstance(buckets, dict):
         return []
@@ -71,6 +86,7 @@ def parse_overview_events(payload: dict[str, Any]) -> list[dict[str, Any]]:
         if not isinstance(bucket, dict):
             continue
         minute = _base_minute(bucket.get("minute") or bucket_key)
+        match_time = _stoppage_time(bucket_key, bucket.get("minute"))
         for side_key, side in (("teamAEvents", "A"), ("teamBEvents", "B")):
             raw_events = bucket.get(side_key)
             if not isinstance(raw_events, list):
@@ -87,6 +103,7 @@ def parse_overview_events(payload: dict[str, Any]) -> list[dict[str, Any]]:
                         "side": side,
                         "code": code,
                         "minute": minute,
+                        "match_time": match_time,
                         "score": _score_key(raw.get("score")),
                         "person": person,
                         "person_id": str(raw.get("person_id") or ""),
@@ -103,6 +120,8 @@ def _player_info(event: dict[str, Any]) -> dict[str, Any]:
         "code": event["code"],
         "event_cn": event_cn,
         "match_event": match_event,
+        # "90+6" when the overview has the stoppage, "" otherwise.
+        "match_time": event.get("match_time") or "",
     }
 
 
