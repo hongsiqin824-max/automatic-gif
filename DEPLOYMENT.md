@@ -65,11 +65,11 @@ location /gif-monitor/ {
 
 ## 4. 更新上线流程
 
-**本地（Mac）** — 一次 `git push` 同时推 gitee + GitHub（已在本仓库 `gitee` 远端配置双 push URL）：
+**本地（Mac）** — 只推 Gitee（服务器只从 Gitee 拉）。**GitHub 自 2026-11-04 起不再维护、不再推送**，停在 `fe0d236`，不用补：
 ```bash
 git add -A
 git commit -m "说明"
-git push            # 自动推 gitee + GitHub
+git push https://gitee.com/tsdka/automatic-gif.git main
 ```
 
 **服务器** — 一键更新（脚本 `/usr/local/bin/deploy-gif`，同时更新 8901 与 match-timeline，仅对有更新的服务重启）：
