@@ -109,6 +109,10 @@ OPEN_PLATFORM_API_NAME=admin-archive-createarticle
 OPEN_PLATFORM_REDIRECT_URI=<本地发布端可访问的 OAuth 回调地址>
 OPEN_PLATFORM_TOKEN_PATH=./data/open-platform-token.json
 # 官方图片上传走后台接口 image-uploadimage-manage，复用上面的 OAuth token（授权用户需在接口白名单内）。
+# 单文件上限：平台 2026-11-04 调为 30M（实测 30,451,576 字节通过、34,764,720 字节报 300007）；
+# 代码按 30,000,000 字节检查（open_platform_client.OFFICIAL_IMAGE_MAX_BYTES，不走 .env）。
+# 超过上限的 GIF 发布前由 ffmpeg 自动压缩（原图不动）；压到最低档仍超则提示移出或截短。
+# 平台以后再调上限：先实测，再只改这一个常量，且不得高于平台真实上限。
 # 默认使用自有服务器上传；只有明确改为 official 才调用懂球帝图片接口。
 OCR_IMAGE_UPLOAD_BACKEND=self_hosted
 # 官方图片上传单独超时，范围 60～120 秒，默认 120 秒。
