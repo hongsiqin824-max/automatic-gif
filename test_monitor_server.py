@@ -4092,5 +4092,58 @@ class PublishNoticeTests(ClipEndpointAlertMatchTests):
         self.assertEqual(head, "【GIF 发布卡住·插件】甲 vs 乙（英超）")
 
 
+class ResolveSourcePrefersDqdTests(unittest.TestCase):
+    """8901 preview prefers the dqd record and falls back to ls."""
+
+    DQD = {"errno": 0, "message": "success", "data": {"resource": "rtmp://h/wyc_live/hd-wi6h", "live_type": "dqd"}}
+    LS = {"errno": 0, "message": "success", "data": {"resource": "rtmp://h/wyc_live/sd-abc", "live_type": "ls"}}
+    EMPTY = {"errno": 0, "message": "无数据", "data": {}}
+
+    def _resolve(self, responses):
+        calls = []
+
+        def fake_query(match_id, live_type=None):
+            calls.append(live_type)
+            value = responses[live_type]
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        with mock.patch.dict(os.environ, {"GIF_MONITOR_SOURCE_OVERRIDE": ""}), \
+                mock.patch.object(monitor_server, "query_source", side_effect=fake_query), \
+                mock.patch("builtins.print"):
+            try:
+                return monitor_server._resolve_source("54338712"), calls
+            except Exception as exc:
+                return exc, calls
+
+    def test_dqd_record_wins_and_ls_is_not_queried(self):
+        resource, calls = self._resolve({"dqd": self.DQD, "ls": self.LS})
+        self.assertEqual(resource, "rtmp://h/wyc_live/hd-wi6h")
+        self.assertEqual(calls, ["dqd"])
+
+    def test_no_dqd_record_falls_back_to_ls(self):
+        resource, calls = self._resolve({"dqd": self.EMPTY, "ls": self.LS})
+        self.assertEqual(resource, "rtmp://h/wyc_live/sd-abc")
+        self.assertEqual(calls, ["dqd", "ls"])
+
+    def test_dqd_query_failure_falls_back_to_ls(self):
+        resource, _ = self._resolve({"dqd": RuntimeError("timeout"), "ls": self.LS})
+        self.assertEqual(resource, "rtmp://h/wyc_live/sd-abc")
+        resource, _ = self._resolve({"dqd": {"errno": 1, "message": "查询失败", "data": {}}, "ls": self.LS})
+        self.assertEqual(resource, "rtmp://h/wyc_live/sd-abc")
+
+    def test_neither_record_is_no_source(self):
+        result, _ = self._resolve({"dqd": self.EMPTY, "ls": self.EMPTY})
+        self.assertIsInstance(result, LookupError)
+
+    def test_list_probe_counts_dqd_only_match_as_available(self):
+        def fake_query(match_id, live_type=None):
+            return self.DQD if live_type == "dqd" else self.EMPTY
+
+        with mock.patch.object(monitor_server, "query_source", side_effect=fake_query):
+            self.assertEqual(monitor_server._batch_query_sources(["1"]), {"1": "available"})
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -31,16 +31,22 @@ class SourceCheckResult:
     retryable: bool = False
 
 
-def query_source(match_id: str) -> dict[str, Any]:
+def query_source(match_id: str, live_type: str | None = None) -> dict[str, Any]:
     """Query the configured live source for one match.
 
     ``user`` must travel on the query string (gateway requirement) while the
     ``secret`` stays in the JSON body and is never exposed to the browser.
+    ``live_type`` selects the record: ``ls`` (data-provider stream, the
+    endpoint default when omitted) or ``dqd`` (Dongqiudi's own stream, only
+    configured for a few matches).
     """
     secret = source_secret()
     if not secret:
         raise RuntimeError("未设置 GIF_SOURCE_SECRET，暂不调用直播源鉴权接口")
-    query = urllib.parse.urlencode({"user": source_user(), "match_id": match_id})
+    params = {"user": source_user(), "match_id": match_id}
+    if live_type:
+        params["live_type"] = live_type
+    query = urllib.parse.urlencode(params)
     return request_json(
         DEFAULT_SOURCE_URL + "?" + query,
         method="POST",

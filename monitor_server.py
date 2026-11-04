@@ -1078,6 +1078,11 @@ def _batch_query_sources(match_ids: list[str]) -> dict[str, str]:
     def _one(match_id: str) -> tuple[str, str]:
         try:
             result = classify_source_response(query_source(match_id))
+            if result.state == "no_source":
+                # dqd-only matches must not show as "no source" in the list.
+                result = classify_source_response(
+                    query_source(match_id, live_type="dqd")
+                )
             return match_id, result.state
         except Exception:
             return match_id, "error"
@@ -1098,18 +1103,53 @@ def _batch_query_sources(match_ids: list[str]) -> dict[str, str]:
 
 
 def _resolve_source(match_id: str) -> str:
-    """Return a usable live-source resource or raise a descriptive error."""
+    """Return a usable live-source resource or raise a descriptive error.
+
+    A match can carry two records: ``dqd`` (Dongqiudi's own stream, only a few
+    matches) and ``ls`` (data-provider stream). Prefer ``dqd`` and fall back to
+    ``ls`` only when no dqd record exists or the dqd query itself failed. This
+    runs once per preview start; a stalling dqd stream is NOT switched to ls
+    automatically (operator decision 2026-11-04). 8899 still queries ls only.
+    """
     # Local-only escape hatch: point every match at a fixed test stream so the
     # player path can be exercised without a real fixture. Never set in prod.
     override = os.environ.get("GIF_MONITOR_SOURCE_OVERRIDE", "").strip()
     if override:
         return override
-    result = classify_source_response(query_source(match_id))
+    dqd_error = None
+    try:
+        dqd = classify_source_response(query_source(match_id, live_type="dqd"))
+    except Exception as exc:
+        dqd = None
+        dqd_error = str(exc)
+    if dqd is not None and dqd.state == "available":
+        resource = str(dqd.data.get("resource") or "").strip()
+        _log_source_resolved(match_id, "dqd", resource)
+        return resource
+    if dqd is not None and dqd.state == "error":
+        dqd_error = dqd.error
+    result = classify_source_response(query_source(match_id, live_type="ls"))
     if result.state == "available":
-        return str(result.data.get("resource") or "").strip()
+        resource = str(result.data.get("resource") or "").strip()
+        _log_source_resolved(match_id, "ls", resource, dqd_error)
+        return resource
     if result.state == "no_source":
         raise LookupError("该比赛暂未配置直播源")
     raise RuntimeError(result.error or "直播源查询失败")
+
+
+def _log_source_resolved(
+    match_id: str, live_type: str, resource: str, dqd_error: str | None = None
+) -> None:
+    payload = {
+        "event": "preview_source_resolved",
+        "match_id": match_id,
+        "live_type": live_type,
+        "resource": resource,
+    }
+    if dqd_error:
+        payload["dqd_error"] = dqd_error
+    print(json.dumps(payload, ensure_ascii=False), flush=True)
 
 
 def _wait_playlist_ready(match_id: str, timeout: float = 9.0) -> bool:
