@@ -32,6 +32,12 @@ OAUTH_STATE_TTL_SECONDS = 10 * 60
 DEFAULT_IMAGE_UPLOAD_TIMEOUT_SECONDS = 120.0
 MIN_IMAGE_UPLOAD_TIMEOUT_SECONDS = 60.0
 MAX_IMAGE_UPLOAD_TIMEOUT_SECONDS = 120.0
+# Per-file limit of the official image endpoint. The platform raised it from
+# 20MB to "30M" on 2026-11-04; measured: 30,451,576 bytes accepted, 34,764,720
+# rejected with 300007. 30,000,000 is the tested-safe value with headroom. It
+# must never exceed the platform's real limit: a 300007 for a file that passed
+# this check is treated as a retriable gateway truncation.
+OFFICIAL_IMAGE_MAX_BYTES = 30_000_000
 # Our own code for "file rejected by the local size check before any request";
 # kept distinct from the platform's 300007 (see upload_images).
 LOCAL_FILE_SIZE_ERROR_CODE = "local_file_size"
@@ -234,7 +240,7 @@ class OpenPlatformClient:
             "endpoint": f"{PLATFORM_ORIGIN}/open/v1/do",
             "type": "archive",
             "multipart_fields": ["file1", "file2"],
-            "max_file_bytes": 20 * 1024 * 1024,
+            "max_file_bytes": OFFICIAL_IMAGE_MAX_BYTES,
             "animated_gif_supported": True,
             "timeout_seconds": self.image_upload_timeout_seconds,
         }
@@ -539,7 +545,7 @@ class OpenPlatformClient:
         gif_path: Path,
         cover_path: Path,
         *,
-        max_bytes: int = 20 * 1024 * 1024,
+        max_bytes: int = OFFICIAL_IMAGE_MAX_BYTES,
     ) -> list[dict[str, Any]]:
         """Upload a GIF and JPG through the Open Platform image endpoint.
 

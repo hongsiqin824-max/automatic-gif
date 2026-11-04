@@ -218,7 +218,8 @@ class ArticlePublisherTests(unittest.TestCase):
             )
 
             self.assertEqual(len(official.calls), 1)
-            self.assertEqual(official.calls[0][2], 20 * 1024 * 1024)
+            # The platform's per-file limit, raised to 30M on 2026-11-04.
+            self.assertEqual(official.calls[0][2], 30_000_000)
             self.assertEqual(
                 created["gif"]["url"],
                 "https://img1.qunliao.info/fastdfs8/M00/gif-event.gif",
@@ -377,6 +378,38 @@ class ArticlePublisherTests(unittest.TestCase):
             # Only the oversized angle was shrunk; the main GIF went up as-is.
             self.assertEqual(len(shrink_calls), 1)
             self.assertEqual(len(official.calls), 1)
+
+    def test_gif_between_old_20mib_and_new_30m_limit_is_uploaded_unshrunk(self):
+        # The platform accepts up to 30M since 2026-11-04 (25.4MB and 30.45MB
+        # uploads verified). A 25MB GIF must keep its original quality.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "ocr.gif"
+            source.write_bytes(animated_gif_bytes() + b"\x00" * 25_000_000)
+            official = FakeOfficialImageClient()
+            publisher = ArticlePublisher(
+                platform_client=FakePlatformClient(),
+                gif_store=PublishedGifStore(
+                    root / "published", "https://matchgif.aisportsapp.com"
+                ),
+                database_path=root / "publish.sqlite3",
+                verify_public_url=False,
+                ocr_image_upload_client=official,
+            )
+            with patch(
+                "article_publisher.shrink_gif_for_upload",
+                side_effect=AssertionError("must not shrink a GIF under the limit"),
+            ):
+                result = publisher.create_or_update_draft(
+                    match_id="54577428",
+                    event={"event_key": "goal-50", "code": "G", "minute": "50"},
+                    match_detail={},
+                    source_path=source,
+                )
+
+            self.assertEqual(len(official.calls), 1)
+            self.assertEqual(official.calls[0][0].stat().st_size, source.stat().st_size)
+            self.assertIsNone(result["gif"]["official_gif_shrunk_bytes"])
 
     def test_ocr_upload_requires_complete_img1_urls(self):
         class MissingPublicUrlClient(FakeOfficialImageClient):

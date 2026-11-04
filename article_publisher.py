@@ -20,7 +20,11 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
-from open_platform_client import OpenPlatformClient, OpenPlatformError
+from open_platform_client import (
+    OFFICIAL_IMAGE_MAX_BYTES,
+    OpenPlatformClient,
+    OpenPlatformError,
+)
 from publish_account_pool import (
     MAX_USER_ID,
     PublishAccountPool,
@@ -30,11 +34,10 @@ from publish_account_pool import (
 
 GIF_ID_PATTERN = re.compile(r"^[a-f0-9]{64}$")
 GIF_HEADERS = {b"GIF87a", b"GIF89a"}
-OFFICIAL_IMAGE_MAX_BYTES = 20 * 1024 * 1024
-# A GIF over the official 20MB limit is re-encoded smaller before upload,
+# A GIF over the official per-file limit is re-encoded smaller before upload,
 # trying (scale, palette colors) in order until it fits. The stored original
-# is never modified. Observed oversize clips were 20.8MB and 22.9MB, so the
-# first step usually suffices; the last one cuts pixels to a quarter.
+# is never modified. On a real clip the first step gives about 93% of the
+# original size; the last one cuts pixels to a quarter.
 GIF_SHRINK_STEPS = ((0.9, 256), (0.8, 192), (0.7, 160), (0.6, 128), (0.5, 128))
 GIF_SHRINK_STEP_TIMEOUT_SECONDS = 60
 EVENT_TYPES = {"G": 1, "PG": 2, "RC": 4, "OG": 5}
@@ -1644,7 +1647,7 @@ class ArticlePublisher:
             ) from exc
         if cover_size > OFFICIAL_IMAGE_MAX_BYTES:
             raise ArticlePublishError(
-                f"第 {position} 张 GIF 的封面超过懂球帝官方图片接口的 20MB 单文件上限",
+                f"第 {position} 张 GIF 的封面超过懂球帝官方图片接口的 {_official_limit_text()} 单文件上限",
                 code="official_image_too_large",
                 stage="official_image_upload",
                 status_code=413,
@@ -1682,7 +1685,7 @@ class ArticlePublisher:
                     raise ArticlePublishError(
                         f"第 {position} 张 GIF 有 {_megabytes(gif_size)}MB，"
                         f"自动压缩到最低画质仍有 {_megabytes(shrink['bytes'])}MB，"
-                        "超过懂球帝图片接口 20MB 上限。请把这张移出（或截短后重新截取）再点重试",
+                        f"超过懂球帝图片接口 {_official_limit_text()} 上限。请把这张移出（或截短后重新截取）再点重试",
                         code="official_image_too_large",
                         stage="official_image_upload",
                         status_code=413,
@@ -2712,7 +2715,7 @@ def shrink_gif_for_upload(
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         raise ArticlePublishError(
-            "服务器未找到 FFmpeg，无法自动压缩超过 20MB 的 GIF",
+            f"服务器未找到 FFmpeg，无法自动压缩超过 {_megabytes(max_bytes)}MB 的 GIF",
             code="official_image_shrink_failed",
             stage="official_image_upload",
             status_code=503,
@@ -2739,7 +2742,7 @@ def shrink_gif_for_upload(
             )
         except subprocess.TimeoutExpired as exc:
             raise ArticlePublishError(
-                "自动压缩超过 20MB 的 GIF 超时",
+                f"自动压缩超过 {_megabytes(max_bytes)}MB 的 GIF 超时",
                 code="official_image_shrink_failed",
                 stage="official_image_upload",
                 status_code=503,
@@ -2748,7 +2751,7 @@ def shrink_gif_for_upload(
         if completed.returncode != 0 or not target.is_file():
             detail = str(completed.stderr or "").strip()[-400:]
             raise ArticlePublishError(
-                f"自动压缩超过 20MB 的 GIF 失败：{detail or '未知错误'}",
+                f"自动压缩超过 {_megabytes(max_bytes)}MB 的 GIF 失败：{detail or '未知错误'}",
                 code="official_image_shrink_failed",
                 stage="official_image_upload",
                 status_code=503,
@@ -2762,7 +2765,13 @@ def shrink_gif_for_upload(
 
 
 def _megabytes(size: Any) -> str:
+    # Same unit as the workshop's "x.xx MB" (1024*1024), so the numbers match.
     return f"{int(size or 0) / (1024 * 1024):.1f}"
+
+
+def _official_limit_text() -> str:
+    # Read at call time so the message always follows the current limit.
+    return f"{_megabytes(OFFICIAL_IMAGE_MAX_BYTES)}MB"
 
 
 def _gif_size(gif: dict[str, Any]) -> tuple[int, int] | None:

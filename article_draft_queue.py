@@ -2409,7 +2409,8 @@ def _friendly_draft_error(
             f"（平台 code={platform_code}），已自动重试 {retries} 次仍失败，请稍后手动重试"
         )
     # "暂时" promises the worker will come back; a terminal failure (e.g. a GIF
-    # still over 20MB after auto-shrink) must not read like a passing hiccup.
+    # still over the upload limit after auto-shrink) must not read like a
+    # passing hiccup.
     if not will_retry:
         return f"{action}失败：{cleaned or '未说明原因'}"
     return f"{action}暂时失败：{cleaned or '未说明原因'}"
