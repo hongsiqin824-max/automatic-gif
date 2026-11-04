@@ -1128,6 +1128,14 @@ def _resolve_source(match_id: str) -> str:
         return resource
     if dqd is not None and dqd.state == "error":
         dqd_error = dqd.error
+    if dqd_error:
+        # A transient dqd failure must not flip a running preview to ls: a
+        # changed resource makes live_preview cold-start and wipe the buffered
+        # history the operator clips from. Keep whatever is already playing.
+        current = _current_preview_upstream(match_id)
+        if current:
+            _log_source_resolved(match_id, "current", current, dqd_error)
+            return current
     result = classify_source_response(query_source(match_id, live_type="ls"))
     if result.state == "available":
         resource = str(result.data.get("resource") or "").strip()
@@ -1150,6 +1158,21 @@ def _log_source_resolved(
     if dqd_error:
         payload["dqd_error"] = dqd_error
     print(json.dumps(payload, ensure_ascii=False), flush=True)
+
+
+def _current_preview_upstream(match_id: str) -> str | None:
+    """Upstream RTMP the match's preview is pulling right now, if any.
+
+    With WebRTC on, ffmpeg reads a loopback RTSP URL and the real upstream is
+    held by the gateway; otherwise ffmpeg's own resource is the upstream.
+    """
+    upstream = webrtc_gateway.upstream_for(match_id)
+    if upstream:
+        return upstream
+    resource = str(live_preview.status(match_id).get("resource") or "").strip()
+    if not resource or resource.startswith(webrtc_gateway.rtsp_base + "/"):
+        return None
+    return resource
 
 
 def _wait_playlist_ready(match_id: str, timeout: float = 9.0) -> bool:

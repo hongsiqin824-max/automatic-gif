@@ -4137,6 +4137,43 @@ class ResolveSourcePrefersDqdTests(unittest.TestCase):
         result, _ = self._resolve({"dqd": self.EMPTY, "ls": self.EMPTY})
         self.assertIsInstance(result, LookupError)
 
+    def test_dqd_failure_keeps_running_preview_upstream(self):
+        # A flaky dqd query on a repeat preview/start must not flip a running
+        # dqd preview to ls (that would cold-start and wipe the history).
+        running = "rtmp://h/wyc_live/hd-wi6h"
+        with mock.patch.object(monitor_server.webrtc_gateway, "upstream_for", return_value=None), \
+                mock.patch.object(monitor_server.live_preview, "status", return_value={"running": True, "resource": running}):
+            resource, calls = self._resolve({"dqd": RuntimeError("timeout"), "ls": self.LS})
+        self.assertEqual(resource, running)
+        self.assertEqual(calls, ["dqd"])
+
+    def test_dqd_failure_keeps_webrtc_upstream_not_loopback(self):
+        with mock.patch.object(monitor_server.webrtc_gateway, "upstream_for", return_value="rtmp://h/wyc_live/hd-wi6h"):
+            resource, _ = self._resolve({"dqd": {"errno": 1, "message": "查询失败", "data": {}}, "ls": self.LS})
+        self.assertEqual(resource, "rtmp://h/wyc_live/hd-wi6h")
+
+    def test_loopback_resource_is_not_reused_as_upstream(self):
+        loopback = monitor_server.webrtc_gateway.rtsp_base + "/54338712"
+        with mock.patch.object(monitor_server.webrtc_gateway, "upstream_for", return_value=None), \
+                mock.patch.object(monitor_server.live_preview, "status", return_value={"resource": loopback}):
+            resource, _ = self._resolve({"dqd": RuntimeError("timeout"), "ls": self.LS})
+        self.assertEqual(resource, "rtmp://h/wyc_live/sd-abc")
+
+    def test_query_source_adds_live_type_only_when_given(self):
+        captured = {}
+
+        def fake_request(url, method=None, body=None):
+            captured["url"] = url
+            return self.EMPTY
+
+        import source_client
+        with mock.patch.object(source_client, "request_json", side_effect=fake_request), \
+                mock.patch.object(source_client, "source_secret", return_value="s"):
+            source_client.query_source("1")
+            self.assertNotIn("live_type", captured["url"])
+            source_client.query_source("1", live_type="dqd")
+            self.assertIn("live_type=dqd", captured["url"])
+
     def test_list_probe_counts_dqd_only_match_as_available(self):
         def fake_query(match_id, live_type=None):
             return self.DQD if live_type == "dqd" else self.EMPTY
