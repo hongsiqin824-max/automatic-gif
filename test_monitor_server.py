@@ -785,6 +785,21 @@ class ClipRetryTests(unittest.TestCase):
         self.assertNotIn("持续故障", text)
         self.assertNotIn("自动重试", text)
 
+    def test_terminal_failure_message_does_not_say_temporary(self):
+        # Seen 2026-11-04: a 20.8MB angle failed terminally as "正式发布暂时失败",
+        # so the operator kept pressing 立即重试 on a file that could never go.
+        from article_draft_queue import _friendly_draft_error
+
+        terminal = _friendly_draft_error(
+            "official_image_upload", "第 2 张 GIF 有 20.8MB",
+            publishing=True, will_retry=False, attempts=1,
+        )
+        self.assertEqual(terminal, "正式发布失败：第 2 张 GIF 有 20.8MB")
+        retrying = _friendly_draft_error(
+            "official_image_upload", "连接失败", publishing=True, will_retry=True,
+        )
+        self.assertEqual(retrying, "正式发布暂时失败：连接失败")
+
 
 class ClipDiscardTests(unittest.TestCase):
     """``POST /api/monitor/clip/discard``: flag a bad clip (reversible), never delete it."""

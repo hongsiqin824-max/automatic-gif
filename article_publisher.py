@@ -11,6 +11,7 @@ import secrets
 import shutil
 import sqlite3
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.error
@@ -30,6 +31,12 @@ from publish_account_pool import (
 GIF_ID_PATTERN = re.compile(r"^[a-f0-9]{64}$")
 GIF_HEADERS = {b"GIF87a", b"GIF89a"}
 OFFICIAL_IMAGE_MAX_BYTES = 20 * 1024 * 1024
+# A GIF over the official 20MB limit is re-encoded smaller before upload,
+# trying (scale, palette colors) in order until it fits. The stored original
+# is never modified. Observed oversize clips were 20.8MB and 22.9MB, so the
+# first step usually suffices; the last one cuts pixels to a quarter.
+GIF_SHRINK_STEPS = ((0.9, 256), (0.8, 192), (0.7, 160), (0.6, 128), (0.5, 128))
+GIF_SHRINK_STEP_TIMEOUT_SECONDS = 60
 EVENT_TYPES = {"G": 1, "PG": 2, "RC": 4, "OG": 5}
 EVENT_LABELS = {
     "G": "进球",
@@ -1537,6 +1544,7 @@ class ArticlePublisher:
         match_id: str,
         event_key: str,
         artifact_kind: str,
+        position: int = 1,
     ) -> dict[str, Any]:
         """Persist a GIF locally and make it available at its public URL."""
         local_gif = self.gif_store.create(source_path)
@@ -1567,7 +1575,9 @@ class ArticlePublisher:
         # endpoint receives both files in one request and returns a FastDFS
         # `url` plus a complete `img1_url` for each file.
         if artifact_kind == "ocr_window" and self.ocr_image_upload_client is not None:
-            gif = self._upload_ocr_images(local_gif, match_id=match_id, event_key=event_key)
+            gif = self._upload_ocr_images(
+                local_gif, match_id=match_id, event_key=event_key, position=position
+            )
             self._save_uploaded_mapping(
                 match_id=match_id,
                 event_key=event_key,
@@ -1610,6 +1620,7 @@ class ArticlePublisher:
         *,
         match_id: str,
         event_key: str,
+        position: int = 1,
     ) -> dict[str, Any]:
         """Upload an OCR GIF and its generated JPEG cover to the platform."""
         gif_path = Path(str(local_gif["path"])).expanduser()
@@ -1631,16 +1642,54 @@ class ArticlePublisher:
                 stage="official_image_upload",
                 status_code=404,
             ) from exc
-        if gif_size > OFFICIAL_IMAGE_MAX_BYTES or cover_size > OFFICIAL_IMAGE_MAX_BYTES:
+        if cover_size > OFFICIAL_IMAGE_MAX_BYTES:
             raise ArticlePublishError(
-                "GIF 或封面超过懂球帝官方图片接口的 20MB 单文件上限",
+                f"第 {position} 张 GIF 的封面超过懂球帝官方图片接口的 20MB 单文件上限",
                 code="official_image_too_large",
                 stage="official_image_upload",
                 status_code=413,
             )
+        work_dir: Path | None = None
+        upload_gif_path = gif_path
+        shrink: dict[str, Any] | None = None
         try:
+            if gif_size > OFFICIAL_IMAGE_MAX_BYTES:
+                work_dir = Path(tempfile.mkdtemp(prefix="gif-shrink-"))
+                shrink_started = time.monotonic()
+                shrink = shrink_gif_for_upload(gif_path, work_dir, OFFICIAL_IMAGE_MAX_BYTES)
+                print(
+                    json.dumps(
+                        {
+                            "event": (
+                                "official_gif_shrunk"
+                                if shrink["path"]
+                                else "official_gif_shrink_insufficient"
+                            ),
+                            "match_id": str(match_id),
+                            "event_key": str(event_key),
+                            "position": position,
+                            "original_bytes": gif_size,
+                            "shrunk_bytes": shrink["bytes"],
+                            "scale": shrink["scale"],
+                            "colors": shrink["colors"],
+                            "elapsed_ms": round((time.monotonic() - shrink_started) * 1000, 1),
+                        },
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
+                if shrink["path"] is None:
+                    raise ArticlePublishError(
+                        f"第 {position} 张 GIF 有 {_megabytes(gif_size)}MB，"
+                        f"自动压缩到最低画质仍有 {_megabytes(shrink['bytes'])}MB，"
+                        "超过懂球帝图片接口 20MB 上限。请把这张移出（或截短后重新截取）再点重试",
+                        code="official_image_too_large",
+                        stage="official_image_upload",
+                        status_code=413,
+                    )
+                upload_gif_path = shrink["path"]
             results = self.ocr_image_upload_client.upload_images(
-                gif_path,
+                upload_gif_path,
                 cover_path,
                 max_bytes=OFFICIAL_IMAGE_MAX_BYTES,
             )
@@ -1665,6 +1714,9 @@ class ArticlePublisher:
                 status_code=503,
                 retriable=True,
             ) from exc
+        finally:
+            if work_dir is not None:
+                shutil.rmtree(work_dir, ignore_errors=True)
 
         if isinstance(results, dict):
             results = results.get("images") or results.get("data") or []
@@ -1738,6 +1790,7 @@ class ArticlePublisher:
             "official_cover_image_id": cover_item.get("image_id"),
             "official_upload_match_id": str(match_id),
             "official_upload_event_key": str(event_key),
+            "official_gif_shrunk_bytes": shrink["bytes"] if shrink else None,
         }
 
     def publish(
@@ -1968,6 +2021,7 @@ class ArticlePublisher:
                         match_id=match_id,
                         event_key=f"{event_key}#{index}",
                         artifact_kind="ocr_window",
+                        position=index + 1,
                     )
                 )
             assignment_key = f"match:{match_id}"
@@ -2645,6 +2699,70 @@ def _article_gif_src(gif: dict[str, Any], allow_relative_media: bool) -> str:
         if path:
             return path
     return str(gif["url"])
+
+
+def shrink_gif_for_upload(
+    source: Path, work_dir: Path, max_bytes: int
+) -> dict[str, Any]:
+    """Re-encode ``source`` into ``work_dir`` until it fits ``max_bytes``.
+
+    Returns ``{"path", "bytes", "scale", "colors"}``; ``path`` is ``None`` when
+    even the last step is still too large (``bytes`` is then that last size).
+    """
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise ArticlePublishError(
+            "服务器未找到 FFmpeg，无法自动压缩超过 20MB 的 GIF",
+            code="official_image_shrink_failed",
+            stage="official_image_upload",
+            status_code=503,
+        )
+    last: dict[str, Any] = {"path": None, "bytes": None, "scale": None, "colors": None}
+    for index, (scale, colors) in enumerate(GIF_SHRINK_STEPS, start=1):
+        target = work_dir / f"shrink_{index}.gif"
+        graph = (
+            f"scale=trunc(iw*{scale}/2)*2:-2:flags=lanczos,split[a][b];"
+            f"[a]palettegen=max_colors={colors}:stats_mode=diff[p];"
+            "[b][p]paletteuse=dither=bayer:bayer_scale=3"
+        )
+        command = [
+            ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+            "-i", str(source), "-filter_complex", graph, str(target),
+        ]
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=GIF_SHRINK_STEP_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ArticlePublishError(
+                "自动压缩超过 20MB 的 GIF 超时",
+                code="official_image_shrink_failed",
+                stage="official_image_upload",
+                status_code=503,
+                retriable=True,
+            ) from exc
+        if completed.returncode != 0 or not target.is_file():
+            detail = str(completed.stderr or "").strip()[-400:]
+            raise ArticlePublishError(
+                f"自动压缩超过 20MB 的 GIF 失败：{detail or '未知错误'}",
+                code="official_image_shrink_failed",
+                stage="official_image_upload",
+                status_code=503,
+            )
+        size = target.stat().st_size
+        last = {"path": None, "bytes": size, "scale": scale, "colors": colors}
+        if 0 < size <= max_bytes:
+            return {**last, "path": target}
+        target.unlink(missing_ok=True)
+    return last
+
+
+def _megabytes(size: Any) -> str:
+    return f"{int(size or 0) / (1024 * 1024):.1f}"
 
 
 def _gif_size(gif: dict[str, Any]) -> tuple[int, int] | None:

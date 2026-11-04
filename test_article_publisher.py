@@ -1,6 +1,8 @@
 import json
 import os
+import shutil
 import sqlite3
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -280,6 +282,101 @@ class ArticlePublisherTests(unittest.TestCase):
                 context.exception.diagnostics["lifecycle"][-1]["event"],
                 "platform_response_received",
             )
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg not installed")
+    def test_oversized_ocr_gif_is_shrunk_before_official_upload(self):
+        # Seen 2026-11-04: a 20.8MB angle failed publication three times with
+        # official_image_too_large. It must now be re-encoded under the limit
+        # and uploaded, while the stored original stays byte-identical.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "ocr.gif"
+            subprocess.run(
+                [
+                    "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                    "-f", "lavfi", "-i", "testsrc=size=640x360:rate=10",
+                    "-t", "2", str(source),
+                ],
+                check=True,
+            )
+            original = source.read_bytes()
+            limit = len(original) - 1
+            uploaded_sizes = []
+
+            class SizeRecordingClient(FakeOfficialImageClient):
+                def upload_images(self, gif_path, cover_path, *, max_bytes):
+                    uploaded_sizes.append(Path(gif_path).stat().st_size)
+                    return super().upload_images(gif_path, cover_path, max_bytes=max_bytes)
+
+            official = SizeRecordingClient()
+            publisher = ArticlePublisher(
+                platform_client=FakePlatformClient(),
+                gif_store=PublishedGifStore(
+                    root / "published", "https://matchgif.aisportsapp.com"
+                ),
+                database_path=root / "publish.sqlite3",
+                verify_public_url=False,
+                ocr_image_upload_client=official,
+            )
+            with patch("article_publisher.OFFICIAL_IMAGE_MAX_BYTES", limit):
+                result = publisher.create_or_update_draft(
+                    match_id="54577428",
+                    event={"event_key": "goal-50", "code": "G", "minute": "50"},
+                    match_detail={},
+                    source_path=source,
+                )
+
+            self.assertEqual(len(uploaded_sizes), 1)
+            self.assertLessEqual(uploaded_sizes[0], limit)
+            self.assertEqual(result["gif"]["official_gif_shrunk_bytes"], uploaded_sizes[0])
+            self.assertEqual(Path(result["gif"]["path"]).read_bytes(), original)
+            # The temporary shrink directory is removed after the upload.
+            self.assertFalse(Path(official.calls[0][0]).exists())
+
+    def test_gif_still_too_large_after_shrink_names_the_angle_and_is_terminal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            main = root / "main.gif"
+            main.write_bytes(animated_gif_bytes())
+            angle = root / "angle.gif"
+            angle.write_bytes(animated_gif_bytes() + b"\x00" * 300_000)
+            official = FakeOfficialImageClient()
+            publisher = ArticlePublisher(
+                platform_client=FakePlatformClient(),
+                gif_store=PublishedGifStore(
+                    root / "published", "https://matchgif.aisportsapp.com"
+                ),
+                database_path=root / "publish.sqlite3",
+                verify_public_url=False,
+                ocr_image_upload_client=official,
+            )
+            # Above the main GIF and its cover, below the padded angle.
+            limit = 200_000
+            shrink_calls = []
+
+            def fake_shrink(source, work_dir, max_bytes):
+                shrink_calls.append(Path(source))
+                return {"path": None, "bytes": max_bytes + 10, "scale": 0.5, "colors": 128}
+
+            with patch("article_publisher.OFFICIAL_IMAGE_MAX_BYTES", limit), patch(
+                "article_publisher.shrink_gif_for_upload", side_effect=fake_shrink
+            ), self.assertRaises(ArticlePublishError) as context:
+                publisher.create_or_update_article(
+                    match_id="54577428",
+                    event={"event_key": "goal-50", "code": "G", "minute": "50"},
+                    match_detail={},
+                    source_path=main,
+                    delivery_mode="publish",
+                    extra_source_paths=[angle],
+                )
+
+            self.assertEqual(context.exception.code, "official_image_too_large")
+            self.assertFalse(context.exception.retriable)
+            self.assertIn("第 2 张", str(context.exception))
+            self.assertIn("移出", str(context.exception))
+            # Only the oversized angle was shrunk; the main GIF went up as-is.
+            self.assertEqual(len(shrink_calls), 1)
+            self.assertEqual(len(official.calls), 1)
 
     def test_ocr_upload_requires_complete_img1_urls(self):
         class MissingPublicUrlClient(FakeOfficialImageClient):
