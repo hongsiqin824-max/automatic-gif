@@ -1,5 +1,7 @@
 # 服务器服务安全关闭手册
 
+> **2026-11-09 状态：8899 Dashboard 已从服务器撤下，现在没有要关的东西**，下文的目录已删除。留底位置和重新启用的步骤见 [SERVICE_RESTART_GUIDE.md](SERVICE_RESTART_GUIDE.md) 开头。
+
 本文档用于关闭服务器上的 Football GIF Dashboard 及它启动的比赛 Worker。以后关闭服务时，按本文档执行，不要直接批量杀 Python 进程。
 
 ## 1. 适用范围和目录

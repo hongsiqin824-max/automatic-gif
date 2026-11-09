@@ -72,17 +72,24 @@ Dashboard or GIF artifacts.
 
 ## Fixed Server Update Workflow
 
-> **Status 2026-11-09: the production 8899 Dashboard is paused (用户：暂时不用).**
-> It has not run since at least 2026-10-31, the release directory
-> `/opt/automatic-gif-release-c24aa3c` was deleted on 2026-11-09 during a disk
-> cleanup, and `autogif.service` / `automatic-post.service` were disabled so a
-> reboot does not bring them back. nginx `/` on matchgif still proxies to 8899
-> (answers 502); `/publish-gifs/` and `/publish-gif-covers/` now return 404
-> (the September self-hosted GIFs behind them are gone). Before using the
-> procedure below again: recreate a release directory from Gitee, copy `.env`
-> (reference: `/opt/automatic-gif/.env`), rebuild `tmp/ocr_venv`, and decide
-> whether `autogif.service` or the manual `nohup` start below is the one to use.
-> 8901 does not depend on 8899: every 8901 GIF is uploaded to the platform.
+> **Status 2026-11-09: the production 8899 Dashboard is retired from web00
+> (用户：暂时不用).** It has not run since at least 2026-10-31. On 2026-11-09
+> both `/opt/automatic-gif-release-c24aa3c` and `/opt/automatic-gif` (old code,
+> `.env`, and the `.venv` used by the commands below) were deleted, and
+> `autogif.service` / `automatic-post.service` were moved out of
+> `/etc/systemd/system` (systemd no longer knows them). Kept for a restart, in
+> `/root/web00-retired-20261109/`: `automatic-gif.env` (its 13 8899-only lines,
+> such as `ARTICLE_PUBLISH_*`, `PYTHON_OCR`, `GIF_OCR_*`, are not in the
+> gif-monitor `.env`), `automatic-gif.env.bak`, and both `.service` files. The
+> drop-in `/etc/systemd/system/autogif.service.d/override.conf` is still there.
+> nginx `/` on matchgif still proxies to 8899 (answers 502); `/publish-gifs/`
+> and `/publish-gif-covers/` return 404 (the September self-hosted GIFs are
+> gone). Every path in the procedure below is therefore stale. To bring 8899
+> back: deploy a new directory from Gitee, create a `.venv`, rebuild
+> `tmp/ocr_venv`, restore the `.env` and the service file from the retired
+> folder (fix their paths), `systemctl daemon-reload`, and only then follow the
+> steps below with the new paths. 8901 does not depend on 8899: every 8901 GIF
+> is uploaded to the platform.
 
 This is the authoritative procedure for every update of the production
 Dashboard. Run these commands in the server SSH terminal, in order, from the

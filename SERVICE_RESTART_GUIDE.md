@@ -1,6 +1,18 @@
 # 服务器服务完整重启手册
 
-> **2026-11-09 状态：服务器上的 8899 Dashboard 暂停使用（用户：暂时不用）。** 至少 10-31 起就没在跑；下面写的发布目录 `/opt/automatic-gif-release-c24aa3c` 已在 11-09 清理硬盘时删除；`autogif.service`、`automatic-post.service` 已关闭开机自启（`systemctl disable`），服务器重启也不会自己起来。要重新启用：先从 Gitee 拉代码建新的发布目录、复制 `.env`（可参考 `/opt/automatic-gif/.env`）、重建 `tmp/ocr_venv`，再按本文档操作；想让它开机自启再 `systemctl enable autogif`。8901 不依赖 8899（8901 的 GIF 都传到平台）。
+> **2026-11-09 状态：8899 Dashboard 已从服务器撤下（用户：暂时不用）。** 至少 10-31 起就没在跑。11-09 已删除：发布目录 `/opt/automatic-gif-release-c24aa3c`，以及旧版目录 `/opt/automatic-gif`（含旧代码、`.env` 和下面命令用到的 `.venv`）。`autogif.service`、`automatic-post.service` 已从 `/etc/systemd/system` 挪走，systemd 里已经没有这两个服务。**下文里的目录和命令现在都用不了。**
+>
+> 留底在 `/root/web00-retired-20261109/`：
+> - `automatic-gif.env`、`automatic-gif.env.bak`：原来的配置。其中 13 行是 8899 专用的（`ARTICLE_PUBLISH_*`、`PYTHON_OCR`、`GIF_OCR_*` 等），gif-monitor 的 `.env` 里没有。
+> - 两个 `.service` 文件。
+> - 另外 `/etc/systemd/system/autogif.service.d/override.conf` 没挪，还在原处，里面写的也是旧目录。
+>
+> 要重新启用 8899：
+> 1. 从 Gitee 部署新目录，建 `.venv`，重建 `tmp/ocr_venv`。
+> 2. 把留底的 `.env` 和启动配置放回去，改成新路径，再 `systemctl daemon-reload`。
+> 3. 把本文档的路径换成新目录，再按步骤操作。
+>
+> 8901 不依赖 8899（8901 的 GIF 都传到平台）。
 
 本文档用于服务器上完整重启 Football GIF Dashboard。完整重启会停止当前比赛 Worker，再停止旧 Dashboard，启动新 Dashboard，最后由页面或接口重新启动需要处理的比赛。
 
