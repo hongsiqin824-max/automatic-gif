@@ -2467,6 +2467,26 @@ function bindCropOverlay() {
   window.addEventListener('resize', () => { if (state.stageMatchId) renderCrop(); });
 }
 
+// The stage's source has been sending a black picture for ``seconds``
+// (source_black_seconds in live_preview.py; 0 = it has a picture). The player
+// itself is fine, so say plainly that it is the pusher and that reloading
+// cannot help: on 11-07 (54494599) the operator reloaded 4 times in 4 minutes
+// while the pusher's own feed was black.
+function sourceBlackText(seconds) {
+  if (!(seconds > 0)) return '';
+  const span = seconds < 60 ? `${Math.round(seconds)} 秒` : `${Math.floor(seconds / 60)} 分钟`;
+  return `⚠ 直播源画面是黑的（已约 ${span}）：是推流方的问题，刷新没用，等推流方恢复`;
+}
+
+function renderStageSourceBlack() {
+  const banner = $('stage-source-black');
+  if (!banner) return;
+  const tile = state.stageMatchId ? state.tiles.get(state.stageMatchId) : null;
+  const text = sourceBlackText(tile ? tile.sourceBlackSeconds : 0);
+  banner.textContent = text;
+  banner.classList.toggle('hidden', !text);
+}
+
 function openStage(matchId) {
   const tile = state.tiles.get(matchId);
   if (!tile || !tile.playlistUrl) { showNotice('该比赛直播还没准备好', 'warning'); return; }
@@ -2487,6 +2507,7 @@ function openStage(matchId) {
   $('stage-status').textContent = '直播播放中';
   $('stage-status').className = 'stage-status ok';
   $('stage-notes').innerHTML = '';
+  renderStageSourceBlack();
   $('stage-clips').innerHTML = '<div class="stage-clip-empty">正在读取 GIF 列表…</div>';
   $('stage-clips-count').textContent = '';
   loadStageClips(matchId);
@@ -2537,6 +2558,7 @@ function openStage(matchId) {
 
 function closeStage() {
   state.stageMatchId = null;
+  renderStageSourceBlack();
   stopDraftPoll();
   clearRange();
   clearCrop();
@@ -3107,6 +3129,8 @@ function keepAlivePreviews() {
       .then((status) => {
         const current = state.tiles.get(matchId);
         if (!current || !status) return;
+        current.sourceBlackSeconds = status.source_black ? status.source_black_seconds : 0;
+        if (matchId === state.stageMatchId) renderStageSourceBlack();
         if (status.running === false || status.history_frozen) {
           // history_frozen: a relaunched ffmpeg is alive but has not appended
           // a segment yet (still connecting, or the source is gone for good);

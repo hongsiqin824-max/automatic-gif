@@ -2742,6 +2742,11 @@ def monitor_preview_status():
         live_preview.playlist_url(match_id) if status.get("running") else None
     )
     status.update(_webrtc_fields(match_id, status.get("running") and _preview_is_webrtc(status)))
+    # The pusher is sending a black picture (live_preview.source_black_seconds):
+    # the stage says it is upstream and that reloading the page cannot help.
+    black_seconds = live_preview.source_black_seconds(match_id)
+    status["source_black"] = black_seconds > 0
+    status["source_black_seconds"] = round(black_seconds)
     return jsonify(status)
 
 

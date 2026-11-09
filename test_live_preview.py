@@ -742,5 +742,129 @@ class LivePreviewFrozenHistoryTests(unittest.TestCase):
         self.assertFalse((media / "seg_00001.ts").exists())
 
 
+class LivePreviewSourceBlackTests(unittest.TestCase):
+    """How long the source has been sending no picture, from segment sizes.
+
+    54494599 on 11-07: the pusher's feed went black for about 4 minutes. The
+    player kept playing the black picture, nothing on the page looked broken
+    and the operator reloaded the page 4 times. Real sizes from that night:
+    black 4-10 KB per 1 s segment, normal play >= 100 KB (99% of 1.17M
+    segments served 11-01..11-09).
+    """
+
+    NORMAL = 200 * 1024
+    BLACK = 8 * 1024
+
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.manager = LivePreviewManager(root=self.root, background_reaper=False)
+        self.manager._build_command = _stub_command_factory(None)
+        self.addCleanup(self._cleanup)
+
+    def _cleanup(self):
+        self.manager.shutdown()
+        self._tmp.cleanup()
+
+    def _start(self, match_id: str = "m1") -> Path:
+        """Start the stub ffmpeg and wait for its own playlist write.
+
+        Our playlist is written after that, so the stub cannot overwrite it.
+        """
+        self.manager.start(match_id, "rtmp://host/app/s")
+        directory = self.manager.media_dir(match_id)
+        deadline = time.time() + 5
+        while not (directory / "index.m3u8").is_file():
+            self.assertLess(time.time(), deadline, "stub ffmpeg never wrote its playlist")
+            time.sleep(0.05)
+        return directory
+
+    @staticmethod
+    def _write(directory: Path, sizes, duration: float = 1.0, missing=()) -> None:
+        lines = ["#EXTM3U", "#EXT-X-VERSION:6", f"#EXT-X-TARGETDURATION:{int(duration)}", "#EXT-X-MEDIA-SEQUENCE:0"]
+        for index, size in enumerate(sizes):
+            name = f"seg_{index:05d}.ts"
+            lines += [f"#EXTINF:{duration:.6f},", name]
+            if index not in missing:
+                (directory / name).write_bytes(b"\0" * size)
+        (directory / "index.m3u8").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def test_black_tail_is_reported_once_long_enough(self):
+        directory = self._start()
+        self._write(directory, [self.NORMAL] * 5 + [self.BLACK] * 12)
+        self.assertEqual(self.manager.source_black_seconds("m1"), 12.0)
+
+    def test_short_fade_to_black_is_not_reported(self):
+        # 1-3 s fades between programmes are normal broadcast.
+        directory = self._start()
+        self._write(directory, [self.NORMAL] * 5 + [self.BLACK] * 3)
+        self.assertEqual(self.manager.source_black_seconds("m1"), 0.0)
+
+    def test_picture_back_clears_it(self):
+        directory = self._start()
+        self._write(directory, [self.NORMAL] * 5 + [self.BLACK] * 30 + [self.NORMAL])
+        self.assertEqual(self.manager.source_black_seconds("m1"), 0.0)
+
+    def test_black_with_sound_counts_and_quiet_play_does_not(self):
+        directory = self._start()
+        # Black picture with full 128k sound: ~16 KB/s audio + a tiny video.
+        self._write(directory, [24 * 1024] * 10)
+        self.assertEqual(self.manager.source_black_seconds("m1"), 10.0)
+        # The low end of normal play seen 11-01..11-09.
+        self._write(directory, [100 * 1024] * 20)
+        self.assertEqual(self.manager.source_black_seconds("m1"), 0.0)
+
+    def test_threshold_is_per_second_of_media(self):
+        # GIF_PREVIEW_SEGMENT_SECONDS=2: 50 KB per 2 s is 25 KB/s -> black.
+        directory = self._start()
+        self._write(directory, [50 * 1024] * 5, duration=2.0)
+        self.assertEqual(self.manager.source_black_seconds("m1"), 10.0)
+        self._write(directory, [70 * 1024] * 5, duration=2.0)
+        self.assertEqual(self.manager.source_black_seconds("m1"), 0.0)
+
+    def test_missing_segment_or_bad_duration_ends_the_count(self):
+        directory = self._start()
+        # ffmpeg deleted an older segment while we were counting back.
+        self._write(directory, [self.BLACK] * 20, missing={9})
+        self.assertEqual(self.manager.source_black_seconds("m1"), 10.0)
+        self._write(directory, [self.BLACK] * 20)
+        playlist = directory / "index.m3u8"
+        playlist.write_text(
+            playlist.read_text(encoding="utf-8").replace(
+                "#EXTINF:1.000000,\nseg_00010.ts", "#EXTINF:x,\nseg_00010.ts"
+            ),
+            encoding="utf-8",
+        )
+        self.assertEqual(self.manager.source_black_seconds("m1"), 9.0)
+
+    def test_only_reported_while_ffmpeg_is_producing(self):
+        self.assertEqual(self.manager.source_black_seconds("nobody"), 0.0)
+        directory = self._start()
+        self._write(directory, [self.BLACK] * 20)
+        entry = self.manager.entries["m1"]
+        # A relaunch that has not appended yet: status reports it as frozen.
+        entry.frozen_tail = "seg_00019.ts"
+        self.assertEqual(self.manager.source_black_seconds("m1"), 0.0)
+        entry.frozen_tail = None
+        self.assertEqual(self.manager.source_black_seconds("m1"), 20.0)
+        entry.process.terminate()
+        entry.process.wait(timeout=5)
+        self.assertEqual(self.manager.source_black_seconds("m1"), 0.0)
+
+    def test_start_and_end_of_a_black_stretch_are_logged_once(self):
+        directory = self._start()
+        with mock.patch("live_preview._log_event") as log:
+            self._write(directory, [self.NORMAL] * 5 + [self.BLACK] * 10)
+            self.manager.source_black_seconds("m1")
+            self.manager.source_black_seconds("m1")
+            self._write(directory, [self.NORMAL] * 5 + [self.BLACK] * 10 + [self.NORMAL])
+            self.manager.source_black_seconds("m1")
+            self.manager.source_black_seconds("m1")
+        events = [c.kwargs for c in log.call_args_list if c.args[0] == "preview_source_black"]
+        self.assertEqual([e["black"] for e in events], [True, False])
+        self.assertEqual(events[0]["seconds"], 10.0)
+        self.assertEqual(events[0]["match_id"], "m1")
+
+
 if __name__ == "__main__":
     unittest.main()

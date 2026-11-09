@@ -202,6 +202,10 @@ body{
 .stage-append-banner{display:flex;align-items:center;gap:10px;margin:0 0 8px;padding:8px 12px;border-radius:6px;border:1px solid var(--cyan);background:rgba(93,225,208,.1);color:var(--cyan);font-size:13px}
 .stage-append-banner.hidden{display:none}
 .stage-append-banner span{flex:1;min-width:0}
+/* Source picture is black (pusher side): below the video, never over it - the
+   operator may be scrubbing back through good history while the live edge is black. */
+.stage-source-black{margin:0 0 8px;padding:8px 12px;border-radius:6px;border:1px solid var(--amber);background:rgba(245,185,76,.12);color:var(--amber);font-size:13px;font-weight:600}
+.stage-source-black.hidden{display:none}
 .stage-append-done{padding:4px 14px;font-size:13px;min-height:0;white-space:nowrap;border-color:var(--cyan);color:var(--cyan)}
 .stage-clip-attachments{display:flex;flex-direction:column;gap:6px;border:1px solid var(--line);border-radius:6px;padding:8px 10px}
 .stage-clip-attachments-head{font-size:12px;color:var(--muted)}

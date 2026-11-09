@@ -58,6 +58,17 @@ PREVIEW_HEIGHT = 480
 PREVIEW_PREV_LOG_NAME = "ffmpeg.prev.log"
 # Sub-directory of the per-match root that holds playlist + segments.
 PREVIEW_MEDIA_SUBDIR = "g1"
+# Source-black detection (54494599 on 11-07: the pusher's feed went black for
+# minutes while the preview kept playing it). A black - or otherwise blank,
+# static - picture re-encodes to almost nothing: that match's black stretches
+# were 4-10 KB per 1 s segment, while 99% of the 1.17M segments served
+# 11-01..11-09 were >= 100 KB. Black with normal sound still stays near
+# 20-25 KB (the 128k AAC track alone is ~16 KB/s). A segment with fewer bytes
+# than this per second of media counts as "no picture".
+SOURCE_BLACK_BYTES_PER_SECOND = 30 * 1024
+# The newest segments must all be that small for this long before it is
+# reported: a 1-3 s fade to black between programmes is normal broadcast.
+SOURCE_BLACK_MIN_SECONDS = 8.0
 
 
 def resolve_ffmpeg() -> str:
@@ -108,6 +119,9 @@ class _PreviewEntry:
     # re-read and any change is logged as ``preview_pdt_drift`` so a bad
     # ffmpeg build is visible in the server log instead of as mis-cut GIFs.
     frozen_tail_pdt: str | None = None
+    # Whether the last source_black_seconds() call found the source black;
+    # only used to log the start and the end of a black stretch once each.
+    source_black: bool = False
 
 
 class LivePreviewManager:
@@ -500,6 +514,74 @@ class LivePreviewManager:
                 before=old_pdt,
                 after=new_pdt,
             )
+
+    @staticmethod
+    def _playlist_durations(directory: Path) -> list[tuple[str, float]]:
+        """``(segment_name, EXTINF seconds)`` per listed segment, oldest first.
+
+        An unreadable or missing playlist gives an empty list; an EXTINF that
+        does not parse gives 0.0 for that segment.
+        """
+        try:
+            lines = (directory / "index.m3u8").read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return []
+        segments: list[tuple[str, float]] = []
+        duration = 0.0
+        for line in lines:
+            line = line.strip()
+            if line.startswith("#EXTINF:"):
+                try:
+                    duration = float(line[len("#EXTINF:"):].split(",", 1)[0])
+                except ValueError:
+                    duration = 0.0
+            elif line and not line.startswith("#"):
+                segments.append((line, duration))
+                duration = 0.0
+        return segments
+
+    def source_black_seconds(self, match_id: str) -> float:
+        """Seconds the source has been sending no picture, 0.0 when it has one.
+
+        54494599 on 11-07: the pusher's feed went black for about 4 minutes.
+        The player kept playing the black picture, so nothing on the page
+        looked broken, and the operator reloaded the page four times - which
+        cannot help when the source itself is black. Counts back from the
+        newest listed segment while each one is below
+        SOURCE_BLACK_BYTES_PER_SECOND, and reports the total once it reaches
+        SOURCE_BLACK_MIN_SECONDS (shorter is 0.0). Only while ffmpeg is
+        producing: a stopped, dead or not-yet-resumed preview is reported by
+        ``status`` instead. Logs ``preview_source_black`` when a black stretch
+        is first seen and when the picture is back. Files are read outside
+        the lock; ffmpeg deleting old segments meanwhile just ends the count.
+        """
+        with self.lock:
+            entry = self.entries.get(match_id)
+            if entry is None or entry.frozen_tail is not None or entry.process.poll() is not None:
+                return 0.0
+            directory = entry.directory
+        seconds = 0.0
+        for name, duration in reversed(self._playlist_durations(directory)):
+            if duration <= 0:
+                break
+            try:
+                size = (directory / name).stat().st_size
+            except OSError:
+                break
+            if size >= SOURCE_BLACK_BYTES_PER_SECOND * duration:
+                break
+            seconds += duration
+        black = seconds >= SOURCE_BLACK_MIN_SECONDS
+        with self.lock:
+            if self.entries.get(match_id) is entry and entry.source_black != black:
+                entry.source_black = black
+                _log_event(
+                    "preview_source_black",
+                    match_id=match_id,
+                    black=black,
+                    seconds=round(seconds, 1),
+                )
+        return seconds if black else 0.0
 
     def _reap_loop(self) -> None:
         while not self._stop.wait(5.0):
