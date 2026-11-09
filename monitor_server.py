@@ -4303,6 +4303,34 @@ if EXTENSION_ENABLED:
     )
 
 
+def _start_retention_worker() -> "RetentionWorker":
+    """Expire old captures / published copies hourly and warn when the disk fills.
+
+    Started only from ``__main__`` (systemd runs this file directly), never on
+    import, so a test run cannot delete files from the working copy.
+    """
+    from monitor_retention import RetentionWorker
+
+    # Same directory and task database the publish queue writes; when publishing
+    # is off there is no queue, and the configured paths are swept instead.
+    data_dir = ROOT / "data"
+    if manual_draft_queue is not None:
+        published_dir = manual_draft_queue.staging_directory
+        database_path = manual_draft_queue.database_path
+    else:
+        published_dir = Path(os.environ.get("ARTICLE_PUBLISH_GIF_DIR", str(data_dir / "published_gifs")))
+        database_path = Path(os.environ.get("ARTICLE_PUBLISH_DB_PATH", str(data_dir / "article_publish.sqlite3")))
+    worker = RetentionWorker(
+        clip_root=CLIP_OUTPUT_ROOT,
+        published_dir=published_dir,
+        database_path=database_path,
+        notify=lambda text: _send_feishu_text(text, FEISHU_PUBLISH_WEBHOOK),
+    )
+    worker.start()
+    atexit.register(worker.stop)
+    return worker
+
+
 if __name__ == "__main__":
     signal.signal(signal.SIGTERM, _exit_on_sigterm)
     print(f"Match monitor console: http://{HOST}:{PORT}")
@@ -4331,4 +4359,5 @@ if __name__ == "__main__":
             ),
             flush=True,
         )
+    _start_retention_worker()
     app.run(host=HOST, port=PORT, threaded=True, debug=False)
