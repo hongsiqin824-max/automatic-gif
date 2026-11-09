@@ -4,8 +4,7 @@
 >
 > 留底在 `/root/web00-retired-20261109/`：
 > - `automatic-gif.env`、`automatic-gif.env.bak`：原来的配置。其中 13 行是 8899 专用的（`ARTICLE_PUBLISH_*`、`PYTHON_OCR`、`GIF_OCR_*` 等），gif-monitor 的 `.env` 里没有。
-> - 两个 `.service` 文件。
-> - 另外 `/etc/systemd/system/autogif.service.d/override.conf` 没挪，还在原处，里面写的也是旧目录。
+> - 两个 `.service` 文件，以及 `autogif.service.d/override.conf`（autogif 的附加配置，写的也是旧目录）。重开时和 `autogif.service` 一起放回 `/etc/systemd/system/`。
 >
 > 要重新启用 8899：
 > 1. 从 Gitee 部署新目录，建 `.venv`，重建 `tmp/ocr_venv`。

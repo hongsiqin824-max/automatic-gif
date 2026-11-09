@@ -80,8 +80,8 @@ Dashboard or GIF artifacts.
 > `/etc/systemd/system` (systemd no longer knows them). Kept for a restart, in
 > `/root/web00-retired-20261109/`: `automatic-gif.env` (its 13 8899-only lines,
 > such as `ARTICLE_PUBLISH_*`, `PYTHON_OCR`, `GIF_OCR_*`, are not in the
-> gif-monitor `.env`), `automatic-gif.env.bak`, and both `.service` files. The
-> drop-in `/etc/systemd/system/autogif.service.d/override.conf` is still there.
+> gif-monitor `.env`), `automatic-gif.env.bak`, both `.service` files, and the
+> `autogif.service.d/override.conf` drop-in (restore it with `autogif.service`).
 > nginx `/` on matchgif still proxies to 8899 (answers 502); `/publish-gifs/`
 > and `/publish-gif-covers/` return 404 (the September self-hosted GIFs are
 > gone). Every path in the procedure below is therefore stale. To bring 8899
