@@ -1805,6 +1805,184 @@ class StageSourceGapTests(unittest.TestCase):
         self.assertEqual(self.run_js('sourceGapSecondsInFragments([{"duration":1},{"duration":1}], 0, 1)'), 0)
 
 
+class HlsStallRecoveryTests(unittest.TestCase):
+    """``attachHls`` / ``hlsLoadingStalled`` from monitor_static/app.js under node.
+
+    hls.js 1.5 calls stopLoad() on every fatal error. 54480021 (11-07): after a
+    fatal media error the page only called recoverMediaError(), the live
+    playlist was never reloaded again and the stage froze at the end of the
+    last playlist it had, until the page was reloaded. A fake Hls records what
+    the page does with the player; the real hls.js was checked in Chrome.
+    """
+
+    FAKE_HLS = """
+const calls = [];
+class FakeHls {
+  constructor() { this.handlers = {}; this.started = true; FakeHls.last = this; }
+  static isSupported() { return true; }
+  on(name, fn) { (this.handlers[name] = this.handlers[name] || []).push(fn); }
+  emit(name, data) { for (const fn of this.handlers[name] || []) fn(name, data); }
+  loadSource() {} attachMedia() {}
+  destroy() { calls.push('destroy'); }
+  recoverMediaError() { calls.push('recoverMediaError'); }
+  startLoad() { calls.push('startLoad'); this.started = true; }
+}
+FakeHls.Events = {MANIFEST_PARSED: 'manifestParsed', LEVEL_LOADED: 'levelLoaded', FRAG_BUFFERED: 'fragBuffered', ERROR: 'error'};
+FakeHls.ErrorTypes = {NETWORK_ERROR: 'networkError', MEDIA_ERROR: 'mediaError', OTHER_ERROR: 'otherError'};
+const window = {Hls: FakeHls};
+const LATENCY = {hlsLiveSyncCount: 3};
+const video = {play() { return Promise.resolve(); }};
+let fakeNow = 1000000;
+Date.now = () => fakeNow;
+const setTimeout = () => { calls.push('rebuildScheduled'); };
+const fatalMedia = () => FakeHls.last.emit('error', {fatal: true, type: 'mediaError'});
+"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.node = shutil.which("node")
+        if not cls.node:
+            raise unittest.SkipTest("node 不可用")
+        source = (Path(monitor_server.__file__).parent / "monitor_static" / "app.js").read_text(encoding="utf-8")
+        import re
+        parts = [
+            re.search(rf"^const {name} = [^;]+;", source, re.M)
+            for name in (
+                "HLS_STALL_GRACE_MS", "HLS_MEDIA_ERROR_REBUILD_COUNT", "HLS_MEDIA_ERROR_WINDOW_MS",
+                "PLAYER_REBUILD_DELAYS_MS", "PLAYHEAD_STUCK_MS", "PLAYHEAD_AHEAD_MIN_S", "PLAYHEAD_STEADY_MS",
+            )
+        ] + [
+            re.search(rf"^function {name}\([^)]*\) \{{.*?^\}}", source, re.M | re.S)
+            for name in (
+                "hlsLoadingStalled", "nextRebuildDelayMs", "nextPlayheadWatch", "playheadStuck",
+                "playheadSteady", "detachPlayer", "attachHls",
+            )
+        ]
+        if any(part is None for part in parts):
+            raise AssertionError("HLS stall constants / helpers / detachPlayer / attachHls missing from app.js")
+        cls.prelude = cls.FAKE_HLS + "\n".join(part.group(0) for part in parts)
+
+    def run_js(self, body: str):
+        script = f"{self.prelude}\n{body}"
+        result = subprocess.run([self.node, "-e", script], capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_fatal_media_error_restarts_loading_after_recovery(self):
+        calls = self.run_js(
+            "attachHls(video, 'index.m3u8', () => {});"
+            "FakeHls.last.started = false;"  # what hls.js does on a fatal error
+            "FakeHls.last.emit('error', {fatal: true, type: 'mediaError'});"
+            "process.stdout.write(JSON.stringify(calls));"
+        )
+        self.assertEqual(calls, ["recoverMediaError", "startLoad"])
+
+    def test_repeated_fatal_media_errors_rebuild_the_player(self):
+        calls = self.run_js(
+            "attachHls(video, 'index.m3u8', () => {});"
+            "fatalMedia(); fakeNow += 5000; fatalMedia(); fakeNow += 5000; fatalMedia();"
+            "process.stdout.write(JSON.stringify(calls));"
+        )
+        self.assertEqual(calls, [
+            "recoverMediaError", "startLoad",
+            "recoverMediaError", "startLoad",
+            "destroy", "rebuildScheduled",
+        ])
+
+    def test_media_errors_spread_out_keep_recovering_in_place(self):
+        calls = self.run_js(
+            "attachHls(video, 'index.m3u8', () => {});"
+            "for (let i = 0; i < 4; i++) { fatalMedia(); fakeNow += HLS_MEDIA_ERROR_WINDOW_MS; }"
+            "process.stdout.write(JSON.stringify(calls));"
+        )
+        self.assertEqual(calls, ["recoverMediaError", "startLoad"] * 4)
+
+    def test_non_fatal_error_is_left_to_hls(self):
+        calls = self.run_js(
+            "attachHls(video, 'index.m3u8', () => {});"
+            "FakeHls.last.emit('error', {fatal: false, type: 'mediaError'});"
+            "process.stdout.write(JSON.stringify(calls));"
+        )
+        self.assertEqual(calls, [])
+
+    def test_playlist_loads_are_timestamped(self):
+        stamps = self.run_js(
+            "attachHls(video, 'index.m3u8', () => {});"
+            "const before = video._hlsPlaylistAt;"
+            "FakeHls.last.emit('levelLoaded', {});"
+            "process.stdout.write(JSON.stringify([before, video._hlsPlaylistAt > 0]));"
+        )
+        self.assertEqual(stamps, [0, True])
+
+    def test_stalled_only_when_stopped_past_the_grace(self):
+        result = self.run_js(
+            "const g = HLS_STALL_GRACE_MS;"
+            "process.stdout.write(JSON.stringify(["
+            "  hlsLoadingStalled({started: false}, 1000, 1000 + g),"      # stopped, grace over
+            "  hlsLoadingStalled({started: false}, 1000, 1000 + g - 1),"  # stopped, still in grace
+            "  hlsLoadingStalled({started: true}, 1000, 1000 + 10 * g),"  # loading (paused, back-off, hidden tab)
+            "  hlsLoadingStalled({}, 1000, 1000 + 10 * g),"               # hls.js without the field
+            "  hlsLoadingStalled({started: false}, 0, 1000 + 10 * g),"    # manifest not parsed yet
+            "  hlsLoadingStalled(null, 1000, 1000 + 10 * g),"
+            "]));"
+        )
+        self.assertEqual(result, [True, False, False, False, False, False])
+
+    def test_rebuilds_back_off_and_a_playing_stream_resets_them(self):
+        delays = self.run_js(
+            "const v = {};"
+            "const out = [];"
+            "for (let i = 0; i < 7; i++) out.push(nextRebuildDelayMs(v));"
+            "v._hlsRebuildCount = 0;"  # what watchPlayheads does once playback is steady
+            "out.push(nextRebuildDelayMs(v));"
+            "process.stdout.write(JSON.stringify(out));"
+        )
+        self.assertEqual(delays, [2000, 10000, 20000, 40000, 60000, 60000, 60000, 2000])
+
+    def watch(self, samples):
+        """Feed [ms, currentTime, ok] samples; return [stuck, steady] after each (ahead=10s)."""
+        return self.run_js(
+            f"let w = null; const out = [];"
+            f"for (const [now, t, ok] of {json.dumps(samples)}) {{"
+            f"  w = nextPlayheadWatch(w, {{t, ok}}, now);"
+            f"  out.push([playheadStuck(w, 10, now), playheadSteady(w, now)]);"
+            f"}}"
+            f"process.stdout.write(JSON.stringify(out));"
+        )
+
+    def test_frozen_playhead_is_stuck_after_the_window(self):
+        out = self.watch([[0, 25.0, True], [2000, 25.0, True], [9000, 25.0, True], [10000, 25.0, True]])
+        self.assertEqual([stuck for stuck, _ in out], [False, False, False, True])
+
+    def test_playing_playhead_is_never_stuck_and_becomes_steady(self):
+        samples = [[i * 2000, 10.0 + i * 2, True] for i in range(17)]  # 32s of normal play
+        out = self.watch(samples)
+        self.assertFalse(any(stuck for stuck, _ in out))
+        self.assertFalse(out[14][1])  # 28s
+        self.assertTrue(out[16][1])   # 32s
+
+    def test_seek_does_not_restart_the_clock_but_playing_does(self):
+        # 25 frozen, auto-seek to 40 at 6s, still frozen: stuck at 10s.
+        out = self.watch([[0, 25.0, True], [2000, 25.0, True], [6000, 40.0, True], [10000, 40.0, True]])
+        self.assertTrue(out[-1][0])
+        # Same, but it plays after the seek: not stuck.
+        out = self.watch([[0, 25.0, True], [6000, 40.0, True], [8000, 42.0, True], [12000, 46.0, True]])
+        self.assertFalse(out[-1][0])
+
+    def test_paused_or_hidden_resets_the_clock(self):
+        out = self.watch([[0, 25.0, True], [8000, 25.0, True], [9000, 25.0, False], [10000, 25.0, True], [12000, 25.0, True]])
+        self.assertEqual([stuck for stuck, _ in out], [False, False, False, False, False])
+
+    def test_no_newer_content_is_not_a_stuck_player(self):
+        # Source stopped delivering: the playhead waits at the end of what exists.
+        result = self.run_js(
+            "let w = nextPlayheadWatch(null, {t: 21.9, ok: true}, 0);"
+            "w = nextPlayheadWatch(w, {t: 21.9, ok: true}, 12000);"
+            "process.stdout.write(JSON.stringify([playheadStuck(w, -0.9, 12000), playheadStuck(w, null, 12000), playheadStuck(w, 10, 12000)]));"
+        )
+        self.assertEqual(result, [False, False, True])
+
+
 class ClipEncodingTests(unittest.TestCase):
     def _make_segments(self, directory: Path, count: int) -> list:
         """Produce real 2-second MPEG-TS segments with ffmpeg for a true clip."""

@@ -412,8 +412,32 @@ function seekToLive(video, onDone) {
   if (video.paused) video.play().catch(() => {});
 }
 
+// Fatal media errors within the window before attachHls stops recovering in
+// place and rebuilds the player (see the ERROR handler).
+const HLS_MEDIA_ERROR_REBUILD_COUNT = 3;
+const HLS_MEDIA_ERROR_WINDOW_MS = 30000;
+
+// Wait before each successive rebuild of one element's player. A stream that
+// keeps breaking would otherwise be torn down and re-fetched every couple of
+// seconds (hundreds of requests, tens of MB), starving the other tiles on the
+// office line. watchPlayheads resets the count once playback is steady.
+const PLAYER_REBUILD_DELAYS_MS = [2000, 10000, 20000, 40000, 60000];
+
+function nextRebuildDelayMs(video) {
+  const done = video._hlsRebuildCount || 0;
+  video._hlsRebuildCount = done + 1;
+  return PLAYER_REBUILD_DELAYS_MS[Math.min(done, PLAYER_REBUILD_DELAYS_MS.length - 1)];
+}
+
 function attachHls(video, playlistUrl, onStatus) {
   detachPlayer(video);
+  // Any fresh attach supersedes a rebuild still waiting out its back-off.
+  clearTimeout(video._hlsRebuildTimer);
+  video._hlsRebuildTimer = null;
+  video._hlsReattachNow = null;
+  // A new player has its own timeline; its first seek to the start position
+  // is not the operator scrubbing (noteStageUserAction measures from here).
+  video._lastPlayheadTime = undefined;
   if (window.Hls && window.Hls.isSupported()) {
     const hls = new window.Hls({
       liveSyncDurationCount: LATENCY.hlsLiveSyncCount,
@@ -424,17 +448,51 @@ function attachHls(video, playlistUrl, onStatus) {
       fragLoadingMaxRetry: 8,
     });
     video._hls = hls;
+    video._hlsPlaylistAt = 0;
+    video._hlsWedged = false;
     let netRetries = 0;
+    let mediaErrorTimes = [];
+    // Tear this player down and attach a fresh one after the back-off; a
+    // fresh player starts at the live edge with a new time base. Kept on the
+    // element for watchPlayheads and 「回到直播」.
+    const rebuild = (text, delayMs) => {
+      if (video._hls !== hls) return false;
+      if (onStatus) onStatus(text, 'warn');
+      try { hls.destroy(); } catch (e) {}
+      video._hls = null;
+      const delay = delayMs != null ? delayMs : nextRebuildDelayMs(video);
+      const reattach = () => {
+        // The element is gone (stage closed, tile removed): nothing to do.
+        if (video.isConnected) attachHls(video, playlistUrl, onStatus);
+      };
+      video._hlsReattachNow = reattach; // 「回到直播」 skips the wait
+      video._hlsRebuildTimer = setTimeout(reattach, delay);
+      return true;
+    };
+    video._rebuildHls = rebuild;
     hls.on(window.Hls.Events.MANIFEST_PARSED, () => {
+      video._hlsPlaylistAt = Date.now();
       video.play().catch(() => {});
       if (onStatus) onStatus('正在播放直播源', 'ok');
     });
+    // Every live playlist reload; reviveStalledPlayers reads it.
+    hls.on(window.Hls.Events.LEVEL_LOADED, () => { video._hlsPlaylistAt = Date.now(); });
     hls.on(window.Hls.Events.FRAG_BUFFERED, () => {
       netRetries = 0;
       if (onStatus) onStatus('正在播放直播源', 'ok');
     });
     hls.on(window.Hls.Events.ERROR, (_e, data) => {
       if (!data || !data.fatal) return;
+      if (data.type === window.Hls.ErrorTypes.MEDIA_ERROR) {
+        const now = Date.now();
+        mediaErrorTimes = mediaErrorTimes.filter((t) => now - t < HLS_MEDIA_ERROR_WINDOW_MS);
+        mediaErrorTimes.push(now);
+      }
+      // Recovering in place reloads the fragment under the playhead, so a
+      // broken stretch of the stream fails the same way every time (54490381
+      // on 11-07 fetched the same three segments 115 times). Past a few
+      // tries, rebuild instead: a fresh player starts at the live edge.
+      const mediaErrorLoop = mediaErrorTimes.length >= HLS_MEDIA_ERROR_REBUILD_COUNT;
       if (data.type === window.Hls.ErrorTypes.NETWORK_ERROR) {
         netRetries += 1;
         if (netRetries > 4) {
@@ -445,14 +503,19 @@ function attachHls(video, playlistUrl, onStatus) {
         }
         if (onStatus) onStatus('网络波动，正在重连…', 'warn');
         try { hls.startLoad(); } catch (e) {}
-      } else if (data.type === window.Hls.ErrorTypes.MEDIA_ERROR) {
+      } else if (data.type === window.Hls.ErrorTypes.MEDIA_ERROR && !mediaErrorLoop) {
         if (onStatus) onStatus('画面波动，正在恢复…', 'warn');
         try { hls.recoverMediaError(); } catch (e) {}
+        // hls.js 1.5 stops every loader on a fatal error, and
+        // recoverMediaError() only re-attaches the media: fragments of the
+        // playlist already in hand are fetched again, but the live playlist
+        // is never reloaded, so the player plays to the end of the last
+        // playlist it saw and freezes there - black, 「落后」 climbing, until
+        // the page is reloaded (54480021 on 11-07). Restart loading; the
+        // playhead stays where it was.
+        try { hls.startLoad(); } catch (e) {}
       } else {
-        if (onStatus) onStatus('播放中断，正在重建…', 'warn');
-        try { hls.destroy(); } catch (e) {}
-        video._hls = null;
-        setTimeout(() => attachHls(video, playlistUrl, onStatus), 2000);
+        rebuild('播放中断，正在重建…');
       }
     });
     hls.loadSource(playlistUrl);
@@ -467,6 +530,62 @@ function attachHls(video, playlistUrl, onStatus) {
     onStatus('浏览器不支持 HLS 播放', 'warn');
   }
   return null;
+}
+
+// Backstop for a player that stopped loading and was never restarted.
+// hls.js clears ``started`` (hls.stopLoad) on every fatal error and only
+// hls.startLoad() sets it again; attachHls restarts or rebuilds on each kind
+// of fatal error, so this should never fire - if it does, some other path
+// left the player stuck at the end of its last playlist. While loading,
+// ``started`` stays true even through retry back-off or a hidden tab's
+// throttled timers, so those are never mistaken for a stall. A future
+// hls.js without the field leaves it undefined and this stays off.
+const HLS_STALL_GRACE_MS = 10000;
+
+function hlsLoadingStalled(hls, playlistAt, now) {
+  if (!hls || hls.started !== false || !playlistAt) return false;
+  return now - playlistAt >= HLS_STALL_GRACE_MS;
+}
+
+// A picture frozen while the stream goes on. After the source's timestamps
+// jump, hls.js keeps reloading the playlist but never gets past the jump: no
+// fatal error, so attachHls never hears of it, and a seek or 「回到直播」
+// keeps the stale time base and stays frozen - only a fresh player recovers
+// (54490381, 11-07: tile frozen 23:18-23:20 through four auto-seeks).
+// watchPlayheads samples every PLAYHEAD_WATCH_MS; a player counts as stuck
+// when, for PLAYHEAD_STUCK_MS, it should be playing (``ok``: page visible,
+// not paused, loading, playlist fresh, source up, no recent operator action)
+// yet its playhead has not moved forward at playing speed, while the
+// playlist already reaches PLAYHEAD_AHEAD_MIN_S past it. That last part
+// keeps a source that simply stopped delivering - the playhead waits at the
+// end of everything there is - from looking like a stuck player.
+const PLAYHEAD_WATCH_MS = 2000;
+const PLAYHEAD_STUCK_MS = 10000;
+const PLAYHEAD_AHEAD_MIN_S = 5;
+// This long playing normally forgets earlier rebuilds (back-off back to the start).
+const PLAYHEAD_STEADY_MS = 30000;
+
+// Pure: the element's next watch record from the previous one and a sample
+// {t, ok}. A jump (seek) is neither progress nor reason to restart the clock.
+function nextPlayheadWatch(prev, sample, now) {
+  if (!sample.ok) return {t: sample.t, at: now, stuckSince: null, steadySince: null};
+  if (!prev) return {t: sample.t, at: now, stuckSince: null, steadySince: null};
+  const moved = sample.t - prev.t;
+  const elapsed = (now - prev.at) / 1000;
+  const playing = moved > 0.05 && moved <= elapsed * 2 + 0.5;
+  if (playing) {
+    return {t: sample.t, at: now, stuckSince: null, steadySince: prev.steadySince == null ? prev.at : prev.steadySince};
+  }
+  return {t: sample.t, at: now, stuckSince: prev.stuckSince == null ? prev.at : prev.stuckSince, steadySince: null};
+}
+
+function playheadStuck(watch, aheadSeconds, now) {
+  return !!watch && watch.stuckSince != null && now - watch.stuckSince >= PLAYHEAD_STUCK_MS
+    && aheadSeconds != null && aheadSeconds >= PLAYHEAD_AHEAD_MIN_S;
+}
+
+function playheadSteady(watch, now) {
+  return !!watch && watch.steadySince != null && now - watch.steadySince >= PLAYHEAD_STEADY_MS;
 }
 
 function teamsText(data) {
@@ -2919,8 +3038,22 @@ $('stage-append-done').addEventListener('click', () => clearAppend());
 bindCropOverlay();
 $('stage-live').addEventListener('click', () => {
   if (!state.stageVideoNode) return;
-  $('stage-status').textContent = '正在回到直播…';
+  const video = state.stageVideoNode;
   $('stage-status').className = 'stage-status';
+  // A stuck player (watchPlayheads) stays stuck after a seek, and one being
+  // rebuilt has no player to seek at all: reconnect now, skipping the
+  // back-off - the operator asked. A fresh player starts at the live edge.
+  const rebuilding = !video._hls && video._hlsReattachNow;
+  if (rebuilding || (video._hlsWedged && video._rebuildHls && video._rebuildHls('画面卡住，正在重新连接…', 0))) {
+    if (rebuilding) video._hlsReattachNow();
+    $('stage-status').textContent = '画面卡住，正在重新连接直播…';
+    video.addEventListener('playing', () => {
+      $('stage-status').textContent = '已重新连接，回到直播';
+      $('stage-status').className = 'stage-status ok';
+    }, {once: true});
+    return;
+  }
+  $('stage-status').textContent = '正在回到直播…';
   seekToLive(state.stageVideoNode, () => {
     $('stage-status').textContent = '已回到直播';
     $('stage-status').className = 'stage-status ok';
@@ -3106,7 +3239,61 @@ function recoverPreview(matchId, status, options = {}) {
   }
 }
 
+function reviveStalledPlayers() {
+  const now = Date.now();
+  const seen = new Set();
+  for (const matchId of state.tiles.keys()) {
+    // Stage and grid elements differ only when the stage runs its own player.
+    for (const video of [videoForMatch(matchId), tileVideoEl(matchId)]) {
+      if (!video || seen.has(video)) continue;
+      seen.add(video);
+      const hls = video._hls;
+      if (!hlsLoadingStalled(hls, video._hlsPlaylistAt, now)) continue;
+      console.warn(`[PREVIEW] ${matchId} | 播放器已停止加载 ${Math.round((now - video._hlsPlaylistAt) / 1000)}s，重新开始加载`);
+      video._hlsPlaylistAt = now;
+      try { hls.startLoad(); } catch (e) {}
+      setTileStatus(matchId, '播放器停止加载，已重新连接', 'warn');
+    }
+  }
+}
+
+function watchPlayheads() {
+  const now = Date.now();
+  const seen = new Set();
+  for (const [matchId, tile] of state.tiles.entries()) {
+    for (const video of [videoForMatch(matchId), tileVideoEl(matchId)]) {
+      if (!video || seen.has(video)) continue;
+      seen.add(video);
+      const hls = video._hls;
+      if (!hls) { video._playheadWatch = null; continue; }
+      const onStage = state.stageMatchId === matchId && state.stageVideoNode === video;
+      const ok = !document.hidden && !tile.down && !video.paused && hls.started === true
+        && !!video._hlsPlaylistAt && now - video._hlsPlaylistAt < HLS_STALL_GRACE_MS
+        && !(onStage && now - state.stageUserActionAt < PLAYHEAD_STUCK_MS);
+      const watch = nextPlayheadWatch(video._playheadWatch, {t: video.currentTime, ok}, now);
+      video._playheadWatch = watch;
+      if (playheadSteady(watch, now)) video._hlsRebuildCount = 0;
+      const live = hls.liveSyncPosition;
+      const ahead = typeof live === 'number' && isFinite(live) ? live - video.currentTime : null;
+      if (!playheadStuck(watch, ahead, now)) continue;
+      video._playheadWatch = null; // the clock starts over after acting
+      video._hlsWedged = true;
+      const stuckText = `画面卡住 ${Math.round((now - watch.stuckSince) / 1000)}s（源数据异常）`;
+      if (onStage && state.range.pinId != null) {
+        // Rebuilding jumps to live; with a start pinned that is the operator's call.
+        addStageNote(`${stuckText}，点「回到直播」重新连接`, 'warn', 'playhead-stuck');
+        continue;
+      }
+      const attempt = (video._hlsRebuildCount || 0) + 1;
+      console.warn(`[PREVIEW] ${matchId} | ${stuckText}，重建播放器（第 ${attempt} 次）`);
+      if (onStage) addStageNote(`${stuckText}，正在重新连接（第 ${attempt} 次）`, 'warn', 'playhead-stuck');
+      if (video._rebuildHls) video._rebuildHls(`画面卡住（源数据异常），正在重新连接（第 ${attempt} 次）`);
+    }
+  }
+}
+
 function keepAlivePreviews() {
+  reviveStalledPlayers();
   const now = Date.now();
   for (const [matchId, tile] of state.tiles.entries()) {
     if (!tile.playlistUrl) {
@@ -3220,6 +3407,7 @@ if (!PANEL) {
   setInterval(refreshMatches, REFRESH_MS);
   setInterval(renderCatalogAge, 5000);
   setInterval(keepAlivePreviews, 8000);
+  setInterval(watchPlayheads, PLAYHEAD_WATCH_MS);
 }
 
 // ---- Real-time goal/red-card alerts (unchanged) ----
