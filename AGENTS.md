@@ -72,6 +72,18 @@ Dashboard or GIF artifacts.
 
 ## Fixed Server Update Workflow
 
+> **Status 2026-11-09: the production 8899 Dashboard is paused (用户：暂时不用).**
+> It has not run since at least 2026-10-31, the release directory
+> `/opt/automatic-gif-release-c24aa3c` was deleted on 2026-11-09 during a disk
+> cleanup, and `autogif.service` / `automatic-post.service` were disabled so a
+> reboot does not bring them back. nginx `/` on matchgif still proxies to 8899
+> (answers 502); `/publish-gifs/` and `/publish-gif-covers/` now return 404
+> (the September self-hosted GIFs behind them are gone). Before using the
+> procedure below again: recreate a release directory from Gitee, copy `.env`
+> (reference: `/opt/automatic-gif/.env`), rebuild `tmp/ocr_venv`, and decide
+> whether `autogif.service` or the manual `nohup` start below is the one to use.
+> 8901 does not depend on 8899: every 8901 GIF is uploaded to the platform.
+
 This is the authoritative procedure for every update of the production
 Dashboard. Run these commands in the server SSH terminal, in order, from the
 fixed release directory (currently `/opt/automatic-gif-release-c24aa3c`):

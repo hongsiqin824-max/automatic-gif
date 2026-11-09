@@ -1,5 +1,7 @@
 # 服务器服务完整重启手册
 
+> **2026-11-09 状态：服务器上的 8899 Dashboard 暂停使用（用户：暂时不用）。** 至少 10-31 起就没在跑；下面写的发布目录 `/opt/automatic-gif-release-c24aa3c` 已在 11-09 清理硬盘时删除；`autogif.service`、`automatic-post.service` 已关闭开机自启（`systemctl disable`），服务器重启也不会自己起来。要重新启用：先从 Gitee 拉代码建新的发布目录、复制 `.env`（可参考 `/opt/automatic-gif/.env`）、重建 `tmp/ocr_venv`，再按本文档操作；想让它开机自启再 `systemctl enable autogif`。8901 不依赖 8899（8901 的 GIF 都传到平台）。
+
 本文档用于服务器上完整重启 Football GIF Dashboard。完整重启会停止当前比赛 Worker，再停止旧 Dashboard，启动新 Dashboard，最后由页面或接口重新启动需要处理的比赛。
 
 如果不希望中断正在处理的比赛，不要执行本文档的完整流程；应只重启前端或等待比赛完成。完整重启会中断直播拉流、OCR 和 GIF 任务，未完成任务需要重新启动或按项目恢复逻辑重新接纳。
