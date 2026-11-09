@@ -9,6 +9,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
 
+import live_preview
 from live_preview import LivePreviewManager, non_negative_env_float
 
 
@@ -1046,6 +1047,125 @@ class LivePreviewStallWatchdogTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     non_negative_env_float(name, 20.0)
 
+
+def _live_with_segments_factory():
+    """A child that writes a two-segment playlist and keeps running (healthy source)."""
+
+    def _build(resource, directory):
+        playlist = directory / "index.m3u8"
+        script = (
+            "import pathlib, time\n"
+            f"pathlib.Path(r'{directory / 'seg_00000.ts'}').write_bytes(b'ts')\n"
+            f"pathlib.Path(r'{directory / 'seg_00001.ts'}').write_bytes(b'ts')\n"
+            f"pathlib.Path(r'{playlist}').write_text({PLAYLIST_WITH_SEGMENTS!r}, encoding='utf-8')\n"
+            "time.sleep(30)\n"
+        )
+        return [sys.executable, "-c", script]
+
+    return _build
+
+
+class LivePreviewSourceSwitchTests(unittest.TestCase):
+    """switch_resource: another source, same directory, history kept (11-09)."""
+
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.addCleanup(self._cleanup)
+        self.manager = LivePreviewManager(
+            root=self.root,
+            background_reaper=False,
+            auto_restart=True,
+            restart_base_delay=0.0,
+            restart_max_delay=0.0,
+            restart_max_retries=3,
+            restart_reset_seconds=100.0,
+            idle_timeout_seconds=10000.0,
+        )
+        self.built = []
+
+    def _cleanup(self):
+        self.manager.shutdown()
+        self._tmp.cleanup()
+
+    def _use(self, factory):
+        def _build(resource, directory):
+            self.built.append(resource)
+            return factory(resource, directory)
+
+        self.manager._build_command = _build
+
+    def _start_live(self, resource="rtmp://h/wyc_live/pt-a"):
+        self._use(_live_with_segments_factory())
+        self.manager.start("m1", resource)
+        playlist = self.manager.media_dir("m1") / "index.m3u8"
+        deadline = time.time() + 5
+        while not playlist.is_file() and time.time() < deadline:
+            time.sleep(0.05)
+        self.assertTrue(playlist.is_file())
+        return self.manager.media_dir("m1")
+
+    def test_switch_keeps_history_and_marks_the_boundary(self):
+        media = self._start_live()
+        self._use(_silent_command_factory())
+        with mock.patch("live_preview._log_event") as log_event:
+            status = self.manager.switch_resource("m1", "rtmp://h/wyc_live/sd-b")
+        self.assertEqual(status["resource"], "rtmp://h/wyc_live/sd-b")
+        self.assertTrue(status["running"])
+        self.assertTrue(status["history_frozen"])
+        self.assertTrue(status["switching"])
+        self.assertEqual(status["drops_recent"], 0)
+        self.assertIsNotNone(status["switched_at_unix"])
+        self.assertEqual(self.built, ["rtmp://h/wyc_live/pt-a", "rtmp://h/wyc_live/sd-b"])
+        # Same directory, old segments untouched: scrubbing back still works.
+        self.assertEqual(self.manager.media_dir("m1"), media)
+        self.assertTrue((media / "seg_00000.ts").is_file())
+        self.assertTrue((media / "seg_00001.ts").is_file())
+        self.assertEqual(self.manager.switch_boundaries("m1"), [1])
+        events = {c.args[0]: c.kwargs for c in log_event.call_args_list}
+        self.assertEqual(events["preview_ffmpeg_exited"]["reason"], live_preview.SWITCH_EXIT_REASON)
+        self.assertEqual(events["preview_resource_switched"]["new"], "rtmp://h/wyc_live/sd-b")
+        self.assertEqual(events["preview_resource_switched"]["boundary_segment"], 1)
+        entry = self.manager.entries["m1"]
+        self.assertEqual((entry.restart_count, entry.cooling, entry.next_restart_at), (0, False, 0.0))
+
+    def test_switch_to_the_same_source_does_nothing(self):
+        self._start_live()
+        before = self.manager.status("m1")["restart_count_total"]
+        status = self.manager.switch_resource("m1", "rtmp://h/wyc_live/pt-a")
+        self.assertEqual(status["restart_count_total"], before)
+        self.assertEqual(self.built, ["rtmp://h/wyc_live/pt-a"])
+        self.assertEqual(self.manager.switch_boundaries("m1"), [])
+
+    def test_switch_without_a_preview_returns_none(self):
+        self.assertIsNone(self.manager.switch_resource("nope", "rtmp://h/x"))
+        self.assertEqual(self.manager.switch_boundaries("nope"), [])
+        with self.assertRaises(ValueError):
+            self.manager.switch_resource("nope", "  ")
+
+    def test_drops_count_picture_breaks_not_refails_and_reset_on_switch(self):
+        manager = self.manager
+        self._use(_dying_with_segments_factory())
+        manager.start("m1", "rtmp://h/wyc_live/pt-a")
+        manager.entries["m1"].process.wait(timeout=5)
+        # The run had delivered two segments, then the source dropped: one break.
+        self._use(_silent_command_factory())
+        manager._reap_tick(time.time())
+        self.assertEqual(manager.status("m1")["drops_recent"], 1)
+        # The replacement dies before delivering anything: the same break.
+        entry = manager.entries["m1"]
+        entry.process.terminate()
+        entry.process.wait(timeout=5)
+        manager._reap_tick(time.time())
+        self.assertEqual(manager.status("m1")["drops_recent"], 1)
+        self.assertEqual(manager.status("m1")["drops_window_seconds"], 600)
+        self.assertFalse(manager.status("m1")["switching"])
+        # A source switch starts the count over for the new source.
+        manager.switch_resource("m1", "rtmp://h/wyc_live/sd-b")
+        self.assertEqual(manager.status("m1")["drops_recent"], 0)
+        # Old breaks age out of the window.
+        manager.entries["m1"].drop_times = [time.time() - 601]
+        self.assertEqual(manager.status("m1")["drops_recent"], 0)
 
 if __name__ == "__main__":
     unittest.main()

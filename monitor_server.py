@@ -72,6 +72,7 @@ _load_dotenv(ROOT / ".env")
 
 from dqd_api import MATCH_STATUS_LABELS, positive_env_float, positive_env_int, validate_match_id  # noqa: E402
 from source_client import classify_source_response, query_source
+import live_sources
 from match_catalog import MATCH_CATALOG_EXCLUDED_COMPETITION_NAMES, MatchCatalog
 from match_players import MatchPlayerLookup, resolve_player
 from live_preview import LivePreviewManager, resolve_ffmpeg
@@ -362,6 +363,16 @@ live_preview = LivePreviewManager(
 )
 match_catalog = MatchCatalog()
 atexit.register(live_preview.shutdown)
+# Every stream of a match (dqd / ls records + the pull-address API), ranked by
+# measured stability, plus the operator's per-match pick. ``query_source`` is
+# looked up at call time so tests can patch it on this module.
+source_catalog = live_sources.SourceCatalog.from_env(
+    lambda match_id, live_type=None: query_source(match_id, live_type=live_type)
+)
+# Time budget for checking a source has a picture: before a switch, and per
+# candidate when a cold preview start has several sources to choose from.
+SOURCE_SWITCH_PROBE_SECONDS = positive_env_float("GIF_MONITOR_SOURCE_PROBE_SECONDS", 5.0)
+SOURCE_START_PROBE_SECONDS = 3.0
 
 # How long a match that just left the ``Playing`` catalog stays known to the
 # monitor. The directory drops a match the moment the feed flips to Played -
@@ -1083,6 +1094,9 @@ def _batch_query_sources(match_ids: list[str]) -> dict[str, str]:
                 result = classify_source_response(
                     query_source(match_id, live_type="dqd")
                 )
+            if result.state == "no_source" and source_catalog.pull.urls_for(match_id):
+                # Neither record, but the pull-address API has it: playable.
+                return match_id, "available"
             return match_id, result.state
         except Exception:
             return match_id, "error"
@@ -1105,55 +1119,65 @@ def _batch_query_sources(match_ids: list[str]) -> dict[str, str]:
 def _resolve_source(match_id: str) -> str:
     """Return a usable live-source resource or raise a descriptive error.
 
-    A match can carry two records: ``dqd`` (Dongqiudi's own stream, only a few
-    matches) and ``ls`` (data-provider stream). Prefer ``dqd`` and fall back to
-    ``ls`` only when no dqd record exists or the dqd query itself failed. This
-    runs once per preview start; a stalling dqd stream is NOT switched to ls
-    automatically (operator decision 2026-11-04). 8899 still queries ls only.
+    A match can have streams in three places (see ``live_sources``): the dqd
+    record, the ls record and the pull-address API. A match whose preview is
+    already running keeps its source: a different resource would cold-start
+    the preview and wipe the buffered history the operator clips from, so
+    changing it is only ever the operator's explicit switch
+    (``/api/monitor/preview/switch``), never a side effect of re-opening.
+    Otherwise the operator's earlier pick for this match wins, then the
+    ranking by measured stability (user, 11-09); with several candidates the
+    first one that is actually pushing is used. A stalling source is still
+    NOT switched automatically (operator decision 2026-11-04). 8899 still
+    queries ls only.
     """
     # Local-only escape hatch: point every match at a fixed test stream so the
     # player path can be exercised without a real fixture. Never set in prod.
     override = os.environ.get("GIF_MONITOR_SOURCE_OVERRIDE", "").strip()
     if override:
         return override
-    dqd_error = None
-    try:
-        dqd = classify_source_response(query_source(match_id, live_type="dqd"))
-    except Exception as exc:
-        dqd = None
-        dqd_error = str(exc)
-    if dqd is not None and dqd.state == "available":
-        resource = str(dqd.data.get("resource") or "").strip()
-        _log_source_resolved(match_id, "dqd", resource)
-        return resource
-    if dqd is not None and dqd.state == "error":
-        dqd_error = dqd.error
-    if dqd_error:
-        # A transient dqd failure must not flip a running preview to ls: a
-        # changed resource makes live_preview cold-start and wipe the buffered
-        # history the operator clips from. Keep whatever is already playing.
-        current = _current_preview_upstream(match_id)
-        if current:
-            _log_source_resolved(match_id, "current", current, dqd_error)
-            return current
-    result = classify_source_response(query_source(match_id, live_type="ls"))
-    if result.state == "available":
-        resource = str(result.data.get("resource") or "").strip()
-        _log_source_resolved(match_id, "ls", resource, dqd_error)
-        return resource
-    if result.state == "no_source":
+    current = _current_preview_upstream(match_id)
+    if current:
+        _log_source_resolved(match_id, "current", current)
+        return current
+    sources, errors = source_catalog.collect(match_id)
+    if not sources:
+        if errors:
+            raise RuntimeError("；".join(errors))
         raise LookupError("该比赛暂未配置直播源")
-    raise RuntimeError(result.error or "直播源查询失败")
+    choice = source_catalog.choices.get(match_id)
+    preferred = None
+    if choice and any(source["url"] == choice["url"] for source in sources):
+        preferred = choice["url"]
+    picked, probe = source_catalog.pick_startable(
+        sources, preferred_url=preferred, timeout_seconds=SOURCE_START_PROBE_SECONDS
+    )
+    _log_source_resolved(
+        match_id,
+        picked["origins"][0],
+        picked["url"],
+        "；".join(errors) or None,
+        kind=picked["kind"],
+        candidates=len(sources),
+        chosen_by_operator=picked["url"] == preferred,
+        probed=probe is not None,
+    )
+    return picked["url"]
 
 
 def _log_source_resolved(
-    match_id: str, live_type: str, resource: str, dqd_error: str | None = None
+    match_id: str,
+    live_type: str,
+    resource: str,
+    dqd_error: str | None = None,
+    **extra: Any,
 ) -> None:
     payload = {
         "event": "preview_source_resolved",
         "match_id": match_id,
         "live_type": live_type,
         "resource": resource,
+        **extra,
     }
     if dqd_error:
         payload["dqd_error"] = dqd_error
@@ -1418,6 +1442,56 @@ def _encode_clip_gif(
 
 def _clip_dir(match_id: str) -> Path:
     return CLIP_OUTPUT_ROOT / match_id
+
+
+_SEGMENT_SEQUENCE_RE = re.compile(r"(\d+)\.ts$")
+
+
+def _one_source_segments(
+    segments: list[tuple[Path, float, float | None]],
+    boundaries: list[int],
+    start_epoch: float | None,
+    end_epoch: float | None,
+) -> list[tuple[Path, float, float | None]] | None:
+    """The segments of the one source ``[start, end]`` was shown from.
+
+    ``boundaries`` are the sequence numbers of the last segment before each
+    operator source switch (``live_preview.switch_boundaries``); everything
+    between two of them came from one source. Two sources run tens of
+    seconds apart (11-09: zb- 28 s behind pt-), so a range whose start and
+    end lie on different sides would jump or repeat: ``None`` (refuse).
+    Otherwise the other sources' segments are dropped: the old run's last
+    PROGRAM-DATE-TIME overlaps the new run's first by a fraction of a second
+    (measured 0.54 s), and a PDT-window pick would splice that old tail in.
+    A time falls on the side of the newest segment (by sequence) that had
+    started by then. No switch, no times, or no PDT: unchanged.
+    """
+    if not boundaries or start_epoch is None or end_epoch is None:
+        return segments
+    numbered: list[tuple[int, tuple[Path, float, float | None]]] = []
+    for segment in segments:
+        match = _SEGMENT_SEQUENCE_RE.search(segment[0].name)
+        if match is None or segment[2] is None:
+            return segments
+        numbered.append((int(match.group(1)), segment))
+    if not numbered:
+        return segments
+    numbered.sort(key=lambda item: item[0])
+
+    def side_of(sequence: int) -> int:
+        return sum(1 for boundary in boundaries if sequence > boundary)
+
+    def side_at(moment: float) -> int:
+        side = side_of(numbered[0][0])
+        for sequence, segment in numbered:
+            if segment[2] <= moment:
+                side = side_of(sequence)
+        return side
+
+    side = side_at(start_epoch)
+    if side_at(end_epoch) != side:
+        return None
+    return [segment for sequence, segment in numbered if side_of(sequence) == side]
 
 
 CLIP_LIST_LIMIT = positive_env_int("GIF_MONITOR_CLIP_LIST_LIMIT", 50)
@@ -2655,6 +2729,12 @@ def monitor_preview_start():
     playlist_ready = _wait_playlist_ready(match_id)
     status = live_preview.status(match_id)
     if not status.get("running"):
+        # A source that dropped again right away (often: the match is over)
+        # still leaves the buffered history; hand that over instead of an error.
+        frozen = _frozen_preview_payload(match_id)
+        if frozen:
+            frozen.update(_source_payload(match_id, frozen))
+            return jsonify(frozen)
         return jsonify(
             {
                 "error": status.get("error") or "直播源拉流启动失败，请稍后重试",
@@ -2669,6 +2749,7 @@ def monitor_preview_start():
             "playlist_ready": playlist_ready,
             **status,
             **_webrtc_fields(match_id, webrtc),
+            **_source_payload(match_id, status),
         }
     )
 
@@ -2715,6 +2796,31 @@ def _preview_is_webrtc(status: dict[str, Any]) -> bool:
     return webrtc_gateway.enabled and resource.startswith(webrtc_gateway.rtsp_base + "/")
 
 
+def _source_payload(match_id: str, status: dict[str, Any]) -> dict[str, Any]:
+    """``source``: which stream the preview plays and who picked it.
+
+    Rides on preview/start and every status poll so all open tabs show the
+    current source and notice another operator's switch. Never the URL: the
+    browser names sources by ``source_id`` / ``label`` / ``name``.
+    """
+    resource = str(status.get("resource") or "")
+    if not resource:
+        return {"source": None}
+    # Same answer as _current_preview_upstream, without re-reading the status
+    # on every poll.
+    upstream = webrtc_gateway.upstream_for(match_id) or (
+        "" if resource.startswith(webrtc_gateway.rtsp_base + "/") else resource
+    )
+    if not upstream:
+        return {"source": None}
+    info: dict[str, Any] = live_sources.describe(upstream)
+    choice = source_catalog.choices.get(match_id)
+    if choice and choice["url"] == upstream:
+        info["chosen_by"] = choice["by"]
+        info["chosen_at_unix"] = choice["at"]
+    return {"source": info}
+
+
 @app.post("/api/monitor/preview/stop")
 def monitor_preview_stop():
     body = request.get_json(silent=True) or {}
@@ -2724,6 +2830,136 @@ def monitor_preview_stop():
         return jsonify({"error": str(exc)}), 400
     live_preview.stop(match_id)
     return jsonify({"ok": True, "match_id": match_id, "running": False})
+
+
+def _public_source(source: dict[str, Any], current: str | None) -> dict[str, Any]:
+    """A catalog entry as the browser sees it: no URL, just names and flags."""
+    return {
+        "source_id": source["source_id"],
+        "kind": source["kind"],
+        "label": source["label"],
+        "note": source["note"],
+        "name": source["name"],
+        "origins": [live_sources.ORIGIN_LABELS.get(o, o) for o in source["origins"]],
+        "pushing": source["pushing"],
+        "current": source["url"] == current,
+    }
+
+
+@app.get("/api/monitor/preview/sources")
+def monitor_preview_sources():
+    """Every stream of a match, best first, for the workshop's source menu."""
+    try:
+        match_id = validate_match_id(request.args.get("match_id", ""))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    try:
+        sources, errors = source_catalog.collect(match_id)
+    except Exception as exc:
+        return jsonify({"error": f"查询直播源失败：{exc}", "code": "source_error"}), 502
+    status = live_preview.status(match_id)
+    current = _current_preview_upstream(match_id) if status.get("resource") is not None else None
+    choice = source_catalog.choices.get(match_id)
+    return jsonify(
+        {
+            "ok": True,
+            "match_id": match_id,
+            "sources": [_public_source(source, current) for source in sources],
+            "errors": errors,
+            "current": live_sources.describe(current) if current else None,
+            # The preview plays a stream no interface lists any more (record
+            # changed, or the pull API dropped it because it stopped pushing).
+            "current_listed": current is None or any(s["url"] == current for s in sources),
+            "chosen": (
+                {
+                    "source_id": live_sources.source_id_of(choice["url"]),
+                    "by": choice["by"],
+                    "at_unix": choice["at"],
+                }
+                if choice
+                else None
+            ),
+            "switchable": status.get("resource") is not None and not _preview_is_webrtc(status),
+        }
+    )
+
+
+@app.post("/api/monitor/preview/switch")
+def monitor_preview_switch():
+    """Switch a running preview to another source of the same match.
+
+    Checks the target has a picture first, so a switch never trades a flaky
+    stream for a dead or undecodable one; then relaunches the preview on it
+    in place (``live_preview.switch_resource``: the buffered history stays)
+    and remembers the pick for the match, so re-opening keeps it.
+    """
+    body = request.get_json(silent=True) or {}
+    try:
+        match_id = validate_match_id(str(body.get("match_id") or ""))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    source_id = str(body.get("source_id") or "").strip()
+    if not source_id:
+        return jsonify({"error": "缺少 source_id"}), 400
+    status = live_preview.status(match_id)
+    if status.get("resource") is None:
+        return jsonify({"error": "这场的预览没有在运行，请先打开小窗", "code": "preview_not_running"}), 409
+    if _preview_is_webrtc(status):
+        return jsonify({"error": "WebRTC 模式下暂不支持切换直播源", "code": "switch_unsupported"}), 409
+    try:
+        sources, _errors = source_catalog.collect(match_id)
+    except Exception as exc:
+        return jsonify({"error": f"查询直播源失败：{exc}", "code": "source_error"}), 502
+    target = next((s for s in sources if s["source_id"] == source_id), None)
+    if target is None:
+        return (
+            jsonify({"error": "这路源已经不在列表里了（可能停推了），请重新打开菜单", "code": "source_gone"}),
+            404,
+        )
+    operator = _current_operator()
+    by = (operator or {}).get("name") or ""
+    current = _current_preview_upstream(match_id)
+    if current == target["url"]:
+        source_catalog.choices.remember(match_id, target["url"], by)
+        status = live_preview.status(match_id)
+        return jsonify({"ok": True, "unchanged": True, "match_id": match_id, **status, **_source_payload(match_id, status)})
+    probe = source_catalog.probe(target["url"], timeout_seconds=SOURCE_SWITCH_PROBE_SECONDS)
+    log_base = {
+        "match_id": match_id,
+        "from_kind": live_sources.kind_of(current or ""),
+        "from": live_sources.stream_name(current or ""),
+        "to_kind": target["kind"],
+        "to": target["name"],
+        "operator": by,
+    }
+    if not probe.get("ok"):
+        print(json.dumps({"event": "preview_source_switch_refused", **log_base, "probe": probe}, ensure_ascii=False), flush=True)
+        return (
+            jsonify(
+                {
+                    "error": f"「{target['label']}」现在连不上（{probe.get('error') or '没有画面'}），没有切换，还在播原来的源",
+                    "code": "probe_failed",
+                }
+            ),
+            409,
+        )
+    try:
+        switched = live_preview.switch_resource(match_id, target["url"])
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc), "code": "switch_failed"}), 409
+    if switched is None:
+        return jsonify({"error": "这场的预览刚刚被关闭了，请重新打开小窗", "code": "preview_not_running"}), 409
+    source_catalog.choices.remember(match_id, target["url"], by)
+    print(json.dumps({"event": "preview_source_switched", **log_base, "probe": probe}, ensure_ascii=False), flush=True)
+    return jsonify(
+        {
+            "ok": True,
+            "match_id": match_id,
+            "playlist_url": live_preview.playlist_url(match_id),
+            **switched,
+            **_source_payload(match_id, switched),
+        }
+    )
 
 
 @app.get("/api/monitor/preview/status")
@@ -2747,6 +2983,7 @@ def monitor_preview_status():
     black_seconds = live_preview.source_black_seconds(match_id)
     status["source_black"] = black_seconds > 0
     status["source_black_seconds"] = round(black_seconds)
+    status.update(_source_payload(match_id, status))
     return jsonify(status)
 
 
@@ -3238,6 +3475,29 @@ def monitor_clip():
                     {
                         "error": f"这一刻已超出缓冲（仅保留最近约 {retained} 秒），请离直播更近时再截取",
                         "code": "anchor_out_of_buffer",
+                    }
+                ),
+                409,
+            )
+    boundaries = live_preview.switch_boundaries(match_id)
+    if boundaries:
+        if anchor_epoch is not None:
+            range_end = anchor_epoch
+            range_start = start_epoch if start_epoch is not None else anchor_epoch - before_seconds
+        elif segments[-1][2] is not None:
+            range_end = segments[-1][2] + segments[-1][1]
+            range_start = range_end - before_seconds
+        else:
+            range_end = range_start = None
+        one_source = _one_source_segments(segments, boundaries, range_start, range_end)
+        if one_source is not None:
+            segments = one_source
+        else:
+            return (
+                jsonify(
+                    {
+                        "error": "区间跨过了切换直播源的位置：两路源进度不一样，画面会跳。请把起点和终点放在同一路源里（切换前或切换后）",
+                        "code": "range_crosses_switch",
                     }
                 ),
                 409,

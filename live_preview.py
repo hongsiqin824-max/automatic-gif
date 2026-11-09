@@ -20,7 +20,7 @@ import subprocess
 import threading
 import time
 import urllib.parse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
@@ -105,6 +105,13 @@ SOURCE_BLACK_BYTES_PER_SECOND = 30 * 1024
 # The newest segments must all be that small for this long before it is
 # reported: a 1-3 s fade to black between programmes is normal broadcast.
 SOURCE_BLACK_MIN_SECONDS = 8.0
+# Window for ``drops_recent`` in status: how many times the picture broke
+# lately. The workshop suggests another source at 3 within it (user, 11-09).
+PREVIEW_DROP_WINDOW_SECONDS = 600.0
+_SEGMENT_SEQUENCE_RE = re.compile(r"(\d+)\.ts$")
+# Recorded as the exit reason when an operator switches the source, so the
+# workshop can say "switching" instead of "source dropped".
+SWITCH_EXIT_REASON = "操作员切换直播源"
 
 
 def resolve_ffmpeg() -> str:
@@ -166,6 +173,16 @@ class _PreviewEntry:
     # Whether the last source_black_seconds() call found the source black;
     # only used to log the start and the end of a black stretch once each.
     source_black: bool = False
+    # When the picture broke: an exit of a run that had been delivering
+    # (not one of the quick re-fails while the history is already frozen,
+    # and not an operator's source switch). Pruned to the drop window.
+    drop_times: list = field(default_factory=list)
+    # Operator source switches (switch_resource): the sequence number of the
+    # last segment the previous source wrote; later numbers came from the new
+    # one. Two sources run tens of seconds apart (11-09: zb- 28 s behind
+    # pt-), so a clip must not span one.
+    switch_boundaries: list = field(default_factory=list)
+    switched_at: float | None = None
 
 
 class LivePreviewManager:
@@ -376,6 +393,84 @@ class LivePreviewManager:
         with self.lock:
             self._stop_entry_locked(match_id)
 
+    def switch_resource(self, match_id: str, resource: str) -> dict[str, Any] | None:
+        """Point a running preview at another source without losing history.
+
+        The operator's source switch. It reuses the drop/relaunch path: the
+        current ffmpeg is stopped and a new one is launched on ``resource``
+        into the *same* directory, so ``append_list`` keeps every buffered
+        segment (scrubbing and clipping the old source still work) and the
+        browser keeps its player. Two sources run tens of seconds apart, so
+        the sequence number of the last old segment is remembered
+        (``switch_boundaries``) and a clip may not span it. ``None`` when
+        the match has no preview entry. Not for a WebRTC-backed preview,
+        whose ffmpeg reads the mediamtx loopback (the caller refuses those).
+        """
+        resource = str(resource or "").strip()
+        if not resource:
+            raise ValueError("缺少可用的直播源地址")
+        with self.lock:
+            entry = self.entries.get(match_id)
+            if entry is None:
+                return None
+            if entry.resource == resource:
+                entry.last_access = time.time()
+                return self._status_locked(match_id)
+            process = entry.process
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    try:
+                        process.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        pass
+            if process.poll() is None:
+                # Never start a second ffmpeg on the same directory.
+                raise RuntimeError("当前转码进程停不下来，请稍后再切换")
+            # Read the tail only now: a terminated ffmpeg flushes its last
+            # segment into the playlist on the way out.
+            listed = self._playlist_entries(entry.directory) or []
+            if listed:
+                seq = _SEGMENT_SEQUENCE_RE.search(listed[-1][0])
+                if seq and int(seq.group(1)) not in entry.switch_boundaries:
+                    entry.switch_boundaries.append(int(seq.group(1)))
+            now = time.time()
+            old = entry.resource
+            entry.last_access = now
+            # A new source starts with a clean slate: a fresh retry budget and
+            # its own drops only (the switch itself is not one).
+            entry.drop_times = []
+            entry.restart_count = 0
+            entry.cooling = False
+            entry.next_restart_at = 0.0
+            entry.switched_at = now
+            self._restart_entry_locked(
+                match_id,
+                now,
+                operator=True,
+                resource=resource,
+                exit_reason=SWITCH_EXIT_REASON,
+                count_drop=False,
+            )
+            _log_event(
+                "preview_resource_switched",
+                match_id=match_id,
+                old=old,
+                new=entry.resource,
+                operator=True,
+                boundary_segment=entry.switch_boundaries[-1] if entry.switch_boundaries else None,
+            )
+            return self._status_locked(match_id)
+
+    def switch_boundaries(self, match_id: str) -> list[int]:
+        """Sequence numbers of the last segment before each source switch."""
+        with self.lock:
+            entry = self.entries.get(match_id)
+            return list(entry.switch_boundaries) if entry is not None else []
+
     def touch(self, match_id: str) -> None:
         with self.lock:
             entry = self.entries.get(match_id)
@@ -421,6 +516,17 @@ class LivePreviewManager:
             "last_exit_code": entry.last_exit_code,
             "last_exit_reason": entry.last_exit_reason,
             "last_exit_at_unix": entry.last_exit_at,
+            # How many times the picture broke in the last drops_window_seconds
+            # (see _PreviewEntry.drop_times); reset by a source switch.
+            "drops_recent": sum(
+                1 for at in entry.drop_times
+                if time.time() - at <= PREVIEW_DROP_WINDOW_SECONDS
+            ),
+            "drops_window_seconds": int(PREVIEW_DROP_WINDOW_SECONDS),
+            "switched_at_unix": entry.switched_at,
+            # Frozen because an operator switched the source and the new one
+            # has not delivered yet (not a drop).
+            "switching": history_frozen and entry.last_exit_reason == SWITCH_EXIT_REASON,
         }
 
     @staticmethod
@@ -459,11 +565,22 @@ class LivePreviewManager:
                 return f"{earlier[-1][:180]} (x{int(repeated.group(1)) + 1})"
         return lines[-1][:200]
 
-    def _record_exit_locked(self, match_id: str, entry: _PreviewEntry, return_code: int | None, now: float) -> bytes:
+    def _record_exit_locked(
+        self,
+        match_id: str,
+        entry: _PreviewEntry,
+        return_code: int | None,
+        now: float,
+        *,
+        reason_override: str | None = None,
+        count_drop: bool = True,
+    ) -> bytes:
         """Capture why the current process died; return its raw stderr.
 
         The raw log is handed back so the caller can re-write it as
-        ``ffmpeg.prev.log`` next to the replacement's log.
+        ``ffmpeg.prev.log`` next to the replacement's log. ``reason_override``
+        names a deliberate stop (an operator's source switch), which is then
+        not counted as a drop either (``count_drop=False``).
         """
         log_tail = self._read_log_tail(entry.log_path, limit=3000)
         reason = self._summarize_exit_reason(log_tail)
@@ -471,6 +588,18 @@ class LivePreviewManager:
             # Terminated by the stall watchdog: ffmpeg's last line would only
             # say it received a signal. stderr_tail below still has its lines.
             reason, entry.stall_reason = entry.stall_reason, None
+        if reason_override:
+            reason = reason_override
+        # A run that delivered since the last reaper tick still counts as
+        # having delivered.
+        self._refresh_frozen_locked(match_id, entry)
+        if count_drop and entry.frozen_tail is None:
+            # This run had been delivering (or was the first one): the
+            # picture broke. Re-fails while already frozen are the same break.
+            entry.drop_times = [
+                at for at in entry.drop_times if now - at <= PREVIEW_DROP_WINDOW_SECONDS
+            ]
+            entry.drop_times.append(now)
         entry.last_exit_code = return_code
         entry.last_exit_reason = reason
         entry.last_exit_at = now
@@ -721,14 +850,25 @@ class LivePreviewManager:
             return
         self._restart_entry_locked(match_id, now)
 
-    def _restart_entry_locked(self, match_id: str, now: float, *, operator: bool = False) -> None:
+    def _restart_entry_locked(
+        self,
+        match_id: str,
+        now: float,
+        *,
+        operator: bool = False,
+        resource: str | None = None,
+        exit_reason: str | None = None,
+        count_drop: bool = True,
+    ) -> None:
         """Relaunch a dead ffmpeg into its existing directory.
 
         ``operator=True`` is the ``start()`` path (the browser or the operator
         re-asked for the same source): the caller has just (re)resolved the
         resource itself, so the ``on_restart`` hook is skipped, and the relaunch
         does not consume the reaper's retry budget (``restart_count`` /
-        ``next_restart_at`` / ``cooling`` stay as they are).
+        ``next_restart_at`` / ``cooling`` stay as they are). ``resource``
+        relaunches against a different source (``switch_resource``);
+        ``exit_reason`` / ``count_drop`` go to ``_record_exit_locked``.
         """
         entry = self.entries.get(match_id)
         if entry is None:
@@ -737,7 +877,14 @@ class LivePreviewManager:
             self.restart_base_delay * (2 ** entry.restart_count),
             self.restart_max_delay,
         )
-        prev_log = self._record_exit_locked(match_id, entry, entry.process.poll(), now)
+        prev_log = self._record_exit_locked(
+            match_id,
+            entry,
+            entry.process.poll(),
+            now,
+            reason_override=exit_reason,
+            count_drop=count_drop,
+        )
         directory = entry.directory
         directory.mkdir(parents=True, exist_ok=True)
         # Relaunch into the same directory: ffmpeg's ``append_list`` picks the
@@ -771,6 +918,8 @@ class LivePreviewManager:
                     new=replacement,
                 )
                 entry.resource = replacement
+        if resource:
+            entry.resource = resource
         command = self._build_command(entry.resource, directory)
         log_path = directory / "ffmpeg.log"
         log_file = log_path.open("wb")

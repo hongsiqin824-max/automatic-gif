@@ -320,4 +320,22 @@ body[data-mode="panel"] .stage-left{display:none}
 body[data-mode="panel"] .stage-right{flex:1 1 auto;max-width:none;min-width:0;width:100%}
 body[data-mode="panel"] .stage-clips-head{padding:10px 12px 0}
 body[data-mode="panel"] .stage-clips{padding:10px 12px 14px}
-.source-label{color:var(--muted);font-size:11px;vertical-align:middle}
+.source-label{color:var(--muted);font-size:11px;vertical-align:middle}/* Source switching (live_sources): chip on tile + stage head, shared menu, unstable-source hint. */
+.source-chip{display:inline-flex;align-items:center;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tile-actions .source-chip{font-size:11px;padding:5px 9px;font-weight:600;color:#c3d5e4}
+.source-chip.warn{color:var(--amber);border-color:rgba(245,185,76,.5)}
+.source-menu{position:fixed;z-index:70;width:380px;max-width:calc(100vw - 24px);max-height:70vh;overflow:auto;background:var(--panel);border:1px solid var(--line);border-radius:10px;box-shadow:0 12px 32px rgba(0,0,0,.45);padding:12px;font-size:13px}
+.source-menu-head{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px;font-weight:700}
+.source-menu-item{display:flex;align-items:center;gap:10px;padding:8px;border:1px solid var(--line);border-radius:8px;margin-bottom:6px}
+.source-menu-item.current{border-color:rgba(98,217,145,.5);background:rgba(98,217,145,.06)}
+.source-menu-item .source-menu-main{flex:1;min-width:0}
+.source-menu-item .source-menu-title{font-weight:600}
+.source-menu-item .source-menu-sub{color:var(--muted);font-size:11px;margin-top:2px;overflow-wrap:anywhere}
+.source-menu-item .button{padding:6px 10px;font-size:12px}
+.source-menu-tag{display:inline-block;font-size:11px;padding:1px 6px;border-radius:999px;margin-left:6px;border:1px solid var(--line);color:var(--muted);font-weight:600}
+.source-menu-tag.ok{color:var(--green);border-color:rgba(98,217,145,.4)}
+.source-menu-note{color:var(--muted);font-size:12px;line-height:1.5;margin-top:6px}
+.source-menu-note.warn{color:var(--amber)}
+.stage-source-hint{display:flex;align-items:center;gap:8px;margin:0 0 8px;padding:6px 10px;border-radius:6px;border:1px solid var(--amber);background:rgba(245,185,76,.10);color:var(--amber);font-size:13px;font-weight:600}
+.stage-source-hint span{flex:1;min-width:0}
+.stage-source-hint .button{padding:5px 10px;font-size:12px}

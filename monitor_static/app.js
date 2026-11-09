@@ -683,10 +683,15 @@ function createTile(data) {
         <span class="lag-badge na" data-role="lag" title="当前画面比服务器最新画面晚多少秒">落后 —</span>
         <button class="button ghost tile-live" data-role="live" type="button" title="跳到直播最新位置">回到直播</button>
         <button class="tile-clips-badge hidden" data-role="clips" type="button" title="查看本场已截取的 GIF">GIF ×0</button>
+        <button class="button ghost source-chip hidden" data-role="source" type="button" title="查看 / 切换本场直播源">源 —</button>
         <span class="tile-status">准备中…</span>
       </div>
     </div>`;
   el.querySelector('[data-role="enlarge"]').addEventListener('click', () => openStage(data.match_id));
+  el.querySelector('[data-role="source"]').addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    openSourceMenu(data.match_id, ev.currentTarget);
+  });
   el.querySelector('[data-role="clips"]').addEventListener('click', (ev) => {
     ev.stopPropagation();
     openStage(data.match_id);
@@ -728,6 +733,8 @@ async function startTilePreview(matchId, {quiet = false} = {}) {
     tile.noSourceSince = null;
     overlay.classList.add('hidden');
     el.classList.remove('no-source');
+    applySourceStatus(matchId, data);
+    refreshSources(matchId);
     startTilePlayback(matchId, video, data, (text, cls) => {
       setTileStatus(matchId, text, cls);
       if (cls === 'fail') {
@@ -2650,6 +2657,8 @@ function openStage(matchId) {
   $('stage-status').className = 'stage-status ok';
   $('stage-notes').innerHTML = '';
   renderStageSourceBlack();
+  renderSourceChips(matchId);
+  renderSourceHint(matchId);
   $('stage-clips').innerHTML = '<div class="stage-clip-empty">正在读取 GIF 列表…</div>';
   $('stage-clips-count').textContent = '';
   loadStageClips(matchId);
@@ -2701,6 +2710,8 @@ function openStage(matchId) {
 function closeStage() {
   state.stageMatchId = null;
   renderStageSourceBlack();
+  renderSourceHint(null);
+  closeSourceMenu();
   stopDraftPoll();
   clearRange();
   clearCrop();
@@ -3081,6 +3092,7 @@ $('stage-live').addEventListener('click', () => {
 });
 document.addEventListener('keydown', (ev) => {
   if (ev.key === 'Escape') {
+    if (sourceMenuOpen()) { closeSourceMenu(); return; }
     if (state.alertPanelOpen) { closeAlertPanel(); return; }
     // First Esc leaves crop editing (keeps the box); the next one closes.
     if (state.crop.editing) { toggleCropEditing(false); return; }
@@ -3139,6 +3151,11 @@ function markPreviewDown(matchId, status) {
     : cooling ? '直播源中断，后台持续重连中…' : '直播源中断，正在自动重连…';
   const reason = describeExitReason(status);
   if (reason && !finished) message += `（${reason}）`;
+  if (status && status.switching) {
+    // An operator switched the source and the new one has not delivered yet.
+    const label = status.source && status.source.label;
+    message = label ? `正在切换直播源到「${label}」…` : '正在切换直播源…';
+  }
   // The server keeps the dead run's playlist on disk and relaunches ffmpeg
   // into the same one, so the operator can still scrub back into and clip
   // the last minutes, and a start set before the drop stays valid.
@@ -3237,6 +3254,11 @@ function recoverPreview(matchId, status, options = {}) {
   }
   const total = status && status.restart_count_total;
   let message = total ? `直播源已恢复（本场累计重连 ${total} 次）` : '直播源已恢复';
+  const pendingSwitch = tile.switchPending;
+  if (pendingSwitch && Date.now() - pendingSwitch.at < SOURCE_SWITCH_PENDING_MS) {
+    message = `已切换到「${pendingSwitch.label}」`;
+  }
+  tile.switchPending = null;
   setTileStatus(matchId, message, 'ok');
   if (staged) {
     if (stageOwn || resumed) {
@@ -3339,6 +3361,7 @@ function keepAlivePreviews() {
       }
       continue;
     }
+    if (!tile.sourcesLoading && now - (tile.sourcesAt || 0) >= SOURCES_REFRESH_MS) refreshSources(matchId);
     fetch(`api/monitor/preview/status?match_id=${encodeURIComponent(matchId)}`)
       .then((response) => (response.ok ? response.json() : null))
       .then((status) => {
@@ -3346,6 +3369,7 @@ function keepAlivePreviews() {
         if (!current || !status) return;
         current.sourceBlackSeconds = status.source_black ? status.source_black_seconds : 0;
         if (matchId === state.stageMatchId) renderStageSourceBlack();
+        applySourceStatus(matchId, status);
         if (status.running === false || status.history_frozen) {
           // history_frozen: a relaunched ffmpeg is alive but has not appended
           // a segment yet (still connecting, or the source is gone for good);
@@ -3376,6 +3400,7 @@ async function restartTilePreview(matchId) {
     });
     if (!state.tiles.get(matchId)) return;
     tile.playlistUrl = data.playlist_url;
+    applySourceStatus(matchId, data);
     // restart_count_total > 0 means the server relaunched into the existing
     // playlist (history kept); 0 means a cold start with a fresh playlist.
     recoverPreview(matchId, data, {fresh: !(data.restart_count_total > 0)});
@@ -3386,6 +3411,304 @@ async function restartTilePreview(matchId) {
     tile.restarting = false;
   }
 }
+
+// ---- live source menu: every stream of a match, switchable (11-09) ----
+//
+// A match can have several streams (dqd record, ls record, pull-address API).
+// The server picks the most stable one at cold start and never changes it on
+// its own; the operator switches here. A switch relaunches the shared preview
+// on the new stream into the same playlist, so the buffered history and this
+// player stay - every tab watching the match follows within one status poll.
+const SOURCES_REFRESH_MS = 120000;
+const SOURCE_SWITCH_PENDING_MS = 120000;
+const SOURCE_HINT_DROPS = 3;
+let sourceMenuState = null;  // {matchId, anchor} while the menu is open
+
+function sourceShortName(info) {
+  if (!info) return '—';
+  return info.kind && info.kind !== 'other' ? info.kind : (info.name || '其他');
+}
+
+function sourceAlternatives(tile) {
+  const list = tile && tile.sources && Array.isArray(tile.sources.sources) ? tile.sources.sources : [];
+  return tile && tile.sources && tile.sources.switchable ? list.filter((s) => !s.current) : [];
+}
+
+function sourceHintActive(tile) {
+  if (!tile || tile.hintDismissed || (tile.data && tile.data.finished)) return false;
+  return (tile.dropsRecent || 0) >= SOURCE_HINT_DROPS && sourceAlternatives(tile).length > 0;
+}
+
+// One status-ish payload (preview/start, preview/status, switch) -> tile state.
+function applySourceStatus(matchId, payload) {
+  const tile = state.tiles.get(matchId);
+  if (!tile || !payload) return;
+  if ('source' in payload) {
+    const next = payload.source || null;
+    const prev = tile.source || null;
+    const ownSwitch = tile.switchPending && Date.now() - tile.switchPending.at < SOURCE_SWITCH_PENDING_MS;
+    if (prev && next && prev.source_id !== next.source_id && !ownSwitch) {
+      // Somebody else switched this match (or a cold start picked anew).
+      const who = next.chosen_by ? `${next.chosen_by} ` : '';
+      const text = `${who}已把直播源切到「${next.label}」`;
+      setTileStatus(matchId, text, 'ok', true);
+      if (state.stageMatchId === matchId) addStageNote(text, 'ok', 'source-switched');
+      refreshSources(matchId);
+    }
+    tile.source = next;
+  }
+  if (typeof payload.drops_recent === 'number') {
+    tile.dropsRecent = payload.drops_recent;
+    tile.dropsWindowSeconds = payload.drops_window_seconds || 600;
+    // The hint comes back for the next bad stretch once this one is over.
+    if (tile.dropsRecent < SOURCE_HINT_DROPS) tile.hintDismissed = false;
+  }
+  renderSourceChips(matchId);
+  renderSourceHint(state.stageMatchId);
+}
+
+async function refreshSources(matchId) {
+  const tile = state.tiles.get(matchId);
+  if (!tile || tile.sourcesLoading) return null;
+  tile.sourcesLoading = true;
+  try {
+    const data = await requestJson(`api/monitor/preview/sources?match_id=${encodeURIComponent(matchId)}`);
+    const current = state.tiles.get(matchId);
+    if (!current) return null;
+    current.sources = data;
+    current.sourcesAt = Date.now();
+    renderSourceChips(matchId);
+    renderSourceHint(state.stageMatchId);
+    if (sourceMenuState && sourceMenuState.matchId === matchId) renderSourceMenu();
+    return data;
+  } catch (error) {
+    tile.sourcesAt = Date.now();  // retry on the next refresh period, not every tick
+    return null;
+  } finally {
+    tile.sourcesLoading = false;
+  }
+}
+
+function renderSourceChip(node, tile) {
+  if (!node) return;
+  if (!tile || !tile.source) {
+    node.classList.add('hidden');
+    return;
+  }
+  const count = tile.sources && Array.isArray(tile.sources.sources) ? tile.sources.sources.length : 0;
+  const hint = sourceHintActive(tile);
+  node.classList.remove('hidden');
+  node.classList.toggle('warn', hint);
+  node.textContent = `源 ${sourceShortName(tile.source)}${count > 1 ? ` ▾ ${count}路` : ''}`;
+  let title = `当前直播源：${tile.source.label}（${tile.source.name}）`;
+  if (tile.source.note) title += `，${tile.source.note}`;
+  if (tile.source.chosen_by) title += `\n${tile.source.chosen_by} 手动选的`;
+  title += count > 1 ? '\n点击查看 / 切换' : '\n点击查看本场直播源';
+  if (hint) title += `\n⚠ ${Math.round((tile.dropsWindowSeconds || 600) / 60)} 分钟内断了 ${tile.dropsRecent} 次，建议换一路`;
+  node.title = title;
+}
+
+function renderSourceChips(matchId) {
+  const tile = state.tiles.get(matchId);
+  renderSourceChip(document.querySelector(`.tile[data-match-id="${matchId}"] [data-role="source"]`), tile);
+  if (state.stageMatchId === matchId) renderSourceChip($('stage-source'), tile);
+}
+
+function renderSourceHint(matchId) {
+  const banner = $('stage-source-hint');
+  if (!banner) return;
+  const tile = matchId ? state.tiles.get(matchId) : null;
+  if (!sourceHintActive(tile)) { banner.classList.add('hidden'); return; }
+  const best = sourceAlternatives(tile)[0];
+  const minutes = Math.round((tile.dropsWindowSeconds || 600) / 60);
+  $('stage-source-hint-text').textContent =
+    `⚠ 当前直播源 ${minutes} 分钟内断了 ${tile.dropsRecent} 次，可以换一路试试（推荐「${best.label}」）`;
+  banner.classList.remove('hidden');
+}
+
+function sourceMenuOpen() {
+  return !!sourceMenuState;
+}
+
+function closeSourceMenu() {
+  sourceMenuState = null;
+  const menu = $('source-menu');
+  if (menu) { menu.classList.add('hidden'); menu.innerHTML = ''; }
+}
+
+function positionSourceMenu() {
+  const menu = $('source-menu');
+  if (!sourceMenuState || !menu) return;
+  const anchor = sourceMenuState.anchor;
+  const rect = anchor && document.body.contains(anchor) ? anchor.getBoundingClientRect() : null;
+  const width = menu.offsetWidth || 380;
+  const height = menu.offsetHeight || 200;
+  let left = rect ? rect.right - width : (window.innerWidth - width) / 2;
+  let top = rect ? rect.bottom + 6 : 80;
+  if (top + height > window.innerHeight - 12 && rect) top = Math.max(12, rect.top - height - 6);
+  left = Math.min(Math.max(12, left), window.innerWidth - width - 12);
+  menu.style.left = `${Math.round(left)}px`;
+  menu.style.top = `${Math.round(top)}px`;
+}
+
+function openSourceMenu(matchId, anchor) {
+  if (sourceMenuState && sourceMenuState.matchId === matchId && sourceMenuState.anchor === anchor) {
+    closeSourceMenu();
+    return;
+  }
+  sourceMenuState = {matchId, anchor, busy: false};
+  renderSourceMenu();
+  refreshSources(matchId);
+}
+
+function fmtClock(unix) {
+  if (!unix) return '';
+  return new Date(unix * 1000).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
+}
+
+function renderSourceMenu() {
+  const menu = $('source-menu');
+  if (!sourceMenuState || !menu) return;
+  const {matchId, busy} = sourceMenuState;
+  const tile = state.tiles.get(matchId);
+  const data = tile && tile.sources;
+  menu.innerHTML = '';
+  const head = document.createElement('div');
+  head.className = 'source-menu-head';
+  const list = data && Array.isArray(data.sources) ? data.sources : null;
+  head.innerHTML = `<span>本场直播源${list ? `（${list.length} 路）` : ''}</span>`;
+  const close = document.createElement('button');
+  close.className = 'button ghost';
+  close.type = 'button';
+  close.textContent = '关闭';
+  close.addEventListener('click', closeSourceMenu);
+  head.appendChild(close);
+  menu.appendChild(head);
+  const note = (text, cls) => {
+    const div = document.createElement('div');
+    div.className = `source-menu-note ${cls || ''}`;
+    div.textContent = text;
+    menu.appendChild(div);
+  };
+  if (!list) {
+    note(tile && tile.sourcesLoading ? '正在读取直播源…' : '还没读到直播源列表，稍后再点一次');
+  } else {
+    if (data.current && !data.current_listed) {
+      note(`正在播的「${data.current.label}」（${data.current.name}）已经不在接口列表里了，可能已停推`, 'warn');
+    }
+    if (!list.length) note('接口里没有这场的直播源');
+    for (const source of list) {
+      const item = document.createElement('div');
+      item.className = `source-menu-item${source.current ? ' current' : ''}`;
+      const main = document.createElement('div');
+      main.className = 'source-menu-main';
+      const title = document.createElement('div');
+      title.className = 'source-menu-title';
+      title.textContent = source.label;
+      if (source.current) {
+        const tag = document.createElement('span');
+        tag.className = 'source-menu-tag ok';
+        tag.textContent = '正在播放';
+        title.appendChild(tag);
+      }
+      if (source.pushing) {
+        const tag = document.createElement('span');
+        tag.className = 'source-menu-tag ok';
+        tag.textContent = '推流中';
+        tag.title = '拉流接口只列出正在推流的地址';
+        title.appendChild(tag);
+      }
+      const sub = document.createElement('div');
+      sub.className = 'source-menu-sub';
+      sub.textContent = [source.name, `来自${source.origins.join('、')}`, source.note].filter(Boolean).join(' · ');
+      main.append(title, sub);
+      item.appendChild(main);
+      if (!source.current && data.switchable) {
+        const button = document.createElement('button');
+        button.className = 'button secondary';
+        button.type = 'button';
+        button.disabled = busy;
+        button.textContent = busy ? '…' : '切到这路';
+        button.addEventListener('click', () => switchSource(matchId, source));
+        item.appendChild(button);
+      }
+      menu.appendChild(item);
+    }
+    if (list.length > 1 && !data.switchable) note('WebRTC 模式下暂不支持切换', 'warn');
+    if (data.errors && data.errors.length) note(`部分接口没查到：${data.errors.join('；')}`, 'warn');
+    if (data.chosen) {
+      const chosen = list.find((s) => s.source_id === data.chosen.source_id);
+      note(`手动选择：${data.chosen.by || '有人'} ${fmtClock(data.chosen.at_unix)} 选了「${chosen ? chosen.label : '一路已不在列表的源'}」，重开这场也会继续用它`);
+    }
+    note('按实测稳定性从好到差排列。切换前会先试连，约 3–6 秒出新画面，已缓存的回看保留；各路源进度不同（实测最多差约 30 秒），不能跨切换点截 GIF。看这场的人会一起切换。');
+  }
+  menu.classList.remove('hidden');
+  positionSourceMenu();
+}
+
+async function switchSource(matchId, source) {
+  const tile = state.tiles.get(matchId);
+  if (!tile || !sourceMenuState || sourceMenuState.busy) return;
+  const pinned = state.stageMatchId === matchId && state.range.pinId != null;
+  const lines = [
+    `切换到「${source.label}」（${source.name}）？`,
+    '',
+    '· 各路源进度不同（实测最多差约 30 秒），切换后画面可能跳过或重复一段；刚发生的进球请先截完再切',
+    '· 已缓存的回看画面保留，但不能跨切换点截 GIF',
+  ];
+  if (pinned) lines.push('· 你已经设了起点：终点也必须放在切换之前');
+  lines.push('· 看这场的其他人也会一起切换');
+  if (!window.confirm(lines.join('\n'))) return;
+  sourceMenuState.busy = true;
+  renderSourceMenu();
+  const staged = state.stageMatchId === matchId;
+  setTileStatus(matchId, `正在试连「${source.label}」…`, 'ok');
+  if (staged) addStageNote(`正在试连「${source.label}」…`, 'ok', 'source-switch-probe');
+  try {
+    const data = await requestJson('api/monitor/preview/switch', {
+      method: 'POST', body: JSON.stringify({match_id: matchId, source_id: source.source_id}),
+    });
+    const current = state.tiles.get(matchId);
+    if (!current) return;
+    if (data.unchanged) {
+      setTileStatus(matchId, `已经在播「${source.label}」`, 'ok');
+    } else {
+      current.switchPending = {label: source.label, at: Date.now()};
+      current.hintDismissed = false;
+      applySourceStatus(matchId, data);
+      markPreviewDown(matchId, data);
+      if (staged) addStageNote(`已连上「${source.label}」，正在切换，几秒后出新画面；切换前缓存的画面仍可回看`, 'ok', 'source-switch');
+    }
+    closeSourceMenu();
+    refreshSources(matchId);
+  } catch (error) {
+    setTileStatus(matchId, error.message, 'warn');
+    if (staged) addStageNote(error.message, 'fail', 'source-switch');
+    if (sourceMenuState) { sourceMenuState.busy = false; renderSourceMenu(); }
+    if (error.data && error.data.code === 'source_gone') refreshSources(matchId);
+  }
+}
+
+$('stage-source').addEventListener('click', (ev) => {
+  if (state.stageMatchId) openSourceMenu(state.stageMatchId, ev.currentTarget);
+});
+$('stage-source-hint-switch').addEventListener('click', () => {
+  if (state.stageMatchId) openSourceMenu(state.stageMatchId, $('stage-source'));
+});
+$('stage-source-hint-dismiss').addEventListener('click', () => {
+  const tile = state.stageMatchId ? state.tiles.get(state.stageMatchId) : null;
+  if (tile) tile.hintDismissed = true;
+  renderSourceHint(state.stageMatchId);
+  if (state.stageMatchId) renderSourceChips(state.stageMatchId);
+});
+document.addEventListener('mousedown', (ev) => {
+  if (!sourceMenuState) return;
+  const menu = $('source-menu');
+  if (menu && menu.contains(ev.target)) return;
+  if (sourceMenuState.anchor && sourceMenuState.anchor.contains(ev.target)) return;
+  closeSourceMenu();
+});
+window.addEventListener('resize', positionSourceMenu);
 
 // ---- init ----
 

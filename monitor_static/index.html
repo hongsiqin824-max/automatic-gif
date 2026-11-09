@@ -72,12 +72,15 @@
 
   <div id="toast-container" class="toast-container"></div>
 
+  <div id="source-menu" class="source-menu hidden" role="dialog" aria-label="直播源"></div>
+
   <div id="stage" class="stage hidden">
     <div class="stage-inner">
       <div class="stage-head">
         <strong id="stage-title">比赛</strong>
         <span class="stage-head-hint muted" title="大窗不会因为落后而自动跳回直播（只在回看快到缓冲尽头时才会跳）">⏪ 回看后不会自动回到直播，看完请点「回到直播」</span>
         <div class="stage-actions">
+          <button id="stage-source" class="button ghost source-chip" type="button" title="查看 / 切换本场直播源">源 —</button>
           <span id="stage-lag" class="lag-badge na" title="当前画面比服务器最新画面晚多少秒">落后 —</span>
           <button id="stage-live" class="button secondary" type="button">回到直播</button>
           <button id="stage-close" class="button ghost" type="button">关闭</button>
@@ -101,6 +104,11 @@
             </div>
           </div>
           <div id="stage-source-black" class="stage-source-black hidden" role="status"></div>
+          <div id="stage-source-hint" class="stage-source-hint hidden" role="status">
+            <span id="stage-source-hint-text"></span>
+            <button id="stage-source-hint-switch" class="button secondary" type="button">切换</button>
+            <button id="stage-source-hint-dismiss" class="button ghost" type="button">不用</button>
+          </div>
           <div id="stage-append-banner" class="stage-append-banner hidden">
             <span id="stage-append-text"></span>
             <button id="stage-append-done" class="button ghost stage-append-done" type="button" title="放弃这次追加，下一张 GIF 独立成条">取消</button>

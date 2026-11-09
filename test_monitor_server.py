@@ -23,6 +23,8 @@ os.environ.setdefault("GIF_MONITOR_ALERT_DB_PATH", "")
 # and 401 every endpoint test; feishu_auth has its own test module.
 os.environ["GIF_MONITOR_FEISHU_APP_ID"] = ""
 os.environ["GIF_MONITOR_FEISHU_APP_SECRET"] = ""
+# Never call the real pull-address API (a developer .env holds its key).
+os.environ["GIF_STREAM_PULL_API_KEY"] = ""
 
 import monitor_server
 import live_preview
@@ -4327,72 +4329,152 @@ class PublishNoticeTests(ClipEndpointAlertMatchTests):
         self.assertEqual(head, "【GIF 发布卡住·插件】甲 vs 乙（英超）")
 
 
-class ResolveSourcePrefersDqdTests(unittest.TestCase):
-    """8901 preview prefers the dqd record and falls back to ls."""
+class ResolveSourceTests(unittest.TestCase):
+    """8901 preview picks among every stream of a match (dqd / ls / pull API).
 
-    DQD = {"errno": 0, "message": "success", "data": {"resource": "rtmp://h/wyc_live/hd-wi6h", "live_type": "dqd"}}
-    LS = {"errno": 0, "message": "success", "data": {"resource": "rtmp://h/wyc_live/sd-abc", "live_type": "ls"}}
+    Order is measured stability (hd > hd-en > sd > pt > ai > zb), a running
+    preview keeps its source, and the operator's pick wins on re-open.
+    """
+
+    HD = "rtmp://h/wyc_live/hd-wi6h"
+    PT = "rtmp://h/wyc_live/pt-f7ww"
+    HDEN = "rtmp://h/wyc_live/hd-en-6Mx"
+    SD = "rtmp://h/wyc_live/sd-abc"
+    ZB = "rtmp://h/wyc_live/zb-d9bvb"
     EMPTY = {"errno": 0, "message": "无数据", "data": {}}
 
-    def _resolve(self, responses):
-        calls = []
+    @staticmethod
+    def _record(url, live_type):
+        return {"errno": 0, "message": "success", "data": {"resource": url, "live_type": live_type}}
+
+    def _catalog(self, responses, *, pull=None, live=None):
+        """Fresh catalog: no record caching, fake pull API, fake probe."""
+        self.calls = []
+        self.probed = []
 
         def fake_query(match_id, live_type=None):
-            calls.append(live_type)
-            value = responses[live_type]
+            self.calls.append(live_type)
+            value = responses.get(live_type, self.EMPTY)
             if isinstance(value, Exception):
                 raise value
             return value
 
+        def fake_probe(url, timeout_seconds=0):
+            self.probed.append(url)
+            ok = live is None or url in live
+            return {"ok": ok, "codec": "h264", "width": 1920, "height": 1080} if ok else {"ok": False, "error": "Input/output error"}
+
+        import live_sources
+        return live_sources.SourceCatalog(
+            records=live_sources.RecordCache(fake_query, ttl_seconds=0),
+            pull=live_sources.PullAddressClient(
+                api_key="k" if pull is not None else "",
+                fetch=lambda url, key, timeout: {"54338712": list(pull or [])},
+            ),
+            choices=live_sources.SourceChoices(),
+            order=live_sources.DEFAULT_SOURCE_ORDER,
+            probe=fake_probe,
+        )
+
+    def _resolve(self, catalog, *, status=None, upstream=None):
+        status = status if status is not None else {"running": False, "resource": None}
         with mock.patch.dict(os.environ, {"GIF_MONITOR_SOURCE_OVERRIDE": ""}), \
-                mock.patch.object(monitor_server, "query_source", side_effect=fake_query), \
-                mock.patch("builtins.print"):
+                mock.patch.object(monitor_server, "source_catalog", catalog), \
+                mock.patch.object(monitor_server.webrtc_gateway, "upstream_for", return_value=upstream), \
+                mock.patch.object(monitor_server.live_preview, "status", return_value=status), \
+                mock.patch("builtins.print") as printed:
             try:
-                return monitor_server._resolve_source("54338712"), calls
+                result = monitor_server._resolve_source("54338712")
             except Exception as exc:
-                return exc, calls
+                result = exc
+        self.logs = [json.loads(c.args[0]) for c in printed.call_args_list if c.args and str(c.args[0]).startswith("{")]
+        return result
 
-    def test_dqd_record_wins_and_ls_is_not_queried(self):
-        resource, calls = self._resolve({"dqd": self.DQD, "ls": self.LS})
-        self.assertEqual(resource, "rtmp://h/wyc_live/hd-wi6h")
-        self.assertEqual(calls, ["dqd"])
+    def test_single_record_is_used_without_probing(self):
+        catalog = self._catalog({"dqd": self._record(self.PT, "dqd")})
+        self.assertEqual(self._resolve(catalog), self.PT)
+        self.assertEqual(self.probed, [])
+        self.assertEqual(self.logs[-1]["live_type"], "dqd")
+        self.assertEqual(self.logs[-1]["kind"], "pt")
 
-    def test_no_dqd_record_falls_back_to_ls(self):
-        resource, calls = self._resolve({"dqd": self.EMPTY, "ls": self.LS})
-        self.assertEqual(resource, "rtmp://h/wyc_live/sd-abc")
-        self.assertEqual(calls, ["dqd", "ls"])
+    def test_measured_stability_ranks_data_provider_hd_en_above_scraped_pt(self):
+        catalog = self._catalog({"dqd": self._record(self.PT, "dqd"), "ls": self._record(self.HDEN, "ls")})
+        self.assertEqual(self._resolve(catalog), self.HDEN)
+        self.assertEqual(self.logs[-1]["live_type"], "ls")
+        self.assertEqual(self.logs[-1]["candidates"], 2)
 
-    def test_dqd_query_failure_falls_back_to_ls(self):
-        resource, _ = self._resolve({"dqd": RuntimeError("timeout"), "ls": self.LS})
-        self.assertEqual(resource, "rtmp://h/wyc_live/sd-abc")
-        resource, _ = self._resolve({"dqd": {"errno": 1, "message": "查询失败", "data": {}}, "ls": self.LS})
-        self.assertEqual(resource, "rtmp://h/wyc_live/sd-abc")
+    def test_rights_holder_hd_ranks_first(self):
+        catalog = self._catalog({"dqd": self._record(self.HD, "dqd"), "ls": self._record(self.SD, "ls")})
+        self.assertEqual(self._resolve(catalog), self.HD)
 
-    def test_neither_record_is_no_source(self):
-        result, _ = self._resolve({"dqd": self.EMPTY, "ls": self.EMPTY})
-        self.assertIsInstance(result, LookupError)
+    def test_best_source_not_pushing_falls_to_next_live_one(self):
+        catalog = self._catalog(
+            {"dqd": self._record(self.HD, "dqd"), "ls": self._record(self.SD, "ls")},
+            live={self.SD},
+        )
+        self.assertEqual(self._resolve(catalog), self.SD)
+        self.assertIn(self.HD, self.probed)
 
-    def test_dqd_failure_keeps_running_preview_upstream(self):
-        # A flaky dqd query on a repeat preview/start must not flip a running
-        # dqd preview to ls (that would cold-start and wipe the history).
-        running = "rtmp://h/wyc_live/hd-wi6h"
-        with mock.patch.object(monitor_server.webrtc_gateway, "upstream_for", return_value=None), \
-                mock.patch.object(monitor_server.live_preview, "status", return_value={"running": True, "resource": running}):
-            resource, calls = self._resolve({"dqd": RuntimeError("timeout"), "ls": self.LS})
-        self.assertEqual(resource, running)
-        self.assertEqual(calls, ["dqd"])
+    def test_nothing_pushing_keeps_best_ranked(self):
+        catalog = self._catalog(
+            {"dqd": self._record(self.PT, "dqd"), "ls": self._record(self.SD, "ls")},
+            live=set(),
+        )
+        self.assertEqual(self._resolve(catalog), self.SD)
+        self.assertFalse(self.logs[-1]["probed"])
 
-    def test_dqd_failure_keeps_webrtc_upstream_not_loopback(self):
-        with mock.patch.object(monitor_server.webrtc_gateway, "upstream_for", return_value="rtmp://h/wyc_live/hd-wi6h"):
-            resource, _ = self._resolve({"dqd": {"errno": 1, "message": "查询失败", "data": {}}, "ls": self.LS})
-        self.assertEqual(resource, "rtmp://h/wyc_live/hd-wi6h")
+    def test_no_record_anywhere_is_no_source(self):
+        self.assertIsInstance(self._resolve(self._catalog({})), LookupError)
+
+    def test_all_queries_failing_is_a_source_error_not_no_source(self):
+        catalog = self._catalog({"dqd": RuntimeError("timeout"), "ls": {"errno": 1, "message": "查询失败", "data": {}}})
+        result = self._resolve(catalog)
+        self.assertIsInstance(result, RuntimeError)
+        self.assertNotIsInstance(result, LookupError)
+
+    def test_dqd_query_failure_still_uses_ls(self):
+        catalog = self._catalog({"dqd": RuntimeError("timeout"), "ls": self._record(self.SD, "ls")})
+        self.assertEqual(self._resolve(catalog), self.SD)
+        self.assertIn("timeout", self.logs[-1]["dqd_error"])
+
+    def test_running_preview_keeps_its_source_without_querying(self):
+        # Re-opening must never change the source: a different resource would
+        # cold-start the preview and wipe the buffered history.
+        catalog = self._catalog({"dqd": self._record(self.HD, "dqd")})
+        running = {"running": True, "resource": self.SD}
+        self.assertEqual(self._resolve(catalog, status=running), self.SD)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.logs[-1]["live_type"], "current")
+
+    def test_webrtc_preview_keeps_gateway_upstream(self):
+        catalog = self._catalog({"dqd": self._record(self.SD, "dqd")})
+        loopback = {"running": True, "resource": monitor_server.webrtc_gateway.rtsp_base + "/54338712"}
+        self.assertEqual(self._resolve(catalog, status=loopback, upstream=self.HD), self.HD)
+        self.assertEqual(self.calls, [])
 
     def test_loopback_resource_is_not_reused_as_upstream(self):
-        loopback = monitor_server.webrtc_gateway.rtsp_base + "/54338712"
-        with mock.patch.object(monitor_server.webrtc_gateway, "upstream_for", return_value=None), \
-                mock.patch.object(monitor_server.live_preview, "status", return_value={"resource": loopback}):
-            resource, _ = self._resolve({"dqd": RuntimeError("timeout"), "ls": self.LS})
-        self.assertEqual(resource, "rtmp://h/wyc_live/sd-abc")
+        catalog = self._catalog({"ls": self._record(self.SD, "ls")})
+        loopback = {"resource": monitor_server.webrtc_gateway.rtsp_base + "/54338712"}
+        self.assertEqual(self._resolve(catalog, status=loopback), self.SD)
+
+    def test_operator_pick_wins_on_reopen(self):
+        catalog = self._catalog({"dqd": self._record(self.HD, "dqd"), "ls": self._record(self.SD, "ls")})
+        catalog.choices.remember("54338712", self.SD, "孙鹏")
+        self.assertEqual(self._resolve(catalog), self.SD)
+        self.assertTrue(self.logs[-1]["chosen_by_operator"])
+
+    def test_operator_pick_not_pushing_falls_back_to_ranking(self):
+        catalog = self._catalog(
+            {"dqd": self._record(self.HD, "dqd"), "ls": self._record(self.SD, "ls")},
+            live={self.HD},
+        )
+        catalog.choices.remember("54338712", self.SD, "孙鹏")
+        self.assertEqual(self._resolve(catalog), self.HD)
+
+    def test_pull_api_only_match_is_playable(self):
+        catalog = self._catalog({}, pull=[self.ZB])
+        self.assertEqual(self._resolve(catalog), self.ZB)
+        self.assertEqual(self.logs[-1]["live_type"], "pull")
 
     def test_query_source_adds_live_type_only_when_given(self):
         captured = {}
@@ -4411,11 +4493,186 @@ class ResolveSourcePrefersDqdTests(unittest.TestCase):
 
     def test_list_probe_counts_dqd_only_match_as_available(self):
         def fake_query(match_id, live_type=None):
-            return self.DQD if live_type == "dqd" else self.EMPTY
+            return self._record(self.HD, "dqd") if live_type == "dqd" else self.EMPTY
 
         with mock.patch.object(monitor_server, "query_source", side_effect=fake_query):
             self.assertEqual(monitor_server._batch_query_sources(["1"]), {"1": "available"})
 
+    def test_list_probe_counts_pull_api_only_match_as_available(self):
+        catalog = self._catalog({}, pull=[self.ZB])
+        with mock.patch.object(monitor_server, "query_source", return_value=self.EMPTY), \
+                mock.patch.object(monitor_server, "source_catalog", catalog):
+            self.assertEqual(
+                monitor_server._batch_query_sources(["54338712", "2"]),
+                {"54338712": "available", "2": "no_source"},
+            )
+
+
+class SourceMenuAndSwitchEndpointTests(unittest.TestCase):
+    """/api/monitor/preview/sources and /api/monitor/preview/switch."""
+
+    PT = "rtmp://h/wyc_live/pt-a9nz"
+    HDEN = "rtmp://h/wyc_live/hd-en-6Mx"
+    ZB = "rtmp://h/wyc_live/zb-d9bvb"
+
+    def setUp(self):
+        import live_sources
+        self.live_sources = live_sources
+        self.client = monitor_server.app.test_client()
+        self.records = {
+            "dqd": {"errno": 0, "message": "ok", "data": {"resource": self.PT}},
+            "ls": {"errno": 0, "message": "ok", "data": {"resource": self.HDEN}},
+        }
+        self.probe_result = {"ok": True, "codec": "h264", "width": 1280, "height": 720, "seconds": 0.3}
+        self.catalog = live_sources.SourceCatalog(
+            records=live_sources.RecordCache(lambda m, live_type=None: self.records[live_type], ttl_seconds=0),
+            # The pull API lists pt-a9nz too: one stream, listed once.
+            pull=live_sources.PullAddressClient(api_key="k", fetch=lambda u, k, t: {"54477923": [self.PT, self.ZB]}),
+            choices=live_sources.SourceChoices(),
+            probe=lambda url, timeout_seconds=0: dict(self.probe_result),
+        )
+        self.status = {"running": True, "resource": self.PT, "playlist_ready": True}
+        self.switch_calls = []
+
+        def fake_switch(match_id, url):
+            self.switch_calls.append(url)
+            self.status = {**self.status, "resource": url, "history_frozen": True, "switching": True}
+            return dict(self.status)
+
+        patches = [
+            mock.patch.object(monitor_server, "source_catalog", self.catalog),
+            mock.patch.object(monitor_server.live_preview, "status", side_effect=lambda m: dict(self.status)),
+            mock.patch.object(monitor_server.live_preview, "switch_resource", side_effect=fake_switch),
+            mock.patch.object(monitor_server.webrtc_gateway, "upstream_for", return_value=None),
+            mock.patch("builtins.print"),
+        ]
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _sources(self):
+        response = self.client.get("/api/monitor/preview/sources?match_id=54477923")
+        self.assertEqual(response.status_code, 200)
+        return response.get_json()
+
+    def test_menu_merges_duplicates_ranks_and_hides_urls(self):
+        data = self._sources()
+        names = [s["name"] for s in data["sources"]]
+        self.assertEqual(names, ["hd-en-6Mx", "pt-a9nz", "zb-d9bvb"])
+        pt = data["sources"][1]
+        self.assertEqual(pt["origins"], ["懂球帝直播源", "拉流接口"])
+        self.assertTrue(pt["pushing"])
+        self.assertTrue(pt["current"])
+        self.assertFalse(data["sources"][0]["pushing"])
+        self.assertTrue(data["switchable"])
+        self.assertTrue(data["current_listed"])
+        self.assertNotIn("rtmp://", json.dumps(data))
+
+    def test_switch_probes_relaunches_and_remembers_the_pick(self):
+        target = next(s for s in self._sources()["sources"] if s["name"] == "zb-d9bvb")
+        response = self.client.post("/api/monitor/preview/switch", json={"match_id": "54477923", "source_id": target["source_id"]})
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertEqual(self.switch_calls, [self.ZB])
+        self.assertEqual(data["source"]["kind"], "zb")
+        self.assertNotIn("rtmp://", json.dumps({k: v for k, v in data.items() if k != "resource"}))
+        self.assertEqual(self.catalog.choices.get("54477923")["url"], self.ZB)
+        self.assertTrue(self._sources()["sources"][2]["current"])
+
+    def test_switch_refused_when_target_has_no_picture(self):
+        self.probe_result = {"ok": False, "error": "Input/output error"}
+        target = self._sources()["sources"][0]
+        response = self.client.post("/api/monitor/preview/switch", json={"match_id": "54477923", "source_id": target["source_id"]})
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.get_json()["code"], "probe_failed")
+        self.assertIn("还在播原来的源", response.get_json()["error"])
+        self.assertEqual(self.switch_calls, [])
+        self.assertIsNone(self.catalog.choices.get("54477923"))
+
+    def test_switch_to_current_source_is_a_no_op(self):
+        current = next(s for s in self._sources()["sources"] if s["current"])
+        response = self.client.post("/api/monitor/preview/switch", json={"match_id": "54477923", "source_id": current["source_id"]})
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["unchanged"])
+        self.assertEqual(self.switch_calls, [])
+
+    def test_switch_unknown_source_and_missing_preview(self):
+        response = self.client.post("/api/monitor/preview/switch", json={"match_id": "54477923", "source_id": "nope"})
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.get_json()["code"], "source_gone")
+        self.status = {"running": False, "resource": None}
+        response = self.client.post("/api/monitor/preview/switch", json={"match_id": "54477923", "source_id": "x"})
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.get_json()["code"], "preview_not_running")
+        response = self.client.post("/api/monitor/preview/switch", json={"match_id": "54477923"})
+        self.assertEqual(response.status_code, 400)
+
+    def test_switch_refused_for_webrtc_preview(self):
+        self.status = {"running": True, "resource": monitor_server.webrtc_gateway.rtsp_base + "/54477923"}
+        with mock.patch.object(monitor_server.webrtc_gateway, "enabled", True):
+            response = self.client.post("/api/monitor/preview/switch", json={"match_id": "54477923", "source_id": "x"})
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.get_json()["code"], "switch_unsupported")
+
+    def test_status_names_current_source_and_who_picked_it(self):
+        self.catalog.choices.remember("54477923", self.PT, "孙鹏")
+        with mock.patch.object(monitor_server.live_preview, "source_black_seconds", return_value=0.0):
+            data = self.client.get("/api/monitor/preview/status?match_id=54477923").get_json()
+        self.assertEqual(data["source"]["kind"], "pt")
+        self.assertEqual(data["source"]["label"], "懂球帝·网站抓取 pt")
+        self.assertEqual(data["source"]["chosen_by"], "孙鹏")
+
+    def test_menu_flags_current_source_no_longer_listed(self):
+        self.status = {"running": True, "resource": "rtmp://h/wyc_live/pt-old1"}
+        data = self._sources()
+        self.assertFalse(data["current_listed"])
+        self.assertEqual(data["current"]["name"], "pt-old1")
+
+
+class ClipAcrossSourceSwitchTests(unittest.TestCase):
+    """A GIF may not span an operator source switch (sources run apart)."""
+
+    @staticmethod
+    def _segments(rows):
+        return [(Path(f"/x/seg_{seq:05d}.ts"), duration, pdt) for seq, duration, pdt in rows]
+
+    # Measured on a real switch (11-09): the old run's last segment (0.84 s)
+    # overlaps the new run's first one by 0.54 s of PDT.
+    ROWS = [(5, 1.0, 192.94), (6, 1.0, 193.94), (7, 0.84, 194.94), (8, 1.0, 195.238), (9, 1.0, 196.238), (10, 1.0, 197.238)]
+
+    def _names(self, kept):
+        return [seg[0].name[4:9] for seg in kept]
+
+    def test_range_spanning_the_switch_is_refused(self):
+        segments = self._segments(self.ROWS)
+        self.assertIsNone(monitor_server._one_source_segments(segments, [7], 193.5, 196.5))
+
+    def test_range_after_the_switch_drops_the_overlapping_old_tail(self):
+        segments = self._segments(self.ROWS)
+        kept = monitor_server._one_source_segments(segments, [7], 195.338, 197.238)
+        self.assertEqual(self._names(kept), ["00008", "00009", "00010"])
+        # And the clip window then holds only the new source.
+        window, _offset, _length = monitor_server._select_clip_window(kept, 2.0, 197.238, 195.338)
+        self.assertEqual(self._names(window), ["00008", "00009"])
+
+    def test_range_before_the_switch_keeps_only_the_old_source(self):
+        segments = self._segments(self.ROWS)
+        kept = monitor_server._one_source_segments(segments, [7], 193.0, 195.1)
+        self.assertEqual(self._names(kept), ["00005", "00006", "00007"])
+
+    def test_no_switch_or_unknown_times_leave_segments_alone(self):
+        segments = self._segments(self.ROWS)
+        self.assertIs(monitor_server._one_source_segments(segments, [], 193.0, 197.0), segments)
+        self.assertIs(monitor_server._one_source_segments(segments, [7], None, 197.0), segments)
+        no_pdt = segments[:2] + [(Path("/x/seg_00007.ts"), 1.0, None)]
+        self.assertIs(monitor_server._one_source_segments(no_pdt, [7], 193.0, 197.0), no_pdt)
+
+    def test_several_switches(self):
+        rows = self.ROWS + [(11, 1.0, 199.5), (12, 1.0, 200.5)]
+        segments = self._segments(rows)
+        self.assertIsNone(monitor_server._one_source_segments(segments, [7, 10], 196.5, 200.0))
+        kept = monitor_server._one_source_segments(segments, [7, 10], 199.6, 201.0)
+        self.assertEqual(self._names(kept), ["00011", "00012"])
 
 if __name__ == "__main__":
     unittest.main()
