@@ -12,6 +12,7 @@ rolling buffer that doubles as the clip source.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
@@ -30,6 +31,41 @@ PREVIEW_ROOT = Path(__file__).resolve().parent / "tmp" / "preview"
 PREVIEW_IDLE_TIMEOUT_SECONDS = positive_env_float(
     "GIF_PREVIEW_IDLE_TIMEOUT_SECONDS", 90.0
 )
+
+
+def non_negative_env_float(name: str, default: float) -> float:
+    """Like ``positive_env_float`` but 0 is allowed (used as "switched off")."""
+    raw_value = os.environ.get(name, "").strip()
+    if not raw_value:
+        return default
+    try:
+        value = float(raw_value)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} 必须是不小于 0 的数") from exc
+    if not math.isfinite(value) or value < 0:
+        raise RuntimeError(f"{name} 必须是不小于 0 的数")
+    return value
+
+
+# Stall watchdog. The source CDN (hs-wyc.dongqiudi.net) can keep an RTMP play
+# session open while delivering no media: the socket keeps receiving
+# something, so -rw_timeout never fires, and ffmpeg sits alive writing nothing
+# until the CDN drops the session about 11 minutes later (11-05 54577162,
+# 11-07 54494777 and 54493413 - the last one froze the stage at 63' with the
+# operator reopening it 12 times). The reaper only relaunched a *dead* ffmpeg
+# and start() reuses a live one, so nothing noticed. Once a run has been
+# producing (see PREVIEW_STALL_MIN_RUN_SECONDS) and its playlist then stops
+# growing for this many seconds, it is terminated and relaunched through the
+# normal auto-restart path: same directory and source, history and a pinned
+# start kept. A healthy run adds a segment every second (one forced keyframe
+# per segment), so 20 s without one is never normal. 0 switches it off.
+PREVIEW_STALL_SECONDS = non_negative_env_float("GIF_PREVIEW_STALL_SECONDS", 20.0)
+# The watchdog only acts on a run whose newest segment came at least this long
+# after it started. Right after a (re)connect to a stream nobody is pushing,
+# the CDN replays a few seconds of cached picture and then holds the session
+# until it refuses it at ~60 s (11-08 54340581 / 54475673: 4-26 segments in
+# 60 s); that retry cycle is left to the CDN exactly as before.
+PREVIEW_STALL_MIN_RUN_SECONDS = 60.0
 # 1s segments: hls.js sits liveSyncDurationCount (3) segments behind the edge
 # and the browser only learns about a segment once it is fully written, so
 # segment length is the single biggest lever on steady-state preview delay
@@ -100,6 +136,14 @@ class _PreviewEntry:
     last_exit_code: int | None = None
     last_exit_reason: str | None = None
     last_exit_at: float | None = None
+    # Stall watchdog bookkeeping for the current run (reset on every
+    # relaunch): the newest playlist segment the reaper has seen and when it
+    # first saw it. ``stall_reason`` is set just before the watchdog
+    # terminates a stalled run so the exit is recorded with it instead of
+    # ffmpeg's own "received signal 15" line.
+    progress_tail: str | None = None
+    progress_at: float = 0.0
+    stall_reason: str | None = None
     # Relaunch bookkeeping. Every ffmpeg run of this entry writes into the
     # *same* directory: the HLS muxer's ``append_list`` reads the playlist the
     # dead run left behind, keeps its segments (with their original
@@ -142,6 +186,8 @@ class LivePreviewManager:
         restart_max_delay: float = 60.0,
         restart_max_retries: int = 6,
         restart_reset_seconds: float = 30.0,
+        stall_seconds: float = PREVIEW_STALL_SECONDS,
+        stall_min_run_seconds: float = PREVIEW_STALL_MIN_RUN_SECONDS,
         on_stop: "Callable[[str], None] | None" = None,
         on_restart: "Callable[[str, str], str | None] | None" = None,
     ) -> None:
@@ -167,6 +213,10 @@ class LivePreviewManager:
         self.restart_max_delay = float(restart_max_delay)
         self.restart_max_retries = int(restart_max_retries)
         self.restart_reset_seconds = float(restart_reset_seconds)
+        # Stall watchdog (see PREVIEW_STALL_SECONDS); acts only together with
+        # auto_restart, whose relaunch path it reuses.
+        self.stall_seconds = float(stall_seconds)
+        self.stall_min_run_seconds = float(stall_min_run_seconds)
         self.lock = threading.RLock()
         self.entries: dict[str, _PreviewEntry] = {}
         self._ffmpeg = resolve_ffmpeg()
@@ -417,6 +467,10 @@ class LivePreviewManager:
         """
         log_tail = self._read_log_tail(entry.log_path, limit=3000)
         reason = self._summarize_exit_reason(log_tail)
+        if entry.stall_reason:
+            # Terminated by the stall watchdog: ffmpeg's last line would only
+            # say it received a signal. stderr_tail below still has its lines.
+            reason, entry.stall_reason = entry.stall_reason, None
         entry.last_exit_code = return_code
         entry.last_exit_reason = reason
         entry.last_exit_at = now
@@ -606,6 +660,7 @@ class LivePreviewManager:
                     if entry.restart_count and now - entry.started_at > self.restart_reset_seconds:
                         entry.restart_count = 0
                         entry.cooling = False
+                    self._watch_stall_locked(match_id, entry, now)
                     continue
                 # Died while still watched: restart under backoff. After the fast
                 # retries are spent we keep probing at max_delay so a recovering
@@ -613,6 +668,58 @@ class LivePreviewManager:
                 if now < entry.next_restart_at:
                     continue
                 self._restart_entry_locked(match_id, now)
+
+    def _watch_stall_locked(self, match_id: str, entry: _PreviewEntry, now: float) -> None:
+        """Relaunch a live ffmpeg whose playlist stopped growing (PREVIEW_STALL_SECONDS).
+
+        Progress is the newest playlist segment changing between reaper ticks.
+        Nothing happens until the run has produced for
+        ``stall_min_run_seconds`` (see PREVIEW_STALL_MIN_RUN_SECONDS), nor when
+        the playlist cannot be read. A stalled run is terminated and relaunched
+        right away through ``_restart_entry_locked``: same resource, same
+        directory, so the history is kept and reported frozen until the
+        replacement appends a segment, exactly like a source drop.
+        """
+        if self.stall_seconds <= 0:
+            return
+        listed = self._playlist_entries(entry.directory)
+        if not listed:
+            return
+        tail = listed[-1][0]
+        if tail != entry.progress_tail:
+            entry.progress_tail = tail
+            entry.progress_at = now
+            return
+        if entry.progress_at - entry.started_at < self.stall_min_run_seconds:
+            return
+        stalled = now - entry.progress_at
+        if stalled < self.stall_seconds:
+            return
+        process = entry.process
+        _log_event(
+            "preview_ffmpeg_stalled",
+            match_id=match_id,
+            resource=entry.resource,
+            pid=process.pid,
+            last_segment=tail,
+            stalled_seconds=round(stalled, 1),
+            uptime_seconds=round(now - entry.started_at, 1),
+        )
+        entry.stall_reason = f"源站连接卡住，{int(stalled)} 秒没有新画面"
+        process.terminate()
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                pass
+        if process.poll() is None:
+            # Never start a second ffmpeg on the same directory; once this one
+            # is gone the normal auto-restart takes over (with this reason).
+            return
+        self._restart_entry_locked(match_id, now)
 
     def _restart_entry_locked(self, match_id: str, now: float, *, operator: bool = False) -> None:
         """Relaunch a dead ffmpeg into its existing directory.
@@ -680,6 +787,10 @@ class LivePreviewManager:
         entry.directory = directory
         entry.log_path = log_path
         entry.started_at = now
+        # A fresh run: its progress is measured from now, against the tail it
+        # inherits (the frozen history), never against the previous run.
+        entry.progress_tail = entry.frozen_tail
+        entry.progress_at = now
         entry.restart_count_total += 1
         if not operator:
             entry.restart_count += 1

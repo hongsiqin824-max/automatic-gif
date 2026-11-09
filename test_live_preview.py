@@ -9,7 +9,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
 
-from live_preview import LivePreviewManager
+from live_preview import LivePreviewManager, non_negative_env_float
 
 
 def _stub_command_factory(directory_playlist_writer):
@@ -864,6 +864,187 @@ class LivePreviewSourceBlackTests(unittest.TestCase):
         self.assertEqual([e["black"] for e in events], [True, False])
         self.assertEqual(events[0]["seconds"], 10.0)
         self.assertEqual(events[0]["match_id"], "m1")
+
+
+def _segment_playlist(count: int) -> str:
+    """An HLS playlist listing seg_00000.ts .. seg_<count-1>.ts (1 s each)."""
+    lines = ["#EXTM3U", "#EXT-X-VERSION:6", "#EXT-X-TARGETDURATION:1", "#EXT-X-MEDIA-SEQUENCE:0"]
+    for index in range(count):
+        lines += ["#EXTINF:1.000000,", f"seg_{index:05d}.ts"]
+    return "\n".join(lines) + "\n"
+
+
+class LivePreviewStallWatchdogTests(unittest.TestCase):
+    """An ffmpeg that is alive but writes nothing is relaunched.
+
+    11-07 54493413: the CDN kept the RTMP session open without media for about
+    11 minutes. ffmpeg neither timed out nor exited, so the stage froze at 63'
+    with no warning, and each of the operator's 12 reopens reused the same
+    stuck process until the CDN finally dropped it.
+    """
+
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.addCleanup(self._cleanup)
+        self.manager = None
+
+    def _cleanup(self):
+        if self.manager is not None:
+            self.manager.shutdown()
+        self._tmp.cleanup()
+
+    def _make(self, **kwargs):
+        # The production retry settings (monitor_server.py defaults).
+        params = dict(
+            root=self.root,
+            background_reaper=False,
+            auto_restart=True,
+            restart_base_delay=5.0,
+            restart_max_delay=60.0,
+            restart_max_retries=6,
+            restart_reset_seconds=30.0,
+            idle_timeout_seconds=100000.0,
+            stall_seconds=20.0,
+            stall_min_run_seconds=60.0,
+        )
+        params.update(kwargs)
+        manager = LivePreviewManager(**params)
+        # A live child that writes nothing itself; the test writes the playlist.
+        manager._build_command = _silent_command_factory()
+        self.manager = manager
+        return manager
+
+    def _start(self, manager, t0):
+        manager.start("m1", "rtmp://host/s")
+        entry = manager.entries["m1"]
+        entry.started_at = t0
+        return entry
+
+    @staticmethod
+    def _write(entry, count):
+        (entry.directory / "index.m3u8").write_text(_segment_playlist(count), encoding="utf-8")
+
+    def _produce_then_stop(self, manager, t0):
+        """A run that produced for 105 s and then stopped at seg_00003.ts."""
+        entry = self._start(manager, t0)
+        self._write(entry, 3)
+        manager._reap_tick(t0 + 100)
+        self._write(entry, 4)
+        manager._reap_tick(t0 + 105)
+        return entry
+
+    def test_stalled_run_is_relaunched_with_history_kept(self):
+        manager = self._make()
+        t0 = time.time()
+        entry = self._produce_then_stop(manager, t0)
+        stuck = entry.process
+        manager._reap_tick(t0 + 120)  # 15 s without a segment: still waiting
+        self.assertIs(manager.entries["m1"].process, stuck)
+        with mock.patch("live_preview._log_event") as log:
+            manager._reap_tick(t0 + 126)  # 21 s: relaunch
+        entry = manager.entries["m1"]
+        self.assertIsNot(entry.process, stuck)
+        self.assertIsNotNone(stuck.poll())  # the stuck ffmpeg is gone, not orphaned
+        self.assertEqual(entry.restart_count_total, 1)
+        self.assertEqual(entry.restart_count, 1)
+        self.assertEqual(entry.resource, "rtmp://host/s")
+        # Same directory, history kept and reported frozen until the
+        # replacement appends - exactly like a source drop.
+        self.assertEqual(entry.directory, manager.match_root("m1") / "g1")
+        self.assertEqual(entry.frozen_tail, "seg_00003.ts")
+        status = manager.status("m1")
+        self.assertTrue(status["running"])
+        self.assertTrue(status["history_frozen"])
+        self.assertEqual(status["last_exit_reason"], "源站连接卡住，21 秒没有新画面")
+        names = [c.args[0] for c in log.call_args_list]
+        self.assertEqual(names[:3], ["preview_ffmpeg_stalled", "preview_ffmpeg_exited", "preview_ffmpeg_restarted"])
+        stalled = log.call_args_list[0].kwargs
+        self.assertEqual(stalled["match_id"], "m1")
+        self.assertEqual(stalled["last_segment"], "seg_00003.ts")
+        self.assertEqual(stalled["stalled_seconds"], 21.0)
+        self.assertEqual(stalled["uptime_seconds"], 126.0)
+        self.assertEqual(log.call_args_list[1].kwargs["reason"], "源站连接卡住，21 秒没有新画面")
+        # The replacement has not produced yet: it is left alone (the CDN's
+        # own ~60 s refusal handles a source nobody is pushing).
+        manager._reap_tick(t0 + 150)
+        self.assertEqual(manager.entries["m1"].restart_count_total, 1)
+        # Its first segment lands, then nothing: still inside its first 60 s
+        # of producing, so this is the CDN's business, not the watchdog's.
+        self._write(entry, 5)
+        manager._reap_tick(t0 + 155)
+        manager._reap_tick(t0 + 180)
+        self.assertEqual(manager.entries["m1"].restart_count_total, 1)
+        # Producing well past a minute after its start and then stalling for
+        # 20 s again: relaunched again.
+        self._write(entry, 6)
+        manager._reap_tick(t0 + 250)
+        manager._reap_tick(t0 + 265)
+        self.assertEqual(manager.entries["m1"].restart_count_total, 1)
+        manager._reap_tick(t0 + 275)
+        self.assertEqual(manager.entries["m1"].restart_count_total, 2)
+        self.assertEqual(manager.entries["m1"].frozen_tail, "seg_00005.ts")
+
+    def test_growing_playlist_is_never_touched(self):
+        manager = self._make()
+        t0 = time.time()
+        entry = self._start(manager, t0)
+        proc = entry.process
+        # 15 s between ticks, but a new segment every time.
+        for count, at in enumerate(range(100, 500, 15), start=1):
+            self._write(entry, count)
+            manager._reap_tick(t0 + at)
+        self.assertIs(manager.entries["m1"].process, proc)
+        self.assertEqual(manager.entries["m1"].restart_count_total, 0)
+
+    def test_cached_burst_after_connect_is_left_to_the_cdn(self):
+        # 11-08 54340581 / 54475673: a connect to a stream nobody pushes gets
+        # a few seconds of cached picture, then nothing until the CDN refuses
+        # the session at ~60 s. That cycle must stay exactly as it was.
+        manager = self._make()
+        t0 = time.time()
+        entry = self._start(manager, t0)
+        proc = entry.process
+        self._write(entry, 8)
+        manager._reap_tick(t0 + 5)
+        manager._reap_tick(t0 + 55)
+        manager._reap_tick(t0 + 300)
+        self.assertIs(manager.entries["m1"].process, proc)
+        self.assertEqual(manager.entries["m1"].restart_count_total, 0)
+
+    def test_switched_off_or_without_auto_restart_does_nothing(self):
+        for kwargs in ({"stall_seconds": 0.0}, {"auto_restart": False}):
+            with self.subTest(**kwargs):
+                manager = self._make(**kwargs)
+                t0 = time.time()
+                entry = self._produce_then_stop(manager, t0)
+                proc = entry.process
+                manager._reap_tick(t0 + 400)
+                self.assertIs(manager.entries["m1"].process, proc)
+                self.assertIsNone(proc.poll())
+                self.assertEqual(manager.entries["m1"].restart_count_total, 0)
+                manager.shutdown()
+
+    def test_unreadable_playlist_is_no_evidence(self):
+        manager = self._make()
+        t0 = time.time()
+        entry = self._produce_then_stop(manager, t0)
+        proc = entry.process
+        (entry.directory / "index.m3u8").unlink()
+        manager._reap_tick(t0 + 400)
+        self.assertIs(manager.entries["m1"].process, proc)
+        self.assertEqual(manager.entries["m1"].restart_count_total, 0)
+
+    def test_stall_seconds_env(self):
+        name = "GIF_TEST_PREVIEW_STALL_SECONDS"
+        self.assertEqual(non_negative_env_float(name + "_UNSET", 20.0), 20.0)
+        for raw, expected in (("", 20.0), ("0", 0.0), ("25", 25.0), (" 7.5 ", 7.5)):
+            with mock.patch.dict("os.environ", {name: raw}):
+                self.assertEqual(non_negative_env_float(name, 20.0), expected)
+        for raw in ("-1", "abc", "nan", "inf"):
+            with mock.patch.dict("os.environ", {name: raw}):
+                with self.assertRaises(RuntimeError):
+                    non_negative_env_float(name, 20.0)
 
 
 if __name__ == "__main__":
