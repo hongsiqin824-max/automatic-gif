@@ -18,14 +18,35 @@ async function baseUrl() {
   return raw.endsWith("/") ? raw : raw + "/";
 }
 
-async function api(path, init = {}) {
+// No request to 8901 may hang for ever: the recorder sends one clip at a time
+// and queues the rest, so an upload that never answers would hold every later
+// clip ("上一条还在上传…") until the page is reloaded. The clip upload covers
+// upload + server encode (14 days to 11-09: max 16.6 MB, encode max 16 s).
+const API_TIMEOUT_MS = 20_000;
+const CLIP_UPLOAD_TIMEOUT_MS = 120_000;
+
+async function api(path, init = {}, timeoutMs = API_TIMEOUT_MS) {
   const url = (await baseUrl()) + path.replace(/^\//, "");
-  const response = await fetch(url, { credentials: "include", ...init });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let response;
   let data = null;
   try {
-    data = await response.json();
-  } catch (_err) {
-    data = null;
+    response = await fetch(url, { credentials: "include", ...init, signal: controller.signal });
+    try {
+      data = await response.json();
+    } catch (_err) {
+      data = null;
+    }
+    // The body read is covered too: an abort there must not pass for "no JSON".
+    if (controller.signal.aborted) throw new Error("aborted");
+  } catch (err) {
+    if (!controller.signal.aborted) throw err;
+    const timeout = new Error(`8901 超过 ${Math.round(timeoutMs / 1000)} 秒没有回应`);
+    timeout.code = "timeout";
+    throw timeout;
+  } finally {
+    clearTimeout(timer);
   }
   if (response.status === 401 && data && data.login_url) {
     const err = new Error("需要登录 8901");
@@ -117,10 +138,15 @@ function setTabState(tabId, patch) {
 
 const shownTabs = new Set();
 const shownTouched = new Set(); // changed since this worker started: storage copy is older
-chrome.storage.session.get(null).then((all) => {
+// Each tab's side panel path, kept in step with what was last given to
+// setOptions, so openPanel can pass it without an await (see openPanel).
+const panelPaths = new Map(); // tabId -> path
+const shownRestored = chrome.storage.session.get(null).then((all) => {
   for (const [key, value] of Object.entries(all || {})) {
     const tabId = Number(key.slice(4));
-    if (key.startsWith("tab:") && value && value.shown && !shownTouched.has(tabId)) shownTabs.add(tabId);
+    if (!key.startsWith("tab:") || !value) continue;
+    if (value.shown && !shownTouched.has(tabId)) shownTabs.add(tabId);
+    if (!panelPaths.has(tabId)) panelPaths.set(tabId, panelPathFor(value.matchId, tabId));
   }
 }).catch(() => null);
 
@@ -128,6 +154,9 @@ async function setShown(tabId, shown) {
   shownTouched.add(tabId);
   if (shown) shownTabs.add(tabId);
   else shownTabs.delete(tabId);
+  // Hiding (the bar's × or Alt+0) means "not using the clipper here": close
+  // this tab's side panel too. It comes back with the next openPanel.
+  if (!shown) chrome.sidePanel.setOptions({ tabId, enabled: false }).catch(() => null);
   await setTabState(tabId, { shown });
   // Every frame: the top-frame bar shows / hides, and the recording frame
   // (maybe a cross-origin iframe) only toasts on its own while shown.
@@ -181,6 +210,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   frameReports.delete(tabId);
   shownTabs.delete(tabId);
   shownTouched.delete(tabId);
+  panelPaths.delete(tabId);
   tabStateWrites.delete(tabId);
 });
 
@@ -271,7 +301,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       case "set-match": {
         if (tabId == null) return null;
         await setTabState(tabId, { matchId: msg.matchId || null });
-        await chrome.sidePanel.setOptions({ tabId, path: await panelPath(msg.matchId) });
+        // Path only. Sent from the bar, which shows only where the clipper is
+        // in use, so this tab's panel may be on; leave that as it is.
+        await setPanelPath(tabId, msg.matchId);
         return { ok: true };
       }
       case "set-shown":
@@ -316,8 +348,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const landed = clipLandingStatus(msg.appended, msg.name);
         broadcastBar(tabId, { type: "bar-status", text: landed.text, level: landed.level });
         chrome.runtime.sendMessage({ type: "panel-refresh", tabId, matchId: msg.matchId, name: msg.name }).catch(() => null);
+        // The operator hid the clipper in this tab while the clip was on its
+        // way: leave the panel closed, the bar status above is enough.
+        if (!shownTabs.has(tabId)) return { ok: true };
         try {
-          await chrome.sidePanel.open({ tabId });
+          await openPanel(tabId);
         } catch (_err) {
           // No side panel: the bar is the only thing the operator can see, so
           // keep the landing result in the text instead of dropping back to a
@@ -414,7 +449,13 @@ async function postClip(job) {
   form.append("capture_mode", meta.captureMode || "captureStream");
   if (meta.crop) form.append("crop", JSON.stringify(meta.crop));
   files.forEach((blob, i) => form.append("file", blob, `seg_${i}.webm`));
-  return api("api/monitor/ext/clip", { method: "POST", body: form });
+  try {
+    return await api("api/monitor/ext/clip", { method: "POST", body: form }, CLIP_UPLOAD_TIMEOUT_MS);
+  } catch (err) {
+    // The server may still finish this clip after we stopped waiting.
+    if (err && err.code === "timeout") err.message += "；如果服务器稍后还是做完了，这张会在重开侧栏后出现";
+    throw err;
+  }
 }
 
 // ---- keyboard commands → main recording frame ---------------------------
@@ -428,7 +469,12 @@ chrome.commands.onCommand.addListener((command, tab) => {
   const tabId = tab && tab.id;
   if (tabId == null) return;
   if (PANEL_COMMANDS.has(command) && !shownTabs.has(tabId)) {
-    chrome.sidePanel.open({ tabId }).catch(() => null);
+    // In use from this instant (runCommand stores it after an await): an
+    // onActivated for this tab still waiting on storage must not switch the
+    // panel being opened here back off.
+    shownTouched.add(tabId);
+    shownTabs.add(tabId);
+    openPanel(tabId).catch(() => null);
   }
   runCommand(command, tabId);
 });
@@ -465,11 +511,45 @@ async function runCommand(command, tabId) {
 }
 
 // ---- side panel -------------------------------------------------------------
+// The panel shows only in tabs where the clipper is in use. Chrome keeps a
+// side panel open per window, not per tab: with a panel enabled everywhere
+// (the manifest default), opening it in the live tab put a copy of 8901 in
+// every other tab too, and each clip opened it there again. So it is off by
+// default; openPanel switches it on for one tab right before opening, hiding
+// the clipper (setShown false) switches it off again, and onActivated says
+// "off" outright for every tab not in use (Chrome's own default for a tab
+// entry is "on"). set-match only changes the path, from a bar that shows
+// only where the clipper is in use.
 
-async function panelPath(matchId) {
+chrome.sidePanel.setOptions({ enabled: false }).catch(() => null);
+
+// ``tab`` tells the panel which tab it belongs to, so it can ignore another
+// tab's "clip created" (panel.js); it never changes for a tab.
+function panelPathFor(matchId, tabId) {
   const params = new URLSearchParams();
   if (matchId) params.set("match_id", matchId);
+  if (tabId != null) params.set("tab", String(tabId));
   return `panel.html${params.toString() ? "?" + params.toString() : ""}`;
+}
+
+// Give Chrome the tab's path (plus ``extra``, e.g. enabled) and remember it.
+function setPanelPath(tabId, matchId, extra = {}) {
+  const path = panelPathFor(matchId, tabId);
+  panelPaths.set(tabId, path);
+  return chrome.sidePanel.setOptions({ tabId, path, ...extra });
+}
+
+// Not async and nothing awaited before open(): Chrome only lets open()
+// through while the click / key press is still being handled. The path goes
+// along with "on": a tab Chrome holds nothing for (browser restarted, or the
+// extension switched off and on) gets an entry from this call alone, and
+// without a path open() fails with "No active side panel". It is the path
+// last given for the tab, so a panel already open is not reloaded.
+function openPanel(tabId) {
+  const path = panelPaths.get(tabId) || panelPathFor(null, tabId);
+  panelPaths.set(tabId, path);
+  chrome.sidePanel.setOptions({ tabId, path, enabled: true }).catch(() => null);
+  return chrome.sidePanel.open({ tabId });
 }
 
 // Toolbar icon = "use the clipper in this tab": side panel and bar together.
@@ -479,13 +559,29 @@ chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: false }).catch(() =>
 
 chrome.action.onClicked.addListener((tab) => {
   if (!tab || tab.id == null) return;
-  chrome.sidePanel.open({ tabId: tab.id }).catch(() => null); // first: still the user's click
+  openPanel(tab.id).catch(() => null); // first: still the user's click
   setShown(tab.id, true);
 });
 
 chrome.tabs.onActivated.addListener(async ({ tabId }) => {
   const state = await tabState(tabId);
-  await chrome.sidePanel.setOptions({ tabId, path: await panelPath(state.matchId) }).catch(() => null);
+  await shownRestored;
+  // Never "on" here: only openPanel turns a tab's panel on.
+  await setPanelPath(tabId, state.matchId, shownTabs.has(tabId) ? {} : { enabled: false }).catch(() => null);
+});
+
+// Install / update: tabs may still hold a panel enabled by an older version
+// (which had it on everywhere). Switch it off in every open tab not in use.
+// storage.session starts empty then, so there is no match to put in the
+// path, and nothing is awaited inside the loop: a click on the icon cannot
+// land between two tabs and be undone.
+chrome.runtime.onInstalled?.addListener(async ({ reason }) => {
+  if (reason !== "install" && reason !== "update") return;
+  const tabs = await chrome.tabs.query({}).catch(() => []);
+  for (const tab of tabs || []) {
+    if (tab.id == null || tab.id < 0 || shownTabs.has(tab.id)) continue;
+    setPanelPath(tab.id, null, { enabled: false }).catch(() => null);
+  }
 });
 
 // A tab that navigated (same tab, new site) keeps its match; push it back to

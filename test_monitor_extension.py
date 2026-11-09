@@ -765,9 +765,11 @@ class ExtensionBackgroundUiTests(unittest.TestCase):
     HARNESS = r"""
 const vm = require("vm");
 const fs = require("fs");
-function load(session = {}) {
+function load(session = {}, opts = {}) {
   const calls = [];
   const listeners = {};
+  const tabOpts = {}; // tabId -> side panel entry as Chrome would hold it
+  const opened = []; // [tabId, "ok" | error] per sidePanel.open
   const store = { session: JSON.parse(JSON.stringify(session)), local: {} };
   const tick = (fn) => new Promise((r) => setTimeout(() => r(fn()), 0));
   const area = (name) => ({
@@ -789,25 +791,46 @@ function load(session = {}) {
     storage: { session: area("session"), local: area("local") },
     tabs: {
       sendMessage: rec("tabs.sendMessage"), create: rec("tabs.create"),
+      query: async () => (opts.tabs || []).map((id) => ({ id })),
       onRemoved: event("tabs.onRemoved"), onActivated: event("tabs.onActivated"),
     },
     sidePanel: {
-      open: rec("sidePanel.open"), setOptions: rec("sidePanel.setOptions"),
+      // Like Chrome (checked in Chrome for Testing 148): a tab's first
+      // setOptions creates its entry from exactly what is given, later ones
+      // update it; open() needs the tab's entry to have a path and be on.
+      open: (...args) => {
+        calls.push(["sidePanel.open", ...args]);
+        const entry = tabOpts[args[0].tabId];
+        let result = "ok";
+        if (opts.openFails) result = "no user gesture";
+        else if (!entry || !entry.path || entry.enabled === false) result = `No active side panel for tabId: ${args[0].tabId}`;
+        opened.push([args[0].tabId, result]);
+        return result === "ok" ? Promise.resolve() : Promise.reject(new Error(result));
+      },
+      setOptions: (...args) => {
+        calls.push(["sidePanel.setOptions", ...args]);
+        const o = args[0];
+        if (o.tabId != null) tabOpts[o.tabId] = Object.assign(tabOpts[o.tabId] || { enabled: true }, JSON.parse(JSON.stringify(o)));
+        return Promise.resolve(null);
+      },
       setPanelBehavior: rec("sidePanel.setPanelBehavior"),
     },
     action: { onClicked: event("action.onClicked") },
     commands: { onCommand: event("commands.onCommand") },
-    runtime: { onMessage: event("runtime.onMessage"), onConnect: event("runtime.onConnect"), sendMessage: rec("runtime.sendMessage") },
+    runtime: {
+      onMessage: event("runtime.onMessage"), onConnect: event("runtime.onConnect"),
+      onInstalled: event("runtime.onInstalled"), sendMessage: rec("runtime.sendMessage"),
+    },
     webNavigation: { onCommitted: event("webNavigation.onCommitted") },
   };
-  const fetch = async () => ({ ok: true, status: 200, json: async () => ({ buffer_seconds: 300, bitrate: 2000000 }) });
-  const ctx = vm.createContext({ chrome, fetch, console, URL, URLSearchParams, setTimeout, clearTimeout });
+  const fetch = opts.fetch || (async () => ({ ok: true, status: 200, json: async () => ({ buffer_seconds: 300, bitrate: 2000000 }) }));
+  const ctx = vm.createContext({ chrome, fetch, console, URL, URLSearchParams, setTimeout, clearTimeout, AbortController, FormData, Blob });
   vm.runInContext(fs.readFileSync(SCRIPT, "utf8"), ctx);
   const send = (msg, sender) => new Promise((r) => listeners["runtime.onMessage"](msg, sender, r));
   const named = (name) => calls.filter((c) => c[0] === name);
   const messages = (tabId) => named("tabs.sendMessage").filter((c) => c[1] === tabId)
     .map((c) => ({ msg: c[2], frameId: c[3] ? c[3].frameId : null }));
-  return { ctx, calls, listeners, store, send, named, messages };
+  return { ctx, calls, listeners, store, send, named, messages, tabOpts, opened };
 }
 const settle = () => new Promise((r) => setTimeout(r, 50));
 const out = (value) => process.stdout.write(JSON.stringify(value));
@@ -978,6 +1001,366 @@ out(h.store.session["tab:9"]);
 """
         )
         self.assertEqual(r, {"matchId": "123", "mainFrameId": 2, "shown": True})
+
+    # ---- side panel only in the tabs that use the clipper (0.1.8) ----
+
+    def test_panel_is_off_by_default(self):
+        r = self.run_js(
+            """
+const h = load();
+await settle();
+out(h.named("sidePanel.setOptions").map((c) => c[1]));
+"""
+        )
+        self.assertEqual(r, [{"enabled": False}])
+
+    def test_icon_enables_the_panel_for_its_tab_then_opens_it_in_the_click(self):
+        r = self.run_js(
+            """
+const h = load();
+await settle();
+const before = h.calls.length;
+h.listeners["action.onClicked"]({ id: 7 });
+// Recorded synchronously, i.e. still inside the click.
+const sync = h.calls.slice(before).filter((c) => c[0].startsWith("sidePanel.")).map((c) => [c[0], c[1]]);
+await settle();
+out({ sync, opened: h.opened });
+"""
+        )
+        # Tab 7 never had a panel entry (fresh browser, or the extension
+        # switched off and on): the path has to come with "on" or open() fails.
+        self.assertEqual(r["sync"], [
+            ["sidePanel.setOptions", {"tabId": 7, "path": "panel.html?tab=7", "enabled": True}],
+            ["sidePanel.open", {"tabId": 7}],
+        ])
+        self.assertEqual(r["opened"], [[7, "ok"]])
+
+    def test_shortcut_enables_then_opens_inside_the_key_press(self):
+        r = self.run_js(
+            """
+const h = load();
+await settle();
+const before = h.calls.length;
+h.listeners["commands.onCommand"]("review", { id: 3 });
+const sync = h.calls.slice(before).filter((c) => c[0].startsWith("sidePanel.")).map((c) => [c[0], c[1]]);
+await settle();
+out({ sync, opened: h.opened });
+"""
+        )
+        self.assertEqual(r["sync"], [
+            ["sidePanel.setOptions", {"tabId": 3, "path": "panel.html?tab=3", "enabled": True}],
+            ["sidePanel.open", {"tabId": 3}],
+        ])
+        self.assertEqual(r["opened"], [[3, "ok"]])
+
+    def test_shortcut_racing_a_tab_switch_keeps_the_panel_on(self):
+        r = self.run_js(
+            """
+const h = load({ "tab:3": { matchId: null, mainFrameId: null, shown: false } });
+await settle();
+// The switch to tab 3 is still reading storage when Alt+3 is pressed there.
+const activation = h.listeners["tabs.onActivated"]({ tabId: 3 });
+h.listeners["commands.onCommand"]("review", { id: 3 });
+await activation;
+await settle();
+out({ entry: h.tabOpts[3], opened: h.opened,
+      offAfterOpen: h.calls.slice(h.calls.findIndex((c) => c[0] === "sidePanel.open"))
+        .filter((c) => c[0] === "sidePanel.setOptions" && c[1].enabled === false).length });
+"""
+        )
+        self.assertEqual(r["opened"], [[3, "ok"]])
+        self.assertEqual(r["offAfterOpen"], 0)
+        self.assertTrue(r["entry"]["enabled"])
+
+    def test_clip_opens_the_panel_only_in_its_own_tab(self):
+        r = self.run_js(
+            """
+// Two tabs in use (two live sites, two matches); the worker just restarted.
+const h = load({ "tab:4": { matchId: "55", mainFrameId: 0, shown: true },
+                 "tab:9": { matchId: "66", mainFrameId: 0, shown: true } });
+await settle();
+const before = h.calls.length;
+await h.send({ type: "clip-created", matchId: "55", name: "clip_a.gif" }, { tab: { id: 4, url: "https://live.example/" }, frameId: 0 });
+const after = h.calls.slice(before);
+out({
+  panel: after.filter((c) => c[0].startsWith("sidePanel.")).map((c) => [c[0], c[1]]),
+  refresh: after.filter((c) => c[0] === "runtime.sendMessage").map((c) => c[1]),
+  opened: h.opened,
+});
+"""
+        )
+        # Tab 9 is not touched; tab 4 keeps its match in the path (restored
+        # from storage after the restart, so an open panel is not reloaded).
+        self.assertEqual(r["panel"], [
+            ["sidePanel.setOptions", {"tabId": 4, "path": "panel.html?match_id=55&tab=4", "enabled": True}],
+            ["sidePanel.open", {"tabId": 4}],
+        ])
+        self.assertEqual(r["opened"], [[4, "ok"]])
+        self.assertEqual(r["refresh"], [{"type": "panel-refresh", "tabId": 4, "matchId": "55", "name": "clip_a.gif"}])
+
+    def test_clip_in_a_hidden_tab_leaves_the_panel_closed(self):
+        r = self.run_js(
+            """
+const h = load({ "tab:4": { matchId: "55", mainFrameId: 0, shown: false } });
+await settle();
+const before = h.calls.length;
+const res = await h.send({ type: "clip-created", matchId: "55", name: "clip_a.gif" }, { tab: { id: 4, url: "https://live.example/" }, frameId: 0 });
+const after = h.calls.slice(before);
+out({ res, panel: after.filter((c) => c[0].startsWith("sidePanel.")).length,
+      bar: h.messages(4).filter((m) => m.msg.type === "bar-status").map((m) => m.msg.text) });
+"""
+        )
+        self.assertEqual(r["res"], {"ok": True})
+        self.assertEqual(r["panel"], 0)
+        self.assertEqual(r["bar"], ["GIF 已生成：clip_a.gif"])
+
+    def test_clip_whose_panel_cannot_open_says_so_in_the_bar(self):
+        r = self.run_js(
+            """
+const h = load({ "tab:4": { matchId: "55", mainFrameId: 0, shown: true } }, { openFails: true });
+await settle();
+await h.send({ type: "clip-created", matchId: "55", name: "clip_a.gif" }, { tab: { id: 4, url: "https://live.example/" }, frameId: 0 });
+out(h.messages(4).filter((m) => m.msg.type === "bar-status").map((m) => m.msg.text));
+"""
+        )
+        self.assertEqual(r, ["GIF 已生成：clip_a.gif", "GIF 已生成：clip_a.gif，点工具栏图标打开侧栏发布"])
+
+    def test_hiding_the_bar_closes_this_tabs_panel(self):
+        r = self.run_js(
+            """
+const h = load();
+await settle();
+h.listeners["action.onClicked"]({ id: 7 });
+await settle();
+const before = h.calls.length;
+await h.send({ type: "set-shown", shown: false }, { tab: { id: 7, url: "https://live.example/" }, frameId: 0 });
+await settle();
+const byX = h.calls.slice(before).filter((c) => c[0] === "sidePanel.setOptions").map((c) => c[1]);
+const mark = h.calls.length;
+h.listeners["commands.onCommand"]("toggle-bar", { id: 7 }); // Alt+0: bar back only
+await settle();
+const back = h.calls.slice(mark).filter((c) => c[0].startsWith("sidePanel.")).length;
+const mark2 = h.calls.length;
+h.listeners["commands.onCommand"]("toggle-bar", { id: 7 }); // Alt+0 again: hide
+await settle();
+const byAlt0 = h.calls.slice(mark2).filter((c) => c[0] === "sidePanel.setOptions").map((c) => c[1]);
+out({ byX, back, byAlt0 });
+"""
+        )
+        self.assertEqual(r["byX"], [{"tabId": 7, "enabled": False}])
+        self.assertEqual(r["back"], 0)
+        self.assertEqual(r["byAlt0"], [{"tabId": 7, "enabled": False}])
+
+    def test_tab_switch_never_turns_the_panel_on_and_match_change_only_sets_the_path(self):
+        r = self.run_js(
+            """
+const h = load({ "tab:5": { matchId: "123", mainFrameId: null, shown: false },
+                 "tab:8": { matchId: "77", mainFrameId: null, shown: true } });
+await settle();
+const before = h.calls.length;
+await h.listeners["tabs.onActivated"]({ tabId: 5 });
+await h.listeners["tabs.onActivated"]({ tabId: 6 });
+await h.listeners["tabs.onActivated"]({ tabId: 8 });
+await h.send({ type: "set-match", matchId: "456" }, { tab: { id: 8, url: "https://live.example/" }, frameId: 0 });
+out(h.calls.slice(before).filter((c) => c[0] === "sidePanel.setOptions").map((c) => c[1]));
+"""
+        )
+        self.assertEqual(r, [
+            {"tabId": 5, "path": "panel.html?match_id=123&tab=5", "enabled": False},
+            {"tabId": 6, "path": "panel.html?tab=6", "enabled": False},
+            # In use (bar shown, restored after a worker restart): left as it is.
+            {"tabId": 8, "path": "panel.html?match_id=77&tab=8"},
+            {"tabId": 8, "path": "panel.html?match_id=456&tab=8"},
+        ])
+
+    def test_install_and_update_switch_the_panel_off_in_open_tabs(self):
+        r = self.run_js(
+            """
+const h = load({}, { tabs: [1, 2] });
+await settle();
+const before = h.calls.length;
+await h.listeners["runtime.onInstalled"]({ reason: "chrome_update" });
+await settle();
+const ignored = h.calls.length - before;
+await h.listeners["runtime.onInstalled"]({ reason: "update" });
+const update = h.calls.slice(before).filter((c) => c[0] === "sidePanel.setOptions").map((c) => c[1]);
+const mark = h.calls.length;
+await h.listeners["runtime.onInstalled"]({ reason: "install" });
+out({ ignored, update, install: h.calls.slice(mark).filter((c) => c[0] === "sidePanel.setOptions").length });
+"""
+        )
+        self.assertEqual(r["ignored"], 0)
+        self.assertEqual(r["update"], [
+            {"tabId": 1, "path": "panel.html?tab=1", "enabled": False},
+            {"tabId": 2, "path": "panel.html?tab=2", "enabled": False},
+        ])
+        self.assertEqual(r["install"], 2)
+
+    def test_install_leaves_a_tab_just_put_in_use_alone(self):
+        r = self.run_js(
+            """
+const h = load({}, { tabs: [1, 2] });
+await settle();
+const installing = h.listeners["runtime.onInstalled"]({ reason: "update" });
+h.listeners["action.onClicked"]({ id: 2 }); // lands while tabs.query is pending
+await installing;
+await settle();
+out({ entry: h.tabOpts[2], off: h.calls.filter((c) => c[0] === "sidePanel.setOptions" && c[1].tabId === 2 && c[1].enabled === false).length });
+"""
+        )
+        self.assertEqual(r["off"], 0)
+        self.assertTrue(r["entry"]["enabled"])
+
+    # ---- requests to 8901 never hang ----
+
+    HANGING_FETCH = """
+// Like fetch: never answers on its own, rejects once the signal aborts.
+const hang = (_url, init) => new Promise((_, reject) => {
+  init.signal.addEventListener("abort", () => reject(new Error("The operation was aborted.")));
+});
+"""
+
+    def test_request_that_never_answers_times_out(self):
+        r = self.run_js(
+            self.HANGING_FETCH
+            + """
+const h = load({}, { fetch: hang });
+const t0 = Date.now();
+const err = await h.ctx.api("api/monitor/matches", {}, 80).then(() => null, (e) => ({ code: e.code, message: e.message }));
+out({ err, waited: Date.now() - t0 >= 75, defaults: vm.runInContext("[API_TIMEOUT_MS, CLIP_UPLOAD_TIMEOUT_MS]", h.ctx) });
+"""
+        )
+        self.assertEqual(r["err"], {"code": "timeout", "message": "8901 超过 0 秒没有回应"})
+        self.assertTrue(r["waited"])
+        self.assertEqual(r["defaults"], [20000, 120000])
+
+    def test_body_that_never_arrives_times_out_too(self):
+        r = self.run_js(
+            """
+const slowBody = async (_url, init) => ({ ok: true, status: 200,
+  json: () => new Promise((_, reject) => init.signal.addEventListener("abort", () => reject(new Error("aborted")))) });
+const h = load({}, { fetch: slowBody });
+out(await h.ctx.api("api/monitor/ext/config", {}, 50).then((d) => ({ data: d }), (e) => ({ code: e.code })));
+"""
+        )
+        self.assertEqual(r, {"code": "timeout"})
+
+    def test_network_error_and_http_error_are_unchanged(self):
+        r = self.run_js(
+            """
+const down = async () => { throw new TypeError("Failed to fetch"); };
+const a = await load({}, { fetch: down }).ctx.api("x").then(() => null, (e) => ({ name: e.name, message: e.message, code: e.code || null }));
+const bad = async () => ({ ok: false, status: 500, json: async () => ({ error: "boom", code: "x_failed" }) });
+const b = await load({}, { fetch: bad }).ctx.api("x").then(() => null, (e) => ({ message: e.message, code: e.code, status: e.status }));
+const login = async () => ({ ok: false, status: 401, json: async () => ({ login_url: "/login" }) });
+const c = await load({}, { fetch: login }).ctx.api("x").then(() => null, (e) => ({ code: e.code }));
+const fine = await load().ctx.api("x");
+out({ a, b, c, fine });
+"""
+        )
+        self.assertEqual(r["a"], {"name": "TypeError", "message": "Failed to fetch", "code": None})
+        self.assertEqual(r["b"], {"message": "boom", "code": "x_failed", "status": 500})
+        self.assertEqual(r["c"], {"code": "login_required"})
+        self.assertEqual(r["fine"], {"buffer_seconds": 300, "bitrate": 2000000})
+
+    def test_clip_upload_gets_the_long_timeout_and_a_hint(self):
+        r = self.run_js(
+            """
+const h = load();
+h.ctx.console = { log() {}, warn() {}, error: console.error }; // postClip logs its upload
+const seen = [];
+h.ctx.api = async (path, init, timeoutMs) => {
+  seen.push([path, init.method, timeoutMs]);
+  const e = new Error("8901 超过 120 秒没有回应"); e.code = "timeout"; throw e;
+};
+const job = { meta: { matchId: "1", startMs: 1, endMs: 2, segments: [] }, files: [] };
+const err = await h.ctx.postClip(job).then(() => null, (e) => ({ code: e.code, message: e.message }));
+out({ seen, err });
+"""
+        )
+        self.assertEqual(r["seen"], [["api/monitor/ext/clip", "POST", 120000]])
+        self.assertEqual(r["err"]["code"], "timeout")
+        self.assertTrue(r["err"]["message"].startswith("8901 超过 120 秒没有回应；如果服务器稍后还是做完了"))
+
+
+class ExtensionPanelTests(unittest.TestCase):
+    """extension/gif-clipper/panel.js: each tab's panel takes only its own tab's clips."""
+
+    HARNESS = r"""
+const vm = require("vm");
+const fs = require("fs");
+async function load(search) {
+  const posted = [];
+  let listener = null;
+  const frame = { style: {}, src: "", contentWindow: { postMessage: (m) => posted.push(m) } };
+  const chrome = { runtime: {
+    lastError: null,
+    sendMessage: (msg, cb) => setTimeout(() => cb(msg.type === "get-base-url" ? "https://m.example/gif-monitor/" : null), 0),
+    onMessage: { addListener: (fn) => { listener = fn; } },
+  } };
+  const document = { getElementById: (id) => (id === "frame" ? frame : { style: {} }) };
+  const ctx = vm.createContext({ chrome, document, location: { search }, URL, URLSearchParams, setTimeout, Promise });
+  vm.runInContext(fs.readFileSync(SCRIPT, "utf8"), ctx);
+  await new Promise((r) => setTimeout(r, 20));
+  return { frame, posted, refresh: (msg) => listener(Object.assign({ type: "panel-refresh" }, msg)) };
+}
+const out = (value) => process.stdout.write(JSON.stringify(value));
+(async () => {
+__BODY__
+})().catch((err) => { console.error(err); process.exit(1); });
+"""
+
+    @classmethod
+    def setUpClass(cls):
+        import shutil
+
+        cls.node = shutil.which("node")
+        if not cls.node:
+            raise unittest.SkipTest("node 不可用")
+        cls.script = Path(__file__).parent / "extension" / "gif-clipper" / "panel.js"
+
+    def run_js(self, body: str):
+        script = f"const SCRIPT = {json.dumps(str(self.script))};" + self.HARNESS.replace("__BODY__", body)
+        result = subprocess.run([self.node, "-e", script], capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_ignores_other_tabs_clips(self):
+        r = self.run_js(
+            """
+const p = await load("?match_id=1&tab=5");
+p.refresh({ tabId: 6, matchId: "2", name: "other.gif" });
+const fromOther = p.posted.length;
+p.refresh({ tabId: 5, matchId: "1", name: "mine.gif" });
+out({ src: p.frame.src, fromOther, posted: p.posted });
+"""
+        )
+        self.assertEqual(r["src"], "https://m.example/gif-monitor/?mode=panel&match_id=1")
+        self.assertEqual(r["fromOther"], 0)
+        self.assertEqual(r["posted"], [{"type": "ext-clip-created", "match_id": "1", "name": "mine.gif"}])
+
+    def test_own_tab_switching_match_still_follows(self):
+        r = self.run_js(
+            """
+const p = await load("?match_id=1&tab=5");
+p.refresh({ tabId: 5, matchId: "3", name: "new.gif" });
+out(p.posted);
+"""
+        )
+        self.assertEqual(r, [
+            {"type": "ext-set-match", "match_id": "3"},
+            {"type": "ext-clip-created", "match_id": "3", "name": "new.gif"},
+        ])
+
+    def test_panel_without_tab_takes_every_clip_as_before(self):
+        r = self.run_js(
+            """
+const p = await load("?match_id=1");
+p.refresh({ tabId: 6, matchId: "1", name: "a.gif" });
+out(p.posted);
+"""
+        )
+        self.assertEqual(r, [{"type": "ext-clip-created", "match_id": "1", "name": "a.gif"}])
 
 
 class ExtensionClusterSliceTests(unittest.TestCase):

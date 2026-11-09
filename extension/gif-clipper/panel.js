@@ -3,7 +3,13 @@
 // iframe via postMessage (the page only accepts chrome-extension:// origins).
 const frame = document.getElementById("frame");
 let baseUrl = "";
-let currentMatchId = new URLSearchParams(location.search).get("match_id") || "";
+const query = new URLSearchParams(location.search);
+let currentMatchId = query.get("match_id") || "";
+// Each tab that uses the clipper has its own panel, and "clip created" goes
+// to all of them: only take this tab's, or a clip in one live tab would turn
+// another tab's panel to its match. No ``tab`` in the URL (the tab's path was
+// never set): take everything, as before.
+const ownTabId = query.has("tab") ? Number(query.get("tab")) : null;
 
 function send(msg) {
   return new Promise((resolve) => {
@@ -38,6 +44,7 @@ async function init() {
 
 chrome.runtime.onMessage.addListener((msg) => {
   if (!msg || msg.type !== "panel-refresh") return false;
+  if (ownTabId != null && msg.tabId != null && msg.tabId !== ownTabId) return false;
   if (msg.matchId && msg.matchId !== currentMatchId) {
     currentMatchId = msg.matchId;
     postToPage({ type: "ext-set-match", match_id: currentMatchId });
