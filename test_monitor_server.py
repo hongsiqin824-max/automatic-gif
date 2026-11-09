@@ -1826,16 +1826,27 @@ class FakeHls {
   destroy() { calls.push('destroy'); }
   recoverMediaError() { calls.push('recoverMediaError'); }
   startLoad() { calls.push('startLoad'); this.started = true; }
+  stopLoad() { calls.push('stopLoad'); this.started = false; }
 }
 FakeHls.Events = {MANIFEST_PARSED: 'manifestParsed', LEVEL_LOADED: 'levelLoaded', FRAG_BUFFERED: 'fragBuffered', ERROR: 'error'};
 FakeHls.ErrorTypes = {NETWORK_ERROR: 'networkError', MEDIA_ERROR: 'mediaError', OTHER_ERROR: 'otherError'};
 const window = {Hls: FakeHls};
 const LATENCY = {hlsLiveSyncCount: 3};
-const video = {play() { return Promise.resolve(); }};
+const listeners = {};
+const video = {
+  isConnected: true,
+  play() { return Promise.resolve(); },
+  addEventListener(name, fn) { (listeners[name] = listeners[name] || []).push(fn); },
+};
 let fakeNow = 1000000;
 Date.now = () => fakeNow;
-const setTimeout = () => { calls.push('rebuildScheduled'); };
+const timers = [];
+const setTimeout = (fn, ms) => { calls.push('rebuildScheduled'); timers.push([fn, ms]); return timers.length; };
+const runTimers = () => { while (timers.length) timers.shift()[0](); };
 const fatalMedia = () => FakeHls.last.emit('error', {fatal: true, type: 'mediaError'});
+const stageNode = {textContent: '直播播放中', className: 'stage-status'};
+const state = {stageVideoNode: null};
+const $ = (id) => (id === 'stage-status' ? stageNode : null);
 """
 
     @classmethod
@@ -1854,7 +1865,7 @@ const fatalMedia = () => FakeHls.last.emit('error', {fatal: true, type: 'mediaEr
         ] + [
             re.search(rf"^function {name}\([^)]*\) \{{.*?^\}}", source, re.M | re.S)
             for name in (
-                "hlsLoadingStalled", "nextRebuildDelayMs", "nextPlayheadWatch", "playheadStuck",
+                "hlsLoadingStalled", "nextRebuildDelayMs", "stageStatusFor", "nextPlayheadWatch", "playheadStuck",
                 "playheadSteady", "detachPlayer", "attachHls",
             )
         ]
@@ -1883,11 +1894,57 @@ const fatalMedia = () => FakeHls.last.emit('error', {fatal: true, type: 'mediaEr
             "fatalMedia(); fakeNow += 5000; fatalMedia(); fakeNow += 5000; fatalMedia();"
             "process.stdout.write(JSON.stringify(calls));"
         )
+        # The third stops the player but keeps it attached (last frame stays
+        # up) until the back-off is over.
         self.assertEqual(calls, [
             "recoverMediaError", "startLoad",
             "recoverMediaError", "startLoad",
-            "destroy", "rebuildScheduled",
+            "stopLoad", "rebuildScheduled",
         ])
+
+    def test_rebuild_swaps_the_player_only_when_the_wait_is_over(self):
+        r = self.run_js(
+            "attachHls(video, 'index.m3u8', () => {});"
+            "const first = FakeHls.last;"
+            "fatalMedia(); fakeNow += 5000; fatalMedia(); fakeNow += 5000; fatalMedia();"
+            "const waiting = {same: video._hls === first, delay: timers[0][1], pending: !!video._hlsRebuildTimer};"
+            "fatalMedia();"  # errors of the stopped player are ignored
+            "const ignored = calls.slice(-1)[0];"
+            "runTimers();"
+            "process.stdout.write(JSON.stringify({waiting, ignored, replaced: video._hls !== first && video._hls === FakeHls.last,"
+            " destroyed: calls.includes('destroy'), pending: !!video._hlsRebuildTimer}));"
+        )
+        self.assertEqual(r, {
+            "waiting": {"same": True, "delay": 2000, "pending": True},
+            "ignored": "rebuildScheduled",
+            "replaced": True, "destroyed": True, "pending": False,
+        })
+
+    def test_a_burst_of_errors_stops_the_recovery_loop(self):
+        # A broken fragment fails again on every recovery, tens of times a
+        # second (54490381: the same segments 115 times): rebuild, do not spin.
+        calls = self.run_js(
+            "attachHls(video, 'index.m3u8', () => {});"
+            "for (let i = 0; i < 10; i++) { fatalMedia(); fakeNow += 50; }"
+            "process.stdout.write(JSON.stringify(calls));"
+        )
+        self.assertEqual(calls, [
+            "recoverMediaError", "startLoad",
+            "recoverMediaError", "startLoad",
+            "stopLoad", "rebuildScheduled",
+        ])
+
+    def test_rebuild_on_the_stage_updates_its_status_line(self):
+        r = self.run_js(
+            "attachHls(video, 'index.m3u8', () => {});"
+            "state.stageVideoNode = video;"
+            "FakeHls.last.emit('error', {fatal: true, type: 'otherError'});"
+            "const during = stageNode.textContent;"
+            "runTimers();"
+            "listeners.playing[0]();"
+            "process.stdout.write(JSON.stringify([during, stageNode.textContent]));"
+        )
+        self.assertEqual(r, ["播放中断，正在重建…", "直播已重新连接"])
 
     def test_media_errors_spread_out_keep_recovering_in_place(self):
         calls = self.run_js(

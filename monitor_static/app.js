@@ -413,7 +413,9 @@ function seekToLive(video, onDone) {
 }
 
 // Fatal media errors within the window before attachHls stops recovering in
-// place and rebuilds the player (see the ERROR handler).
+// place and rebuilds the player (see the ERROR handler). Every error counts,
+// even several in the same instant: a broken fragment fails again on every
+// recovery (tens of times a second), and only the rebuild stops that.
 const HLS_MEDIA_ERROR_REBUILD_COUNT = 3;
 const HLS_MEDIA_ERROR_WINDOW_MS = 30000;
 
@@ -427,6 +429,15 @@ function nextRebuildDelayMs(video) {
   const done = video._hlsRebuildCount || 0;
   video._hlsRebuildCount = done + 1;
   return PLAYER_REBUILD_DELAYS_MS[Math.min(done, PLAYER_REBUILD_DELAYS_MS.length - 1)];
+}
+
+// The stage status line, when ``video`` is the stage's player. A tile that is
+// enlarged keeps its grid onStatus, which only writes the tile's line, so
+// rebuilds and stalls on the stage would otherwise leave 「直播播放中」 up.
+function stageStatusFor(video, text, cls) {
+  if (!video || state.stageVideoNode !== video) return;
+  const node = $('stage-status');
+  if (node) { node.textContent = text; node.className = `stage-status ${cls || ''}`; }
 }
 
 function attachHls(video, playlistUrl, onStatus) {
@@ -450,20 +461,30 @@ function attachHls(video, playlistUrl, onStatus) {
     video._hls = hls;
     video._hlsPlaylistAt = 0;
     video._hlsWedged = false;
+    video._stuckFirstAt = null;
     let netRetries = 0;
     let mediaErrorTimes = [];
-    // Tear this player down and attach a fresh one after the back-off; a
-    // fresh player starts at the live edge with a new time base. Kept on the
-    // element for watchPlayheads and 「回到直播」.
+    let retiring = false;
+    // Rebuild: stop this player now, attach a fresh one after the back-off (a
+    // fresh player starts at the live edge with a new time base). Until then
+    // the old one stays attached, only stopped, so the picture keeps its last
+    // frame instead of going blank for up to a minute, and frameAnchorMs can
+    // still read its PDT. Kept on the element for watchPlayheads and 「回到直播」.
     const rebuild = (text, delayMs) => {
-      if (video._hls !== hls) return false;
+      if (video._hls !== hls || retiring) return false;
+      retiring = true;
       if (onStatus) onStatus(text, 'warn');
-      try { hls.destroy(); } catch (e) {}
-      video._hls = null;
+      stageStatusFor(video, text, 'warn');
+      try { hls.stopLoad(); } catch (e) {}
       const delay = delayMs != null ? delayMs : nextRebuildDelayMs(video);
       const reattach = () => {
-        // The element is gone (stage closed, tile removed): nothing to do.
-        if (video.isConnected) attachHls(video, playlistUrl, onStatus);
+        clearTimeout(video._hlsRebuildTimer);
+        video._hlsRebuildTimer = null;
+        video._hlsReattachNow = null;
+        if (video._hls !== hls) return; // someone else attached meanwhile
+        if (!video.isConnected) { detachPlayer(video); return; } // stage closed, tile removed
+        attachHls(video, playlistUrl, onStatus);
+        video.addEventListener('playing', () => stageStatusFor(video, '直播已重新连接', 'ok'), {once: true});
       };
       video._hlsReattachNow = reattach; // 「回到直播」 skips the wait
       video._hlsRebuildTimer = setTimeout(reattach, delay);
@@ -479,10 +500,12 @@ function attachHls(video, playlistUrl, onStatus) {
     hls.on(window.Hls.Events.LEVEL_LOADED, () => { video._hlsPlaylistAt = Date.now(); });
     hls.on(window.Hls.Events.FRAG_BUFFERED, () => {
       netRetries = 0;
-      if (onStatus) onStatus('正在播放直播源', 'ok');
+      if (onStatus && !retiring) onStatus('正在播放直播源', 'ok');
     });
     hls.on(window.Hls.Events.ERROR, (_e, data) => {
       if (!data || !data.fatal) return;
+      // Stopped and about to be replaced: recovering it would restart it.
+      if (retiring) return;
       if (data.type === window.Hls.ErrorTypes.MEDIA_ERROR) {
         const now = Date.now();
         mediaErrorTimes = mediaErrorTimes.filter((t) => now - t < HLS_MEDIA_ERROR_WINDOW_MS);
@@ -3040,17 +3063,14 @@ $('stage-live').addEventListener('click', () => {
   if (!state.stageVideoNode) return;
   const video = state.stageVideoNode;
   $('stage-status').className = 'stage-status';
-  // A stuck player (watchPlayheads) stays stuck after a seek, and one being
-  // rebuilt has no player to seek at all: reconnect now, skipping the
-  // back-off - the operator asked. A fresh player starts at the live edge.
-  const rebuilding = !video._hls && video._hlsReattachNow;
+  // A stuck player (watchPlayheads) stays stuck after a seek, and one waiting
+  // out a rebuild is stopped: reconnect now, skipping the
+  // back-off - the operator asked. A fresh player starts at the live edge;
+  // the rebuild puts 「直播已重新连接」 up once it plays.
+  const rebuilding = !!video._hlsRebuildTimer && !!video._hlsReattachNow;
   if (rebuilding || (video._hlsWedged && video._rebuildHls && video._rebuildHls('画面卡住，正在重新连接…', 0))) {
     if (rebuilding) video._hlsReattachNow();
     $('stage-status').textContent = '画面卡住，正在重新连接直播…';
-    video.addEventListener('playing', () => {
-      $('stage-status').textContent = '已重新连接，回到直播';
-      $('stage-status').className = 'stage-status ok';
-    }, {once: true});
     return;
   }
   $('stage-status').textContent = '正在回到直播…';
@@ -3248,6 +3268,8 @@ function reviveStalledPlayers() {
       if (!video || seen.has(video)) continue;
       seen.add(video);
       const hls = video._hls;
+      // A player waiting out a rebuild is stopped on purpose.
+      if (video._hlsRebuildTimer) continue;
       if (!hlsLoadingStalled(hls, video._hlsPlaylistAt, now)) continue;
       console.warn(`[PREVIEW] ${matchId} | 播放器已停止加载 ${Math.round((now - video._hlsPlaylistAt) / 1000)}s，重新开始加载`);
       video._hlsPlaylistAt = now;
@@ -3265,7 +3287,8 @@ function watchPlayheads() {
       if (!video || seen.has(video)) continue;
       seen.add(video);
       const hls = video._hls;
-      if (!hls) { video._playheadWatch = null; continue; }
+      // No player, or one already stopped for a rebuild: nothing to judge.
+      if (!hls || video._hlsRebuildTimer) { video._playheadWatch = null; continue; }
       const onStage = state.stageMatchId === matchId && state.stageVideoNode === video;
       const ok = !document.hidden && !tile.down && !video.paused && hls.started === true
         && !!video._hlsPlaylistAt && now - video._hlsPlaylistAt < HLS_STALL_GRACE_MS
@@ -3273,15 +3296,20 @@ function watchPlayheads() {
       const watch = nextPlayheadWatch(video._playheadWatch, {t: video.currentTime, ok}, now);
       video._playheadWatch = watch;
       if (playheadSteady(watch, now)) video._hlsRebuildCount = 0;
+      // Playing again (or nothing to judge): the next stall is counted afresh.
+      if (!ok || watch.steadySince != null) video._stuckFirstAt = null;
       const live = hls.liveSyncPosition;
       const ahead = typeof live === 'number' && isFinite(live) ? live - video.currentTime : null;
       if (!playheadStuck(watch, ahead, now)) continue;
       video._playheadWatch = null; // the clock starts over after acting
       video._hlsWedged = true;
-      const stuckText = `画面卡住 ${Math.round((now - watch.stuckSince) / 1000)}s（源数据异常）`;
+      // Time since this stall began, across repeated notes on a pinned stage.
+      video._stuckFirstAt = video._stuckFirstAt || watch.stuckSince;
+      const stuckText = `画面卡住 ${Math.round((now - video._stuckFirstAt) / 1000)}s（源数据异常）`;
       if (onStage && state.range.pinId != null) {
         // Rebuilding jumps to live; with a start pinned that is the operator's call.
         addStageNote(`${stuckText}，点「回到直播」重新连接`, 'warn', 'playhead-stuck');
+        stageStatusFor(video, `${stuckText}，点「回到直播」重新连接`, 'warn');
         continue;
       }
       const attempt = (video._hlsRebuildCount || 0) + 1;
