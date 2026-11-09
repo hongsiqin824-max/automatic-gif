@@ -2620,18 +2620,24 @@ function bindCropOverlay() {
 // (source_black_seconds in live_preview.py; 0 = it has a picture). The player
 // itself is fine, so say plainly that it is the pusher and that reloading
 // cannot help: on 11-07 (54494599) the operator reloaded 4 times in 4 minutes
-// while the pusher's own feed was black.
-function sourceBlackText(seconds) {
+// while the pusher's own feed was black. ``switchTo`` is the label of the
+// best other source for this match ('' = none, or switching is unavailable):
+// with one, point at the 「源」 button in the stage header instead of telling
+// the operator to just wait.
+function sourceBlackText(seconds, switchTo) {
   if (!(seconds > 0)) return '';
   const span = seconds < 60 ? `${Math.round(seconds)} 秒` : `${Math.floor(seconds / 60)} 分钟`;
-  return `⚠ 直播源画面是黑的（已约 ${span}）：是推流方的问题，刷新没用，等推流方恢复`;
+  const head = `⚠ 直播源画面是黑的（已约 ${span}）：是推流方的问题，刷新没用`;
+  if (!switchTo) return `${head}，等推流方恢复`;
+  return `${head}；可以点右上角「源」按钮换一路试试（推荐「${switchTo}」）`;
 }
 
 function renderStageSourceBlack() {
   const banner = $('stage-source-black');
   if (!banner) return;
   const tile = state.stageMatchId ? state.tiles.get(state.stageMatchId) : null;
-  const text = sourceBlackText(tile ? tile.sourceBlackSeconds : 0);
+  const best = sourceAlternatives(tile)[0];
+  const text = sourceBlackText(tile ? tile.sourceBlackSeconds : 0, best ? best.label : '');
   banner.textContent = text;
   banner.classList.toggle('hidden', !text);
 }
@@ -3479,6 +3485,7 @@ async function refreshSources(matchId) {
     current.sourcesAt = Date.now();
     renderSourceChips(matchId);
     renderSourceHint(state.stageMatchId);
+    if (matchId === state.stageMatchId) renderStageSourceBlack();  // its 「换一路」 advice follows the list
     if (sourceMenuState && sourceMenuState.matchId === matchId) renderSourceMenu();
     return data;
   } catch (error) {
