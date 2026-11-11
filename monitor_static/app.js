@@ -1453,6 +1453,53 @@ function buildCopyButton(getText) {
   return btn;
 }
 
+// ---- publish form timing ----
+// Where the time between a GIF being ready and 发布 goes (11-11 baseline:
+// median 38 s, every title typed by hand): when this tab first showed the
+// row, the first edit, the span over which the title was typed, and which
+// fields the operator changed. Sent with 发布 and only written to the server
+// log. Kept per clip name outside the form, because the stage list rebuilds
+// its forms (new pushes, player info) while the operator is typing.
+const formTimings = new Map();
+const FORM_TIMING_MAX = 200;
+
+function formTimingFor(name, now = Date.now()) {
+  let timing = formTimings.get(name);
+  if (!timing) {
+    timing = {shownAt: now, firstEditAt: null, titleFirstAt: null, titleLastAt: null, titleInputs: 0, edited: new Set()};
+    formTimings.set(name, timing);
+    if (formTimings.size > FORM_TIMING_MAX) formTimings.delete(formTimings.keys().next().value);
+  }
+  return timing;
+}
+
+// ``kind`` is the DOM event type: only 'input' counts as a title keystroke
+// (a text field also fires 'change' when it loses focus).
+function noteFormEdit(name, key, kind = 'input', now = Date.now()) {
+  const timing = formTimingFor(name, now);
+  if (timing.firstEditAt == null) timing.firstEditAt = now;
+  timing.edited.add(key);
+  if (key === 'title' && kind === 'input') {
+    if (timing.titleFirstAt == null) timing.titleFirstAt = now;
+    timing.titleLastAt = now;
+    timing.titleInputs += 1;
+  }
+}
+
+function formTimingPayload(name, now = Date.now()) {
+  const timing = formTimings.get(name);
+  if (!timing) return null;
+  const since = (at) => (at == null ? null : Math.max(0, at - timing.shownAt));
+  return {
+    shown_to_publish_ms: Math.max(0, now - timing.shownAt),
+    shown_to_first_edit_ms: since(timing.firstEditAt),
+    title_first_input_ms: since(timing.titleFirstAt),
+    title_last_input_ms: since(timing.titleLastAt),
+    title_inputs: timing.titleInputs,
+    edited: [...timing.edited],
+  };
+}
+
 function buildClipForm(item, row) {
   const form = document.createElement('div');
   form.className = 'stage-clip-form';
@@ -1471,6 +1518,7 @@ function buildClipForm(item, row) {
   const candidates = Array.isArray(item.candidates) ? item.candidates : [];
   const radioName = `clip-src-${item.name.replace(/\W/g, '')}`;
   const dirty = new Set();
+  formTimingFor(item.name);
 
   // What the server tied this clip to, shown on the row itself so the
   // operator sees it next to the radio it is about.
@@ -1582,8 +1630,8 @@ function buildClipForm(item, row) {
     const wrap = document.createElement('label');
     wrap.className = 'stage-clip-field';
     wrap.appendChild(document.createTextNode(labelText));
-    el.addEventListener('input', () => { dirty.add(key); syncPublishButton(); });
-    el.addEventListener('change', () => { dirty.add(key); syncPublishButton(); });
+    el.addEventListener('input', (ev) => { dirty.add(key); noteFormEdit(item.name, key, ev.type); syncPublishButton(); });
+    el.addEventListener('change', (ev) => { dirty.add(key); noteFormEdit(item.name, key, ev.type); syncPublishButton(); });
     wrap.appendChild(el);
     container.appendChild(wrap);
   };
@@ -1647,6 +1695,7 @@ function buildClipForm(item, row) {
     // The pick itself counts as an edit (so a list rebuild keeps it); re-fill
     // only the fields the operator has not touched.
     dirty.add('alert_seq');
+    noteFormEdit(item.name, 'alert_seq', 'change');
     if (!dirty.has('match_event')) typeSel.value = radio.dataset.matchEvent;
     if (!dirty.has('match_time')) timeEl.value = radio.dataset.matchTime;
     if (!dirty.has('match_score')) scoreEl.value = radio.dataset.score;
@@ -1848,8 +1897,12 @@ async function publishClip(name, formValues, button, row, force) {
   try {
     const data = await requestJson('api/monitor/clip/publish', {
       method: 'POST',
-      body: JSON.stringify({match_id: matchId, name, ...formValues, ...(force ? {force: true} : {})}),
+      body: JSON.stringify({
+        match_id: matchId, name, ...formValues, ...(force ? {force: true} : {}),
+        timing: formTimingPayload(name),
+      }),
     });
+    formTimings.delete(name);
     addStageNote(data.delivery_mode === 'publish' ? '已提交发布' : '已提交建草稿', 'ok');
     if (state.stageMatchId === matchId) loadStageClips(matchId);
   } catch (error) {

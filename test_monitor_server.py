@@ -554,6 +554,37 @@ class ClipRangeEndpointTests(unittest.TestCase):
         self.assertIsNone(self.store.get(pin_id, "54622319"))
 
 
+    def test_clip_log_carries_the_encode_time_and_a_failure_is_logged(self):
+        # 11-11: the workshop's monitor_clip line had no timing (the
+        # extension's monitor_ext_clip has encode_ms), so how long a GIF took
+        # could only be guessed from the file name to the second.
+        pin_id = self._pin(4.0).get_json()["pin_id"]
+        with mock.patch("builtins.print") as printed:
+            response = self.client.post(
+                "/api/monitor/clip",
+                json={"match_id": "54622319", "pin_id": pin_id, "end_epoch_ms": round((self.base + 12.5) * 1000)},
+            )
+        self.assertEqual(response.status_code, 200, response.get_json())
+        events = [json.loads(c.args[0]) for c in printed.call_args_list if c.args and str(c.args[0]).startswith("{")]
+        clip = next(e for e in events if e["event"] == "monitor_clip")
+        self.assertIsInstance(clip["encode_ms"], int)
+        self.assertGreaterEqual(clip["encode_ms"], 0)
+        # An encode that fails leaves a line too, with ffmpeg's reason.
+        pin_id = self._pin(4.0).get_json()["pin_id"]
+        with mock.patch.object(monitor_server, "_encode_clip_gif", side_effect=RuntimeError("GIF 编码失败：boom")), \
+             mock.patch("builtins.print") as printed:
+            response = self.client.post(
+                "/api/monitor/clip",
+                json={"match_id": "54622319", "pin_id": pin_id, "end_epoch_ms": round((self.base + 12.5) * 1000)},
+            )
+        self.assertEqual(response.status_code, 500)
+        events = [json.loads(c.args[0]) for c in printed.call_args_list if c.args and str(c.args[0]).startswith("{")]
+        failed = next(e for e in events if e["event"] == "monitor_clip_failed")
+        self.assertEqual(failed["match_id"], "54622319")
+        self.assertIn("boom", failed["error"])
+        self.assertIsInstance(failed["encode_ms"], int)
+
+
 class ClipListTests(unittest.TestCase):
     """``GET /api/monitor/clips``: newest-first GIFs joined to draft records."""
 
@@ -3007,6 +3038,45 @@ class ClipEndpointAlertMatchTests(unittest.TestCase):
 
 class ClipPublishEndpointTests(ClipEndpointAlertMatchTests):
     """Capture and publish are two steps; ``/api/monitor/clip/publish`` is the only path to the queue."""
+
+    def test_publish_logs_the_form_timing_and_the_clip_age(self):
+        # 11-11: the 38 s median between a GIF being ready and 发布 could not
+        # be broken down; the page now sends how it was spent and the server
+        # writes it, cleaned, into the manual_draft_enqueue line.
+        name = self._clip(10.0).get_json()["name"]
+        timing = {
+            "shown_to_publish_ms": 31000.4, "shown_to_first_edit_ms": 4000,
+            "title_first_input_ms": 9000, "title_last_input_ms": 26000,
+            "title_inputs": 18, "edited": ["title", "match_time", "bogus"],
+            "secret": "not logged",
+        }
+        with mock.patch("builtins.print") as printed:
+            published = self.client.post(
+                "/api/monitor/clip/publish",
+                json={"match_id": "54622319", "name": name, "title": "t", "timing": timing},
+            )
+        self.assertEqual(published.status_code, 200, published.get_json())
+        lines = [json.loads(c.args[0]) for c in printed.call_args_list if c.args and str(c.args[0]).startswith("{")]
+        line = next(e for e in lines if e["event"] == "manual_draft_enqueue")
+        self.assertEqual(line["timing"], {
+            "shown_to_publish_ms": 31000, "shown_to_first_edit_ms": 4000,
+            "title_first_input_ms": 9000, "title_last_input_ms": 26000,
+            "title_inputs": 18, "edited": ["match_time", "title"],
+        })
+        self.assertIsInstance(line["clip_age_seconds"], float)
+        self.assertGreaterEqual(line["clip_age_seconds"], 0.0)
+        # The timing never reaches the CMS event.
+        self.assertNotIn("timing", self.queue.enqueue.call_args.kwargs["event"])
+
+    def test_publish_from_an_old_page_logs_no_timing(self):
+        name = self._clip(10.0).get_json()["name"]
+        with mock.patch("builtins.print") as printed:
+            published = self.client.post(
+                "/api/monitor/clip/publish", json={"match_id": "54622319", "name": name, "title": "t"}
+            )
+        self.assertEqual(published.status_code, 200, published.get_json())
+        lines = [json.loads(c.args[0]) for c in printed.call_args_list if c.args and str(c.args[0]).startswith("{")]
+        self.assertIsNone(next(e for e in lines if e["event"] == "manual_draft_enqueue")["timing"])
 
     def test_capture_writes_sidecar_and_does_not_enqueue(self):
         data = self._clip(10.0).get_json()

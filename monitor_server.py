@@ -3544,11 +3544,26 @@ def monitor_clip():
     # while this one is still encoding must find the mode already used up.
     # A failed encode gives the claim back, so one bad attempt costs nothing.
     append_claim = _take_append_target(match_id)
+    encode_started = time.perf_counter()
     try:
         _encode_clip_gif(segments, before_seconds, output_path, anchor_epoch, start_epoch, crop=crop)
     except Exception as exc:
         _restore_append_target(match_id, append_claim)
+        print(
+            json.dumps(
+                {
+                    "event": "monitor_clip_failed",
+                    "match_id": match_id,
+                    "encode_ms": round((time.perf_counter() - encode_started) * 1000),
+                    "error": str(exc)[-400:],
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
         return jsonify({"error": str(exc)}), 500
+    # Same field as the extension's monitor_ext_clip: how long the GIF took.
+    encode_ms = round((time.perf_counter() - encode_started) * 1000)
     if pin is not None:
         clip_pins.release(pin["pin_id"])
     # Resolve which goal/red card this clip belongs to so the draft carries
@@ -3570,6 +3585,7 @@ def monitor_clip():
                 "segments": len(segments),
                 "with_pdt": sum(1 for seg in segments if seg[2] is not None),
                 "clip": output_path.name,
+                "encode_ms": encode_ms,
                 "alert_match": {
                     "mode": alert_match["mode"],
                     "candidates": alert_match["candidates"],
@@ -3627,6 +3643,42 @@ def monitor_clip():
             "appended": appended,
         }
     )
+
+
+# How the page says the operator spent the time before 发布 (app.js
+# formTimingPayload). 11-11 baseline: median 38 s from the GIF being ready to
+# 发布, every title typed by hand; this shows where those seconds go. Only
+# logged with manual_draft_enqueue, never stored or sent to the CMS.
+_PUBLISH_TIMING_MS_KEYS = (
+    "shown_to_publish_ms",
+    "shown_to_first_edit_ms",
+    "title_first_input_ms",
+    "title_last_input_ms",
+)
+_PUBLISH_TIMING_FIELDS = frozenset({"alert_seq", "match_event", "match_time", "match_score", "title"})
+
+
+def _timing_number(value: Any, ceiling: int) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return None
+    return int(min(max(value, 0), ceiling))
+
+
+def _publish_timing(raw: Any) -> dict[str, Any] | None:
+    """The page's form timing for one 发布, cleaned for the log (None if absent)."""
+    if not isinstance(raw, dict):
+        return None
+    timing: dict[str, Any] = {
+        key: _timing_number(raw.get(key), 86_400_000) for key in _PUBLISH_TIMING_MS_KEYS
+    }
+    timing["title_inputs"] = _timing_number(raw.get("title_inputs"), 100_000)
+    edited = raw.get("edited")
+    timing["edited"] = (
+        sorted({str(field) for field in edited if str(field) in _PUBLISH_TIMING_FIELDS})
+        if isinstance(edited, list)
+        else []
+    )
+    return timing
 
 
 @app.post("/api/monitor/clip/publish")
@@ -3748,6 +3800,11 @@ def monitor_clip_publish():
         _write_clip_meta(gif_path, meta)
     # Once sent, nobody should keep appending angles to this row.
     clip_append.clear(match_id, name=name)
+    try:
+        # The GIF file is written once, when its encode finishes.
+        clip_age_seconds: float | None = round(time.time() - gif_path.stat().st_mtime, 1)
+    except OSError:
+        clip_age_seconds = None
     print(
         json.dumps(
             {
@@ -3760,6 +3817,9 @@ def monitor_clip_publish():
                 "delivery_mode": _manual_delivery_mode(),
                 "status": status,
                 "error": publish_error,
+                # GIF ready -> 发布, and how the page says that time was spent.
+                "clip_age_seconds": clip_age_seconds,
+                "timing": _publish_timing(body.get("timing")),
             },
             ensure_ascii=False,
         ),
