@@ -9,6 +9,17 @@ const MATCHES_TTL_MS = 60_000;
 
 let configCache = { at: 0, value: null };
 let matchesCache = { at: 0, value: null };
+let matchesInFlight = null;
+
+// Logged out of 8901 (the session cookie expired): every tab's bar asks for
+// the match list once a minute and gets 401. 11-11: one Mac with ~15 such
+// tabs, logged out since 11-03, sent 15 a minute (all in the same second,
+// the tabs were restored together) for over a week. That answer is reused
+// for LOGIN_RETRY_MS instead of asking again; any successful request clears
+// it, and a bar that has just been loaded asks at once (the operator reloads
+// the live page after logging in).
+const LOGIN_RETRY_MS = 5 * 60_000;
+let loginRequired = null; // { at, err } while 8901 says to log in
 
 // ---- 8901 base URL / config --------------------------------------------
 
@@ -52,6 +63,7 @@ async function api(path, init = {}, timeoutMs = API_TIMEOUT_MS) {
     const err = new Error("需要登录 8901");
     err.code = "login_required";
     err.loginUrl = new URL(data.login_url, url).href;
+    loginRequired = { at: Date.now(), err };
     throw err;
   }
   if (!response.ok) {
@@ -60,6 +72,7 @@ async function api(path, init = {}, timeoutMs = API_TIMEOUT_MS) {
     err.status = response.status;
     throw err;
   }
+  loginRequired = null;
   return data;
 }
 
@@ -72,10 +85,26 @@ async function getConfig(force = false) {
   return value;
 }
 
-async function getMatches(force = false) {
+// ``retryLogin``: a bar that has just been loaded (the operator may have
+// logged in meanwhile) skips the remembered "log in" answer; the minute
+// refresh does not.
+async function getMatches(force = false, retryLogin = false) {
   if (!force && matchesCache.value && Date.now() - matchesCache.at < MATCHES_TTL_MS) {
     return matchesCache.value;
   }
+  if (!force && !retryLogin && loginRequired && Date.now() - loginRequired.at < LOGIN_RETRY_MS) {
+    throw loginRequired.err;
+  }
+  // Tabs restored together all ask in the same second: one request for all.
+  if (!matchesInFlight) {
+    matchesInFlight = fetchMatches().finally(() => {
+      matchesInFlight = null;
+    });
+  }
+  return matchesInFlight;
+}
+
+async function fetchMatches() {
   const data = await api("api/monitor/matches");
   const playing = Array.isArray(data.playing) ? data.playing : [];
   // Same rule as the page: finished matches past the grace window are only
@@ -330,7 +359,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       case "get-config":
         return await getConfig(!!msg.force);
       case "get-matches":
-        return await getMatches(!!msg.force);
+        return await getMatches(!!msg.force, !!msg.retryLogin);
       case "get-base-url":
         return await baseUrl();
       case "get-crop":

@@ -1283,6 +1283,87 @@ out({ seen, err });
         self.assertTrue(r["err"]["message"].startswith("8901 超过 120 秒没有回应；如果服务器稍后还是做完了"))
 
 
+class ExtensionLoggedOutPollingTests(unittest.TestCase):
+    """0.1.9: a logged-out plugin stops asking 8901 every minute from every tab.
+
+    11-11: one Mac (Chrome 153), logged out since 11-03, sent ~15 match-list
+    requests a minute, all in the same second (tabs restored together, each
+    with its bar), every one a 401, for over a week. Borrows the fake-Chrome
+    harness of ExtensionBackgroundUiTests without inheriting its tests.
+    """
+
+    HARNESS = ExtensionBackgroundUiTests.HARNESS
+    setUpClass = ExtensionBackgroundUiTests.__dict__["setUpClass"]
+    run_js = ExtensionBackgroundUiTests.run_js
+
+    SETUP = r"""
+const LIVE = { tab: { id: 1, url: "https://live.example/" }, frameId: 0 };
+let loggedIn = false;
+const hits = [];
+const fetch = async (url) => {
+  if (String(url).includes("api/monitor/matches")) hits.push(url);
+  if (!loggedIn) return { ok: false, status: 401, json: async () => ({ error: "login", login_url: "/gif-monitor/login" }) };
+  return { ok: true, status: 200, json: async () => ({ playing: [{ match_id: "54477923", team_A_name: "甲", team_B_name: "乙" }], upcoming: [] }) };
+};
+const h = load({}, { fetch });
+await settle();
+const setNow = (ms) => vm.runInContext(`Date.now = () => ${ms}`, h.ctx);
+const ask = (extra = {}) => h.send({ type: "get-matches", ...extra }, LIVE);
+"""
+
+    def test_tabs_asking_together_share_one_request_and_a_logout_is_remembered(self):
+        r = self.run_js(self.SETUP + """
+setNow(1_000_000);
+const together = await Promise.all(Array.from({ length: 15 }, () => ask()));
+const afterBurst = hits.length;
+setNow(1_000_000 + 60_000);
+const minuteLater = await ask();
+const afterMinute = hits.length;
+setNow(1_000_000 + 5 * 60_000 + 1);
+await ask();
+out({ afterBurst, afterMinute, afterExpiry: hits.length, first: together[0], same: together.every((x) => x.code === "login_required"),
+      minuteLater });
+""")
+        self.assertEqual(r["afterBurst"], 1)
+        self.assertTrue(r["same"])
+        self.assertEqual(r["first"]["code"], "login_required")
+        self.assertTrue(r["first"]["loginUrl"].endswith("/gif-monitor/login"))
+        # The minute refresh gets the remembered answer without a request.
+        self.assertEqual(r["afterMinute"], 1)
+        self.assertEqual(r["minuteLater"]["code"], "login_required")
+        # After 5 minutes it asks again.
+        self.assertEqual(r["afterExpiry"], 2)
+
+    def test_a_reloaded_bar_asks_at_once_and_a_login_clears_it(self):
+        r = self.run_js(self.SETUP + """
+setNow(2_000_000);
+await ask();
+loggedIn = true;
+setNow(2_000_000 + 30_000);
+const stale = await ask();
+const fresh = await ask({ retryLogin: true });
+loggedIn = false;
+setNow(2_000_000 + 60_000);
+const cached = await ask();
+out({ hits: hits.length, stale: stale.code || null, fresh, cached });
+""")
+        # Still inside the 5 minutes: the minute refresh does not ask...
+        self.assertEqual(r["stale"], "login_required")
+        # ...but a bar that has just been loaded does, and gets the list.
+        self.assertEqual(r["fresh"][0]["match_id"], "54477923")
+        self.assertEqual(r["hits"], 2)
+        # A successful answer forgot the logout (the list is then cached).
+        self.assertEqual(r["cached"][0]["match_id"], "54477923")
+
+    def test_logged_in_tabs_asking_together_share_one_request(self):
+        r = self.run_js(self.SETUP + """
+loggedIn = true;
+const lists = await Promise.all(Array.from({ length: 15 }, () => ask()));
+out({ hits: hits.length, all: lists.every((l) => Array.isArray(l) && l.length === 1) });
+""")
+        self.assertEqual(r, {"hits": 1, "all": True})
+
+
 class ExtensionPanelTests(unittest.TestCase):
     """extension/gif-clipper/panel.js: each tab's panel takes only its own tab's clips."""
 

@@ -15,6 +15,17 @@
   let startMs = null;
   let cropEntry = null;   // this match's saved crop {crop, last, aspect} (background), or null
   let videoAspect = 0;    // recording video width / height, from the status poll
+  // Set while 8901 answers "log in" (session expired): the status line keeps
+  // saying so over the 2 s recorder poll, and a click opens the login page.
+  // Before 0.1.9 the line said it for under 2 s and only the dropdown kept a
+  // hint, so a logged-out operator could miss it for days.
+  let loginUrl = null;
+  // The match dropdown: what it was last built from, whether the operator has
+  // it open, and a list that arrived meanwhile. Rebuilding it while open
+  // closed it under the operator's hand every minute.
+  let matchesKey = "";
+  let matchPicking = false;
+  let pendingMatches = null;
 
   function send(msg) {
     return new Promise((resolve) => {
@@ -50,6 +61,7 @@
       kbd { font: 11px/1 ui-monospace, Menlo, monospace; opacity: .7; margin-left: 4px; }
       .status { color: #9fb0c8; max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       .status.ok { color: #5fd38a; } .status.fail { color: #ff7b7b; } .status.warn { color: #ffc46b; }
+      .status.link { cursor: pointer; text-decoration: underline; max-width: 420px; }
       .rec { color: #ff6b6b; font-weight: 600; }
       .hide { background: transparent; color: #7f8ba0; padding: 4px 6px; }
       .crop.on { color: #ffc46b; } .crop.warn { color: #1a1300; background: #ffc46b; }
@@ -81,6 +93,23 @@
     ui.finish.addEventListener("click", () => send({ type: "command", command: "finish" }));
     ui.review.addEventListener("click", () => send({ type: "command", command: "review" }));
     ui.crop.addEventListener("click", toggleCrop);
+    ui.status.addEventListener("click", () => {
+      if (loginUrl) send({ type: "open-login", loginUrl });
+    });
+    // The dropdown counts as being picked from the press that opens it until
+    // a pick or leaving it; a list refreshed meanwhile is applied then.
+    const startPicking = () => { matchPicking = true; };
+    const stopPicking = () => {
+      matchPicking = false;
+      if (pendingMatches) {
+        const latest = pendingMatches;
+        pendingMatches = null;
+        renderMatches(latest, {});
+      }
+    };
+    ui.match.addEventListener("mousedown", startPicking);
+    ui.match.addEventListener("focus", startPicking);
+    ui.match.addEventListener("blur", stopPicking);
     ui.hide.addEventListener("click", () => {
       // Hide only: recording keeps going; the icon or Alt+0 brings it back.
       hide();
@@ -91,6 +120,7 @@
       setStatus(ui.match.value ? "已选比赛" : "未选比赛", ui.match.value ? "ok" : "warn");
       updateButtons();
       loadCrop();
+      stopPicking();
     });
     makeDraggable(bar.querySelector(".grip"));
     (document.fullscreenElement || document.documentElement).appendChild(host);
@@ -128,7 +158,8 @@
       setInterval(pollStatus, 2000),
       setInterval(() => loadMatches({ matchId: ui.match.value }), 60_000),
     ];
-    await loadMatches(state || (await send({ type: "get-tab-state" })) || {});
+    // Just loaded: the operator may have logged in since the last "log in".
+    await loadMatches(state || (await send({ type: "get-tab-state" })) || {}, { retryLogin: true });
     pollStatus();
   }
 
@@ -200,18 +231,38 @@
     loadCrop();
   }
 
-  async function loadMatches(state) {
-    const matches = await send({ type: "get-matches" });
+  async function loadMatches(state, { retryLogin = false } = {}) {
+    const matches = await send({ type: "get-matches", retryLogin });
     if (!matches || matches.error) {
       if (matches && matches.code === "login_required") {
-        setStatus("请先登录 8901", "fail");
-        ui.match.innerHTML = '<option value="">登录后刷新页面</option>';
+        loginUrl = matches.loginUrl || loginUrl || "";
+        showLoginNeeded();
+        if (!ui.match.value) ui.match.innerHTML = '<option value="">登录后刷新页面</option>';
+        matchesKey = "";
       } else {
         setStatus("读取比赛列表失败", "fail");
       }
       return;
     }
+    if (loginUrl !== null) {
+      loginUrl = null;
+      setStatus("已登录 8901", "ok", 3000);
+    }
+    renderMatches(matches, state);
+  }
+
+  // Rebuilds the dropdown only when the list changed, and never while the
+  // operator has it open (the list is kept for when they are done).
+  function renderMatches(matches, state) {
+    const key = JSON.stringify(matches.map((m) => [m.match_id, m.label, m.score]));
     const keep = state.matchId || ui.match.value;
+    // Nothing new: same list, and the match to keep is already the one shown.
+    if (key === matchesKey && keep === ui.match.value) return;
+    if (matchPicking) {
+      pendingMatches = matches;
+      return;
+    }
+    matchesKey = key;
     ui.match.innerHTML = '<option value="">选择比赛…</option>';
     for (const m of matches) {
       const opt = document.createElement("option");
@@ -232,11 +283,20 @@
     loadCrop();
   }
 
+  function showLoginNeeded() {
+    setStatus("8901 登录已过期，点这里重新登录，登录后刷新本页", "fail");
+    ui.status.classList.add("link");
+    ui.status.title = "截好的 GIF 传不上 8901，要先登录";
+  }
+
   async function pollStatus() {
     const s = await send({ type: "recorder-status" });
     if (!s) return;
     if (Date.now() < statusHoldUntil) {
       // A pushed message (e.g. "请先在小条里选择比赛") is still on show.
+    } else if (loginUrl !== null) {
+      // Recording still works, but no GIF can reach 8901 until the login.
+      showLoginNeeded();
     } else if (!s.elected || !s.recording) {
       setStatus("没有找到正在播放的视频", "warn");
     } else {
