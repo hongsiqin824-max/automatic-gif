@@ -175,7 +175,8 @@ class _PreviewEntry:
     source_black: bool = False
     # When the picture broke: an exit of a run that had been delivering
     # (not one of the quick re-fails while the history is already frozen,
-    # and not an operator's source switch). Pruned to the drop window.
+    # not a source that never delivered at all, and not an operator's source
+    # switch). Pruned to the drop window.
     drop_times: list = field(default_factory=list)
     # Operator source switches (switch_resource): the sequence number of the
     # last segment the previous source wrote; later numbers came from the new
@@ -593,9 +594,17 @@ class LivePreviewManager:
         # A run that delivered since the last reaper tick still counts as
         # having delivered.
         self._refresh_frozen_locked(match_id, entry)
-        if count_drop and entry.frozen_tail is None:
-            # This run had been delivering (or was the first one): the
-            # picture broke. Re-fails while already frozen are the same break.
+        if (
+            count_drop
+            and entry.frozen_tail is None
+            and self._playlist_entries(entry.directory)
+        ):
+            # This run had been delivering: the picture broke. Re-fails while
+            # already frozen are the same break. A source that never delivered
+            # a single segment leaves no playlist, so ``frozen_tail`` stays
+            # None across its re-fails; without the playlist check every retry
+            # of it counted as a new break (12 retries -> drops_recent 12 before
+            # kick-off, and a false "断了 N 次，建议换一路").
             entry.drop_times = [
                 at for at in entry.drop_times if now - at <= PREVIEW_DROP_WINDOW_SECONDS
             ]

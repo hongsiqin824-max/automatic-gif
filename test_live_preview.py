@@ -1167,5 +1167,30 @@ class LivePreviewSourceSwitchTests(unittest.TestCase):
         manager.entries["m1"].drop_times = [time.time() - 601]
         self.assertEqual(manager.status("m1")["drops_recent"], 0)
 
+    def test_a_source_that_never_delivered_is_not_counted_as_breaking(self):
+        # 2342dba review (11-09): before kick-off several sources are not
+        # pushing yet; each retry of one that never gave a segment counted as
+        # a break (12 retries -> drops_recent 12) and the workshop suggested
+        # switching away from a source that had simply not started.
+        manager = self.manager
+        for write_playlist in (False, True):  # no playlist / empty playlist
+            self._use(_dying_command_factory(write_playlist=write_playlist))
+            manager.start("m1", f"rtmp://h/wyc_live/sd-{int(write_playlist)}")
+            for _ in range(4):
+                manager.entries["m1"].process.wait(timeout=5)
+                manager._reap_tick(time.time())
+            self.assertGreaterEqual(manager.status("m1")["restart_count_total"], 3)
+            self.assertEqual(manager.status("m1")["drops_recent"], 0)
+            manager.stop("m1")
+        # Once it does deliver and then drops, that is one break.
+        self._use(_dying_with_segments_factory())
+        manager.start("m1", "rtmp://h/wyc_live/sd-2")
+        manager.entries["m1"].process.wait(timeout=5)
+        self._use(_dying_command_factory(write_playlist=False))
+        for _ in range(3):
+            manager._reap_tick(time.time())
+            manager.entries["m1"].process.wait(timeout=5)
+        self.assertEqual(manager.status("m1")["drops_recent"], 1)
+
 if __name__ == "__main__":
     unittest.main()
