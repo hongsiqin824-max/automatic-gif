@@ -2688,7 +2688,7 @@ def _frozen_preview_payload(match_id: str) -> dict[str, Any] | None:
         "ok": True,
         "match_id": match_id,
         "playlist_url": live_preview.playlist_url(match_id),
-        **status,
+        **_public_preview_status(status),
         "playlist_ready": True,
         "history_only": True,
         **_webrtc_fields(match_id, False),
@@ -2733,11 +2733,12 @@ def monitor_preview_start():
         # still leaves the buffered history; hand that over instead of an error.
         frozen = _frozen_preview_payload(match_id)
         if frozen:
-            frozen.update(_source_payload(match_id, frozen))
+            # From the raw status: the payload's ``resource`` is only a name.
+            frozen.update(_source_payload(match_id, status))
             return jsonify(frozen)
         return jsonify(
             {
-                "error": status.get("error") or "直播源拉流启动失败，请稍后重试",
+                "error": _redact_stream_urls(status.get("error")) or "直播源拉流启动失败，请稍后重试",
                 "code": "preview_exited",
             }
         ), 502
@@ -2747,7 +2748,7 @@ def monitor_preview_start():
             "match_id": match_id,
             "playlist_url": live_preview.playlist_url(match_id),
             "playlist_ready": playlist_ready,
-            **status,
+            **_public_preview_status(status),
             **_webrtc_fields(match_id, webrtc),
             **_source_payload(match_id, status),
         }
@@ -2819,6 +2820,40 @@ def _source_payload(match_id: str, status: dict[str, Any]) -> dict[str, Any]:
         info["chosen_by"] = choice["by"]
         info["chosen_at_unix"] = choice["at"]
     return {"source": info}
+
+
+# Stream addresses in free text: ffmpeg's exit lines start with the full
+# address ("rtmp://hs-wyc…/wyc_live/pt-xxxx: Input/output error").
+_STREAM_URL_RE = re.compile(r"\b(?:rtmps?|rtsps?|https?)://[^\s'\"<>]+", re.IGNORECASE)
+
+
+def _redact_stream_urls(text: Any) -> Any:
+    """``text`` with every stream address cut down to its stream name."""
+    if not isinstance(text, str) or "://" not in text:
+        return text
+    return _STREAM_URL_RE.sub(
+        lambda match: live_sources.stream_name(match.group(0)) or "直播源", text
+    )
+
+
+def _public_preview_status(status: dict[str, Any]) -> dict[str, Any]:
+    """A ``live_preview`` status as the browser gets it: no stream address.
+
+    The pull-address interface's terms say the addresses must not be exposed
+    in full (2342dba review, problem 3), yet ``resource`` and the ffmpeg exit
+    text (``error`` / ``last_exit_reason``) carried them to every open tab.
+    The workshop only tests ``resource`` against null (is there an entry for
+    this match at all) and turns the exit text into a short hint, so the
+    stream name (``pt-xxxx``, already shown in the source menu) serves both.
+    Server-side callers keep using the raw status.
+    """
+    public = dict(status)
+    if public.get("resource") is not None:
+        public["resource"] = live_sources.stream_name(public["resource"]) or "直播源"
+    for key in ("error", "last_exit_reason"):
+        if key in public:
+            public[key] = _redact_stream_urls(public[key])
+    return public
 
 
 @app.post("/api/monitor/preview/stop")
@@ -2922,7 +2957,7 @@ def monitor_preview_switch():
     if current == target["url"]:
         source_catalog.choices.remember(match_id, target["url"], by)
         status = live_preview.status(match_id)
-        return jsonify({"ok": True, "unchanged": True, "match_id": match_id, **status, **_source_payload(match_id, status)})
+        return jsonify({"ok": True, "unchanged": True, "match_id": match_id, **_public_preview_status(status), **_source_payload(match_id, status)})
     probe = source_catalog.probe(target["url"], timeout_seconds=SOURCE_SWITCH_PROBE_SECONDS)
     log_base = {
         "match_id": match_id,
@@ -2956,7 +2991,7 @@ def monitor_preview_switch():
             "ok": True,
             "match_id": match_id,
             "playlist_url": live_preview.playlist_url(match_id),
-            **switched,
+            **_public_preview_status(switched),
             **_source_payload(match_id, switched),
         }
     )
@@ -2984,7 +3019,7 @@ def monitor_preview_status():
     status["source_black"] = black_seconds > 0
     status["source_black_seconds"] = round(black_seconds)
     status.update(_source_payload(match_id, status))
-    return jsonify(status)
+    return jsonify(_public_preview_status(status))
 
 
 @app.get("/preview/<match_id>/<path:filename>")

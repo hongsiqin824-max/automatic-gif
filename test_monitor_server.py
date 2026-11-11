@@ -4575,7 +4575,8 @@ class SourceMenuAndSwitchEndpointTests(unittest.TestCase):
         data = response.get_json()
         self.assertEqual(self.switch_calls, [self.ZB])
         self.assertEqual(data["source"]["kind"], "zb")
-        self.assertNotIn("rtmp://", json.dumps({k: v for k, v in data.items() if k != "resource"}))
+        self.assertNotIn("rtmp://", json.dumps(data))
+        self.assertEqual(data["resource"], "zb-d9bvb")
         self.assertEqual(self.catalog.choices.get("54477923")["url"], self.ZB)
         self.assertTrue(self._sources()["sources"][2]["current"])
 
@@ -4627,6 +4628,93 @@ class SourceMenuAndSwitchEndpointTests(unittest.TestCase):
         data = self._sources()
         self.assertFalse(data["current_listed"])
         self.assertEqual(data["current"]["name"], "pt-old1")
+
+
+class PreviewPayloadHidesStreamAddressTests(unittest.TestCase):
+    """No stream address reaches the browser (2342dba review, problem 3).
+
+    The pull-address interface's terms say addresses must not be exposed in
+    full, yet preview start / status / switch carried ``resource`` and the
+    ffmpeg exit text, which starts with the address, to every open tab.
+    """
+
+    PT = "rtmp://hs-wyc.example/wyc_live/pt-a9nz"
+    EXIT = f"{PT}: Input/output error (x19)"
+
+    def setUp(self):
+        self.client = monitor_server.app.test_client()
+        self.status = {"running": True, "resource": self.PT, "playlist_ready": True}
+        patches = [
+            mock.patch.object(monitor_server, "_resolve_source", return_value=self.PT),
+            mock.patch.object(monitor_server.live_preview, "start", side_effect=lambda m, r: dict(self.status)),
+            mock.patch.object(monitor_server.live_preview, "status", side_effect=lambda m: dict(self.status)),
+            mock.patch.object(monitor_server.live_preview, "source_black_seconds", return_value=0.0),
+            mock.patch.object(monitor_server, "_wait_playlist_ready", return_value=True),
+            mock.patch.object(monitor_server.webrtc_gateway, "enabled", False),
+            mock.patch.object(monitor_server.webrtc_gateway, "upstream_for", return_value=None),
+        ]
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _assert_hidden(self, data):
+        self.assertNotIn("://", json.dumps(data, ensure_ascii=False))
+
+    def test_status_names_the_stream_but_not_its_address(self):
+        self.status.update(running=False, error=self.EXIT, last_exit_reason=self.EXIT)
+        data = self.client.get("/api/monitor/preview/status?match_id=54477923").get_json()
+        self._assert_hidden(data)
+        # The workshop tests resource against null and turns the exit text
+        # into a hint: both still work with the stream name.
+        self.assertEqual(data["resource"], "pt-a9nz")
+        self.assertEqual(data["last_exit_reason"], "pt-a9nz: Input/output error (x19)")
+        self.assertEqual(data["error"], "pt-a9nz: Input/output error (x19)")
+        # The source block is still worked out from the real address.
+        self.assertEqual(data["source"]["kind"], "pt")
+        self.assertEqual(data["source"]["name"], "pt-a9nz")
+
+    def test_no_preview_still_reports_resource_null(self):
+        self.status = {"running": False, "resource": None, "playlist_ready": False}
+        data = self.client.get("/api/monitor/preview/status?match_id=54477923").get_json()
+        self.assertIsNone(data["resource"])
+        self.assertNotIn("last_exit_reason", data)
+
+    def test_start_hides_the_address(self):
+        response = self.client.post("/api/monitor/preview/start", json={"match_id": "54477923"})
+        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
+        data = response.get_json()
+        self._assert_hidden(data)
+        self.assertEqual(data["resource"], "pt-a9nz")
+        self.assertEqual(data["source"]["kind"], "pt")
+
+    def test_start_failure_text_hides_the_address(self):
+        self.status = {"running": False, "resource": None, "playlist_ready": False, "error": self.EXIT}
+        response = self.client.post("/api/monitor/preview/start", json={"match_id": "54477923"})
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.get_json()["error"], "pt-a9nz: Input/output error (x19)")
+
+    def test_start_with_only_history_left_hides_the_address(self):
+        self.status = {"running": False, "resource": self.PT, "history_frozen": True,
+                       "error": self.EXIT, "last_exit_reason": self.EXIT}
+        with TemporaryDirectory() as tmp:
+            (Path(tmp) / "index.m3u8").write_text("#EXTM3U\n", encoding="utf-8")
+            with mock.patch.object(monitor_server.live_preview, "media_dir", return_value=Path(tmp)):
+                response = self.client.post("/api/monitor/preview/start", json={"match_id": "54477923"})
+        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
+        data = response.get_json()
+        self._assert_hidden(data)
+        self.assertTrue(data["history_only"])
+        self.assertEqual(data["resource"], "pt-a9nz")
+        self.assertEqual(data["source"]["kind"], "pt")
+
+    def test_redact_keeps_the_text_around_each_address(self):
+        redact = monitor_server._redact_stream_urls
+        self.assertEqual(
+            redact("open rtmp://h/live/sd-1?token=abc failed; rtsp://127.0.0.1:8554/54477923 too"),
+            "open sd-1 failed; 54477923 too",
+        )
+        self.assertEqual(redact("Non-monotonous DTS"), "Non-monotonous DTS")
+        self.assertIsNone(redact(None))
 
 
 class ClipAcrossSourceSwitchTests(unittest.TestCase):
