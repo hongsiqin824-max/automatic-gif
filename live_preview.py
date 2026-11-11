@@ -173,6 +173,10 @@ class _PreviewEntry:
     # Whether the last source_black_seconds() call found the source black;
     # only used to log the start and the end of a black stretch once each.
     source_black: bool = False
+    # When the current black stretch began. The playlist only holds the last
+    # ~10 minutes (600 x 1 s), so counting back over it alone tops out there
+    # and a longer black stage kept saying "已约 10 分钟".
+    source_black_since: float | None = None
     # When the picture broke: an exit of a run that had been delivering
     # (not one of the quick re-fails while the history is already frozen,
     # not a source that never delivered at all, and not an operator's source
@@ -753,6 +757,11 @@ class LivePreviewManager:
                 return 0.0
             directory = entry.directory
         seconds = 0.0
+        # True when the count stopped at a segment that has a picture, i.e.
+        # the black stretch started inside the listed history and ``seconds``
+        # is its whole length. Otherwise (every listed segment black, or the
+        # oldest one just deleted) the stretch may be older than the playlist.
+        picture_found = False
         for name, duration in reversed(self._playlist_durations(directory)):
             if duration <= 0:
                 break
@@ -761,18 +770,29 @@ class LivePreviewManager:
             except OSError:
                 break
             if size >= SOURCE_BLACK_BYTES_PER_SECOND * duration:
+                picture_found = True
                 break
             seconds += duration
         black = seconds >= SOURCE_BLACK_MIN_SECONDS
+        now = time.time()
         with self.lock:
-            if self.entries.get(match_id) is entry and entry.source_black != black:
-                entry.source_black = black
-                _log_event(
-                    "preview_source_black",
-                    match_id=match_id,
-                    black=black,
-                    seconds=round(seconds, 1),
-                )
+            if self.entries.get(match_id) is entry:
+                if not black:
+                    entry.source_black_since = None
+                elif picture_found or entry.source_black_since is None:
+                    entry.source_black_since = now - seconds
+                else:
+                    # Black for longer than the playlist reaches back: keep
+                    # counting from when it was first seen.
+                    seconds = max(seconds, now - entry.source_black_since)
+                if entry.source_black != black:
+                    entry.source_black = black
+                    _log_event(
+                        "preview_source_black",
+                        match_id=match_id,
+                        black=black,
+                        seconds=round(seconds, 1),
+                    )
         return seconds if black else 0.0
 
     def _reap_loop(self) -> None:

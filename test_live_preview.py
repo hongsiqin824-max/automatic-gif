@@ -829,6 +829,10 @@ class LivePreviewSourceBlackTests(unittest.TestCase):
         self._write(directory, [self.BLACK] * 20, missing={9})
         self.assertEqual(self.manager.source_black_seconds("m1"), 10.0)
         self._write(directory, [self.BLACK] * 20)
+        # A separate case: forget the stretch the first one started (otherwise
+        # the time since then would be reported, see
+        # test_black_longer_than_the_playlist_keeps_counting).
+        self.manager.entries["m1"].source_black_since = None
         playlist = directory / "index.m3u8"
         playlist.write_text(
             playlist.read_text(encoding="utf-8").replace(
@@ -865,6 +869,26 @@ class LivePreviewSourceBlackTests(unittest.TestCase):
         self.assertEqual([e["black"] for e in events], [True, False])
         self.assertEqual(events[0]["seconds"], 10.0)
         self.assertEqual(events[0]["match_id"], "m1")
+
+    def test_black_longer_than_the_playlist_keeps_counting(self):
+        # 11-09 review of ef6cb4e: the playlist holds the last 600 x 1 s, so a
+        # count over it alone stopped at ~10 minutes and the stage kept saying
+        # "已约 10 分钟" however long the source stayed black.
+        directory = self._start()
+        self._write(directory, [self.BLACK] * 30)
+        real_time = time.time
+        self.assertEqual(self.manager.source_black_seconds("m1"), 30.0)
+        with mock.patch("live_preview.time.time", side_effect=lambda: real_time() + 700):
+            self.assertGreaterEqual(self.manager.source_black_seconds("m1"), 729.0)
+        # The picture comes back: the stretch is over and forgotten.
+        self._write(directory, [self.BLACK] * 29 + [self.NORMAL])
+        self.assertEqual(self.manager.source_black_seconds("m1"), 0.0)
+        self.assertIsNone(self.manager.entries["m1"].source_black_since)
+        # A new stretch that starts inside the playlist is measured from it,
+        # not from the old one.
+        self._write(directory, [self.NORMAL] + [self.BLACK] * 12)
+        with mock.patch("live_preview.time.time", side_effect=lambda: real_time() + 900):
+            self.assertEqual(self.manager.source_black_seconds("m1"), 12.0)
 
 
 def _segment_playlist(count: int) -> str:
