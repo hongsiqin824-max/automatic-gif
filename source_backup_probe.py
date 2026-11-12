@@ -92,6 +92,22 @@ def _load_dotenv(path: Path) -> None:
             os.environ.setdefault(key, value)
 
 
+def catalog_kickoff(item: dict[str, Any]) -> float:
+    """Kick-off of a directory row. ``start_play`` is UTC wall time (checked
+    2026-11-12: 中国U19-越南U19 ``11:35`` scored at 19:49 Beijing), while
+    ``sort_timestamp`` - which ``match_catalog.catalog_match_timestamp``
+    prefers - is that wall time read as Beijing, i.e. 8 hours early."""
+    start_play = str(item.get("start_play") or "").strip()
+    try:
+        return datetime.strptime(start_play, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        pass
+    try:
+        return float(item.get("sort_timestamp")) + 8 * 3600
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"比赛 {item.get('match_id')!r} 没有开球时间") from exc
+
+
 def stream_name(url: str) -> str:
     """Last path part (``pt-f7ww``); results never carry the full address."""
     return str(url or "").strip().split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1]
@@ -566,7 +582,7 @@ def main() -> None:
     _load_dotenv(ROOT / ".env")
     import live_preview
     import live_sources
-    from match_catalog import MatchCatalog, catalog_match_timestamp
+    from match_catalog import MatchCatalog
 
     try:
         max_backups = max(0, int(os.environ.get("GIF_SOURCE_PROBE_MAX", DEFAULT_MAX_BACKUPS)))
@@ -580,7 +596,7 @@ def main() -> None:
         results_path=ROOT / "data" / "source_probe" / "results.jsonl",
         catalog_playing=lambda: catalog.snapshot().get("playing", []),
         collect_sources=lambda match_id: sources.collect(match_id)[0],
-        kickoff_of=catalog_match_timestamp,
+        kickoff_of=catalog_kickoff,
         kind_of=live_sources.kind_of,
         make_pull=lambda url: BackupPull(url, ffmpeg),
         max_backups=max_backups,

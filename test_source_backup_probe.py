@@ -101,6 +101,16 @@ class VerdictTest(unittest.TestCase):
 
 
 class ParsingTest(unittest.TestCase):
+    def test_catalog_kickoff_reads_start_play_as_utc(self):
+        from datetime import datetime, timedelta, timezone
+        bj = timezone(timedelta(hours=8))
+        item = {"match_id": "54419539", "start_play": "2026-11-12 19:45:00", "sort_timestamp": 1794483900}
+        self.assertEqual(datetime.fromtimestamp(probe_mod.catalog_kickoff(item), bj).strftime("%m-%d %H:%M"), "11-13 03:45")
+        only_sort = {"match_id": "1", "sort_timestamp": 1794483900}
+        self.assertEqual(probe_mod.catalog_kickoff(only_sort), probe_mod.catalog_kickoff(item))
+        with self.assertRaises(ValueError):
+            probe_mod.catalog_kickoff({"match_id": "2"})
+
     def test_progress_lines(self):
         self.assertEqual(parse_out_time("out_time_us=1500000\n"), 1500000)
         self.assertEqual(parse_out_time("out_time_ms=1500000"), 1500000)
