@@ -1,0 +1,21 @@
+[Unit]
+Description=8901 备用直播源测量 (gif-source-probe, source_backup_probe.py；不影响 8901)
+After=network-online.target gif-monitor.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/gif-monitor
+ExecStart=/opt/gif-monitor/.venv/bin/python -u /opt/gif-monitor/source_backup_probe.py
+Restart=always
+RestartSec=10
+KillSignal=SIGTERM
+TimeoutStopSec=20
+# Below 8901 in CPU priority: measuring must never slow the previews.
+Nice=10
+StandardOutput=journal
+StandardError=journal
+Environment=HOME=/root
+
+[Install]
+WantedBy=multi-user.target
