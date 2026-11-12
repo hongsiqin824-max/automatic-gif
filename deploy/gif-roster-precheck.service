@@ -1,0 +1,23 @@
+[Unit]
+Description=8901 GIF 排班表预检 (gif-roster-precheck, roster_precheck.py；不影响 8901)
+After=network-online.target gif-monitor.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/gif-monitor
+ExecStart=/opt/gif-monitor/.venv/bin/python -u /opt/gif-monitor/roster_precheck.py
+Restart=always
+RestartSec=10
+# Exit 2 = not configured (no sheet token / webhook): stay stopped, do not loop.
+RestartPreventExitStatus=2
+KillSignal=SIGTERM
+TimeoutStopSec=20
+# Below 8901 in CPU priority; checks run once a minute.
+Nice=10
+StandardOutput=journal
+StandardError=journal
+Environment=HOME=/root
+
+[Install]
+WantedBy=multi-user.target
